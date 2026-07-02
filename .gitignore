@@ -1,0 +1,34 @@
+# Local agent/project context may contain private endpoints or credentials.
+AGENTS.md
+.agent-docs/
+
+# Environment and secret material.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+
+# Dependencies and build output.
+node_modules/
+.next/
+dist/
+build/
+coverage/
+
+# Logs and local runtime files.
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS/editor noise.
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
