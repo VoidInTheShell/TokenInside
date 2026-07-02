@@ -185,6 +185,12 @@ export async function getFeishuDepartmentById(departmentId: string) {
   return data.department ?? (data as FeishuDepartment);
 }
 
+export async function getFeishuDepartmentNameById(departmentId?: string) {
+  if (!departmentId) return undefined;
+  const department = await getFeishuDepartmentById(departmentId);
+  return department.name;
+}
+
 export async function resolveApprovalTargetForUser(openId: string): Promise<ApprovalTarget> {
   const user = await getFeishuContactUserByOpenId(openId);
   const departmentIds = user.department_ids?.filter(Boolean) ?? [];

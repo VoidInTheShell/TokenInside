@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getConfig } from "@/lib/config";
-import { getFeishuContactUserByOpenId } from "@/lib/feishu";
+import { getFeishuContactUserByOpenId, getFeishuDepartmentNameById } from "@/lib/feishu";
 import { getCurrentUser } from "@/lib/session";
 import {
   getActiveTokenForUser,
@@ -36,6 +36,14 @@ async function hydrateUserDepartment<T extends Awaited<ReturnType<typeof getCurr
   }
 }
 
+async function resolveDepartmentName(departmentId?: string) {
+  try {
+    return await getFeishuDepartmentNameById(departmentId);
+  } catch {
+    return undefined;
+  }
+}
+
 export async function GET() {
   const user = await hydrateUserDepartment(await getCurrentUser());
   const config = getConfig();
@@ -55,6 +63,10 @@ export async function GET() {
     getAdminScopeForUser(user.id),
     getStoreSnapshot(),
   ]);
+  const [departmentName, adminScopeDepartmentName] = await Promise.all([
+    resolveDepartmentName(user.departmentId),
+    resolveDepartmentName(adminScope?.departmentId),
+  ]);
 
   return NextResponse.json({
     authenticated: true,
@@ -66,12 +78,14 @@ export async function GET() {
       tenantKey: user.tenantKey,
       openId: user.openId,
       departmentId: user.departmentId,
+      departmentName,
     },
     activeToken,
     adminScope: adminScope
       ? {
           type: adminScope.scopeType,
           departmentId: adminScope.departmentId,
+          departmentName: adminScopeDepartmentName,
           source: adminScope.source,
         }
       : null,

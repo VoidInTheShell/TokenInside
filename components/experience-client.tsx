@@ -36,6 +36,7 @@ type SessionResponse = {
     tenantKey: string;
     openId: string;
     departmentId?: string;
+    departmentName?: string;
   };
   activeToken?: {
     id: string;
@@ -46,6 +47,7 @@ type SessionResponse = {
   adminScope?: {
     type: "global" | "department";
     departmentId?: string;
+    departmentName?: string;
     source: "manual" | "department_supervisor";
   } | null;
   requests: Array<{
@@ -108,7 +110,11 @@ function avatarInitial(user?: SessionResponse["user"]) {
 function scopeLabel(scope?: SessionResponse["adminScope"]) {
   if (!scope) return "";
   if (scope.type === "global") return "全局管理";
-  return `部门 ${scope.departmentId ?? "-"}`;
+  return `部门 ${scope.departmentName ?? scope.departmentId ?? "-"}`;
+}
+
+function departmentLabel(user?: SessionResponse["user"]) {
+  return user?.departmentName ?? user?.departmentId ?? "-";
 }
 
 export function ExperienceClient() {
@@ -337,12 +343,8 @@ export function ExperienceClient() {
                   <span>{session?.user?.openId ? maskSecret(session.user.openId) : "-"}</span>
                 </div>
                 <div className="user-card-meta">
-                  <span>租户</span>
-                  <strong>{session?.user?.tenantKey ?? "-"}</strong>
-                </div>
-                <div className="user-card-meta">
                   <span>部门</span>
-                  <strong>{session?.user?.departmentId ?? "-"}</strong>
+                  <strong>{departmentLabel(session?.user)}</strong>
                 </div>
                 {session?.adminScope && (
                   <div className="user-card-action">

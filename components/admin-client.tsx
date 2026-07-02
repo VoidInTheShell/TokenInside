@@ -34,11 +34,13 @@ type AdminOverviewResponse = {
     tenantKey: string;
     openId: string;
     departmentId?: string;
+    departmentName?: string;
   };
   overview?: {
     scope: {
       type: "global" | "department";
       departmentId?: string;
+      departmentName?: string;
       source: "manual" | "department_supervisor";
     };
     totals: {
@@ -96,7 +98,7 @@ function badgeVariant(status?: string) {
 function scopeLabel(scope?: AdminScopeSummary) {
   if (!scope) return "无管理范围";
   if (scope.type === "global") return "全局管理";
-  return `部门 ${scope.departmentId ?? "-"}`;
+  return `部门 ${scope.departmentName ?? scope.departmentId ?? "-"}`;
 }
 
 function displayName(user?: AdminOverviewResponse["user"]) {
@@ -105,6 +107,10 @@ function displayName(user?: AdminOverviewResponse["user"]) {
 
 function avatarInitial(user?: AdminOverviewResponse["user"]) {
   return displayName(user).trim().slice(0, 1).toUpperCase() || "T";
+}
+
+function departmentLabel(user?: AdminOverviewResponse["user"]) {
+  return user?.departmentName ?? user?.departmentId ?? "-";
 }
 
 export function AdminClient() {
@@ -257,7 +263,7 @@ export function AdminClient() {
                 </div>
                 <div className="user-card-meta">
                   <span>部门</span>
-                  <strong>{data.user?.departmentId ?? "-"}</strong>
+                  <strong>{departmentLabel(data.user)}</strong>
                 </div>
               </div>
             </CardContent>
@@ -353,7 +359,7 @@ export function AdminClient() {
                 </div>
                 <div className="meta-row">
                   <span>部门</span>
-                  <strong>{data?.user?.departmentId ?? "-"}</strong>
+                  <strong>{departmentLabel(data?.user)}</strong>
                 </div>
               </div>
             </CardContent>

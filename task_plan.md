@@ -50,7 +50,7 @@
 | B | in_progress | 服务器优先真实链路：先产出 Docker 镜像并部署 USLA，再在 `ti.kumiko-love.com` 完成飞书 OAuth、部门领导解析、卡片审批回调、NewAPI token 管理和 `/v1` 代理实测 |
 | C | planned | 将 JSON MVP store 迁移到 PostgreSQL，并补齐唯一 active key、事件幂等和事务状态机 |
 | D | pulled_forward | 部署运维工作前置并合入 B0；测试阶段先用 Docker + USLA 公网域名解决飞书回调验证闭环 |
-| E | in_progress | 已按最新口径前置补齐申请界面/用户后台分流、用户后台模型列表、管理员入口权限展示、`/admin` 入口壳、管理范围数据结构和只读概览 API；后续需补部门主管同步、用量统计、调额、额度重置和 key 重置 |
+| E | in_progress | 已按最新口径前置补齐申请界面/用户后台分流、用户后台模型列表、管理员入口权限展示、`/admin` 入口壳、管理范围数据结构和只读概览 API；后续需补部门主管同步、用量统计、默认额度配置、审批单额度覆盖、调额、额度重置和 key 重置 |
 
 ## 当前落地状态
 
@@ -95,6 +95,9 @@
 39. 线上基础验证通过：公网 `/api/health` 200，公网 `/` 200 HTML，公网 `/v1/models` 无 key 返回 401 JSON，公网 `/v1/embeddings` 返回 TokenInside allowlist 404 JSON；签名加密事件 challenge 返回 `{"challenge":"ti-b2-card-check-20260702"}`，签名加密 `card.action.trigger` 缺字段模拟返回 200 错误 toast。
 40. 用户真实测试发现三项问题：用户已加入部门但用户卡片部门仍显示占位符；点击申请时报 `Bot ability is not activated.`；申请理由需要用户填写，默认申请金额需要展示但不可修改。已本地修复部门懒同步、申请表单和机器人能力错误提示。
 41. B2/B3 修复已部署到 USLA：镜像 `voidintheshell/tokeninside:b2-card-fix-20260702-2310` 与 `latest` 已推送并部署，digest 为 `sha256:52ab21f02022e0b0f7ed68e5cbce282a2bcbf5acf1e74629f34a3df5923e4ffa`；远端容器 running/healthy，公网 `/api/health`、`/`、`/v1/models` 无 key、`/v1/embeddings` allowlist 404 和签名加密事件 challenge 均复测通过。
+42. 最新额度配置需求已补入计划：管理后台需要提供默认申请额度配置，初始化值为 `200`；普通用户申请页只展示该值且不可修改；审批每条申请时可手动确认或覆盖最终额度，审批通过后以最终额度发放和进入账期统计。
+43. 用户卡片展示收尾已本地完成：首页用户卡移除“租户”，部门展示改为服务端从飞书部门详情解析出的 `departmentName`，管理后台当前用户与管理范围同样优先展示部门名称。
+44. 用户卡片展示收尾已部署到 USLA：当前运行镜像为 `voidintheshell/tokeninside:b2-user-card-dept-20260702`，digest `sha256:a2593de49c3564e23fdc36dd19703e59329ae42c370b1b0831f322ea2332d98e`，公网健康、未登录 session、无 key `/v1/models` 和飞书事件签名 challenge 均已复测。
 
 ## 计划文档索引
 
@@ -112,11 +115,11 @@
 
 B 阶段优先执行顺序已调整为服务器优先：
 
-1. B0 代码、镜像、Hub 推送、USLA pull-only 部署和 BunkerWeb 错误体透传配置已完成；当前运行镜像为 `voidintheshell/tokeninside:b2-card-fix-20260702-2310`，上一稳定卡片审批镜像为 `voidintheshell/tokeninside:b2-card-20260702-2210`。
+1. B0 代码、镜像、Hub 推送、USLA pull-only 部署和 BunkerWeb 错误体透传配置已完成；当前运行镜像为 `voidintheshell/tokeninside:b2-user-card-dept-20260702`，上一稳定卡片审批镜像为 `voidintheshell/tokeninside:b2-card-fix-20260702-2310`。
 2. B1 当前代码层修复已本地和公网验证通过：H5 JSSDK 加载、`h5sdk.ready()`、`requestAccess.appID`、`requestAuthCode` 回退、OAuth token 交换、自动免登、用户身份卡、无按钮 UI 和 `20029 invalid redirect uri` 明确诊断均已部署；公网事件回调加密 challenge 已通过。用户已在飞书后台补齐重定向 URL，并手动确认后台可获取飞书用户信息。
 3. B2/B3 主路径已调整为部门领导卡片审批；下一步提交 Token 申请，解析申请人所在部门领导，向该领导发送审批卡片，并通过 `card.action.trigger` 完成一次通过/拒绝来确认 payload、权限和幂等状态机。
 4. B5 使用审批通过后发放的 key 访问 `https://ti.kumiko-love.com/v1` 完成数据面透传验证。
-5. E 阶段已从信息架构文档推进到本地代码：申请界面、用户后台、模型列表、管理员入口可见性和数据面 allowlist 已完成本地验证；后续继续补 `admin_scopes` 写入/同步、部门主管范围展开、用量统计、调额和 key/额度重置，不能把当前入口壳当成完整管理后台。
+5. E 阶段已从信息架构文档推进到本地代码：申请界面、用户后台、模型列表、管理员入口可见性和数据面 allowlist 已完成本地验证；后续继续补 `admin_scopes` 写入/同步、部门主管范围展开、用量统计、默认额度配置、审批单额度覆盖、调额和 key/额度重置，不能把当前入口壳当成完整管理后台。
 
 ## 当前外部阻塞
 

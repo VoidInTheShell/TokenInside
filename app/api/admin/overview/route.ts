@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { getFeishuDepartmentNameById } from "@/lib/feishu";
 import { getCurrentUser } from "@/lib/session";
 import { getAdminOverview, getAdminScopeForUser } from "@/lib/store";
 
@@ -8,6 +9,14 @@ export const dynamic = "force-dynamic";
 function responseStatus(request: Request, status: 401 | 403) {
   const url = new URL(request.url);
   return url.searchParams.get("mode") === "soft" ? 200 : status;
+}
+
+async function resolveDepartmentName(departmentId?: string) {
+  try {
+    return await getFeishuDepartmentNameById(departmentId);
+  } catch {
+    return undefined;
+  }
 }
 
 export async function GET(request: Request) {
@@ -24,6 +33,7 @@ export async function GET(request: Request) {
   }
 
   const scope = await getAdminScopeForUser(user.id);
+  const userDepartmentName = await resolveDepartmentName(user.departmentId);
   if (!scope) {
     return NextResponse.json(
       {
@@ -37,6 +47,7 @@ export async function GET(request: Request) {
           tenantKey: user.tenantKey,
           openId: user.openId,
           departmentId: user.departmentId,
+          departmentName: userDepartmentName,
         },
       },
       { status: responseStatus(request, 403) },
@@ -44,6 +55,7 @@ export async function GET(request: Request) {
   }
 
   const overview = await getAdminOverview(scope);
+  const scopeDepartmentName = await resolveDepartmentName(overview.scope.departmentId);
   return NextResponse.json({
     authenticated: true,
     authorized: true,
@@ -54,7 +66,14 @@ export async function GET(request: Request) {
       tenantKey: user.tenantKey,
       openId: user.openId,
       departmentId: user.departmentId,
+      departmentName: userDepartmentName,
     },
-    overview,
+    overview: {
+      ...overview,
+      scope: {
+        ...overview.scope,
+        departmentName: scopeDepartmentName,
+      },
+    },
   });
 }
