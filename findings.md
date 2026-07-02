@@ -106,6 +106,8 @@
 75. B1 飞书端内免登已由用户手动确认通过：飞书后台重定向 URL 配置成功，后台可以获取到飞书用户信息；后续真实链路应转入 B2/B3 的部门领导卡片审批和 `card.action.trigger` 回调实测。
 76. B2/B3 代码主路径已从旧 `approval_instance` 切到飞书交互卡片：`/api/token/request` 创建本地申请单后解析申请人部门负责人并发送 `msg_type=interactive` 卡片，`/api/feishu/events` 增加 `card.action.trigger` 分支，按 requestId、nonce 和 `operator.open_id` 做审批人校验。
 77. 当前飞书通讯录权限实测未通过：`npm run b:check -- --feishu-contact` 在 `users.find_by_department` 返回 `99991672 Access denied`，提示缺少 `[contact:contact.base:readonly, contact:department.organize:readonly, contact:contact:access_as_app, contact:contact:readonly, contact:contact:readonly_as_app]` 中至少一个应用身份通讯录权限；真实提交申请前必须先在飞书后台开通权限并配置通讯录数据范围。
+78. 用户调整飞书权限后，`npm run b:check -- --feishu-contact` 已通过：应用身份可读取通讯录成员列表，样本返回 `department_ids` 和 `leader_user_id`；用户详情同样返回 `department_ids` 和 `leader_user_id`。B2 可以继续进入真实申请发卡测试。
+79. B2/B3 镜像 `voidintheshell/tokeninside:b2-card-20260702-2210` 已部署到 USLA，digest `sha256:388c7af2ee4c05ed2a7448d722b4e6cc2ceddf0bca85abcfc25574d79c8accb9`。线上签名加密 challenge 和签名加密 `card.action.trigger` 缺字段模拟均能返回 200，说明事件入口可承接飞书卡片回调。
 
 ## 官方文档来源
 

@@ -89,7 +89,10 @@
 33. 已新增登录用户模型列表 API `/api/models`，服务端通过当前 active token 的 NewAPI token id 读取完整 key 后调用 NewAPI `/v1/models`，前端只接收模型元数据，不暴露明文 key。
 34. 数据面 MVP 范围已在 `/v1/[...path]` 代码层收口：仅允许 `GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`；其它路径返回 404，已知路径方法不匹配返回 405。
 35. JSON MVP store 写入临时文件名已改为每次写入唯一，修复并发代理日志写入时 `rename ENOENT` 的本地复现问题。
-36. B2/B3 卡片审批主路径已本地代码落地：申请接口默认解析部门领导并发送交互卡片，事件入口新增 `card.action.trigger` 分支并校验 requestId、nonce 和审批人 open_id；当前真实权限探测卡在飞书应用未开通通讯录应用身份权限。
+36. B2/B3 卡片审批主路径已本地代码落地：申请接口默认解析部门领导并发送交互卡片，事件入口新增 `card.action.trigger` 分支并校验 requestId、nonce 和审批人 open_id。
+37. B2 通讯录权限阻塞已解除：用户调整飞书权限后，`npm run b:check -- --feishu-contact` 已通过，应用身份可读取成员列表、`department_ids`、用户详情和 `leader_user_id` 字段。
+38. B2/B3 卡片审批代码已部署到 USLA：镜像 `voidintheshell/tokeninside:b2-card-20260702-2210` 与 `latest` 已推送并部署，digest 为 `sha256:388c7af2ee4c05ed2a7448d722b4e6cc2ceddf0bca85abcfc25574d79c8accb9`；远端容器 running/healthy。
+39. 线上基础验证通过：公网 `/api/health` 200，公网 `/` 200 HTML，公网 `/v1/models` 无 key 返回 401 JSON，公网 `/v1/embeddings` 返回 TokenInside allowlist 404 JSON；签名加密事件 challenge 返回 `{"challenge":"ti-b2-card-check-20260702"}`，签名加密 `card.action.trigger` 缺字段模拟返回 200 错误 toast。
 
 ## 计划文档索引
 
@@ -115,6 +118,6 @@ B 阶段优先执行顺序已调整为服务器优先：
 
 ## 当前外部阻塞
 
-1. B2 部门领导解析需要飞书应用开通应用身份通讯录权限。当前 `npm run b:check -- --feishu-contact` 返回 `99991672 Access denied`，提示缺少 `[contact:contact.base:readonly, contact:department.organize:readonly, contact:contact:access_as_app, contact:contact:readonly, contact:contact:readonly_as_app]` 中至少一个相关权限，并需要对应通讯录数据权限范围覆盖测试用户和部门。
+1. 暂无已确认的权限阻塞。下一步需要用真实飞书用户在 `https://ti.kumiko-love.com` 提交 Token 申请，验证部门领导解析、机器人发卡片和领导点击后的 `card.action.trigger` 回调字段。
 
 继续 B 阶段外部实测前必须准备服务器私有环境变量，且不得将真实密钥写入仓库。

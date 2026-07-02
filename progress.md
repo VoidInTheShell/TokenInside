@@ -160,3 +160,12 @@
 156. 更新 `/api/feishu/events`：保留旧 `approval_instance` 备用处理，同时新增 `card.action.trigger` 分支，提取 `operator.open_id`、`action.value.requestId`、`action.value.action`、`action.value.nonce` 和 `message_id`，校验审批目标和 nonce 后执行通过/拒绝。
 157. 运行 `npm run typecheck` 和 `npm run build` 均通过。无签名事件 curl 返回 401 `Invalid Feishu event signature`，符合当前 `.env` 启用签名校验的安全预期；尝试用本地 Node 构造签名测试请求时被 Windows 沙箱 `CreateProcessWithLogonW failed: 1326` 拦截，未完成本地签名事件模拟。
 158. 运行 `npm run b:check -- --feishu-contact` 未通过：飞书 `tenant_access_token` 可获取，但通讯录 `users.find_by_department` 返回 `99991672 Access denied`，提示缺少应用身份通讯录权限 `[contact:contact.base:readonly, contact:department.organize:readonly, contact:contact:access_as_app, contact:contact:readonly, contact:contact:readonly_as_app]` 中至少一个；真实 B2/B3 申请发卡前需先开通权限和通讯录数据范围。
+159. 用户调整飞书相关权限后，重新运行 `npm run b:check -- --feishu-contact` 通过：飞书 `tenant_access_token` 可获取，通讯录成员列表返回 `items=3`，列表字段包含 `department_ids` 和 `leader_user_id`，用户详情字段同样包含 `department_ids` 和 `leader_user_id`。本地 `.env` 的 `TOKENINSIDE_SESSION_SECRET` 仍是占位符提醒，但不影响本次飞书通讯录权限探测。
+160. 构建 B2/B3 镜像 `tokeninside:b2-card-20260702-2210` 成功，Docker 构建阶段 `npm run build` 通过，路由表包含 `/api/models` 和 `/api/feishu/events` 等入口。
+161. 推送 Docker Hub 成功：`voidintheshell/tokeninside:b2-card-20260702-2210` 与 `voidintheshell/tokeninside:latest` 均指向 digest `sha256:388c7af2ee4c05ed2a7448d722b4e6cc2ceddf0bca85abcfc25574d79c8accb9`。
+162. USLA `/home/beihai/tokeninside/docker-compose.yml` 已备份为 `docker-compose.yml.before-b2-card-20260702-2210`，compose image 已切换到 `voidintheshell/tokeninside:b2-card-20260702-2210`；远端只执行 `sudo -n docker compose pull` 与 `up -d`，未进行源码构建。
+163. 远端容器 `tokeninside-tokeninside-1` 当前 `running/healthy`，镜像 ID 为 `sha256:388c7af2ee4c05ed2a7448d722b4e6cc2ceddf0bca85abcfc25574d79c8accb9`，端口仍为 `0.0.0.0:16878->16878/tcp`。
+164. 远端本机验证通过：`/api/health` 200 JSON 且关键配置均为 true，`/api/session` 200 未登录 JSON，`/v1/models` 无 key 返回 401 JSON，`/v1/embeddings` 返回 TokenInside allowlist 404 JSON。
+165. 公网验证通过：`https://ti.kumiko-love.com/api/health` 200 JSON，`/` 200 HTML，`/v1/models` 无 key 返回 401 JSON，`/v1/embeddings` 返回 404 JSON 且错误体由 TokenInside 返回。
+166. 在远端容器内使用生产环境变量构造签名加密飞书 challenge，经公网 `POST https://ti.kumiko-love.com/api/feishu/events` 返回 200 `{"challenge":"ti-b2-card-check-20260702"}`。
+167. 在远端容器内构造签名加密 `card.action.trigger` 缺字段模拟 payload，经公网事件入口返回 200 `{"ok":false,"toast":{"type":"error","content":"审批卡片参数不完整"}}`，说明卡片事件分支已部署并能安全处理异常 payload。
