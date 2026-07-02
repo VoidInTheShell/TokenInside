@@ -106,7 +106,9 @@ function badgeVariant(status?: string) {
 function scopeLabel(scope?: AdminScopeSummary) {
   if (!scope) return "无管理范围";
   if (scope.type === "global") return "全局管理";
-  return `部门 ${scope.departmentName ?? scope.departmentId ?? "-"}`;
+  if (scope.departmentName) return `部门 ${scope.departmentName}`;
+  if (!scope.departmentId || scope.departmentId === "0") return "未分配部门";
+  return `部门 ${scope.departmentId}`;
 }
 
 function displayName(user?: AdminOverviewResponse["user"]) {
@@ -118,7 +120,9 @@ function avatarInitial(user?: AdminOverviewResponse["user"]) {
 }
 
 function departmentLabel(user?: AdminOverviewResponse["user"]) {
-  return user?.departmentName ?? user?.departmentId ?? "-";
+  if (user?.departmentName) return user.departmentName;
+  if (!user?.departmentId || user.departmentId === "0") return "未分配部门";
+  return user.departmentId;
 }
 
 function canEditQuota(status: string) {
@@ -256,14 +260,6 @@ export function AdminClient() {
 
   const overview = data?.overview;
   const totals = overview?.totals;
-  const status = loading || busy
-    ? "自动识别中"
-    : data?.authorized
-      ? scopeLabel(overview?.scope)
-      : data?.authenticated
-        ? "未授权"
-        : "等待飞书身份";
-
   return (
     <>
       <FeishuSdkScript
@@ -312,47 +308,70 @@ export function AdminClient() {
               面向飞书部门主管和 TokenInside 管理员的审批、发放、用量与异常处理工作区。
             </p>
           </div>
-          <div className="toolbar">
-            <Badge variant={data?.authorized ? "success" : "warning"}>{status}</Badge>
-            <Button variant="outline" onClick={() => void refresh()} disabled={busy}>
-              <RefreshCwIcon data-icon="inline-start" />
-              刷新
-            </Button>
-            <a className="button button-outline" href="/">
-              <ArrowLeftIcon data-icon="inline-start" />
-              返回控制台
-            </a>
-          </div>
+          <a className="button button-outline" href="/">
+            <ArrowLeftIcon data-icon="inline-start" />
+            返回控制台
+          </a>
         </header>
 
-        {data?.authenticated && (
-          <Card>
-            <CardContent>
-              <div className="user-card">
-                <div className="user-avatar" aria-hidden="true">
-                  {data.user?.avatarUrl ? (
-                    <img src={data.user.avatarUrl} alt="" />
-                  ) : (
-                    <span>{avatarInitial(data.user)}</span>
-                  )}
-                </div>
-                <div className="user-card-main">
-                  <span className="user-card-label">当前飞书用户</span>
-                  <strong>{displayName(data.user)}</strong>
-                  <span>{data.user?.openId ? maskSecret(data.user.openId) : "-"}</span>
-                </div>
-                <div className="user-card-meta">
-                  <span>管理范围</span>
-                  <strong>{scopeLabel(overview?.scope)}</strong>
-                </div>
-                <div className="user-card-meta">
-                  <span>部门</span>
-                  <strong>{departmentLabel(data.user)}</strong>
-                </div>
+        <Card>
+          <CardContent>
+            <div className="user-card">
+              <div className="user-avatar" aria-hidden="true">
+                {data?.user?.avatarUrl ? (
+                  <img src={data.user.avatarUrl} alt="" />
+                ) : (
+                  <span>{avatarInitial(data?.user)}</span>
+                )}
               </div>
-            </CardContent>
-          </Card>
-        )}
+              <div className="user-card-main">
+                <span className="user-card-label">当前飞书用户</span>
+                <strong>{data?.authenticated ? displayName(data.user) : "等待飞书身份"}</strong>
+                <span>{data?.user?.openId ? maskSecret(data.user.openId) : "-"}</span>
+              </div>
+              <div className="user-card-meta">
+                <span>管理范围</span>
+                <strong>{scopeLabel(overview?.scope)}</strong>
+              </div>
+              <div className="user-card-meta">
+                <span>部门</span>
+                <strong>{departmentLabel(data?.user)}</strong>
+              </div>
+              <div className="user-card-controls">
+                <Badge
+                  className="identity-status"
+                  aria-label={
+                    loading || busy
+                      ? "自动识别中"
+                      : data?.authenticated
+                        ? "飞书身份已识别"
+                        : "等待飞书身份"
+                  }
+                  title={
+                    loading || busy
+                      ? "自动识别中"
+                      : data?.authenticated
+                        ? "飞书身份已识别"
+                        : "等待飞书身份"
+                  }
+                  variant={data?.authenticated ? "success" : "warning"}
+                >
+                  {loading || busy ? (
+                    "自动识别中"
+                  ) : data?.authenticated ? (
+                    <CheckCircle2Icon data-icon="inline-start" />
+                  ) : (
+                    "等待飞书身份"
+                  )}
+                </Badge>
+                <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={busy}>
+                  <RefreshCwIcon data-icon="inline-start" />
+                  刷新
+                </Button>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
 
         {error && <div className="alert alert-danger">{error}</div>}
         {message && <div className="alert">{message}</div>}

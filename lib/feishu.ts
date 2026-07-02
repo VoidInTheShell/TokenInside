@@ -38,6 +38,11 @@ type FeishuDepartment = {
   department_id?: string;
   open_department_id?: string;
   name?: string;
+  i18n_name?: {
+    zh_cn?: string;
+    en_us?: string;
+    ja_jp?: string;
+  };
   parent_department_id?: string;
   leader_user_id?: string;
 };
@@ -186,9 +191,9 @@ export async function getFeishuDepartmentById(departmentId: string) {
 }
 
 export async function getFeishuDepartmentNameById(departmentId?: string) {
-  if (!departmentId) return undefined;
+  if (!departmentId || departmentId === "0") return undefined;
   const department = await getFeishuDepartmentById(departmentId);
-  return department.name;
+  return department.name ?? department.i18n_name?.zh_cn ?? department.i18n_name?.en_us;
 }
 
 export async function resolveApprovalTargetForUser(openId: string): Promise<ApprovalTarget> {

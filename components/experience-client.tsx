@@ -113,11 +113,15 @@ function avatarInitial(user?: SessionResponse["user"]) {
 function scopeLabel(scope?: SessionResponse["adminScope"]) {
   if (!scope) return "";
   if (scope.type === "global") return "全局管理";
-  return `部门 ${scope.departmentName ?? scope.departmentId ?? "-"}`;
+  if (scope.departmentName) return `部门 ${scope.departmentName}`;
+  if (!scope.departmentId || scope.departmentId === "0") return "未分配部门";
+  return `部门 ${scope.departmentId}`;
 }
 
 function departmentLabel(user?: SessionResponse["user"]) {
-  return user?.departmentName ?? user?.departmentId ?? "-";
+  if (user?.departmentName) return user.departmentName;
+  if (!user?.departmentId || user.departmentId === "0") return "未分配部门";
+  return user.departmentId;
 }
 
 export function ExperienceClient() {
@@ -312,19 +316,6 @@ export function ExperienceClient() {
                 {hasActiveToken ? "账户、key 与可用模型。" : "飞书用户身份与申请入口。"}
               </p>
             </div>
-            <div className="toolbar">
-              <Badge variant={session?.authenticated ? "success" : "warning"}>
-                {loading || busy
-                  ? "自动识别中"
-                  : session?.authenticated
-                    ? displayName(session.user)
-                    : "等待飞书身份"}
-              </Badge>
-              <Button variant="outline" onClick={() => void refresh()} disabled={busy}>
-                <RefreshCwIcon data-icon="inline-start" />
-                刷新
-              </Button>
-            </div>
           </header>
 
           {error && <div className="alert alert-danger">{error}</div>}
@@ -332,7 +323,7 @@ export function ExperienceClient() {
 
           <Card>
             <CardContent>
-              <div className="user-card">
+              <div className={session?.adminScope ? "user-card user-card-with-action" : "user-card"}>
                 <div className="user-avatar" aria-hidden="true">
                   {session?.user?.avatarUrl ? (
                     <img src={session.user.avatarUrl} alt="" />
@@ -357,6 +348,38 @@ export function ExperienceClient() {
                     </a>
                   </div>
                 )}
+                <div className="user-card-controls">
+                  <Badge
+                    className="identity-status"
+                    aria-label={
+                      loading || busy
+                        ? "自动识别中"
+                        : session?.authenticated
+                          ? "飞书身份已识别"
+                          : "等待飞书身份"
+                    }
+                    title={
+                      loading || busy
+                        ? "自动识别中"
+                        : session?.authenticated
+                          ? "飞书身份已识别"
+                          : "等待飞书身份"
+                    }
+                    variant={session?.authenticated ? "success" : "warning"}
+                  >
+                    {loading || busy ? (
+                      "自动识别中"
+                    ) : session?.authenticated ? (
+                      <CheckCircle2Icon data-icon="inline-start" />
+                    ) : (
+                      "等待飞书身份"
+                    )}
+                  </Badge>
+                  <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={busy}>
+                    <RefreshCwIcon data-icon="inline-start" />
+                    刷新
+                  </Button>
+                </div>
               </div>
             </CardContent>
           </Card>
