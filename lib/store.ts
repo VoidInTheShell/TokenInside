@@ -3,6 +3,7 @@ import path from "node:path";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
 import type {
+  AdminScope,
   FeishuEvent,
   FeishuUser,
   ProxyRequestLog,
@@ -18,6 +19,7 @@ const initialStore: StoreShape = {
   tokenAccounts: [],
   feishuEvents: [],
   proxyRequestLogs: [],
+  adminScopes: [],
 };
 
 async function readStore(): Promise<StoreShape> {
@@ -232,4 +234,104 @@ export async function addProxyLog(log: Omit<ProxyRequestLog, "id" | "createdAt">
     store.proxyRequestLogs.push(stored);
     return stored;
   });
+}
+
+export async function getAdminScopeForUser(feishuUserId: string) {
+  const store = await readStore();
+  return (
+    store.adminScopes.find(
+      (scope) => scope.feishuUserId === feishuUserId && scope.status === "active",
+    ) ?? null
+  );
+}
+
+function tokenRequestInScope(
+  request: TokenRequest,
+  scope: AdminScope,
+  usersById: Map<string, FeishuUser>,
+) {
+  if (scope.scopeType === "global") return true;
+  const user = usersById.get(request.feishuUserId);
+  return Boolean(user?.departmentId && user.departmentId === scope.departmentId);
+}
+
+function tokenAccountInScope(
+  account: TokenAccount,
+  scope: AdminScope,
+  usersById: Map<string, FeishuUser>,
+) {
+  if (scope.scopeType === "global") return true;
+  const user = usersById.get(account.feishuUserId);
+  return Boolean(user?.departmentId && user.departmentId === scope.departmentId);
+}
+
+function proxyLogInScope(
+  log: ProxyRequestLog,
+  scope: AdminScope,
+  usersById: Map<string, FeishuUser>,
+) {
+  if (scope.scopeType === "global") return true;
+  if (!log.feishuUserId) return false;
+  const user = usersById.get(log.feishuUserId);
+  return Boolean(user?.departmentId && user.departmentId === scope.departmentId);
+}
+
+export async function getAdminOverview(scope: AdminScope) {
+  const store = await readStore();
+  const usersById = new Map(store.users.map((user) => [user.id, user]));
+  const scopedUsers =
+    scope.scopeType === "global"
+      ? store.users
+      : store.users.filter((user) => user.departmentId === scope.departmentId);
+  const scopedRequests = store.tokenRequests.filter((request) =>
+    tokenRequestInScope(request, scope, usersById),
+  );
+  const scopedAccounts = store.tokenAccounts.filter((account) =>
+    tokenAccountInScope(account, scope, usersById),
+  );
+  const scopedProxyLogs = store.proxyRequestLogs.filter((log) =>
+    proxyLogInScope(log, scope, usersById),
+  );
+
+  return {
+    scope: {
+      type: scope.scopeType,
+      departmentId: scope.departmentId,
+      source: scope.source,
+    },
+    totals: {
+      users: scopedUsers.length,
+      tokenRequests: scopedRequests.length,
+      pendingRequests: scopedRequests.filter(
+        (request) => request.status === "pending_feishu_approval",
+      ).length,
+      provisionedRequests: scopedRequests.filter(
+        (request) => request.status === "provisioned",
+      ).length,
+      failedRequests: scopedRequests.filter(
+        (request) => request.status === "approved_provision_failed",
+      ).length,
+      activeTokens: scopedAccounts.filter((account) => account.status === "active").length,
+      proxyLogs: scopedProxyLogs.length,
+    },
+    latestRequests: [...scopedRequests]
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+      .slice(0, 20)
+      .map((request) => {
+        const user = usersById.get(request.feishuUserId);
+        return {
+          id: request.id,
+          requestType: request.requestType,
+          status: request.status,
+          reason: request.reason,
+          requestedMonthlyQuota: request.requestedMonthlyQuota,
+          approvalInstanceCode: request.approvalInstanceCode,
+          requesterName: user?.name,
+          requesterOpenId: user?.openId,
+          departmentId: user?.departmentId,
+          updatedAt: request.updatedAt,
+          createdAt: request.createdAt,
+        };
+      }),
+  };
 }

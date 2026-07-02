@@ -77,6 +77,17 @@ export type ProxyRequestLog = {
   createdAt: string;
 };
 
+export type AdminScope = {
+  id: string;
+  feishuUserId: string;
+  scopeType: "global" | "department";
+  departmentId?: string;
+  source: "manual" | "department_supervisor";
+  status: "active" | "disabled";
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type StoreShape = {
   version: 1;
   users: FeishuUser[];
@@ -84,4 +95,5 @@ export type StoreShape = {
   tokenAccounts: TokenAccount[];
   feishuEvents: FeishuEvent[];
   proxyRequestLogs: ProxyRequestLog[];
+  adminScopes: AdminScope[];
 };

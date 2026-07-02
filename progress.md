@@ -87,3 +87,21 @@
 83. 执行 `npm run typecheck` 通过；执行公网 `GET https://ti.kumiko-love.com/v1/models` 无 key 仍返回 401 `application/json`，反代错误体透传保持正常。
 84. 收尾验证：`npm run build`、`npm run b:check -- --all`、`npm run b:check -- --subscribe-approval` 均通过；远端容器 healthy，线上 `/api/health` 所有关键配置为 true，近期容器日志只有 Next.js 启动 Ready 信息。
 85. 提交前将 `scripts/b-stage-check.mjs` 改为识别 `TOKENINSIDE_SESSION_SECRET` 占位符；本地 `.env` 会显示该项 missing，但飞书 tenant token、NewAPI 只读和审批订阅幂等检查仍通过，远端生产 session secret 未被覆盖。
+86. 根据飞书“管理员后台”和移动端入口讨论更新计划文档：普通入口与移动端主页统一为 `https://ti.kumiko-love.com`，管理员后台入口为 `https://ti.kumiko-love.com/admin`，但管理权限仍由 TokenInside 服务端基于飞书 OAuth、部门主管关系和 `admin_scopes` 计算；同步更新总方案、E 阶段计划、实施路线图、`task_plan.md` 和 `findings.md`。
+87. 本次使用 `planning-with-files-zh` 恢复上下文时，`session-catchup.py` 在 Windows 沙箱中触发 `CreateProcessWithLogonW failed: 1326`；已直接读取 `task_plan.md`、`findings.md` 和 `progress.md` 继续，未影响文档修改。
+88. 本轮继续使用 `planning-with-files-zh` 恢复计划；再次运行 `session-catchup.py` 仍因 Windows 沙箱触发 `CreateProcessWithLogonW failed: 1326`，已沿用直接读取计划文件的方式继续。
+89. 通过 Next MCP 确认 dev server 位于 `http://localhost:16878`，初始路由没有 `/admin`，与飞书后台管理员入口计划不一致；决定前置 E0 管理入口壳。
+90. 新增 `AdminScope` 类型、JSON store `adminScopes` 字段、`getAdminScopeForUser` 与 `getAdminOverview`，管理概览按 `global` 或 `department` 范围过滤 users、token requests、token accounts 和 proxy logs。
+91. 新增 `GET /api/admin/overview`：未登录直接访问返回 401，已登录但无管理范围返回 403，有管理范围返回只读概览；页面可用 `?mode=soft` 读取状态体且不产生浏览器 console error。
+92. 新增 `components/admin-client.tsx` 和 `app/admin/page.tsx`，实现 shadcn 风格管理后台入口壳，复用飞书免登、显示管理范围、状态概览和最新申请；首页侧边栏已增加 `/admin` 导航。
+93. 首次类型检查发现两个问题：`AdminOverviewResponse["overview"]["scope"]` 未处理可选字段，以及 ES2022 lib 不支持 `toSorted`；已改为 `NonNullable` 类型别名和 `[...array].sort(...)`。
+94. 浏览器首次打开 `/admin` 时，未登录 API 401 被 Chrome 记录为 console error；已给管理 API 增加 `mode=soft`，保留直接 API 401/403，同时让页面正常未登录状态无 console error。
+95. 验证结果：`npm run build` 通过，路由包含 `/admin` 与 `/api/admin/overview`；直接 `GET /api/admin/overview` 返回 401 JSON；soft 请求返回 200 JSON；Next MCP `get_errors` 无 config/session 错误。
+96. 一次并行执行 `npm run typecheck` 和 `npm run build` 时，`tsc` 因 `.next/types/cache-life.d.ts`、`.next/types/validator.ts` 被 build 重写而短暂缺失失败；单独复跑 `npm run typecheck` 已通过。
+97. 浏览器最终复查 `/admin`：快照显示中文未登录/未授权状态、当前用户为 `-`，console 无 error/warn；截图保存为 `.local-data/admin-page-final.png`。
+98. 按“本地构建、推送 Docker Hub、服务端只拉取运行”的约束构建新镜像：`tokeninside:e0-admin-20260702-1710`、`voidintheshell/tokeninside:e0-admin-20260702-1710` 和 `voidintheshell/tokeninside:latest`；Docker 构建阶段 `npm run build` 通过，路由包含 `/admin` 与 `/api/admin/overview`。
+99. 已推送 Docker Hub：`voidintheshell/tokeninside:e0-admin-20260702-1710` 与 `voidintheshell/tokeninside:latest`，digest 均为 `sha256:23e6d5e9ba9fea04d77e18a2a0cb49a5659ab858c151ac496728f37cb86f56f1`。
+100. 中断恢复后确认远端 compose 已指向新 tag，但容器仍运行旧 `b0-20260702-1526`；随后执行 `sudo -n docker compose pull` 和 `sudo -n docker compose up -d`，未在服务器执行源码构建。
+101. 远端 compose 替换前备份为 `/home/beihai/tokeninside/docker-compose.yml.before-e0-admin-20260702-1710`；当前容器 `tokeninside-tokeninside-1` 使用 `voidintheshell/tokeninside:e0-admin-20260702-1710`，镜像 digest `sha256:23e6d5e9ba9fea04d77e18a2a0cb49a5659ab858c151ac496728f37cb86f56f1`，状态 running/healthy。
+102. 远端本机验证通过：`/api/health` 200 JSON 且所有关键配置为 true，`/admin` 200 HTML，`/api/admin/overview` 未登录返回 401 JSON。
+103. 公网验证通过：`https://ti.kumiko-love.com/api/health` 200 JSON，`/admin` 200 HTML，`/api/admin/overview` 未登录 401 JSON，`/api/admin/overview?mode=soft` 200 JSON，`/v1/models` 无 key 保持 TokenInside JSON 401。

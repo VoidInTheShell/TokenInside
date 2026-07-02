@@ -209,10 +209,10 @@ export function ExperienceClient() {
         </div>
 
         <nav className="nav-list" aria-label="主导航">
-          <div className="nav-item active">
+          <a className="nav-item active" href="/">
             <KeyRoundIcon data-icon="inline-start" />
             Token 控制台
-          </div>
+          </a>
           <div className="nav-item">
             <RouteIcon data-icon="inline-start" />
             /v1 透传网关
@@ -221,10 +221,10 @@ export function ExperienceClient() {
             <ActivityIcon data-icon="inline-start" />
             审计与用量
           </div>
-          <div className="nav-item">
+          <a className="nav-item" href="/admin">
             <ShieldCheckIcon data-icon="inline-start" />
-            飞书审批
-          </div>
+            管理后台
+          </a>
         </nav>
 
         <div className="sidebar-footer">

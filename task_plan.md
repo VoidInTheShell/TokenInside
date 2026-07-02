@@ -25,6 +25,7 @@
 6. 将飞书权限边界影响到数据库字段、管理员身份、MVP 范围和安全边界。
 7. 明确审批链路不是系统代主管审批，而是 TokenInside 使用 `tenant_access_token` 创建审批实例，并指定当前飞书用户为审批发起人。
 8. 明确审批结果回写需要应用后台订阅 `approval_instance` 事件，并调用审批事件订阅接口绑定 `approval_code`。
+9. 明确飞书普通入口、移动端主页和管理员后台入口均使用 `ti.kumiko-love.com` 同一业务域名，TokenInside 通过 `/` 与 `/admin` 做路由分流，管理权限由服务端计算。
 
 ## 风险
 
@@ -44,7 +45,7 @@
 | B | in_progress | 服务器优先真实链路：先产出 Docker 镜像并部署 USLA，再在 `ti.kumiko-love.com` 完成飞书 OAuth、审批事件、NewAPI token 管理和 `/v1` 代理实测 |
 | C | planned | 将 JSON MVP store 迁移到 PostgreSQL，并补齐唯一 active key、事件幂等和事务状态机 |
 | D | pulled_forward | 部署运维工作前置并合入 B0；测试阶段先用 Docker + USLA 公网域名解决飞书回调验证闭环 |
-| E | planned | 补齐用户后台、部门主管/管理员后台、用量统计、调额、额度重置和 key 重置 |
+| E | partially_pulled_forward | 已前置补齐 `/admin` 管理入口壳、管理范围数据结构和只读概览 API；用户后台、部门主管同步、用量统计、调额、额度重置和 key 重置仍待后续阶段 |
 
 ## 当前落地状态
 
@@ -70,6 +71,9 @@
 20. 远端容器已用同一 Hub 镜像重建并恢复 healthy，线上 `/api/health` 显示 `approvalCode`、`approvalEventVerification`、`approvalEventEncryption` 全部为 true。
 21. 线上加密飞书事件 challenge 已通过签名、解密和 verification token 校验，返回 `{"challenge":"ti-encrypted-check"}`。
 22. 飞书审批事件订阅已调用成功；`npm run b:check -- --subscribe-approval` 已支持幂等复跑，当前返回 `already subscribed`。
+23. 飞书入口策略已补入计划：普通入口和移动端主页使用 `https://ti.kumiko-love.com`，飞书“管理员后台”使用 `https://ti.kumiko-love.com/admin`，但管理员权限仍由 TokenInside 服务端基于部门主管关系和 `admin_scopes` 判断。
+24. E0 管理入口已前置落地：新增 `/admin` 页面、`/api/admin/overview`、JSON store `adminScopes` 结构、管理范围过滤和首页到管理后台的导航；直接访问管理 API 保持 401/403，页面 soft 请求避免未登录状态产生浏览器 console error。
+25. E0 管理入口已部署到 USLA：新镜像 `voidintheshell/tokeninside:e0-admin-20260702-1710` 与 `latest` 已推送，digest `sha256:23e6d5e9ba9fea04d77e18a2a0cb49a5659ab858c151ac496728f37cb86f56f1`；远端 compose 已 pull-only 重建，容器 healthy，公网 `/admin` 返回 200。
 
 ## 计划文档索引
 
@@ -79,16 +83,17 @@
 | `.agent-docs/TokenInside-B阶段真实链路实测计划.md` | 飞书 OAuth、审批、事件、NewAPI token 管理、`/v1` 代理真实链路实测 |
 | `.agent-docs/TokenInside-C阶段数据库生产化计划.md` | PostgreSQL schema、约束、迁移、事务和 JSON 数据导入 |
 | `.agent-docs/TokenInside-D阶段部署运维计划.md` | Docker、USLA 部署、反代、健康检查、日志和防绕过网络策略 |
-| `.agent-docs/TokenInside-E阶段管理后台与用量统计计划.md` | 用户后台、管理员后台、部门权限、用量同步、调额和重置 |
+| `.agent-docs/TokenInside-E阶段管理后台与用量统计计划.md` | 用户后台、管理员后台、飞书入口分流、部门权限、用量同步、调额和重置 |
 | `.agent-docs/TokenInside-真实链路实测记录.md` | B 阶段本地落地结果、待实测项和外部阻塞项 |
 
 ## 下一阶段入口
 
 B 阶段优先执行顺序已调整为服务器优先：
 
-1. B0 代码、镜像、Hub 推送、USLA pull-only 部署和 BunkerWeb 错误体透传配置已完成，当前运行镜像为 `voidintheshell/tokeninside:b0-20260702-1526`。
-2. B1 在飞书后台把网页入口、H5 可信域名、OAuth 和事件订阅 URL 都切到 `ti.kumiko-love.com`，从飞书客户端工作台完成端内免登。
+1. B0 代码、镜像、Hub 推送、USLA pull-only 部署和 BunkerWeb 错误体透传配置已完成；当前运行镜像为 `voidintheshell/tokeninside:e0-admin-20260702-1710`，上一稳定镜像为 `voidintheshell/tokeninside:b0-20260702-1526`。
+2. B1 在飞书后台把网页入口、移动端主页、管理员后台入口、H5 可信域名、OAuth 和事件订阅 URL 都切到 `ti.kumiko-love.com`；其中管理员后台入口指向 `https://ti.kumiko-love.com/admin`，从飞书客户端工作台完成端内免登。
 3. B2/B3 已不再缺配置变量；下一步需要真实飞书用户登录后提交 Token 申请，并由审批人完成一次通过/拒绝来确认审批实例字段、事件 payload 和状态枚举。
 4. B5 使用审批通过后发放的 key 访问 `https://ti.kumiko-love.com/v1` 完成数据面透传验证。
+5. E0 `/admin` 已部署到公网；后续 E 阶段应继续补 `admin_scopes` 写入/同步、部门主管范围展开、用量统计、调额和 key/额度重置，不能把当前入口壳当成完整管理后台。
 
 继续 B 阶段外部实测前必须准备服务器私有环境变量，且不得将真实密钥写入仓库。

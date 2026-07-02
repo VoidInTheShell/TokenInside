@@ -1,0 +1,393 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import {
+  ActivityIcon,
+  ArrowLeftIcon,
+  CheckCircle2Icon,
+  KeyRoundIcon,
+  LogInIcon,
+  RefreshCwIcon,
+  RouteIcon,
+  ShieldCheckIcon,
+  UsersRoundIcon,
+} from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { formatDateTime, maskSecret } from "@/lib/utils";
+
+type AdminOverviewResponse = {
+  authenticated: boolean;
+  authorized: boolean;
+  error?: string;
+  user?: {
+    id: string;
+    name?: string;
+    tenantKey: string;
+    openId: string;
+    departmentId?: string;
+  };
+  overview?: {
+    scope: {
+      type: "global" | "department";
+      departmentId?: string;
+      source: "manual" | "department_supervisor";
+    };
+    totals: {
+      users: number;
+      tokenRequests: number;
+      pendingRequests: number;
+      provisionedRequests: number;
+      failedRequests: number;
+      activeTokens: number;
+      proxyLogs: number;
+    };
+    latestRequests: Array<{
+      id: string;
+      requestType: string;
+      status: string;
+      reason: string;
+      requestedMonthlyQuota: number;
+      approvalInstanceCode?: string;
+      requesterName?: string;
+      requesterOpenId?: string;
+      departmentId?: string;
+      updatedAt: string;
+      createdAt: string;
+    }>;
+  };
+};
+
+type AdminScopeSummary = NonNullable<AdminOverviewResponse["overview"]>["scope"];
+
+declare global {
+  interface Window {
+    tt?: {
+      requestAccess?: (options: {
+        scopeList: string[];
+        success?: (res: { code?: string }) => void;
+        fail?: (err: unknown) => void;
+      }) => void;
+    };
+  }
+}
+
+const statusLabel: Record<string, string> = {
+  pending_feishu_approval: "飞书审批中",
+  approved: "审批通过",
+  approved_provisioning: "发放中",
+  approved_provision_failed: "发放失败",
+  provisioned: "已发放",
+  rejected: "已拒绝",
+  cancelled: "已取消",
+  draft_pending_approval_config: "待配置审批",
+};
+
+function badgeVariant(status?: string) {
+  if (!status) return "default";
+  if (["provisioned", "approved"].includes(status)) return "success";
+  if (["rejected", "cancelled", "approved_provision_failed"].includes(status)) {
+    return "danger";
+  }
+  return "warning";
+}
+
+function scopeLabel(scope?: AdminScopeSummary) {
+  if (!scope) return "无管理范围";
+  if (scope.type === "global") return "全局管理";
+  return `部门 ${scope.departmentId ?? "-"}`;
+}
+
+export function AdminClient() {
+  const [data, setData] = useState<AdminOverviewResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+
+  async function refresh() {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/admin/overview?mode=soft", { cache: "no-store" });
+      const body = (await res.json()) as AdminOverviewResponse;
+      setData(body);
+      if (!res.ok || body.error) setError(body.error ?? "读取管理概览失败");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取管理概览失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  async function connectFeishu() {
+    setError(null);
+    setMessage(null);
+    if (!window.tt?.requestAccess) {
+      setError("当前浏览器没有检测到飞书 H5 JSAPI，请从飞书工作台应用入口打开。");
+      return;
+    }
+
+    setBusy(true);
+    window.tt.requestAccess({
+      scopeList: [],
+      success: async (res) => {
+        try {
+          if (!res.code) throw new Error("飞书未返回授权码");
+          const callback = await fetch("/api/auth/feishu/callback", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ code: res.code }),
+          });
+          if (!callback.ok) {
+            const body = await callback.json().catch(() => ({}));
+            throw new Error(body.error ?? "飞书登录失败");
+          }
+          setMessage("飞书身份已绑定。");
+          await refresh();
+        } catch (err) {
+          setError(err instanceof Error ? err.message : "飞书登录失败");
+        } finally {
+          setBusy(false);
+        }
+      },
+      fail: (err) => {
+        setBusy(false);
+        setError(`飞书授权失败：${JSON.stringify(err)}`);
+      },
+    });
+  }
+
+  const overview = data?.overview;
+  const totals = overview?.totals;
+  const status = loading
+    ? "读取中"
+    : data?.authorized
+      ? scopeLabel(overview?.scope)
+      : data?.authenticated
+        ? "未授权"
+        : "未登录飞书";
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark">TI</div>
+          <div>
+            <h1 className="brand-title">TokenInside</h1>
+            <p className="brand-subtitle">Admin Workspace</p>
+          </div>
+        </div>
+
+        <nav className="nav-list" aria-label="主导航">
+          <a className="nav-item" href="/">
+            <KeyRoundIcon data-icon="inline-start" />
+            Token 控制台
+          </a>
+          <a className="nav-item active" href="/admin">
+            <ShieldCheckIcon data-icon="inline-start" />
+            管理后台
+          </a>
+          <div className="nav-item">
+            <RouteIcon data-icon="inline-start" />
+            /v1 透传网关
+          </div>
+          <div className="nav-item">
+            <ActivityIcon data-icon="inline-start" />
+            审计与用量
+          </div>
+        </nav>
+
+        <div className="sidebar-footer">
+          管理入口只复用飞书免登会话；管理范围由服务端保存的 TokenInside 管理范围记录决定。
+        </div>
+      </aside>
+
+      <main className="main">
+        <header className="topbar">
+          <div>
+            <h2 className="page-title">TokenInside 管理后台</h2>
+            <p className="page-description">
+              面向飞书部门主管和 TokenInside 管理员的审批、发放、用量与异常处理工作区。
+            </p>
+          </div>
+          <div className="toolbar">
+            <Badge variant={data?.authorized ? "success" : "warning"}>{status}</Badge>
+            <Button variant="outline" onClick={() => void refresh()} disabled={busy}>
+              <RefreshCwIcon data-icon="inline-start" />
+              刷新
+            </Button>
+            {!data?.authenticated && (
+              <Button onClick={() => void connectFeishu()} disabled={busy}>
+                <LogInIcon data-icon="inline-start" />
+                飞书免登
+              </Button>
+            )}
+            <a className="button button-outline" href="/">
+              <ArrowLeftIcon data-icon="inline-start" />
+              返回控制台
+            </a>
+          </div>
+        </header>
+
+        {error && <div className="alert alert-danger">{error}</div>}
+        {message && <div className="alert">{message}</div>}
+
+        <section className="grid grid-4">
+          <Card>
+            <CardContent>
+              <div className="metric">
+                <span className="metric-label">管理用户</span>
+                <span className="metric-value">{totals?.users ?? 0}</span>
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent>
+              <div className="metric">
+                <span className="metric-label">待审批</span>
+                <span className="metric-value">{totals?.pendingRequests ?? 0}</span>
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent>
+              <div className="metric">
+                <span className="metric-label">active key</span>
+                <span className="metric-value">{totals?.activeTokens ?? 0}</span>
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent>
+              <div className="metric">
+                <span className="metric-label">代理审计日志</span>
+                <span className="metric-value">{totals?.proxyLogs ?? 0}</span>
+              </div>
+            </CardContent>
+          </Card>
+        </section>
+
+        <section className="grid grid-2">
+          <Card>
+            <CardHeader>
+              <CardTitle>管理范围</CardTitle>
+              <CardDescription>服务端基于当前飞书用户匹配 TokenInside 管理范围记录。</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="meta-list">
+                <div className="meta-row">
+                  <span>授权状态</span>
+                  <Badge variant={data?.authorized ? "success" : "warning"}>
+                    {data?.authorized ? "已授权" : "未授权"}
+                  </Badge>
+                </div>
+                <div className="meta-row">
+                  <span>范围</span>
+                  <strong>{scopeLabel(overview?.scope)}</strong>
+                </div>
+                <div className="meta-row">
+                  <span>来源</span>
+                  <strong>{overview?.scope.source ?? "-"}</strong>
+                </div>
+                <div className="meta-row">
+                  <span>当前用户</span>
+                  <strong>{data?.user ? (data.user.name ?? maskSecret(data.user.openId)) : "-"}</strong>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>状态概览</CardTitle>
+              <CardDescription>审批与发放状态来自 TokenInside 本地状态机。</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="meta-list">
+                <div className="meta-row">
+                  <span>申请总数</span>
+                  <strong>{totals?.tokenRequests ?? 0}</strong>
+                </div>
+                <div className="meta-row">
+                  <span>已发放</span>
+                  <strong>{totals?.provisionedRequests ?? 0}</strong>
+                </div>
+                <div className="meta-row">
+                  <span>发放失败</span>
+                  <strong>{totals?.failedRequests ?? 0}</strong>
+                </div>
+                <div className="meta-row">
+                  <span>部门</span>
+                  <strong>{data?.user?.departmentId ?? "-"}</strong>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        </section>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>最新申请</CardTitle>
+            <CardDescription>仅展示当前管理范围内的申请记录，不显示 NewAPI 明文 key。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {!overview?.latestRequests.length ? (
+              <div className="empty">
+                <UsersRoundIcon data-icon="inline-start" />
+                暂无可查看申请
+              </div>
+            ) : (
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>申请人</th>
+                      <th>状态</th>
+                      <th>额度</th>
+                      <th>审批实例</th>
+                      <th>更新时间</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {overview.latestRequests.map((request) => (
+                      <tr key={request.id}>
+                        <td>{request.requesterName ?? maskSecret(request.requesterOpenId)}</td>
+                        <td>
+                          <Badge variant={badgeVariant(request.status)}>
+                            {statusLabel[request.status] ?? request.status}
+                          </Badge>
+                        </td>
+                        <td>{request.requestedMonthlyQuota}</td>
+                        <td>{maskSecret(request.approvalInstanceCode)}</td>
+                        <td>{formatDateTime(request.updatedAt)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {data?.authorized && (
+          <div className="alert">
+            <CheckCircle2Icon data-icon="inline-start" /> 当前管理范围已由服务端确认。调额、重置和部门主管同步仍按 E
+            阶段继续补齐。
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}

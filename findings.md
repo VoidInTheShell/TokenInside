@@ -18,6 +18,7 @@
 14. 获取子部门列表接口可用 `tenant_access_token`，如需读取部门名称、父子关系、负责人等字段，颗粒度权限应包含部门基础信息和部门组织架构信息。
 15. 获取部门直属用户列表接口可用 `tenant_access_token`，如需读取成员姓名、头像、所属部门等字段，颗粒度权限应包含用户基础信息和用户组织架构信息。
 16. 使用应用身份读取根部门 `0` 下的部门或成员时，飞书会校验应用通讯录数据权限范围；如需全量同步，数据权限范围需要覆盖全部成员。
+17. 飞书移动端主页建议直接配置为业务自身域名，并在业务页面中通过 `requestAccess` 和登录态管理完成免登，避免把主页直接配置成授权接口导致重复重定向和加载变慢。
 
 ## 对 TokenInside 的设计影响
 
@@ -63,6 +64,17 @@
 40. 远端启用 `FEISHU_APPROVAL_EVENT_ENCRYPT_KEY` 后，明文无签名 challenge 不再是有效测试方式；应使用带 `x-lark-request-timestamp`、`x-lark-request-nonce`、`x-lark-signature` 的加密事件 payload 测试。
 41. 线上 `https://ti.kumiko-love.com/api/feishu/events` 已通过签名加密 challenge 测试，说明 TokenInside 事件入口、AES 解密、verification token 校验和 GreenJP/BunkerWeb POST 链路均可用于飞书事件回调。
 42. B2/B3 当前不再受配置变量阻塞；剩余不可由普通浏览器完成的部分是飞书客户端端内 OAuth、真实用户提交审批、主管审批动作和飞书实际 `approval_instance` payload 字段确认。
+43. 飞书“管理员后台”入口应作为 `https://ti.kumiko-love.com/admin` 的快捷深链，不应作为 TokenInside 管理权限来源。
+44. TokenInside 管理员权限必须由服务端基于飞书 OAuth 当前用户、飞书部门主管同步结果和 `admin_scopes` 计算；前端跳转和入口可见性不能替代授权。
+45. 普通入口、移动端入口和管理员入口应使用同一业务域名 `ti.kumiko-love.com`；移动端差异通过响应式布局处理，避免新增域名带来的 OAuth、Cookie、H5 可信域名和反代复杂度。
+46. 管理员也是普通用户；识别到管理范围后应显示管理入口或恢复上次工作区，不应无条件强制跳转管理员后台。
+47. `/admin` 入口已本地落地为最小管理后台壳：未登录可从同页触发飞书免登，已登录后由服务端 `adminScopes` 范围判断是否授权；这不是新的认证方式。
+48. `GET /api/admin/overview` 直接访问保留 401/403 语义，前端使用 `?mode=soft` 读取相同状态体并返回 HTTP 200，避免未登录/未授权的正常 UI 状态污染浏览器 console。
+49. JSON MVP store 已加入 `adminScopes`，当前支持 `global` 与 `department` 两种范围；申请、token account 和 proxy log 统计都按同一范围过滤，避免部门主管看到全局代理日志数量。
+50. 本地 Next 路由已包含 `/admin` 与 `/api/admin/overview`；`npm run typecheck`、`npm run build`、直接 API 401、soft API 200、浏览器 `/admin` 快照和 console 检查均已通过。
+51. 不要并行执行 `npm run typecheck` 与 `npm run build`：当前 `tsconfig.json` include 了 `.next/types/**/*.ts`，`next build` 会重写 `.next/types`，并行时 `tsc` 可能遇到临时缺失文件；单独复跑 `typecheck` 可通过。
+52. E0 管理入口镜像已发布并部署：`voidintheshell/tokeninside:e0-admin-20260702-1710` / `latest` 指向 digest `sha256:23e6d5e9ba9fea04d77e18a2a0cb49a5659ab858c151ac496728f37cb86f56f1`；远端 `docker-compose.yml.before-e0-admin-20260702-1710` 是替换镜像 tag 前的备份。
+53. 公网 `https://ti.kumiko-love.com/admin` 已返回 200 HTML；公网 `/api/admin/overview` 未登录返回 401 JSON，`/api/admin/overview?mode=soft` 返回 200 JSON，`/v1/models` 无 key 仍返回 TokenInside JSON 401。
 
 ## 官方文档来源
 
@@ -83,6 +95,7 @@
 15. `https://github.com/QuantumNous/new-api/blob/main/router/api-router.go`
 16. `https://github.com/QuantumNous/new-api/blob/main/controller/token.go`
 17. `https://github.com/QuantumNous/new-api/blob/main/middleware/auth.go`
+18. `https://open.feishu.cn/document/best-practices/how-to-configure-the-mobile-end-homepage`
 
 ## 本地计划文档
 
