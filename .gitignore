@@ -22,10 +22,13 @@ coverage/
 
 # Logs and local runtime files.
 *.log
+*.err
+*.tsbuildinfo
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+.local-data/
 
 # OS/editor noise.
 .DS_Store

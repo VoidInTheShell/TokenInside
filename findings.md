@@ -29,6 +29,11 @@
 6. 审批定义应在飞书审批后台配置直属主管或部门负责人节点；主管审批动作由飞书流转完成，TokenInside 只处理发起和结果回写。
 7. 如果 MVP 包含部门主管后台，或需要稳定处理多部门用户主管链路，需要追加 `contact:department.base:readonly`、`contact:department.organize:readonly`、`contact:user.base:readonly`、`contact:user.department:readonly`，并配置通讯录数据权限范围。
 8. 通讯录宽权限如 `contact:contact:readonly_as_app` 或 `contact:contact:readonly` 不应默认申请，只有颗粒度权限无法满足接口时再评估。
+9. TokenInside 控制面前端已确认采用 shadcn/ui 风格和组件体系；后续页面、表单、表格、反馈组件和主题样式应按该约束实现。
+10. Next.js 16.2.10 本地文档确认 App Router 的 route handler `params` 为异步 Promise，`cookies()` 也按异步 API 使用；`/v1/[...path]` 代理路由已按该约束实现。
+11. `npm audit` 初次报告 Next 依赖链中的 `postcss@8.4.31` 存在 moderate 漏洞；`npm audit fix --force` 会错误降级到 Next 9.3.3，因此采用 npm `overrides` 固定 `postcss@^8.5.10`，复查为 0 vulnerabilities。
+12. Next/Turbopack 构建对动态 `process.cwd()` store path 产生 NFT 追踪警告；在 `lib/config.ts` 给 `process.cwd()` 添加 `turbopackIgnore` 注释后，生产构建无警告通过。
+13. 本次落地采用 JSON 文件 store 跑通状态机，不作为最终生产数据库方案；生产阶段仍应按实现方案第 14 节迁移到 PostgreSQL 并补唯一 active key 的数据库约束。
 
 ## 官方文档来源
 
