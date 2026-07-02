@@ -108,6 +108,9 @@
 77. 当前飞书通讯录权限实测未通过：`npm run b:check -- --feishu-contact` 在 `users.find_by_department` 返回 `99991672 Access denied`，提示缺少 `[contact:contact.base:readonly, contact:department.organize:readonly, contact:contact:access_as_app, contact:contact:readonly, contact:contact:readonly_as_app]` 中至少一个应用身份通讯录权限；真实提交申请前必须先在飞书后台开通权限并配置通讯录数据范围。
 78. 用户调整飞书权限后，`npm run b:check -- --feishu-contact` 已通过：应用身份可读取通讯录成员列表，样本返回 `department_ids` 和 `leader_user_id`；用户详情同样返回 `department_ids` 和 `leader_user_id`。B2 可以继续进入真实申请发卡测试。
 79. B2/B3 镜像 `voidintheshell/tokeninside:b2-card-20260702-2210` 已部署到 USLA，digest `sha256:388c7af2ee4c05ed2a7448d722b4e6cc2ceddf0bca85abcfc25574d79c8accb9`。线上签名加密 challenge 和签名加密 `card.action.trigger` 缺字段模拟均能返回 200，说明事件入口可承接飞书卡片回调。
+80. 真实申请测试暴露 `Bot ability is not activated.`，这说明应用机器人能力本身未启用或未发布生效；通讯录权限已通过，但发交互卡片还依赖飞书应用后台 Bot/机器人能力开关。代码侧已将该错误转换为中文可操作提示。
+81. 用户卡片部门显示占位符的原因是 OAuth 基础用户信息不返回部门字段，已有 session 的用户也不会自动写回 `departmentId`；已改为登录回调和 `/api/session` 懒加载时通过通讯录 `department_ids` 补写本地用户部门。
+82. 申请表单口径已修正：申请理由由用户填写；默认月额度固定显示为 `200` 且禁用，不允许用户修改，提交时按服务端校验的固定值传入。
 
 ## 官方文档来源
 

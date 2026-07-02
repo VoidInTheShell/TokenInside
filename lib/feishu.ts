@@ -54,7 +54,11 @@ function feishuErrorMessage(body: {
   error?: string;
   error_description?: string;
 }, fallback: string) {
-  return body.error_description ?? body.message ?? body.msg ?? body.error ?? fallback;
+  const message = body.error_description ?? body.message ?? body.msg ?? body.error ?? fallback;
+  if (message.toLowerCase().includes("bot ability is not activated")) {
+    return "飞书应用机器人能力未启用：请在飞书开放平台应用后台启用 Bot/机器人能力，并确认应用已发布后再提交申请。";
+  }
+  return message;
 }
 
 async function feishuFetch<T>(

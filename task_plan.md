@@ -93,6 +93,7 @@
 37. B2 通讯录权限阻塞已解除：用户调整飞书权限后，`npm run b:check -- --feishu-contact` 已通过，应用身份可读取成员列表、`department_ids`、用户详情和 `leader_user_id` 字段。
 38. B2/B3 卡片审批代码已部署到 USLA：镜像 `voidintheshell/tokeninside:b2-card-20260702-2210` 与 `latest` 已推送并部署，digest 为 `sha256:388c7af2ee4c05ed2a7448d722b4e6cc2ceddf0bca85abcfc25574d79c8accb9`；远端容器 running/healthy。
 39. 线上基础验证通过：公网 `/api/health` 200，公网 `/` 200 HTML，公网 `/v1/models` 无 key 返回 401 JSON，公网 `/v1/embeddings` 返回 TokenInside allowlist 404 JSON；签名加密事件 challenge 返回 `{"challenge":"ti-b2-card-check-20260702"}`，签名加密 `card.action.trigger` 缺字段模拟返回 200 错误 toast。
+40. 用户真实测试发现三项问题：用户已加入部门但用户卡片部门仍显示占位符；点击申请时报 `Bot ability is not activated.`；申请理由需要用户填写，默认申请金额需要展示但不可修改。已本地修复部门懒同步、申请表单和机器人能力错误提示。
 
 ## 计划文档索引
 
@@ -118,6 +119,6 @@ B 阶段优先执行顺序已调整为服务器优先：
 
 ## 当前外部阻塞
 
-1. 暂无已确认的权限阻塞。下一步需要用真实飞书用户在 `https://ti.kumiko-love.com` 提交 Token 申请，验证部门领导解析、机器人发卡片和领导点击后的 `card.action.trigger` 回调字段。
+1. 飞书应用需要启用 Bot/机器人能力。当前真实申请发卡返回 `Bot ability is not activated.`，这不是 TokenInside 代码权限判断，而是飞书应用后台能力开关未启用或未发布生效。
 
 继续 B 阶段外部实测前必须准备服务器私有环境变量，且不得将真实密钥写入仓库。

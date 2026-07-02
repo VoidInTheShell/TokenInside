@@ -21,6 +21,8 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
 import { formatDateTime, maskSecret } from "@/lib/utils";
 
@@ -68,7 +70,7 @@ type ModelsResponse = {
 
 type WorkspacePanel = "account" | "models";
 
-const DEFAULT_REASON = "申请个人 LLM 调用 Token，用于共绩内部工具接入。";
+const DEFAULT_REASON_PLACEHOLDER = "请说明使用场景、接入工具和预计调用方式。";
 const DEFAULT_MONTHLY_QUOTA = 200;
 
 const statusLabel: Record<string, string> = {
@@ -117,6 +119,7 @@ export function ExperienceClient() {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [key, setKey] = useState<string | null>(null);
+  const [reason, setReason] = useState("");
   const [panel, setPanel] = useState<WorkspacePanel>("account");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -211,7 +214,7 @@ export function ExperienceClient() {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          reason: DEFAULT_REASON,
+          reason: reason.trim(),
           requestedMonthlyQuota: DEFAULT_MONTHLY_QUOTA,
         }),
       });
@@ -360,22 +363,43 @@ export function ExperienceClient() {
                 <CardDescription>
                   {latestRequest
                     ? `最近状态：${statusLabel[latestRequest.status] ?? latestRequest.status}`
-                    : "默认额度按当前 MVP 口径提交。"}
+                    : "填写申请理由后提交。"}
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <div className="apply-panel">
-                  <div className="apply-status">
-                    <SparklesIcon data-icon="inline-start" />
-                    <span>{latestRequest ? formatDateTime(latestRequest.updatedAt) : "首次申请"}</span>
+                <div className="field-group">
+                  <div className="field">
+                    <label htmlFor="requestedMonthlyQuota">默认申请额度</label>
+                    <Input
+                      id="requestedMonthlyQuota"
+                      value={String(DEFAULT_MONTHLY_QUOTA)}
+                      disabled
+                    />
+                    <span className="field-description">当前 MVP 固定额度，用户不可修改。</span>
                   </div>
-                  <Button
-                    onClick={() => void requestToken()}
-                    disabled={!session?.authenticated || busy}
-                  >
-                    <SendIcon data-icon="inline-start" />
-                    申请 Token
-                  </Button>
+                  <div className="field">
+                    <label htmlFor="requestReason">申请理由</label>
+                    <Textarea
+                      id="requestReason"
+                      placeholder={DEFAULT_REASON_PLACEHOLDER}
+                      value={reason}
+                      onChange={(event) => setReason(event.target.value)}
+                      disabled={!session?.authenticated || busy}
+                    />
+                  </div>
+                  <div className="apply-panel">
+                    <div className="apply-status">
+                      <SparklesIcon data-icon="inline-start" />
+                      <span>{latestRequest ? formatDateTime(latestRequest.updatedAt) : "首次申请"}</span>
+                    </div>
+                    <Button
+                      onClick={() => void requestToken()}
+                      disabled={!session?.authenticated || busy || reason.trim().length < 4}
+                    >
+                      <SendIcon data-icon="inline-start" />
+                      申请 Token
+                    </Button>
+                  </div>
                 </div>
               </CardContent>
             </Card>

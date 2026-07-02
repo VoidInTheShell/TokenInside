@@ -169,3 +169,8 @@
 165. 公网验证通过：`https://ti.kumiko-love.com/api/health` 200 JSON，`/` 200 HTML，`/v1/models` 无 key 返回 401 JSON，`/v1/embeddings` 返回 404 JSON 且错误体由 TokenInside 返回。
 166. 在远端容器内使用生产环境变量构造签名加密飞书 challenge，经公网 `POST https://ti.kumiko-love.com/api/feishu/events` 返回 200 `{"challenge":"ti-b2-card-check-20260702"}`。
 167. 在远端容器内构造签名加密 `card.action.trigger` 缺字段模拟 payload，经公网事件入口返回 200 `{"ok":false,"toast":{"type":"error","content":"审批卡片参数不完整"}}`，说明卡片事件分支已部署并能安全处理异常 payload。
+168. 用户真实测试反馈：用户已加入部门但用户卡片部门仍显示占位符；点击申请时报 `Bot ability is not activated.`；申请理由应该由用户填写，默认申请金额应该展示但不能修改。
+169. 修复部门显示：`/api/auth/feishu/callback` 在 OAuth 登录后 best-effort 读取通讯录用户详情并写入第一个 `department_ids`；`/api/session` 在已有用户缺少 `departmentId` 时做懒同步，刷新页面也可补写部门。
+170. 修复申请表单：`components/experience-client.tsx` 恢复申请理由 `Textarea`，默认月额度 `200` 用禁用 `Input` 展示，提交按钮在理由少于 4 个字符时禁用。
+171. 修复飞书发卡错误提示：`lib/feishu.ts` 将 `Bot ability is not activated` 转换为中文提示，说明需要在飞书开放平台应用后台启用 Bot/机器人能力并确认发布生效。
+172. 验证：`npm run typecheck` 通过；`npm run build` 通过。
