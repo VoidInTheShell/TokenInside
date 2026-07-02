@@ -89,6 +89,7 @@
 33. 已新增登录用户模型列表 API `/api/models`，服务端通过当前 active token 的 NewAPI token id 读取完整 key 后调用 NewAPI `/v1/models`，前端只接收模型元数据，不暴露明文 key。
 34. 数据面 MVP 范围已在 `/v1/[...path]` 代码层收口：仅允许 `GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`；其它路径返回 404，已知路径方法不匹配返回 405。
 35. JSON MVP store 写入临时文件名已改为每次写入唯一，修复并发代理日志写入时 `rename ENOENT` 的本地复现问题。
+36. B2/B3 卡片审批主路径已本地代码落地：申请接口默认解析部门领导并发送交互卡片，事件入口新增 `card.action.trigger` 分支并校验 requestId、nonce 和审批人 open_id；当前真实权限探测卡在飞书应用未开通通讯录应用身份权限。
 
 ## 计划文档索引
 
@@ -111,5 +112,9 @@ B 阶段优先执行顺序已调整为服务器优先：
 3. B2/B3 主路径已调整为部门领导卡片审批；下一步提交 Token 申请，解析申请人所在部门领导，向该领导发送审批卡片，并通过 `card.action.trigger` 完成一次通过/拒绝来确认 payload、权限和幂等状态机。
 4. B5 使用审批通过后发放的 key 访问 `https://ti.kumiko-love.com/v1` 完成数据面透传验证。
 5. E 阶段已从信息架构文档推进到本地代码：申请界面、用户后台、模型列表、管理员入口可见性和数据面 allowlist 已完成本地验证；后续继续补 `admin_scopes` 写入/同步、部门主管范围展开、用量统计、调额和 key/额度重置，不能把当前入口壳当成完整管理后台。
+
+## 当前外部阻塞
+
+1. B2 部门领导解析需要飞书应用开通应用身份通讯录权限。当前 `npm run b:check -- --feishu-contact` 返回 `99991672 Access denied`，提示缺少 `[contact:contact.base:readonly, contact:department.organize:readonly, contact:contact:access_as_app, contact:contact:readonly, contact:contact:readonly_as_app]` 中至少一个相关权限，并需要对应通讯录数据权限范围覆盖测试用户和部门。
 
 继续 B 阶段外部实测前必须准备服务器私有环境变量，且不得将真实密钥写入仓库。

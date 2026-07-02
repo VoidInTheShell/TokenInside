@@ -1,4 +1,8 @@
 export type RequestStatus =
+  | "pending_card_send"
+  | "pending_card_approval"
+  | "approval_card_send_failed"
+  | "approval_route_failed"
   | "pending_feishu_approval"
   | "approved"
   | "approved_provisioning"
@@ -34,6 +38,11 @@ export type TokenRequest = {
   approvalUuid: string;
   approvalInstanceCode?: string;
   approvalDepartmentId?: string;
+  approvalMode?: "feishu_card" | "feishu_approval_legacy" | "manual";
+  approvalTargetOpenId?: string;
+  approvalTargetSource?: "department_leader" | "parent_department_leader" | "manual_fallback";
+  approvalCardMessageId?: string;
+  approvalActionNonceHash?: string;
   errorMessage?: string;
   createdAt: string;
   updatedAt: string;
@@ -58,6 +67,10 @@ export type FeishuEvent = {
   eventType?: string;
   instanceCode?: string;
   approvalStatus?: string;
+  cardRequestId?: string;
+  cardAction?: string;
+  operatorOpenId?: string;
+  messageId?: string;
   processingStatus: "processed" | "ignored" | "failed";
   payloadJson: unknown;
   errorMessage?: string;

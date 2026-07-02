@@ -104,6 +104,8 @@
 73. `/v1/[...path]` 已加入 MVP 数据面 allowlist：`GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`；未纳入路径返回 404 JSON，已知路径方法不匹配返回 405 JSON。
 74. 本地并发冒烟暴露 JSON MVP store 写入临时文件名只用 `process.pid` 会导致并发 `rename ENOENT`；已改为 `process.pid + randomId("tmp")`，避免并发代理日志写入抢同一 tmp 文件。
 75. B1 飞书端内免登已由用户手动确认通过：飞书后台重定向 URL 配置成功，后台可以获取到飞书用户信息；后续真实链路应转入 B2/B3 的部门领导卡片审批和 `card.action.trigger` 回调实测。
+76. B2/B3 代码主路径已从旧 `approval_instance` 切到飞书交互卡片：`/api/token/request` 创建本地申请单后解析申请人部门负责人并发送 `msg_type=interactive` 卡片，`/api/feishu/events` 增加 `card.action.trigger` 分支，按 requestId、nonce 和 `operator.open_id` 做审批人校验。
+77. 当前飞书通讯录权限实测未通过：`npm run b:check -- --feishu-contact` 在 `users.find_by_department` 返回 `99991672 Access denied`，提示缺少 `[contact:contact.base:readonly, contact:department.organize:readonly, contact:contact:access_as_app, contact:contact:readonly, contact:contact:readonly_as_app]` 中至少一个应用身份通讯录权限；真实提交申请前必须先在飞书后台开通权限并配置通讯录数据范围。
 
 ## 官方文档来源
 

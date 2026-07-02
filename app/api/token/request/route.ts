@@ -1,7 +1,10 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { getConfig } from "@/lib/config";
-import { createApprovalInstance } from "@/lib/feishu";
+import { randomId, sha256Hex } from "@/lib/crypto";
+import {
+  resolveApprovalTargetForUser,
+  sendTokenApprovalCard,
+} from "@/lib/feishu";
 import { getCurrentUser } from "@/lib/session";
 import {
   createTokenRequest,
@@ -32,37 +35,50 @@ export async function POST(request: Request) {
     }
 
     const input = requestSchema.parse(await request.json());
-    const approvalCode = getConfig().feishu.approvalCodeTokenRequest;
+    const nonce = randomId("card");
     const tokenRequest = await createTokenRequest({
       feishuUserId: user.id,
       reason: input.reason,
       requestedMonthlyQuota: input.requestedMonthlyQuota,
-      approvalCode,
-      approvalDepartmentId: user.departmentId,
-      status: approvalCode ? "pending_feishu_approval" : "draft_pending_approval_config",
+      approvalMode: "feishu_card",
+      approvalActionNonceHash: sha256Hex(nonce),
+      status: "pending_card_send",
     });
 
-    if (!approvalCode) {
-      return NextResponse.json({
-        request: tokenRequest,
-        warning: "FEISHU_APPROVAL_CODE_TOKEN_REQUEST is not configured",
+    let routeResolved = false;
+    try {
+      const target = await resolveApprovalTargetForUser(user.openId);
+      routeResolved = true;
+      await updateTokenRequest(tokenRequest.id, {
+        approvalDepartmentId: target.departmentId,
+        approvalTargetOpenId: target.leaderOpenId,
+        approvalTargetSource: target.source,
       });
+
+      const message = await sendTokenApprovalCard({
+        receiveOpenId: target.leaderOpenId,
+        requestId: tokenRequest.id,
+        nonce,
+        applicantName: user.name,
+        applicantOpenId: user.openId,
+        requestedMonthlyQuota: input.requestedMonthlyQuota,
+        reason: input.reason,
+      });
+      const updated = await updateTokenRequest(tokenRequest.id, {
+        approvalCardMessageId: message.message_id,
+        status: "pending_card_approval",
+      });
+
+      return NextResponse.json({ request: updated });
+    } catch (err) {
+      const errorMessage =
+        err instanceof Error ? err.message : "Send Feishu approval card failed";
+      const updated = await updateTokenRequest(tokenRequest.id, {
+        status: routeResolved ? "approval_card_send_failed" : "approval_route_failed",
+        errorMessage,
+      });
+      return NextResponse.json({ request: updated, error: errorMessage }, { status: 400 });
     }
-
-    const approval = await createApprovalInstance({
-      approvalCode,
-      openId: user.openId,
-      departmentId: user.departmentId,
-      uuid: tokenRequest.approvalUuid,
-      reason: input.reason,
-      requestedMonthlyQuota: input.requestedMonthlyQuota,
-    });
-    const updated = await updateTokenRequest(tokenRequest.id, {
-      approvalInstanceCode: approval.instance_code,
-      status: "pending_feishu_approval",
-    });
-
-    return NextResponse.json({ request: updated });
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Create token request failed" },

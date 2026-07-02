@@ -8,6 +8,7 @@ import { sha256Hex } from "@/lib/crypto";
 import { provisionTokenForRequest } from "@/lib/provisioning";
 import {
   addFeishuEvent,
+  findTokenRequestById,
   findTokenRequestByInstance,
   getFeishuEventByUuid,
   updateTokenRequest,
@@ -45,6 +46,15 @@ function nestedValue(source: unknown, path: string[]) {
     cursor = cursor[part];
   }
   return stringValue(cursor);
+}
+
+function nestedUnknown(source: unknown, path: string[]) {
+  let cursor = source;
+  for (const part of path) {
+    if (!isRecord(cursor)) return undefined;
+    cursor = cursor[part];
+  }
+  return cursor;
 }
 
 function firstString(source: unknown, paths: string[][]) {
@@ -101,6 +111,192 @@ function extractApprovalEvent(payload: FeishuEventPayload) {
   return { eventUuid, eventType, instanceCode, approvalStatus };
 }
 
+function extractCardActionEvent(payload: FeishuEventPayload) {
+  const actionValue =
+    nestedUnknown(payload, ["event", "action", "value"]) ??
+    nestedUnknown(payload, ["event", "action", "values"]) ??
+    nestedUnknown(payload, ["event", "action"]);
+  const eventUuid =
+    firstString(payload, [
+      ["header", "event_id"],
+      ["event", "event_id"],
+      ["event", "uuid"],
+      ["uuid"],
+    ]) ?? sha256Hex(JSON.stringify(payload));
+  const eventType = firstString(payload, [
+    ["header", "event_type"],
+    ["event", "type"],
+    ["type"],
+  ]);
+  const operatorOpenId = firstString(payload, [
+    ["event", "operator", "open_id"],
+    ["event", "operator", "operator_id", "open_id"],
+    ["event", "operator_id", "open_id"],
+    ["event", "open_id"],
+  ]);
+  const messageId = firstString(payload, [
+    ["event", "message_id"],
+    ["event", "context", "open_message_id"],
+    ["event", "open_message_id"],
+  ]);
+  const cardRequestId = firstString(actionValue, [
+    ["requestId"],
+    ["request_id"],
+    ["card_request_id"],
+  ]);
+  const cardAction = firstString(actionValue, [["action"], ["cardAction"], ["card_action"]]);
+  const nonce = firstString(actionValue, [["nonce"], ["approvalNonce"], ["approval_nonce"]]);
+
+  return {
+    eventUuid,
+    eventType,
+    operatorOpenId,
+    messageId,
+    cardRequestId,
+    cardAction,
+    nonce,
+  };
+}
+
+function cardToast(content: string, type: "success" | "error" = "success") {
+  return NextResponse.json({ ok: type === "success", toast: { type, content } });
+}
+
+async function handleCardActionEvent(input: {
+  encrypted: boolean;
+  payload: FeishuEventPayload;
+  eventUuid: string;
+  eventType?: string;
+  operatorOpenId?: string;
+  messageId?: string;
+  cardRequestId?: string;
+  cardAction?: string;
+  nonce?: string;
+}) {
+  const {
+    encrypted,
+    payload,
+    eventUuid,
+    eventType,
+    operatorOpenId,
+    messageId,
+    cardRequestId,
+    cardAction,
+    nonce,
+  } = input;
+
+  if (!cardRequestId || !cardAction || !operatorOpenId || !nonce) {
+    await addFeishuEvent({
+      eventUuid,
+      eventType,
+      cardRequestId,
+      cardAction,
+      operatorOpenId,
+      messageId,
+      processingStatus: "ignored",
+      payloadJson: { encrypted, payload },
+      errorMessage: "Missing card action requestId, action, operator open_id or nonce",
+    });
+    return cardToast("审批卡片参数不完整", "error");
+  }
+
+  const tokenRequest = await findTokenRequestById(cardRequestId);
+  if (!tokenRequest) {
+    await addFeishuEvent({
+      eventUuid,
+      eventType,
+      cardRequestId,
+      cardAction,
+      operatorOpenId,
+      messageId,
+      processingStatus: "ignored",
+      payloadJson: { encrypted, payload },
+      errorMessage: "Token request not found for card action",
+    });
+    return cardToast("申请单不存在或已失效", "error");
+  }
+
+  const expectedNonceHash = tokenRequest.approvalActionNonceHash;
+  if (!expectedNonceHash || sha256Hex(nonce) !== expectedNonceHash) {
+    await addFeishuEvent({
+      eventUuid,
+      eventType,
+      cardRequestId,
+      cardAction,
+      operatorOpenId,
+      messageId,
+      processingStatus: "failed",
+      payloadJson: { encrypted, payload },
+      errorMessage: "Invalid card action nonce",
+    });
+    return cardToast("审批卡片校验失败", "error");
+  }
+
+  if (operatorOpenId !== tokenRequest.approvalTargetOpenId) {
+    await addFeishuEvent({
+      eventUuid,
+      eventType,
+      cardRequestId,
+      cardAction,
+      operatorOpenId,
+      messageId,
+      processingStatus: "ignored",
+      payloadJson: { encrypted, payload },
+      errorMessage: "Card action operator is not the approval target",
+    });
+    return cardToast("当前用户无权审批此申请", "error");
+  }
+
+  if (tokenRequest.status !== "pending_card_approval") {
+    await addFeishuEvent({
+      eventUuid,
+      eventType,
+      cardRequestId,
+      cardAction,
+      operatorOpenId,
+      messageId,
+      processingStatus: "ignored",
+      payloadJson: { encrypted, payload },
+      errorMessage: `Token request status is ${tokenRequest.status}`,
+    });
+    return cardToast("该申请已处理", "success");
+  }
+
+  const normalizedAction = cardAction.toLowerCase();
+  if (normalizedAction === "approve" || normalizedAction === "approved") {
+    await updateTokenRequest(tokenRequest.id, { status: "approved" });
+    await provisionTokenForRequest({ ...tokenRequest, status: "approved" });
+  } else if (normalizedAction === "reject" || normalizedAction === "rejected") {
+    await updateTokenRequest(tokenRequest.id, { status: "rejected" });
+  } else {
+    await addFeishuEvent({
+      eventUuid,
+      eventType,
+      cardRequestId,
+      cardAction,
+      operatorOpenId,
+      messageId,
+      processingStatus: "ignored",
+      payloadJson: { encrypted, payload },
+      errorMessage: `Unsupported card action ${cardAction}`,
+    });
+    return cardToast("不支持的审批动作", "error");
+  }
+
+  await addFeishuEvent({
+    eventUuid,
+    eventType,
+    cardRequestId,
+    cardAction,
+    operatorOpenId,
+    messageId,
+    processingStatus: "processed",
+    payloadJson: { encrypted, payload },
+  });
+
+  return cardToast(normalizedAction.startsWith("approve") ? "已通过" : "已拒绝");
+}
+
 export async function POST(request: Request) {
   const rawBody = await request.text();
   const signatureOk = verifyFeishuEventSignature({
@@ -133,6 +329,7 @@ export async function POST(request: Request) {
 
   const { eventUuid, eventType, instanceCode, approvalStatus } =
     extractApprovalEvent(payload);
+  const cardActionEvent = extractCardActionEvent(payload);
   const existingEvent = await getFeishuEventByUuid(eventUuid);
   if (
     existingEvent &&
@@ -142,6 +339,18 @@ export async function POST(request: Request) {
   }
 
   try {
+    if (
+      eventType === "card.action.trigger" ||
+      cardActionEvent.eventType === "card.action.trigger" ||
+      cardActionEvent.cardRequestId
+    ) {
+      return await handleCardActionEvent({
+        encrypted,
+        payload,
+        ...cardActionEvent,
+      });
+    }
+
     if (!instanceCode || !approvalStatus) {
       await addFeishuEvent({
         eventUuid,

@@ -26,6 +26,28 @@ type FeishuOAuthTokenResponse = {
   message?: string;
 };
 
+type FeishuContactUser = {
+  open_id?: string;
+  user_id?: string;
+  name?: string;
+  department_ids?: string[];
+  leader_user_id?: string;
+};
+
+type FeishuDepartment = {
+  department_id?: string;
+  open_department_id?: string;
+  name?: string;
+  parent_department_id?: string;
+  leader_user_id?: string;
+};
+
+type ApprovalTarget = {
+  departmentId: string;
+  leaderOpenId: string;
+  source: "department_leader" | "parent_department_leader";
+};
+
 function feishuErrorMessage(body: {
   msg?: string;
   message?: string;
@@ -125,6 +147,155 @@ export async function getFeishuUserInfo(userAccessToken: string) {
     method: "GET",
     userAccessToken,
   });
+}
+
+export async function getFeishuContactUserByOpenId(openId: string) {
+  const tenantAccessToken = await getTenantAccessToken();
+  const params = new URLSearchParams({
+    user_id_type: "open_id",
+    department_id_type: "open_department_id",
+  });
+  const data = await feishuFetch<{ user?: FeishuContactUser }>(
+    `/open-apis/contact/v3/users/${encodeURIComponent(openId)}?${params.toString()}`,
+    {
+      method: "GET",
+      tenantAccessToken,
+    },
+  );
+  return data.user ?? (data as FeishuContactUser);
+}
+
+export async function getFeishuDepartmentById(departmentId: string) {
+  const tenantAccessToken = await getTenantAccessToken();
+  const params = new URLSearchParams({
+    department_id_type: "open_department_id",
+    user_id_type: "open_id",
+  });
+  const data = await feishuFetch<{ department?: FeishuDepartment }>(
+    `/open-apis/contact/v3/departments/${encodeURIComponent(departmentId)}?${params.toString()}`,
+    {
+      method: "GET",
+      tenantAccessToken,
+    },
+  );
+  return data.department ?? (data as FeishuDepartment);
+}
+
+export async function resolveApprovalTargetForUser(openId: string): Promise<ApprovalTarget> {
+  const user = await getFeishuContactUserByOpenId(openId);
+  const departmentIds = user.department_ids?.filter(Boolean) ?? [];
+  if (departmentIds.length === 0) {
+    throw new Error("Feishu contact user has no department_ids; cannot route approval card");
+  }
+
+  const visited = new Set<string>();
+  let currentDepartmentId: string | undefined = departmentIds[0];
+  let initialDepartmentId = currentDepartmentId;
+
+  while (currentDepartmentId && !visited.has(currentDepartmentId)) {
+    visited.add(currentDepartmentId);
+    const department = await getFeishuDepartmentById(currentDepartmentId);
+    const departmentId =
+      department.open_department_id ?? department.department_id ?? currentDepartmentId;
+    if (!initialDepartmentId) initialDepartmentId = departmentId;
+
+    if (department.leader_user_id && department.leader_user_id !== openId) {
+      return {
+        departmentId,
+        leaderOpenId: department.leader_user_id,
+        source:
+          departmentId === initialDepartmentId
+            ? "department_leader"
+            : "parent_department_leader",
+      };
+    }
+
+    currentDepartmentId = department.parent_department_id;
+  }
+
+  throw new Error("No valid Feishu department leader found for current user");
+}
+
+export async function sendTokenApprovalCard(input: {
+  receiveOpenId: string;
+  requestId: string;
+  nonce: string;
+  applicantName?: string;
+  applicantOpenId: string;
+  requestedMonthlyQuota: number;
+  reason: string;
+}) {
+  const tenantAccessToken = await getTenantAccessToken();
+  const card = {
+    config: {
+      wide_screen_mode: true,
+    },
+    header: {
+      template: "blue",
+      title: {
+        tag: "plain_text",
+        content: "TokenInside Token 申请",
+      },
+    },
+    elements: [
+      {
+        tag: "div",
+        text: {
+          tag: "lark_md",
+          content: [
+            `**申请人**：${input.applicantName ?? input.applicantOpenId}`,
+            `**月额度**：${input.requestedMonthlyQuota}`,
+            `**申请说明**：${input.reason}`,
+          ].join("\n"),
+        },
+      },
+      {
+        tag: "action",
+        actions: [
+          {
+            tag: "button",
+            type: "primary",
+            text: {
+              tag: "plain_text",
+              content: "通过",
+            },
+            value: {
+              requestId: input.requestId,
+              action: "approve",
+              nonce: input.nonce,
+            },
+          },
+          {
+            tag: "button",
+            type: "danger",
+            text: {
+              tag: "plain_text",
+              content: "拒绝",
+            },
+            value: {
+              requestId: input.requestId,
+              action: "reject",
+              nonce: input.nonce,
+            },
+          },
+        ],
+      },
+    ],
+  };
+
+  const params = new URLSearchParams({ receive_id_type: "open_id" });
+  return feishuFetch<{ message_id?: string }>(
+    `/open-apis/im/v1/messages?${params.toString()}`,
+    {
+      method: "POST",
+      tenantAccessToken,
+      body: JSON.stringify({
+        receive_id: input.receiveOpenId,
+        msg_type: "interactive",
+        content: JSON.stringify(card),
+      }),
+    },
+  );
 }
 
 export async function createApprovalInstance(input: {

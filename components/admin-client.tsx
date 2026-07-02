@@ -57,6 +57,7 @@ type AdminOverviewResponse = {
       reason: string;
       requestedMonthlyQuota: number;
       approvalInstanceCode?: string;
+      approvalCardMessageId?: string;
       requesterName?: string;
       requesterOpenId?: string;
       departmentId?: string;
@@ -69,6 +70,10 @@ type AdminOverviewResponse = {
 type AdminScopeSummary = NonNullable<AdminOverviewResponse["overview"]>["scope"];
 
 const statusLabel: Record<string, string> = {
+  pending_card_send: "发送审批卡片中",
+  pending_card_approval: "卡片审批中",
+  approval_card_send_failed: "审批卡片发送失败",
+  approval_route_failed: "审批路由失败",
   pending_feishu_approval: "飞书审批中",
   approved: "审批通过",
   approved_provisioning: "发放中",
@@ -374,7 +379,7 @@ export function AdminClient() {
                       <th>申请人</th>
                       <th>状态</th>
                       <th>额度</th>
-                      <th>审批实例</th>
+                      <th>审批消息</th>
                       <th>更新时间</th>
                     </tr>
                   </thead>
@@ -388,7 +393,7 @@ export function AdminClient() {
                           </Badge>
                         </td>
                         <td>{request.requestedMonthlyQuota}</td>
-                        <td>{maskSecret(request.approvalInstanceCode)}</td>
+                        <td>{maskSecret(request.approvalCardMessageId ?? request.approvalInstanceCode)}</td>
                         <td>{formatDateTime(request.updatedAt)}</td>
                       </tr>
                     ))}

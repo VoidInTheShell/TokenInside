@@ -72,6 +72,10 @@ const DEFAULT_REASON = "申请个人 LLM 调用 Token，用于共绩内部工具
 const DEFAULT_MONTHLY_QUOTA = 200;
 
 const statusLabel: Record<string, string> = {
+  pending_card_send: "发送审批卡片中",
+  pending_card_approval: "卡片审批中",
+  approval_card_send_failed: "审批卡片发送失败",
+  approval_route_failed: "审批路由失败",
   pending_feishu_approval: "飞书审批中",
   approved: "审批通过",
   approved_provisioning: "发放中",

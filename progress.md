@@ -153,3 +153,10 @@
 149. 验证通过：`npm run typecheck` 通过；`npm run build` 通过，路由表包含新增 `/api/models`；本地 `GET /api/session` 未登录返回 200 JSON；`GET /api/models` 未登录返回 401 JSON；`GET /v1/models` 无 key 返回 401 JSON；`GET /v1/embeddings` 返回 404 JSON；`GET /v1/chat/completions` 返回 405 JSON；`POST /v1/responses` 无 key 返回 401 JSON。
 150. 浏览器验证通过：`http://127.0.0.1:16878/` 首页快照显示未登录态只有 Token 申请、用户身份卡和禁用的申请按钮；桌面/移动宽度 console 均无 error/warn；截图工具本轮超时，未保存截图。
 151. 用户确认飞书后台重定向 URL 已配置成功，手动测试能够在后台获取到用户信息；据此将 B1 从 `20029 invalid redirect uri` 配置阻塞推进为可继续 B2/B3 卡片审批真实链路。
+152. 按用户要求先提交收尾 commit：`c13de87 feat(control-plane): add user workspace model view`，提交内容包含 E1/E2 首页/用户后台/模型列表、`/v1` allowlist、JSON store 并发写修复和计划文件更新。
+153. 继续 B2/B3 代码推进：扩展 `RequestStatus` 和 `TokenRequest` 字段，增加 `approvalMode`、`approvalTargetOpenId`、`approvalTargetSource`、`approvalCardMessageId`、`approvalActionNonceHash`；`FeishuEvent` 增加卡片 request/action/operator/message 字段。
+154. 更新 `lib/feishu.ts`：新增通讯录用户详情、部门详情、部门负责人解析和 `sendTokenApprovalCard()`，通过应用机器人向部门领导发送 `msg_type=interactive` 审批卡片。
+155. 更新 `/api/token/request`：默认走 `feishu_card` 主路径，创建申请单后解析部门领导并发送审批卡片；解析失败进入 `approval_route_failed`，发送失败进入 `approval_card_send_failed`，发送成功进入 `pending_card_approval`。
+156. 更新 `/api/feishu/events`：保留旧 `approval_instance` 备用处理，同时新增 `card.action.trigger` 分支，提取 `operator.open_id`、`action.value.requestId`、`action.value.action`、`action.value.nonce` 和 `message_id`，校验审批目标和 nonce 后执行通过/拒绝。
+157. 运行 `npm run typecheck` 和 `npm run build` 均通过。无签名事件 curl 返回 401 `Invalid Feishu event signature`，符合当前 `.env` 启用签名校验的安全预期；尝试用本地 Node 构造签名测试请求时被 Windows 沙箱 `CreateProcessWithLogonW failed: 1326` 拦截，未完成本地签名事件模拟。
+158. 运行 `npm run b:check -- --feishu-contact` 未通过：飞书 `tenant_access_token` 可获取，但通讯录 `users.find_by_department` 返回 `99991672 Access denied`，提示缺少应用身份通讯录权限 `[contact:contact.base:readonly, contact:department.organize:readonly, contact:contact:access_as_app, contact:contact:readonly, contact:contact:readonly_as_app]` 中至少一个；真实 B2/B3 申请发卡前需先开通权限和通讯录数据范围。

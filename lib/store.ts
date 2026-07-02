@@ -108,6 +108,10 @@ export async function createTokenRequest(input: {
   requestedMonthlyQuota: number;
   approvalCode?: string;
   approvalDepartmentId?: string;
+  approvalMode?: TokenRequest["approvalMode"];
+  approvalTargetOpenId?: string;
+  approvalTargetSource?: TokenRequest["approvalTargetSource"];
+  approvalActionNonceHash?: string;
   status?: TokenRequest["status"];
 }) {
   return mutate((store) => {
@@ -122,6 +126,10 @@ export async function createTokenRequest(input: {
       approvalCode: input.approvalCode,
       approvalUuid: randomId("approval"),
       approvalDepartmentId: input.approvalDepartmentId,
+      approvalMode: input.approvalMode,
+      approvalTargetOpenId: input.approvalTargetOpenId,
+      approvalTargetSource: input.approvalTargetSource,
+      approvalActionNonceHash: input.approvalActionNonceHash,
       createdAt: now,
       updatedAt: now,
     };
@@ -148,6 +156,11 @@ export async function findTokenRequestByInstance(instanceCode: string) {
     store.tokenRequests.find((request) => request.approvalInstanceCode === instanceCode) ??
     null
   );
+}
+
+export async function findTokenRequestById(id: string) {
+  const store = await readStore();
+  return store.tokenRequests.find((request) => request.id === id) ?? null;
 }
 
 export async function listUserTokenRequests(feishuUserId: string) {
@@ -326,6 +339,7 @@ export async function getAdminOverview(scope: AdminScope) {
           reason: request.reason,
           requestedMonthlyQuota: request.requestedMonthlyQuota,
           approvalInstanceCode: request.approvalInstanceCode,
+          approvalCardMessageId: request.approvalCardMessageId,
           requesterName: user?.name,
           requesterOpenId: user?.openId,
           departmentId: user?.departmentId,
