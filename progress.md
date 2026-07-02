@@ -24,3 +24,21 @@
 20. 运行 `npm install` 成功安装依赖；初次 `npm audit` 报 Next 间接依赖 `postcss` moderate 漏洞，因 `--force` 会降级 Next，改用 `overrides.postcss=^8.5.10` 后重新安装并确认 0 vulnerabilities。
 21. 运行 `npm run typecheck` 通过；运行 `npm run build` 通过。初次构建有 Turbopack NFT 追踪警告，已通过 `turbopackIgnore` 注释修复，二次构建无警告。
 22. 启动本地开发服务 `http://127.0.0.1:16878`，浏览器打开首页成功，控制台无 error/warn；`/api/session` 返回未登录会话，`/v1/models` 携带未绑定 key 返回 403，符合代理绑定校验预期。
+23. 根据“先把所有计划文档全部落地”要求，新增 `.agent-docs/TokenInside-实施总路线图.md`，固化 A 到 E 阶段总路线、风险排序、推荐执行顺序和文档维护规则。
+24. 新增 `.agent-docs/TokenInside-B阶段真实链路实测计划.md`，细化飞书 OAuth、审批实例、审批事件、NewAPI token 管理和 `/v1` 代理的实测任务、验收标准和需确认契约。
+25. 新增 `.agent-docs/TokenInside-C阶段数据库生产化计划.md`，细化 PostgreSQL 表结构、唯一约束、ORM 选择、store 迁移、事务状态机和 JSON 导入。
+26. 新增 `.agent-docs/TokenInside-D阶段部署运维计划.md`，细化 Docker/Compose、USLA `16878` 部署、`ti.kumiko-love.com` 反代、健康检查、日志和 NewAPI 防绕过策略。
+27. 新增 `.agent-docs/TokenInside-E阶段管理后台与用量统计计划.md`，细化用户后台、管理员范围、部门同步、用量同步、管理页面、调额和 key/额度重置。
+28. 更新 `task_plan.md` 增加 B/C/D/E 总控阶段、计划文档索引和下一阶段入口；更新 `findings.md` 记录阶段拆分和关键实测风险。
+29. 继续 B 阶段落地，确认本地 Next.js dev server 在 `16878`，Next MCP `get_errors` 无 config/session 错误，路由包含 `/api/auth/feishu/callback`、`/api/feishu/events`、`/api/token/request`、`/api/token/key` 和 `/v1/[...path]`。
+30. 读取 B 阶段计划，确认当前仓库缺少 `.env.local`，因此真实飞书 OAuth、审批创建、审批回调和 NewAPI token 变更调用不能在本机直接完成。
+31. 查阅 upstream NewAPI 源码，确认 `/api/token` 创建不返回 id/key，完整 key 需 `POST /api/token/:id/key`，控制面 API 需要 `Authorization` 与 `New-Api-User`。
+32. 更新 `lib/newapi.ts`：新增 `NEWAPI_CONTROL_USER_ID` 请求头支持，创建 token 后按唯一 name 搜索 id，再获取完整 key；补齐禁用 token 和更新 quota 的封装。
+33. 更新 `lib/feishu.ts`、`lib/crypto.ts` 和 `/api/feishu/events`：支持飞书加密事件解包、verification token 校验、challenge、字段多路径提取、事件幂等和失败记录。
+34. 新增 `scripts/b-stage-check.mjs` 与 `npm run b:check`，用于本地检查 B 阶段环境变量 readiness，并可在填入真实 `.env.local` 后按参数执行 Feishu/NewAPI 读写探测。
+35. 运行 `npm run typecheck` 通过；首次直接运行检查脚本因沙箱启动限制失败，使用已批准的 `npm run b:check` 后成功执行，输出当前缺少 B 阶段真实环境变量。
+36. 运行 `npm run build` 通过，Next.js 16.2.10 生产构建成功，动态路由包含所有 API 和 `/v1/[...path]`。
+37. 本地 API 冒烟：`/api/session` 未登录返回正常；`/api/feishu/events` challenge 返回 `{"challenge":"ti-check"}`；`/v1/models` 未携带 Bearer key 返回 401，符合预期。
+38. Next MCP `get_errors` 复查仍无 config/session 错误。
+39. 执行密钥落盘检查，排除 `AGENTS.md` 和 `.agent-docs` 后未发现用户提供的 NewAPI System AK 写入源码、示例配置或脚本。
+40. `next-env.d.ts` 因 `next build` 自动从 `.next/dev/types/routes.d.ts` 切换为 `.next/types/routes.d.ts`，这是 Next 生成文件变化；未手写修改。

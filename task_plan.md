@@ -41,6 +41,10 @@
 | A3 | complete | 实现飞书 OAuth 回调、当前会话、Token 申请、key 查看、审批事件回写 API |
 | A4 | complete | 实现根路径 `/v1/[...path]` NewAPI 透传代理、key hash 绑定校验和代理审计 |
 | A5 | complete | 完成依赖安装、类型检查、生产构建、依赖审计和本地页面/API 冒烟验证 |
+| B | in_progress | 飞书 OAuth、审批实例、审批事件、NewAPI token 管理和 `/v1` 代理真实链路实测 |
+| C | planned | 将 JSON MVP store 迁移到 PostgreSQL，并补齐唯一 active key、事件幂等和事务状态机 |
+| D | planned | 部署到 USLA `16878`，通过 `ti.kumiko-love.com` 反代对外提供控制面和 `/v1` 网关 |
+| E | planned | 补齐用户后台、部门主管/管理员后台、用量统计、调额、额度重置和 key 重置 |
 
 ## 当前落地状态
 
@@ -49,3 +53,29 @@
 3. `.env.example` 只保留占位符，没有写入真实 NewAPI System AK、飞书密钥或其他私密凭据。
 4. 依赖审计通过 `postcss` override 修复为 0 vulnerabilities。
 5. 外部飞书审批定义、飞书事件订阅、NewAPI token 创建接口仍需用真实环境变量实测。
+6. B 阶段已补齐真实链路承接代码：飞书事件加密解包、verification token 校验、事件幂等、NewAPI token 创建后搜索取 key、禁用和额度更新封装。
+7. 当前仓库未发现 `.env.local`，因此飞书 OAuth、审批实例创建、审批事件回调、NewAPI 真实 token 创建和 `/v1` 成功代理仍等待真实环境变量与飞书后台触发。
+8. B 阶段本地验证已通过：`npm run typecheck`、`npm run build`、`npm run b:check` readiness、无密钥 API 冒烟和密钥落盘检查。
+
+## 计划文档索引
+
+| 文档 | 用途 |
+|---|---|
+| `.agent-docs/TokenInside-实施总路线图.md` | A 到 E 阶段总路线、风险排序和下一步入口 |
+| `.agent-docs/TokenInside-B阶段真实链路实测计划.md` | 飞书 OAuth、审批、事件、NewAPI token 管理、`/v1` 代理真实链路实测 |
+| `.agent-docs/TokenInside-C阶段数据库生产化计划.md` | PostgreSQL schema、约束、迁移、事务和 JSON 数据导入 |
+| `.agent-docs/TokenInside-D阶段部署运维计划.md` | Docker、USLA 部署、反代、健康检查、日志和防绕过网络策略 |
+| `.agent-docs/TokenInside-E阶段管理后台与用量统计计划.md` | 用户后台、管理员后台、部门权限、用量同步、调额和重置 |
+| `.agent-docs/TokenInside-真实链路实测记录.md` | B 阶段本地落地结果、待实测项和外部阻塞项 |
+
+## 下一阶段入口
+
+B 阶段优先执行顺序：
+
+1. B1 飞书 OAuth 免登实测。
+2. B2 飞书审批实例创建实测。
+3. B4 NewAPI token 管理接口实测。
+4. B3 审批事件订阅与回写。
+5. B5 `/v1` 数据面透传实测。
+
+继续 B 阶段外部实测前必须准备 `.env.local`，且不得将真实密钥写入仓库。

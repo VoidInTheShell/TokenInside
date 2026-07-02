@@ -34,6 +34,17 @@
 11. `npm audit` 初次报告 Next 依赖链中的 `postcss@8.4.31` 存在 moderate 漏洞；`npm audit fix --force` 会错误降级到 Next 9.3.3，因此采用 npm `overrides` 固定 `postcss@^8.5.10`，复查为 0 vulnerabilities。
 12. Next/Turbopack 构建对动态 `process.cwd()` store path 产生 NFT 追踪警告；在 `lib/config.ts` 给 `process.cwd()` 添加 `turbopackIgnore` 注释后，生产构建无警告通过。
 13. 本次落地采用 JSON 文件 store 跑通状态机，不作为最终生产数据库方案；生产阶段仍应按实现方案第 14 节迁移到 PostgreSQL 并补唯一 active key 的数据库约束。
+14. 后续执行已拆为 B/C/D/E 四个阶段：B 先实测飞书和 NewAPI 真实契约，C 再做 PostgreSQL 生产化，D 做 USLA 部署和反代，E 最后补管理后台和用量统计。
+15. B 阶段需要优先确认 NewAPI token 创建、查询完整 key、禁用 token、更新 quota、查询 logs 的真实接口和凭据边界；这些契约会直接影响 `lib/newapi.ts` 和数据库字段设计。
+16. 飞书审批事件 payload、事件签名、可选加密、审批状态枚举和 `instance_code` 字段路径必须通过真实回调确认；当前 `/api/feishu/events` 只能作为骨架。
+17. 部署阶段必须新增健康检查和网络层防绕过策略；否则用户可能直连 NewAPI，导致 TokenInside 代理审计和策略控制失效。
+18. 管理后台应排在真实链路、数据库和部署之后，避免在 NewAPI logs 字段和部门权限未确认前过早设计复杂统计页面。
+19. 本机 `C:\0.01.Project\0.0.00.CompanyProject` 下未发现 NewAPI 源码目录；通过 upstream `QuantumNous/new-api` 源码确认 token 管理路由。
+20. NewAPI `/api/token` 创建接口返回成功状态，不返回 token id 或明文 key；创建后需要按唯一 name 搜索 token，再调用 `POST /api/token/:id/key` 获取完整 key。
+21. NewAPI `/api/token` 控制面路由使用用户态鉴权，除 `Authorization` 外还需要 `New-Api-User` 请求头；本项目新增 `NEWAPI_CONTROL_USER_ID` 作为服务端环境变量。
+22. NewAPI token name 有长度校验，TokenInside 发放时需要使用短名称，避免包含完整飞书用户 id 和申请单 id 导致创建失败。
+23. 飞书事件入口已补齐加密事件解包、verification token 校验、challenge 返回、审批字段多路径提取和 `event_id` 幂等处理；真实字段路径仍需飞书后台回调确认。
+24. 当前仓库没有 `.env.local`，`npm run b:check` 只能完成环境 readiness 检查，外部 Feishu/NewAPI 网络实测需在填入真实密钥后执行。
 
 ## 官方文档来源
 
@@ -51,3 +62,15 @@
 12. `https://open.feishu.cn/document/server-docs/approval-v4/task/approve`
 13. `https://open.feishu.cn/document/server-docs/contact-v3/department/children`
 14. `https://open.feishu.cn/document/server-docs/contact-v3/user/find_by_department`
+15. `https://github.com/QuantumNous/new-api/blob/main/router/api-router.go`
+16. `https://github.com/QuantumNous/new-api/blob/main/controller/token.go`
+17. `https://github.com/QuantumNous/new-api/blob/main/middleware/auth.go`
+
+## 本地计划文档
+
+1. `.agent-docs/TokenInside-实施总路线图.md`
+2. `.agent-docs/TokenInside-B阶段真实链路实测计划.md`
+3. `.agent-docs/TokenInside-C阶段数据库生产化计划.md`
+4. `.agent-docs/TokenInside-D阶段部署运维计划.md`
+5. `.agent-docs/TokenInside-E阶段管理后台与用量统计计划.md`
+6. `.agent-docs/TokenInside-真实链路实测记录.md`
