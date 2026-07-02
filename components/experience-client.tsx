@@ -39,7 +39,6 @@ type SessionResponse = {
     tenantKey: string;
     openId: string;
     departmentId?: string;
-    departmentName?: string;
   };
   activeToken?: {
     id: string;
@@ -50,7 +49,6 @@ type SessionResponse = {
   adminScope?: {
     type: "global" | "department";
     departmentId?: string;
-    departmentName?: string;
     source: "manual" | "department_supervisor";
   } | null;
   requests: Array<{
@@ -113,15 +111,7 @@ function avatarInitial(user?: SessionResponse["user"]) {
 function scopeLabel(scope?: SessionResponse["adminScope"]) {
   if (!scope) return "";
   if (scope.type === "global") return "全局管理";
-  if (scope.departmentName) return `部门 ${scope.departmentName}`;
-  if (!scope.departmentId || scope.departmentId === "0") return "未分配部门";
-  return `部门 ${scope.departmentId}`;
-}
-
-function departmentLabel(user?: SessionResponse["user"]) {
-  if (user?.departmentName) return user.departmentName;
-  if (!user?.departmentId || user.departmentId === "0") return "未分配部门";
-  return user.departmentId;
+  return "部门管理";
 }
 
 export function ExperienceClient() {
@@ -335,10 +325,6 @@ export function ExperienceClient() {
                   <span className="user-card-label">当前飞书用户</span>
                   <strong>{session?.authenticated ? displayName(session.user) : "等待飞书身份"}</strong>
                   <span>{session?.user?.openId ? maskSecret(session.user.openId) : "-"}</span>
-                </div>
-                <div className="user-card-meta">
-                  <span>部门</span>
-                  <strong>{departmentLabel(session?.user)}</strong>
                 </div>
                 {session?.adminScope && (
                   <div className="user-card-action">

@@ -226,7 +226,7 @@ a {
 
 .user-card {
   display: grid;
-  grid-template-columns: auto minmax(180px, 1fr) repeat(2, minmax(130px, auto)) auto;
+  grid-template-columns: auto minmax(180px, 1fr) minmax(130px, auto) auto;
   align-items: center;
   gap: 16px;
 }
