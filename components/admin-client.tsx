@@ -1,12 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   ActivityIcon,
   ArrowLeftIcon,
   CheckCircle2Icon,
   KeyRoundIcon,
-  LogInIcon,
   RefreshCwIcon,
   RouteIcon,
   ShieldCheckIcon,
@@ -21,6 +20,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
 import { formatDateTime, maskSecret } from "@/lib/utils";
 
 type AdminOverviewResponse = {
@@ -30,6 +30,7 @@ type AdminOverviewResponse = {
   user?: {
     id: string;
     name?: string;
+    avatarUrl?: string;
     tenantKey: string;
     openId: string;
     departmentId?: string;
@@ -67,18 +68,6 @@ type AdminOverviewResponse = {
 
 type AdminScopeSummary = NonNullable<AdminOverviewResponse["overview"]>["scope"];
 
-declare global {
-  interface Window {
-    tt?: {
-      requestAccess?: (options: {
-        scopeList: string[];
-        success?: (res: { code?: string }) => void;
-        fail?: (err: unknown) => void;
-      }) => void;
-    };
-  }
-}
-
 const statusLabel: Record<string, string> = {
   pending_feishu_approval: "飞书审批中",
   approved: "审批通过",
@@ -105,82 +94,88 @@ function scopeLabel(scope?: AdminScopeSummary) {
   return `部门 ${scope.departmentId ?? "-"}`;
 }
 
+function displayName(user?: AdminOverviewResponse["user"]) {
+  return user?.name || maskSecret(user?.openId) || "-";
+}
+
+function avatarInitial(user?: AdminOverviewResponse["user"]) {
+  return displayName(user).trim().slice(0, 1).toUpperCase() || "T";
+}
+
 export function AdminClient() {
   const [data, setData] = useState<AdminOverviewResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [feishuSdkReady, setFeishuSdkReady] = useState(false);
+  const [autoLoginAttempted, setAutoLoginAttempted] = useState(false);
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const res = await fetch("/api/admin/overview?mode=soft", { cache: "no-store" });
       const body = (await res.json()) as AdminOverviewResponse;
       setData(body);
-      if (!res.ok || body.error) setError(body.error ?? "读取管理概览失败");
+      if (!res.ok || (body.error && body.authenticated)) {
+        setError(body.error ?? "读取管理概览失败");
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "读取管理概览失败");
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
 
   useEffect(() => {
     void refresh();
-  }, []);
+  }, [refresh]);
 
-  async function connectFeishu() {
+  const connectFeishu = useCallback(async () => {
     setError(null);
     setMessage(null);
-    if (!window.tt?.requestAccess) {
-      setError("当前浏览器没有检测到飞书 H5 JSAPI，请从飞书工作台应用入口打开。");
+    setBusy(true);
+    try {
+      const result = await loginWithFeishu();
+      setMessage(
+        result.method === "requestAuthCode"
+          ? "已通过飞书身份自动登录（兼容模式）。"
+          : "已通过飞书身份自动登录。",
+      );
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "飞书登录失败");
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  useEffect(() => {
+    if (loading || busy || autoLoginAttempted || !feishuSdkReady || data?.authenticated) {
       return;
     }
-
-    setBusy(true);
-    window.tt.requestAccess({
-      scopeList: [],
-      success: async (res) => {
-        try {
-          if (!res.code) throw new Error("飞书未返回授权码");
-          const callback = await fetch("/api/auth/feishu/callback", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ code: res.code }),
-          });
-          if (!callback.ok) {
-            const body = await callback.json().catch(() => ({}));
-            throw new Error(body.error ?? "飞书登录失败");
-          }
-          setMessage("飞书身份已绑定。");
-          await refresh();
-        } catch (err) {
-          setError(err instanceof Error ? err.message : "飞书登录失败");
-        } finally {
-          setBusy(false);
-        }
-      },
-      fail: (err) => {
-        setBusy(false);
-        setError(`飞书授权失败：${JSON.stringify(err)}`);
-      },
-    });
-  }
+    setAutoLoginAttempted(true);
+    void connectFeishu();
+  }, [autoLoginAttempted, busy, connectFeishu, data?.authenticated, feishuSdkReady, loading]);
 
   const overview = data?.overview;
   const totals = overview?.totals;
-  const status = loading
-    ? "读取中"
+  const status = loading || busy
+    ? "自动识别中"
     : data?.authorized
       ? scopeLabel(overview?.scope)
       : data?.authenticated
         ? "未授权"
-        : "未登录飞书";
+        : "等待飞书身份";
 
   return (
-    <div className="app-shell">
+    <>
+      <FeishuSdkScript
+        onReady={() => setFeishuSdkReady(true)}
+        onError={(sdkError) => setError(sdkError)}
+      />
+      <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">TI</div>
@@ -210,7 +205,7 @@ export function AdminClient() {
         </nav>
 
         <div className="sidebar-footer">
-          管理入口只复用飞书免登会话；管理范围由服务端保存的 TokenInside 管理范围记录决定。
+          管理入口只复用当前飞书会话；管理范围由服务端保存的 TokenInside 管理范围记录决定。
         </div>
       </aside>
 
@@ -228,18 +223,41 @@ export function AdminClient() {
               <RefreshCwIcon data-icon="inline-start" />
               刷新
             </Button>
-            {!data?.authenticated && (
-              <Button onClick={() => void connectFeishu()} disabled={busy}>
-                <LogInIcon data-icon="inline-start" />
-                飞书免登
-              </Button>
-            )}
             <a className="button button-outline" href="/">
               <ArrowLeftIcon data-icon="inline-start" />
               返回控制台
             </a>
           </div>
         </header>
+
+        {data?.authenticated && (
+          <Card>
+            <CardContent>
+              <div className="user-card">
+                <div className="user-avatar" aria-hidden="true">
+                  {data.user?.avatarUrl ? (
+                    <img src={data.user.avatarUrl} alt="" />
+                  ) : (
+                    <span>{avatarInitial(data.user)}</span>
+                  )}
+                </div>
+                <div className="user-card-main">
+                  <span className="user-card-label">当前飞书用户</span>
+                  <strong>{displayName(data.user)}</strong>
+                  <span>{data.user?.openId ? maskSecret(data.user.openId) : "-"}</span>
+                </div>
+                <div className="user-card-meta">
+                  <span>管理范围</span>
+                  <strong>{scopeLabel(overview?.scope)}</strong>
+                </div>
+                <div className="user-card-meta">
+                  <span>部门</span>
+                  <strong>{data.user?.departmentId ?? "-"}</strong>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {error && <div className="alert alert-danger">{error}</div>}
         {message && <div className="alert">{message}</div>}
@@ -388,6 +406,7 @@ export function AdminClient() {
           </div>
         )}
       </main>
-    </div>
+      </div>
+    </>
   );
 }

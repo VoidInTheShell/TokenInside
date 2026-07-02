@@ -34,8 +34,10 @@ export async function GET() {
     user: {
       id: user.id,
       name: user.name,
+      avatarUrl: user.avatarUrl,
       tenantKey: user.tenantKey,
       openId: user.openId,
+      departmentId: user.departmentId,
     },
     activeToken,
     requests,

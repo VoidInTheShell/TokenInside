@@ -2,12 +2,38 @@ import { getConfig } from "@/lib/config";
 import { decryptAes256CbcBase64, sha256Hex, safeEqual } from "@/lib/crypto";
 
 const feishuBaseUrl = "https://open.feishu.cn";
+const feishuAccountsBaseUrl = "https://accounts.feishu.cn";
 
 type FeishuResponse<T> = {
   code?: number;
   msg?: string;
+  message?: string;
+  error?: string;
+  error_description?: string;
   data?: T;
+} & Record<string, unknown>;
+
+type FeishuOAuthTokenResponse = {
+  code?: number;
+  access_token?: string;
+  token_type?: string;
+  expires_in?: number;
+  refresh_token?: string;
+  scope?: string;
+  error?: string;
+  error_description?: string;
+  msg?: string;
+  message?: string;
 };
+
+function feishuErrorMessage(body: {
+  msg?: string;
+  message?: string;
+  error?: string;
+  error_description?: string;
+}, fallback: string) {
+  return body.error_description ?? body.message ?? body.msg ?? body.error ?? fallback;
+}
 
 async function feishuFetch<T>(
   path: string,
@@ -29,9 +55,9 @@ async function feishuFetch<T>(
   });
   const body = (await res.json()) as FeishuResponse<T>;
   if (!res.ok || (typeof body.code === "number" && body.code !== 0)) {
-    throw new Error(body.msg ?? `Feishu API failed: ${res.status}`);
+    throw new Error(feishuErrorMessage(body, `Feishu API failed: ${res.status}`));
   }
-  return body.data as T;
+  return (body.data ?? body) as T;
 }
 
 export async function getTenantAccessToken() {
@@ -58,13 +84,12 @@ export async function exchangeFeishuCode(code: string) {
     throw new Error("FEISHU_APP_ID and FEISHU_APP_SECRET are required");
   }
 
-  return feishuFetch<{
-    access_token: string;
-    token_type: string;
-    expires_in: number;
-    refresh_token?: string;
-  }>("/open-apis/authen/v1/oidc/access_token", {
+  const res = await fetch(`${feishuAccountsBaseUrl}/oauth/v3/token`, {
     method: "POST",
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+    },
+    cache: "no-store",
     body: JSON.stringify({
       grant_type: "authorization_code",
       code,
@@ -72,6 +97,20 @@ export async function exchangeFeishuCode(code: string) {
       client_secret: feishu.appSecret,
     }),
   });
+  const body = (await res.json()) as FeishuOAuthTokenResponse;
+  if (!res.ok || (typeof body.code === "number" && body.code !== 0)) {
+    throw new Error(feishuErrorMessage(body, `Feishu OAuth token failed: ${res.status}`));
+  }
+  if (!body.access_token) {
+    throw new Error("Feishu OAuth token response did not include access_token");
+  }
+  return {
+    access_token: body.access_token,
+    token_type: body.token_type ?? "Bearer",
+    expires_in: body.expires_in ?? 0,
+    refresh_token: body.refresh_token,
+    scope: body.scope,
+  };
 }
 
 export async function getFeishuUserInfo(userAccessToken: string) {

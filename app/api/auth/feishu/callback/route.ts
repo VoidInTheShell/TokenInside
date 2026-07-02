@@ -8,7 +8,6 @@ export const runtime = "nodejs";
 
 const callbackSchema = z.object({
   code: z.string().min(1),
-  departmentId: z.string().optional(),
 });
 
 export async function POST(request: Request) {
@@ -23,7 +22,6 @@ export async function POST(request: Request) {
       feishuUserIdFromFeishu: userInfo.user_id,
       name: userInfo.name,
       avatarUrl: userInfo.avatar_url,
-      departmentId: input.departmentId,
     });
 
     const sessionToken = createSessionToken({

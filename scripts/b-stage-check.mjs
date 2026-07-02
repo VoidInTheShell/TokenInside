@@ -99,6 +99,110 @@ async function checkFeishu() {
   status("Feishu tenant_access_token", Boolean(tenantAccessToken));
 }
 
+function maskId(value) {
+  if (!value || typeof value !== "string") return "";
+  if (value.length <= 10) return `${value.slice(0, 2)}...${value.slice(-2)}`;
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+function fieldNames(value) {
+  return Object.keys(value ?? {}).sort().join(", ");
+}
+
+async function feishuContactFetch(path, tenantAccessToken) {
+  const res = await fetch(`https://open.feishu.cn${path}`, {
+    method: "GET",
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      authorization: `Bearer ${tenantAccessToken}`,
+    },
+  });
+  const text = await res.text();
+  const body = text ? JSON.parse(text) : {};
+  if (!res.ok || (typeof body.code === "number" && body.code !== 0)) {
+    const message = body.message ?? body.msg ?? body.error ?? res.status;
+    throw new Error(`${message}${body.code ? ` (code=${body.code})` : ""}`);
+  }
+  return body.data ?? body;
+}
+
+async function checkFeishuContactRead() {
+  const tenantAccessToken = await getFeishuTenantAccessToken();
+  status("Feishu tenant_access_token", Boolean(tenantAccessToken));
+
+  let userPage;
+  try {
+    const params = new URLSearchParams({
+      department_id: "0",
+      department_id_type: "open_department_id",
+      fetch_child: "true",
+      page_size: "50",
+      user_id_type: "open_id",
+    });
+    userPage = await feishuContactFetch(
+      `/open-apis/contact/v3/users/find_by_department?${params.toString()}`,
+      tenantAccessToken,
+    );
+  } catch (err) {
+    status("Feishu contact users.find_by_department", false, err instanceof Error ? err.message : String(err));
+    process.exitCode = 1;
+    return;
+  }
+
+  const users = Array.isArray(userPage.items) ? userPage.items : [];
+  status("Feishu contact user list", users.length > 0, `items=${users.length}`);
+  if (users.length === 0) {
+    process.exitCode = 1;
+  }
+  if (users[0]) {
+    console.log(`info    Feishu contact user list fields - ${fieldNames(users[0])}`);
+  }
+
+  const listedLeaderUser = users.find((user) => user.leader_user_id);
+  status(
+    "Feishu contact leader_user_id in list",
+    Boolean(listedLeaderUser?.leader_user_id),
+    listedLeaderUser?.leader_user_id ? maskId(listedLeaderUser.leader_user_id) : "not returned in sampled users",
+  );
+
+  const sampleUser = users.find((user) => user.open_id || user.user_id);
+  if (!sampleUser) {
+    status("Feishu contact user detail", false, "no user id returned from list");
+    process.exitCode = 1;
+    return;
+  }
+
+  const userIdType = sampleUser.open_id ? "open_id" : "user_id";
+  const userId = sampleUser.open_id ?? sampleUser.user_id;
+  let detail;
+  try {
+    const params = new URLSearchParams({
+      user_id_type: userIdType,
+      department_id_type: "open_department_id",
+    });
+    const data = await feishuContactFetch(
+      `/open-apis/contact/v3/users/${encodeURIComponent(userId)}?${params.toString()}`,
+      tenantAccessToken,
+    );
+    detail = data.user ?? data;
+  } catch (err) {
+    status("Feishu contact user detail", false, err instanceof Error ? err.message : String(err));
+    process.exitCode = 1;
+    return;
+  }
+
+  status("Feishu contact user detail", Boolean(detail?.open_id || detail?.user_id));
+  console.log(`info    Feishu contact user detail fields - ${fieldNames(detail)}`);
+  status(
+    "Feishu contact leader_user_id in detail",
+    Boolean(detail?.leader_user_id),
+    detail?.leader_user_id ? maskId(detail.leader_user_id) : "not returned for sampled user",
+  );
+  if (!listedLeaderUser?.leader_user_id && !detail?.leader_user_id) {
+    process.exitCode = 1;
+  }
+}
+
 async function subscribeFeishuApprovalEvents() {
   requireValues(["FEISHU_APPROVAL_CODE_TOKEN_REQUEST"]);
   const tenantAccessToken = await getFeishuTenantAccessToken();
@@ -203,8 +307,9 @@ async function checkNewApiMutation() {
 
 async function main() {
   if (args.has("--help")) {
-    console.log("Usage: npm run b:check -- [--feishu] [--newapi] [--mutate-newapi] [--subscribe-approval] [--all]");
+    console.log("Usage: npm run b:check -- [--feishu] [--feishu-contact] [--newapi] [--mutate-newapi] [--subscribe-approval] [--all]");
     console.log("--newapi only reads token list; --mutate-newapi creates one test token and disables it.");
+    console.log("--feishu-contact checks read access to contact users and leader_user_id without printing personal data.");
     console.log("--subscribe-approval binds FEISHU_APPROVAL_CODE_TOKEN_REQUEST to approval_instance events.");
     return;
   }
@@ -237,6 +342,9 @@ async function main() {
 
   if (args.has("--all") || args.has("--feishu")) {
     await checkFeishu();
+  }
+  if (args.has("--feishu-contact")) {
+    await checkFeishuContactRead();
   }
   if (args.has("--all") || args.has("--newapi")) {
     await checkNewApiRead();

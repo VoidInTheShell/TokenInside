@@ -216,6 +216,63 @@ a {
   gap: 14px;
 }
 
+.user-card {
+  display: grid;
+  grid-template-columns: auto minmax(180px, 1fr) repeat(2, minmax(130px, auto));
+  align-items: center;
+  gap: 16px;
+}
+
+.user-avatar {
+  display: grid;
+  place-items: center;
+  width: 54px;
+  height: 54px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  font-size: 18px;
+  font-weight: 650;
+  flex: 0 0 auto;
+}
+
+.user-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.user-card-main,
+.user-card-meta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.user-card-main strong,
+.user-card-meta strong {
+  overflow-wrap: anywhere;
+}
+
+.user-card-main span,
+.user-card-meta span {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.user-card-main strong {
+  font-size: 18px;
+  line-height: 1.25;
+}
+
+.user-card-label {
+  text-transform: uppercase;
+}
+
 .metric {
   display: flex;
   flex-direction: column;
@@ -490,6 +547,15 @@ a {
 
   .toolbar {
     justify-content: flex-start;
+  }
+
+  .user-card {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .user-card-meta {
+    grid-column: 1 / -1;
   }
 
   .grid-4,

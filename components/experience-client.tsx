@@ -1,12 +1,11 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIcon,
   CheckCircle2Icon,
   ClipboardCopyIcon,
   KeyRoundIcon,
-  LogInIcon,
   RefreshCwIcon,
   RouteIcon,
   SendIcon,
@@ -23,6 +22,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
 import { formatDateTime, maskSecret } from "@/lib/utils";
 
 type SessionResponse = {
@@ -31,8 +31,10 @@ type SessionResponse = {
   user?: {
     id: string;
     name?: string;
+    avatarUrl?: string;
     tenantKey: string;
     openId: string;
+    departmentId?: string;
   };
   activeToken?: {
     id: string;
@@ -50,18 +52,6 @@ type SessionResponse = {
   }>;
   proxyLogCount: number;
 };
-
-declare global {
-  interface Window {
-    tt?: {
-      requestAccess?: (options: {
-        scopeList: string[];
-        success?: (res: { code?: string }) => void;
-        fail?: (err: unknown) => void;
-      }) => void;
-    };
-  }
-}
 
 const statusLabel: Record<string, string> = {
   pending_feishu_approval: "飞书审批中",
@@ -83,6 +73,14 @@ function badgeVariant(status?: string) {
   return "warning";
 }
 
+function displayName(user?: SessionResponse["user"]) {
+  return user?.name || maskSecret(user?.openId) || "-";
+}
+
+function avatarInitial(user?: SessionResponse["user"]) {
+  return displayName(user).trim().slice(0, 1).toUpperCase() || "T";
+}
+
 export function ExperienceClient() {
   const [session, setSession] = useState<SessionResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -92,8 +90,10 @@ export function ExperienceClient() {
   const [key, setKey] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [feishuSdkReady, setFeishuSdkReady] = useState(false);
+  const [autoLoginAttempted, setAutoLoginAttempted] = useState(false);
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -105,51 +105,40 @@ export function ExperienceClient() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
 
   useEffect(() => {
     void refresh();
-  }, []);
+  }, [refresh]);
 
   const usageRows = useMemo(() => session?.requests ?? [], [session]);
 
-  async function connectFeishu() {
+  const connectFeishu = useCallback(async () => {
     setError(null);
     setMessage(null);
-    if (!window.tt?.requestAccess) {
-      setError("当前浏览器没有检测到飞书 H5 JSAPI，请从飞书工作台应用入口打开。");
+    setBusy(true);
+    try {
+      const result = await loginWithFeishu();
+      setMessage(
+        result.method === "requestAuthCode"
+          ? "已通过飞书身份自动登录（兼容模式）。"
+          : "已通过飞书身份自动登录。",
+      );
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "飞书登录失败");
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  useEffect(() => {
+    if (loading || busy || autoLoginAttempted || !feishuSdkReady || session?.authenticated) {
       return;
     }
-
-    setBusy(true);
-    window.tt.requestAccess({
-      scopeList: [],
-      success: async (res) => {
-        try {
-          if (!res.code) throw new Error("飞书未返回授权码");
-          const callback = await fetch("/api/auth/feishu/callback", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ code: res.code }),
-          });
-          if (!callback.ok) {
-            const body = await callback.json().catch(() => ({}));
-            throw new Error(body.error ?? "飞书登录失败");
-          }
-          setMessage("飞书身份已绑定。");
-          await refresh();
-        } catch (err) {
-          setError(err instanceof Error ? err.message : "飞书登录失败");
-        } finally {
-          setBusy(false);
-        }
-      },
-      fail: (err) => {
-        setBusy(false);
-        setError(`飞书授权失败：${JSON.stringify(err)}`);
-      },
-    });
-  }
+    setAutoLoginAttempted(true);
+    void connectFeishu();
+  }, [autoLoginAttempted, busy, connectFeishu, feishuSdkReady, loading, session?.authenticated]);
 
   async function requestToken() {
     setBusy(true);
@@ -198,7 +187,12 @@ export function ExperienceClient() {
   }
 
   return (
-    <div className="app-shell">
+    <>
+      <FeishuSdkScript
+        onReady={() => setFeishuSdkReady(true)}
+        onError={(sdkError) => setError(sdkError)}
+      />
+      <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">TI</div>
@@ -243,24 +237,47 @@ export function ExperienceClient() {
           </div>
           <div className="toolbar">
             <Badge variant={session?.authenticated ? "success" : "warning"}>
-              {loading
-                ? "读取中"
+              {loading || busy
+                ? "自动识别中"
                 : session?.authenticated
-                  ? session.user?.name || session.user?.openId
-                  : "未登录飞书"}
+                  ? displayName(session.user)
+                  : "等待飞书身份"}
             </Badge>
             <Button variant="outline" onClick={() => void refresh()} disabled={busy}>
               <RefreshCwIcon data-icon="inline-start" />
               刷新
             </Button>
-            {!session?.authenticated && (
-              <Button onClick={() => void connectFeishu()} disabled={busy}>
-                <LogInIcon data-icon="inline-start" />
-                飞书免登
-              </Button>
-            )}
           </div>
         </header>
+
+        {session?.authenticated && (
+          <Card>
+            <CardContent>
+              <div className="user-card">
+                <div className="user-avatar" aria-hidden="true">
+                  {session.user?.avatarUrl ? (
+                    <img src={session.user.avatarUrl} alt="" />
+                  ) : (
+                    <span>{avatarInitial(session.user)}</span>
+                  )}
+                </div>
+                <div className="user-card-main">
+                  <span className="user-card-label">当前飞书用户</span>
+                  <strong>{displayName(session.user)}</strong>
+                  <span>{session.user?.openId ? maskSecret(session.user.openId) : "-"}</span>
+                </div>
+                <div className="user-card-meta">
+                  <span>租户</span>
+                  <strong>{session.user?.tenantKey ?? "-"}</strong>
+                </div>
+                <div className="user-card-meta">
+                  <span>部门</span>
+                  <strong>{session.user?.departmentId ?? "-"}</strong>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {error && <div className="alert alert-danger">{error}</div>}
         {message && <div className="alert">{message}</div>}
@@ -432,6 +449,7 @@ export function ExperienceClient() {
           </div>
         )}
       </main>
-    </div>
+      </div>
+    </>
   );
 }

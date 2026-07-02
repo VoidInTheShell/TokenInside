@@ -14,7 +14,6 @@ export const runtime = "nodejs";
 const requestSchema = z.object({
   reason: z.string().min(4).max(500),
   requestedMonthlyQuota: z.number().positive().max(1000000),
-  departmentId: z.string().optional(),
 });
 
 export async function POST(request: Request) {
@@ -39,7 +38,7 @@ export async function POST(request: Request) {
       reason: input.reason,
       requestedMonthlyQuota: input.requestedMonthlyQuota,
       approvalCode,
-      approvalDepartmentId: input.departmentId ?? user.departmentId,
+      approvalDepartmentId: user.departmentId,
       status: approvalCode ? "pending_feishu_approval" : "draft_pending_approval_config",
     });
 
@@ -53,7 +52,7 @@ export async function POST(request: Request) {
     const approval = await createApprovalInstance({
       approvalCode,
       openId: user.openId,
-      departmentId: input.departmentId ?? user.departmentId,
+      departmentId: user.departmentId,
       uuid: tokenRequest.approvalUuid,
       reason: input.reason,
       requestedMonthlyQuota: input.requestedMonthlyQuota,

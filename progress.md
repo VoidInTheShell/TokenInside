@@ -105,3 +105,39 @@
 101. 远端 compose 替换前备份为 `/home/beihai/tokeninside/docker-compose.yml.before-e0-admin-20260702-1710`；当前容器 `tokeninside-tokeninside-1` 使用 `voidintheshell/tokeninside:e0-admin-20260702-1710`，镜像 digest `sha256:23e6d5e9ba9fea04d77e18a2a0cb49a5659ab858c151ac496728f37cb86f56f1`，状态 running/healthy。
 102. 远端本机验证通过：`/api/health` 200 JSON 且所有关键配置为 true，`/admin` 200 HTML，`/api/admin/overview` 未登录返回 401 JSON。
 103. 公网验证通过：`https://ti.kumiko-love.com/api/health` 200 JSON，`/admin` 200 HTML，`/api/admin/overview` 未登录 401 JSON，`/api/admin/overview?mode=soft` 200 JSON，`/v1/models` 无 key 保持 TokenInside JSON 401。
+104. 用户反馈当前已在飞书 H5/客户端内打开 TokenInside，但仍报“当前浏览器没有检测到飞书 H5 JSAPI，请从飞书工作台应用入口打开。”；据此将 B1 从等待端内实测改为先处理 H5 JSSDK/JSAPI 初始化阻塞。
+105. 新增 `.agent-docs/TokenInside-B1飞书H5免登修复计划.md`，覆盖 JSSDK loader、`h5sdk.ready()`、`requestAccess.appID`、`requestAuthCode.appId` 回退、OAuth v3 token 交换、自动免登、验证和 Docker Hub/USLA pull-only 部署复测。
+106. 同步更新 `task_plan.md` 计划文档索引、当前落地状态和下一阶段入口；同步更新 `findings.md` 记录飞书端内 H5 JSAPI 检测失败的根因边界与修复方向。
+107. 同步更新 `.agent-docs/TokenInside-B阶段真实链路实测计划.md` 的 B1 小节，把当前阻塞改为先执行 B1 H5 免登专项修复，再继续审批申请实测。
+108. 继续 B1 修复落地，新增 `components/feishu-login.tsx`：按飞书/Lark 端内环境加载 H5 JSSDK，等待 `h5sdk.ready()`，优先调用 `tt.requestAccess({ appID, scopeList: [] })`，并在旧客户端/`errno=103` 时回退 `tt.requestAuthCode({ appId })`。
+109. 新增 `GET /api/feishu/app-id`，只读返回 `FEISHU_APP_ID`，不暴露 App Secret、tenant token、user token 或 NewAPI key。
+110. 修改 `lib/feishu.ts`：`exchangeFeishuCode()` 改用 `https://accounts.feishu.cn/oauth/v3/token`，按顶层 `access_token` 响应解析，并兼容 `msg`、`message`、`error`、`error_description`。
+111. 修改 `/api/auth/feishu/callback` 与 `/api/token/request`：不再接受客户端 `departmentId` 写入用户或审批部门，部门只能来自服务端当前飞书用户会话。
+112. 修改 `components/experience-client.tsx` 与 `components/admin-client.tsx`：移除手动“飞书免登”按钮，页面进入后在 H5 JSSDK ready 且未登录时自动尝试一次飞书登录；登录成功后刷新会话。
+113. `/api/session` 与 `/api/admin/overview` 已返回 `avatarUrl` 和部门字段；首页和 `/admin` 新增用户身份卡，展示头像、姓名、open_id、租户/部门或管理范围。
+114. 运行 `npm run typecheck` 通过；运行 `npm run build` 通过，生产构建路由包含新增 `/api/feishu/app-id`。
+115. 本地普通浏览器刷新 `/` 和 `/admin`，控制台无 error/warn；Next MCP `get_errors` 返回 `configErrors: []`、`sessionErrors: []`；页面快照确认不再显示“飞书免登”按钮，普通浏览器保持“等待飞书身份”状态。
+116. 更新 `task_plan.md`、`findings.md`、`.agent-docs/TokenInside-B1飞书H5免登修复计划.md` 和 `.agent-docs/TokenInside-B阶段真实链路实测计划.md`，将 B1 口径改为完全自动识别/自动登录，记录本地验证完成，飞书端内真实复测与 Docker/USLA 更新仍待执行。
+117. 根据最新审批方案，确认 MVP 主路径从飞书原生审批实例切换为“TokenInside 自管审批状态机 + 飞书交互卡片请求回调”；旧 `approval_instance` 路径保留为备用/历史实测记录。
+118. 根据“审批需要发给用户所在部门的领导”，更新方案为服务端通过飞书通讯录解析申请人 `department_ids` 和部门 `leader_user_id`，多部门用户必须选择申请所属部门并由后端校验，前端不能自报审批人。
+119. 更新 `.agent-docs/TokenInside-飞书NewAPI单用户多Key透传实现方案.md`：重写第 7 节为卡片审批链路，补充审批目标解析、卡片发送、`card.action.trigger` 回调、状态机、数据字段、安全边界、MVP 范围和最终建议。
+120. 更新 `.agent-docs/TokenInside-B阶段真实链路实测计划.md`、`.agent-docs/TokenInside-实施总路线图.md`、`.agent-docs/TokenInside-C阶段数据库生产化计划.md`、`.agent-docs/TokenInside-D阶段部署运维计划.md` 和 `.agent-docs/TokenInside-E阶段管理后台与用量统计计划.md`，把 B2/B3、部署变量、生产 schema 和后续管理功能改为卡片审批主路径。
+121. 同步更新 `task_plan.md` 和 `findings.md`，记录所需飞书能力：应用机器人发送交互卡片、`card.action.trigger` 回调、通讯录用户部门归属、部门负责人字段、应用可用范围和回调操作者校验。
+122. 为 B1 修复构建并推送 `voidintheshell/tokeninside:b1-feishu-h5-auto-20260702` 与 `latest`，digest `sha256:c02c43e2732d8df05dc643a78a0741d3c15e89cc1006c96c6e494a259618bd57`；随后部署到 RemoteUSDMITLA，容器 healthy，远端本机 `/api/health`、`/admin`、`/api/session` 通过。
+123. 公网浏览器验证发现缺少 favicon 导致 `/favicon.ico` 404 console error；新增 `app/icon.svg` 并在 `app/layout.tsx` metadata 中显式声明 `/icon.svg`，重新运行 `npm run typecheck` 和 `npm run build` 均通过。
+124. 重新构建并推送 `voidintheshell/tokeninside:b1-feishu-h5-auto-20260702-2` 与 `latest`，digest `sha256:a26b20e2277cdcbe64cc9cd8fa3d5f38c45fccaa107d17cbcb2087c45e977fd4`；第一次 Docker build 因 Docker Hub metadata 网络超时失败，按网络失败重试后成功。
+125. RemoteUSDMITLA `/home/beihai/tokeninside/docker-compose.yml` 已备份为 `docker-compose.yml.before-b1-feishu-h5-auto-20260702` 和 `docker-compose.yml.before-b1-feishu-h5-auto-20260702-2`；当前 compose image 为 `voidintheshell/tokeninside:b1-feishu-h5-auto-20260702-2`，服务器只执行 Docker Hub pull 和 compose up，未进行源码构建。
+126. 远端最终验证：容器 `tokeninside-tokeninside-1` running/healthy，imageId `sha256:a26b20e2277cdcbe64cc9cd8fa3d5f38c45fccaa107d17cbcb2087c45e977fd4`；远端本机 `/api/health` 200，`/icon.svg` 200 image/svg+xml，`/admin` 200。
+127. 公网最终验证：`https://ti.kumiko-love.com/icon.svg` 200 image/svg+xml，`/api/feishu/app-id` 200 JSON，`/admin` 200 HTML，`/v1/models` 无 key 401 JSON；隔离浏览器打开 `/` 和 `/admin` 均无 console error/warn，页面快照确认只显示“等待飞书身份”和“刷新”，没有“飞书免登”按钮。
+128. 用户在飞书 H5 端内复测已从“没有检测到 H5 JSAPI”推进到 `requestAccess` 返回 `20029 invalid redirect uri in h5 case`；查阅飞书重定向 URL 官方文档确认，调用 `tt.requestAccess` 的当前页面地址也必须加入应用安全设置的重定向 URL 列表。已在 `components/feishu-login.tsx` 增加 `20029/invalid redirect uri` 识别，页面会提示需要添加的当前 URL；飞书后台需补 `https://ti.kumiko-love.com/` 和 `https://ti.kumiko-love.com/admin` 后再端内复测。
+129. 用户纠正当前应先部署 Docker，使飞书后台回调地址可以通过 challenge 验证；本地 Docker Desktop 起初未运行，启动 Docker Desktop 后 `docker info` 正常。
+130. 本地构建 `tokeninside:b1-feishu-h5-redirect-20260702` 成功，Docker 构建阶段 `npm run build` 通过；推送 `voidintheshell/tokeninside:b1-feishu-h5-redirect-20260702` 与 `latest` 到 Docker Hub，digest 均为 `sha256:117e94f6074d3a36dfb6d51e838b4499a153b2f8f04ea3ffdb70071f643f9dab`。
+131. RemoteUSDMITLA `/home/beihai/tokeninside/docker-compose.yml` 已备份为 `docker-compose.yml.before-b1-feishu-h5-redirect-20260702`，compose image 已切换到 `voidintheshell/tokeninside:b1-feishu-h5-redirect-20260702`，远端只执行 Docker Hub pull 和 compose up，未执行源码构建。
+132. 远端容器 `tokeninside-tokeninside-1` 已 running/healthy，镜像 digest 为 `sha256:117e94f6074d3a36dfb6d51e838b4499a153b2f8f04ea3ffdb70071f643f9dab`；远端本机与公网 `/api/health` 均返回 `status: ok`，配置项 `sessionSecret`、`feishuApp`、`approvalEventVerification`、`approvalEventEncryption`、`newapiControl` 均为 true。
+133. 在容器内使用生产环境变量构造签名加密飞书 challenge，经公网 `POST https://ti.kumiko-love.com/api/feishu/events` 返回 200 `{"challenge":"ti-deploy-check-20260702"}`，确认当前部署的回调地址可通过加密 challenge 链路。
+134. 公网基础验证：`/` 200 HTML，`/admin` 200 HTML，`/api/feishu/app-id` 200 JSON，`/v1/models` 无 key 返回 `{"error":"Bearer NewAPI key is required"}`，反代仍透传 TokenInside JSON 错误体。
+135. 根据最新需求变更，先读取 `task_plan.md`、`findings.md`、`progress.md` 和 `.agent-docs` 方案索引，确认当前文档仍保留 `/admin` 入口壳、旧用户后台和泛 `/v1/*` 透传范围。
+136. 更新 `.agent-docs/TokenInside-飞书NewAPI单用户多Key透传实现方案.md`：补充 shadcn 白蓝主题、申请界面/用户后台/管理后台三页面、按身份分流、申请界面只保留用户卡片和申请按钮、用户后台模型列表菜单、管理入口只对管理员展示、移除透传网关子菜单，以及数据面 MVP 只透传 OpenAI Chat Completions、OpenAI Responses、Claude-compatible messages。
+137. 更新 `.agent-docs/TokenInside-E阶段管理后台与用量统计计划.md`：重排 E1-E7，新增申请界面，扩展用户后台模型列表，调整管理员默认进入用户后台和用户卡片旁管理入口，取消四个统计卡片作为管理后台首屏必需项。
+138. 更新 `.agent-docs/TokenInside-B阶段真实链路实测计划.md` 与 `.agent-docs/TokenInside-D阶段部署运维计划.md`：把 B5/D 阶段数据面验证范围同步为 `/v1/models`、`/v1/chat/completions`、`/v1/responses` 和 Claude-compatible messages，明确 embeddings、images、audio、Gemini-compatible 不属于本期 MVP 验收。
+139. 更新 `.agent-docs/TokenInside-实施总路线图.md`、`task_plan.md` 和 `findings.md`：将最新产品变更写入总路线、当前落地状态、下一阶段入口和研究结论；本轮未修改前端或服务端代码。
