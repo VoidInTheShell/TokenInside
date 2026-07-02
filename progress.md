@@ -42,3 +42,48 @@
 38. Next MCP `get_errors` 复查仍无 config/session 错误。
 39. 执行密钥落盘检查，排除 `AGENTS.md` 和 `.agent-docs` 后未发现用户提供的 NewAPI System AK 写入源码、示例配置或脚本。
 40. `next-env.d.ts` 因 `next build` 自动从 `.next/dev/types/routes.d.ts` 切换为 `.next/types/routes.d.ts`，这是 Next 生成文件变化；未手写修改。
+41. 根据用户要求推进 B1/B4 前置梳理，读取 B 阶段计划、`.env.example`、`scripts/b-stage-check.mjs`、`lib/config.ts`、`lib/feishu.ts`、`lib/newapi.ts`、飞书 OAuth 回调、Token 申请、key 查看、发放和 `/v1` 代理代码。
+42. 通过 Next MCP 确认本地 dev server 位于 `http://127.0.0.1:16878`，`get_errors` 无 config/session 错误，App Router 路由包含 B1/B4 所需入口。
+43. 执行 `npm run b:check`，确认当前没有可用 `.env.local` 被加载，B1/B4 所需 `TOKENINSIDE_SESSION_SECRET`、飞书应用凭据、NewAPI base URL、`NEWAPI_CONTROL_USER_ID` 和 NewAPI 控制面凭据均缺失。
+44. 读取 `.gitignore`，确认 `.env` 与 `.env.*` 已忽略，真实密钥可写入 `.env.local` 而不进入 git。
+45. 更新 `.agent-docs/TokenInside-真实链路实测记录.md`，补充 B1/B4 推进前置清单、当前本地状态和建议执行顺序。
+46. 根据飞书事件订阅 Request URL 必须公网验证的问题，调整计划为服务器优先：D 阶段部署工作前置合入 B0，最终调试产物改为 Docker 镜像，真实链路直接在 USLA + `ti.kumiko-love.com` 上验证。
+47. 继续 B0，新增 Docker 部署基础件：`Dockerfile`、`.dockerignore`、`.env.production.example`、`docker-compose.example.yml`、`app/api/health/route.ts`，并将 `next.config.ts` 配置为 `output: "standalone"`，`npm start` 监听 `0.0.0.0:16878`。
+48. 运行 `npm run typecheck` 通过；运行 `npm run build` 通过，生产路由新增 `/api/health`。
+49. 本机 Docker Desktop 启动后运行 `docker build -t tokeninside:latest .` 成功，Dockerfile 内部 `npm ci` 审计 0 vulnerabilities，容器构建阶段 `npm run build` 通过。
+50. 以 `tokeninside:latest` 启动本地临时容器，宿主 `127.0.0.1:16879` 映射容器 `16878`，使用 `.env.production.example` 验证生产容器启动。
+51. 本地容器 B0 冒烟通过：`/api/health` 返回 `status: ok` 且 JSON store 可写，`/api/session` 未登录返回 JSON，`/api/feishu/events` challenge 返回 `{"challenge":"ti-check"}`，`/v1/models` 无 Authorization 返回 401，未绑定 Bearer key 返回 403，首页返回 200。
+52. 查看本地容器日志，只包含 Next.js 启动和 Ready 信息，未打印 NewAPI key、System AK、飞书 App Secret 或 session secret；随后停止并移除临时容器。
+53. 用户将认证信息放入 `.env` 后，执行 `npm run b:check`，确认 `.env` 可被脚本加载；当前具备 `TOKENINSIDE_SESSION_SECRET`、飞书 App ID/Secret、NewAPI base URL、`NEWAPI_CONTROL_USER_ID` 和 NewAPI 控制面凭据。
+54. 执行 `npm run b:check -- --feishu` 通过，飞书 `tenant_access_token` 可正常获取。
+55. 首次执行 `npm run b:check -- --newapi` 失败，NewAPI 返回 `LLMAPI-User not provided`；据此更新 `lib/newapi.ts` 与 `scripts/b-stage-check.mjs`，在控制面请求中同时发送 `New-Api-User` 和 `LLMAPI-User`。
+56. 重新执行 `npm run b:check -- --newapi` 通过，NewAPI `/api/token` 只读访问成功。
+57. 执行 `npm run b:check -- --mutate-newapi` 通过，创建 `TI-bcheck-*` 测试 token、搜索 token id、确认完整 key 可读取并立刻禁用测试 token；脚本未打印明文 key。
+58. 将 `FEISHU_APPROVAL_EVENT_ENCRYPT_KEY` 在 readiness 输出中改为可选项，避免未启用飞书事件加密时误判；`FEISHU_APPROVAL_CODE_TOKEN_REQUEST` 和 `FEISHU_APPROVAL_EVENT_VERIFICATION_TOKEN` 仍缺失，B2/B3 审批链路暂不能闭环。
+59. 运行 `npm run typecheck`、`npm run build` 和 `docker build -t tokeninside:latest .` 均通过；Next MCP `get_errors` 无 config/session 错误。
+60. 按用户要求改为本地构建并推送 Docker Hub，服务器不做源码构建；已将本地镜像标记并推送为 `voidintheshell/tokeninside:b0-20260702-1526` 与 `voidintheshell/tokeninside:latest`。
+61. Docker Hub 镜像 digest 为 `sha256:77faf6da8a61fac4f5033582563af3f8c7305fe31ed4f7ea158a0c324a25d3d7`，本地 `docker images` 显示两个 tag 指向同一 image id，大小约 279MB。
+62. 上传服务器私有 `.env.production` 到 `/home/beihai/tokeninside/.env.production` 并设置 `chmod 600`；未将真实密钥写入仓库或文档。
+63. 上传 pull-only `docker-compose.yml` 到 `/home/beihai/tokeninside`，执行 `sudo -n docker compose pull` 与 `up -d` 后容器 `tokeninside-tokeninside-1` 使用 Hub 镜像运行，状态为 `running` / `healthy`。
+64. 首次公网反代因 compose 仅绑定 `127.0.0.1:16878` 返回 502；将端口发布改为 `16878:16878` 后，宿主监听 `0.0.0.0:16878`，公网 GET 链路恢复。
+65. 远端本机直连验证通过：`/api/health` 返回 `status: ok` 且 store writable，`/api/feishu/events` challenge 返回 200 JSON，`/v1/models` 无认证返回 401 JSON，未绑定 key 返回 403 JSON，首页返回 200。
+66. 公网 `https://ti.kumiko-love.com/api/health`、`/api/session` 和 `/` 当前返回 200；`/v1/models` 无认证返回 401、未绑定 key 返回 403，但响应体被 BunkerWeb 替换为 HTML。
+67. 公网 POST `/api/feishu/events` challenge 当前返回 BunkerWeb 400 HTML；同一请求服务器本机直连返回 200 JSON，说明应用路由可用，飞书事件订阅前需修正 BunkerWeb 对该 POST 路径的处理。
+68. B0 当前结论：代码、镜像、本地生产容器、Docker Hub 推送和 USLA pull-only 部署已完成；继续 B1/B2/B3 前需要补齐飞书审批环境变量，并修复 BunkerWeb 对事件 POST 与 `/v1` JSON 错误体的拦截。
+69. 根据用户追问复查 `/api/feishu/events`，确认路由文件存在且实现为 `POST`；使用 Linux curl 发送有效 JSON challenge 到公网域名返回 200 `application/json`，此前 400 是 PowerShell curl 引号导致无效 JSON 的测试误差。
+70. 在 `RemoteJPGreenSB` 备份 BunkerWeb 配置相关表到 `/home/beihai/docker/bunkerweb/backups/ti-kumiko-bw-before-20260702T080825Z.sql.gz`。
+71. 给 BunkerWeb live DB 中 `ti.kumiko-love.com` service 增加 `REVERSE_PROXY_INTERCEPT_ERRORS=no`，重启 `bw-scheduler` 后生成配置，确认 `/etc/nginx/ti.kumiko-love.com/server-http/reverse-proxy.conf` 为 `proxy_intercept_errors off;`。
+72. 公网复测通过：`/v1/models` 无认证返回 401 `application/json`，未绑定 key 返回 403 `application/json`，`POST /api/feishu/events` challenge 返回 200 `application/json`，无效 JSON payload 返回 TokenInside 自身的 400 `application/json`。
+73. B0 反代层结论更新：事件入口无需额外 WAF 放行；已完成错误体透传配置，后续 B1/B2/B3 的剩余外部阻塞仍是飞书审批 code 与事件 verification token。
+74. 用户补齐所需 key 后，执行 `npm run b:check`，确认 `FEISHU_APPROVAL_CODE_TOKEN_REQUEST`、`FEISHU_APPROVAL_EVENT_VERIFICATION_TOKEN` 和 `FEISHU_APPROVAL_EVENT_ENCRYPT_KEY` 已配置；未打印密钥值。
+75. 执行 `npm run b:check -- --all` 通过，飞书 `tenant_access_token` 可获取，NewAPI `/api/token` 只读访问成功。
+76. 检查线上 `/api/health`，确认远端在更新前仍显示 `approvalCode=false`、`approvalEventVerification=false`、`approvalEventEncryption=false`。
+77. 发现本地 `.env` 的 `TOKENINSIDE_SESSION_SECRET` 仍是占位符，因此未整文件覆盖远端环境；只把三项飞书审批变量合并到 `/home/beihai/tokeninside/.env.production`，并保留远端原有 session secret。
+78. 远端 `.env.production` 更新前备份为 `.env.production.before-approval-20260702T082337Z`；容器 `tokeninside-tokeninside-1` 已用同一 Hub 镜像 `voidintheshell/tokeninside:b0-20260702-1526` 重建并恢复 healthy。
+79. 复测远端本机和公网 `/api/health`，确认 `approvalCode`、`approvalEventVerification`、`approvalEventEncryption` 均为 true。
+80. 在远端容器内构造签名加密飞书 challenge，经 `https://ti.kumiko-love.com/api/feishu/events` 返回 200 `{"challenge":"ti-encrypted-check"}`，验证线上签名校验、AES 解密、verification token 和反代 POST 链路均可用。
+81. 调用飞书审批事件订阅接口绑定当前 `approval_code`，首次返回 `code=0 msg=success`；随后将该动作沉淀为 `npm run b:check -- --subscribe-approval`。
+82. `npm run b:check -- --subscribe-approval` 首次复跑遇到飞书返回 `subscription existed`，已将脚本改为幂等成功；最终复跑输出 `Feishu approval event subscribe - already subscribed`。
+83. 执行 `npm run typecheck` 通过；执行公网 `GET https://ti.kumiko-love.com/v1/models` 无 key 仍返回 401 `application/json`，反代错误体透传保持正常。
+84. 收尾验证：`npm run build`、`npm run b:check -- --all`、`npm run b:check -- --subscribe-approval` 均通过；远端容器 healthy，线上 `/api/health` 所有关键配置为 true，近期容器日志只有 Next.js 启动 Ready 信息。
+85. 提交前将 `scripts/b-stage-check.mjs` 改为识别 `TOKENINSIDE_SESSION_SECRET` 占位符；本地 `.env` 会显示该项 missing，但飞书 tenant token、NewAPI 只读和审批订阅幂等检查仍通过，远端生产 session secret 未被覆盖。

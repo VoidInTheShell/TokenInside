@@ -41,9 +41,9 @@
 | A3 | complete | 实现飞书 OAuth 回调、当前会话、Token 申请、key 查看、审批事件回写 API |
 | A4 | complete | 实现根路径 `/v1/[...path]` NewAPI 透传代理、key hash 绑定校验和代理审计 |
 | A5 | complete | 完成依赖安装、类型检查、生产构建、依赖审计和本地页面/API 冒烟验证 |
-| B | in_progress | 飞书 OAuth、审批实例、审批事件、NewAPI token 管理和 `/v1` 代理真实链路实测 |
+| B | in_progress | 服务器优先真实链路：先产出 Docker 镜像并部署 USLA，再在 `ti.kumiko-love.com` 完成飞书 OAuth、审批事件、NewAPI token 管理和 `/v1` 代理实测 |
 | C | planned | 将 JSON MVP store 迁移到 PostgreSQL，并补齐唯一 active key、事件幂等和事务状态机 |
-| D | planned | 部署到 USLA `16878`，通过 `ti.kumiko-love.com` 反代对外提供控制面和 `/v1` 网关 |
+| D | pulled_forward | 部署运维工作前置并合入 B0；测试阶段先用 Docker + USLA 公网域名解决飞书回调验证闭环 |
 | E | planned | 补齐用户后台、部门主管/管理员后台、用量统计、调额、额度重置和 key 重置 |
 
 ## 当前落地状态
@@ -52,10 +52,24 @@
 2. 首版使用 `.local-data/tokeninside.json` 作为 MVP 状态存储；后续生产化应替换为 PostgreSQL。
 3. `.env.example` 只保留占位符，没有写入真实 NewAPI System AK、飞书密钥或其他私密凭据。
 4. 依赖审计通过 `postcss` override 修复为 0 vulnerabilities。
-5. 外部飞书审批定义、飞书事件订阅、NewAPI token 创建接口仍需用真实环境变量实测。
+5. 外部飞书审批定义、飞书事件订阅、NewAPI token 创建接口改为在 USLA 公网测试环境实测，避免飞书事件订阅 URL 必须公网验证导致本地死循环。
 6. B 阶段已补齐真实链路承接代码：飞书事件加密解包、verification token 校验、事件幂等、NewAPI token 创建后搜索取 key、禁用和额度更新封装。
-7. 当前仓库未发现 `.env.local`，因此飞书 OAuth、审批实例创建、审批事件回调、NewAPI 真实 token 创建和 `/v1` 成功代理仍等待真实环境变量与飞书后台触发。
+7. 当前仓库未发现 `.env.local`；后续真实密钥优先写入服务器环境变量或服务器私有 `.env.production`，本地只做构建和脚本 readiness。
 8. B 阶段本地验证已通过：`npm run typecheck`、`npm run build`、`npm run b:check` readiness、无密钥 API 冒烟和密钥落盘检查。
+9. B 阶段策略已调整为服务器优先：最终阶段产物是 Docker 镜像，所有飞书事件、审批回调和 NewAPI 控制面实测直接在 `https://ti.kumiko-love.com` 上调试。
+10. B0 本地 Docker 基线已完成：已新增 Dockerfile、`.dockerignore`、`.env.production.example`、compose 示例和 `/api/health`；`tokeninside:latest` 镜像构建成功，本地生产容器冒烟通过。
+11. `.env` 已可被本地检查脚本加载；B1 基础飞书凭据检查通过，B4 NewAPI token 控制面只读和变更探测通过。
+12. B2/B3 仍等待飞书审批配置变量：`FEISHU_APPROVAL_CODE_TOKEN_REQUEST` 与 `FEISHU_APPROVAL_EVENT_VERIFICATION_TOKEN`。
+13. B0 镜像已按“本地构建、推送 Docker Hub、服务器只拉取运行”的方式完成：`voidintheshell/tokeninside:b0-20260702-1526` 与 `voidintheshell/tokeninside:latest` 已推送，digest 为 `sha256:77faf6da8a61fac4f5033582563af3f8c7305fe31ed4f7ea158a0c324a25d3d7`。
+14. USLA `/home/beihai/tokeninside` 已使用 pull-only compose 拉取并运行 Hub 镜像，容器 `tokeninside-tokeninside-1` 当前 `running` / `healthy`，端口为 `0.0.0.0:16878->16878/tcp`，服务器未执行源码构建。
+15. 远端本机直连验证通过：`/api/health` 返回 `status: ok` 且 JSON store 可写，`/api/feishu/events` challenge 返回 200 JSON，`/v1/models` 无认证返回 401 JSON，未绑定 key 返回 403 JSON，首页返回 200。
+16. 公网域名 `https://ti.kumiko-love.com` 链路已通：`/api/health`、`/api/session`、`/` 和 `POST /api/feishu/events` challenge 均返回预期 JSON/HTML。
+17. GreenJP/BunkerWeb 已为 `ti.kumiko-love.com` 设置 `REVERSE_PROXY_INTERCEPT_ERRORS=no`，公网 `/v1/models` 的 401/403 和事件入口无效 payload 的 400 均能保留 TokenInside 上游 JSON 响应体。
+18. 用户补齐审批相关 `.env` 后，本地 `npm run b:check -- --all` 已通过，飞书 tenant token 与 NewAPI token 只读接口均可用。
+19. 已将审批 code、事件 verification token、事件 encrypt key 三项合并进远端 `/home/beihai/tokeninside/.env.production`，保留远端原有 session secret；变更前备份为 `.env.production.before-approval-20260702T082337Z`。
+20. 远端容器已用同一 Hub 镜像重建并恢复 healthy，线上 `/api/health` 显示 `approvalCode`、`approvalEventVerification`、`approvalEventEncryption` 全部为 true。
+21. 线上加密飞书事件 challenge 已通过签名、解密和 verification token 校验，返回 `{"challenge":"ti-encrypted-check"}`。
+22. 飞书审批事件订阅已调用成功；`npm run b:check -- --subscribe-approval` 已支持幂等复跑，当前返回 `already subscribed`。
 
 ## 计划文档索引
 
@@ -70,12 +84,11 @@
 
 ## 下一阶段入口
 
-B 阶段优先执行顺序：
+B 阶段优先执行顺序已调整为服务器优先：
 
-1. B1 飞书 OAuth 免登实测。
-2. B2 飞书审批实例创建实测。
-3. B4 NewAPI token 管理接口实测。
-4. B3 审批事件订阅与回写。
-5. B5 `/v1` 数据面透传实测。
+1. B0 代码、镜像、Hub 推送、USLA pull-only 部署和 BunkerWeb 错误体透传配置已完成，当前运行镜像为 `voidintheshell/tokeninside:b0-20260702-1526`。
+2. B1 在飞书后台把网页入口、H5 可信域名、OAuth 和事件订阅 URL 都切到 `ti.kumiko-love.com`，从飞书客户端工作台完成端内免登。
+3. B2/B3 已不再缺配置变量；下一步需要真实飞书用户登录后提交 Token 申请，并由审批人完成一次通过/拒绝来确认审批实例字段、事件 payload 和状态枚举。
+4. B5 使用审批通过后发放的 key 访问 `https://ti.kumiko-love.com/v1` 完成数据面透传验证。
 
-继续 B 阶段外部实测前必须准备 `.env.local`，且不得将真实密钥写入仓库。
+继续 B 阶段外部实测前必须准备服务器私有环境变量，且不得将真实密钥写入仓库。

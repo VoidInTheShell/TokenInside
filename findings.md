@@ -45,6 +45,24 @@
 22. NewAPI token name 有长度校验，TokenInside 发放时需要使用短名称，避免包含完整飞书用户 id 和申请单 id 导致创建失败。
 23. 飞书事件入口已补齐加密事件解包、verification token 校验、challenge 返回、审批字段多路径提取和 `event_id` 幂等处理；真实字段路径仍需飞书后台回调确认。
 24. 当前仓库没有 `.env.local`，`npm run b:check` 只能完成环境 readiness 检查，外部 Feishu/NewAPI 网络实测需在填入真实密钥后执行。
+25. 飞书事件订阅 Request URL 需要公网服务完成 challenge 验证，本地端到端测试会和飞书后台事件配置形成死循环；B 阶段应改为服务器优先，先产出 Docker 镜像部署到 USLA，再用 `https://ti.kumiko-love.com` 完成飞书 OAuth、审批事件和 NewAPI 控制面真实调试。
+26. Next.js 16.2.10 的 standalone 输出适合 B0 Docker 镜像：`next.config.ts` 设置 `output: "standalone"` 后，Docker 可直接复制 `.next/standalone` 与 `.next/static`，并通过 `HOSTNAME=0.0.0.0`、`PORT=16878` 运行 `server.js`。
+27. B0 本地 Docker 基线已验证：镜像 `tokeninside:latest` 可重复构建，容器生产模式可访问首页、`/api/session`、`/api/health`、飞书 challenge 和 `/v1` 代理校验；临时容器日志未出现密钥类信息。
+28. `.env.production.example` 已作为可提交占位符放行，真实 `.env.production` 仍被 `.gitignore` 忽略；服务器部署时必须使用私有 `.env.production`，不能直接复用示例占位符。
+29. 当前 `.env` 已足够完成 B1 基础飞书凭据探测和 B4 NewAPI 控制面探测；飞书审批实例创建和事件订阅仍缺 `FEISHU_APPROVAL_CODE_TOKEN_REQUEST` 与 `FEISHU_APPROVAL_EVENT_VERIFICATION_TOKEN`。
+30. 测试 NewAPI 实例要求 `LLMAPI-User` 请求头；为兼容 NewAPI upstream 与该测试实例，控制面请求需要同时发送 `New-Api-User` 和 `LLMAPI-User`，值均来自 `NEWAPI_CONTROL_USER_ID`。
+31. NewAPI token 管理真实契约已初步确认：`/api/token` 可创建 token，`/api/token/search` 可按 name 找到 id，`POST /api/token/:id/key` 可取完整 key，`PUT /api/token/?status_only=true` 可禁用 token。
+32. B0 部署路径已按用户要求固定为本地 Docker 构建并推送 Docker Hub，服务器只执行 pull-only compose；当前镜像为 `voidintheshell/tokeninside:b0-20260702-1526`，digest `sha256:77faf6da8a61fac4f5033582563af3f8c7305fe31ed4f7ea158a0c324a25d3d7`。
+33. 当前 GreenJP/BunkerWeb 到 USLA 的反代拓扑要求容器端口发布到宿主 `0.0.0.0:16878`；仅绑定 `127.0.0.1:16878` 时公网反代会返回 502。
+34. `/api/feishu/events` 路由已写入并在公网可用；有效 JSON challenge 经 `https://ti.kumiko-love.com/api/feishu/events` 返回 200 JSON。此前公网 400 来自本地 PowerShell curl 构造了无效 JSON，并非 BunkerWeb 拦截有效飞书 challenge。
+35. 已在 BunkerWeb `ti.kumiko-love.com` service 上设置 `REVERSE_PROXY_INTERCEPT_ERRORS=no`；公网 `/v1/models` 的 401/403 和事件入口无效 payload 的 400 均保留 TokenInside 上游 JSON，OpenAI-compatible 错误体兼容性已恢复。
+36. 线上 `/api/health` 当前显示 NewAPI 控制面配置已就绪、JSON store 可写；`approvalCode` 与 `approvalEventVerification` 仍为 false，对应缺少 `FEISHU_APPROVAL_CODE_TOKEN_REQUEST` 和 `FEISHU_APPROVAL_EVENT_VERIFICATION_TOKEN`。
+37. 本地 `.env` 已补齐飞书审批 code、事件 verification token 和事件 encrypt key；本地 `npm run b:check -- --all` 已验证飞书 tenant token 与 NewAPI token 只读访问。
+38. 本地 `.env` 的 `TOKENINSIDE_SESSION_SECRET` 仍是占位符时，不能整文件覆盖远端 `.env.production`；应只合并新增密钥项或在远端单独维护生产 session secret。
+39. 飞书审批事件订阅接口为 `POST /open-apis/approval/v4/approvals/:approval_code/subscribe`；首次订阅返回 `code=0 msg=success`，重复订阅可能返回 `subscription existed` 且 HTTP 非 2xx，脚本应按幂等成功处理。
+40. 远端启用 `FEISHU_APPROVAL_EVENT_ENCRYPT_KEY` 后，明文无签名 challenge 不再是有效测试方式；应使用带 `x-lark-request-timestamp`、`x-lark-request-nonce`、`x-lark-signature` 的加密事件 payload 测试。
+41. 线上 `https://ti.kumiko-love.com/api/feishu/events` 已通过签名加密 challenge 测试，说明 TokenInside 事件入口、AES 解密、verification token 校验和 GreenJP/BunkerWeb POST 链路均可用于飞书事件回调。
+42. B2/B3 当前不再受配置变量阻塞；剩余不可由普通浏览器完成的部分是飞书客户端端内 OAuth、真实用户提交审批、主管审批动作和飞书实际 `approval_instance` payload 字段确认。
 
 ## 官方文档来源
 
