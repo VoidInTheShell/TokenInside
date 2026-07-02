@@ -174,3 +174,8 @@
 170. 修复申请表单：`components/experience-client.tsx` 恢复申请理由 `Textarea`，默认月额度 `200` 用禁用 `Input` 展示，提交按钮在理由少于 4 个字符时禁用。
 171. 修复飞书发卡错误提示：`lib/feishu.ts` 将 `Bot ability is not activated` 转换为中文提示，说明需要在飞书开放平台应用后台启用 Bot/机器人能力并确认发布生效。
 172. 验证：`npm run typecheck` 通过；`npm run build` 通过。
+173. 提交代码修复：`9d4ded4 fix(feishu): sync department and restore request reason`。
+174. 构建 Docker 镜像 `tokeninside:b2-card-fix-20260702-2310` 成功，Docker 构建阶段 `npm run build` 通过；推送 `voidintheshell/tokeninside:b2-card-fix-20260702-2310` 与 `voidintheshell/tokeninside:latest`，digest 均为 `sha256:52ab21f02022e0b0f7ed68e5cbce282a2bcbf5acf1e74629f34a3df5923e4ffa`。
+175. RemoteUSDMITLA `/home/beihai/tokeninside/docker-compose.yml` 已备份为 `docker-compose.yml.before-b2-card-fix-20260702-2310`，compose image 已切换到 `voidintheshell/tokeninside:b2-card-fix-20260702-2310`；远端只执行 `sudo -n docker compose pull` 与 `up -d`，未进行源码构建。
+176. 远端容器 `tokeninside-tokeninside-1` running/healthy，端口保持 `0.0.0.0:16878->16878/tcp`，运行镜像 digest 为 `sha256:52ab21f02022e0b0f7ed68e5cbce282a2bcbf5acf1e74629f34a3df5923e4ffa`。
+177. 远端和公网复测通过：`/api/health` 200 JSON，`/api/session` 未登录 200 JSON，公网 `/` 200 HTML，`/v1/models` 无 key 401 JSON，`/v1/embeddings` allowlist 404 JSON；容器内构造签名加密飞书 challenge，经公网事件入口返回 200 `{"challenge":"ti-b2-card-fix-check-20260702"}`；容器日志仅有 Next.js Ready 信息。

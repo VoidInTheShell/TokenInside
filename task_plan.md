@@ -94,6 +94,7 @@
 38. B2/B3 卡片审批代码已部署到 USLA：镜像 `voidintheshell/tokeninside:b2-card-20260702-2210` 与 `latest` 已推送并部署，digest 为 `sha256:388c7af2ee4c05ed2a7448d722b4e6cc2ceddf0bca85abcfc25574d79c8accb9`；远端容器 running/healthy。
 39. 线上基础验证通过：公网 `/api/health` 200，公网 `/` 200 HTML，公网 `/v1/models` 无 key 返回 401 JSON，公网 `/v1/embeddings` 返回 TokenInside allowlist 404 JSON；签名加密事件 challenge 返回 `{"challenge":"ti-b2-card-check-20260702"}`，签名加密 `card.action.trigger` 缺字段模拟返回 200 错误 toast。
 40. 用户真实测试发现三项问题：用户已加入部门但用户卡片部门仍显示占位符；点击申请时报 `Bot ability is not activated.`；申请理由需要用户填写，默认申请金额需要展示但不可修改。已本地修复部门懒同步、申请表单和机器人能力错误提示。
+41. B2/B3 修复已部署到 USLA：镜像 `voidintheshell/tokeninside:b2-card-fix-20260702-2310` 与 `latest` 已推送并部署，digest 为 `sha256:52ab21f02022e0b0f7ed68e5cbce282a2bcbf5acf1e74629f34a3df5923e4ffa`；远端容器 running/healthy，公网 `/api/health`、`/`、`/v1/models` 无 key、`/v1/embeddings` allowlist 404 和签名加密事件 challenge 均复测通过。
 
 ## 计划文档索引
 
@@ -111,7 +112,7 @@
 
 B 阶段优先执行顺序已调整为服务器优先：
 
-1. B0 代码、镜像、Hub 推送、USLA pull-only 部署和 BunkerWeb 错误体透传配置已完成；当前运行镜像为 `voidintheshell/tokeninside:b1-feishu-h5-redirect-20260702`，上一稳定镜像为 `voidintheshell/tokeninside:b1-feishu-h5-auto-20260702-2`。
+1. B0 代码、镜像、Hub 推送、USLA pull-only 部署和 BunkerWeb 错误体透传配置已完成；当前运行镜像为 `voidintheshell/tokeninside:b2-card-fix-20260702-2310`，上一稳定卡片审批镜像为 `voidintheshell/tokeninside:b2-card-20260702-2210`。
 2. B1 当前代码层修复已本地和公网验证通过：H5 JSSDK 加载、`h5sdk.ready()`、`requestAccess.appID`、`requestAuthCode` 回退、OAuth token 交换、自动免登、用户身份卡、无按钮 UI 和 `20029 invalid redirect uri` 明确诊断均已部署；公网事件回调加密 challenge 已通过。用户已在飞书后台补齐重定向 URL，并手动确认后台可获取飞书用户信息。
 3. B2/B3 主路径已调整为部门领导卡片审批；下一步提交 Token 申请，解析申请人所在部门领导，向该领导发送审批卡片，并通过 `card.action.trigger` 完成一次通过/拒绝来确认 payload、权限和幂等状态机。
 4. B5 使用审批通过后发放的 key 访问 `https://ti.kumiko-love.com/v1` 完成数据面透传验证。

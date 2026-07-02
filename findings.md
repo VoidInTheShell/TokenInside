@@ -111,6 +111,9 @@
 80. 真实申请测试暴露 `Bot ability is not activated.`，这说明应用机器人能力本身未启用或未发布生效；通讯录权限已通过，但发交互卡片还依赖飞书应用后台 Bot/机器人能力开关。代码侧已将该错误转换为中文可操作提示。
 81. 用户卡片部门显示占位符的原因是 OAuth 基础用户信息不返回部门字段，已有 session 的用户也不会自动写回 `departmentId`；已改为登录回调和 `/api/session` 懒加载时通过通讯录 `department_ids` 补写本地用户部门。
 82. 申请表单口径已修正：申请理由由用户填写；默认月额度固定显示为 `200` 且禁用，不允许用户修改，提交时按服务端校验的固定值传入。
+83. B2/B3 修复镜像 `voidintheshell/tokeninside:b2-card-fix-20260702-2310` 已部署到 USLA，digest `sha256:52ab21f02022e0b0f7ed68e5cbce282a2bcbf5acf1e74629f34a3df5923e4ffa`；远端 compose 已备份为 `docker-compose.yml.before-b2-card-fix-20260702-2310`，服务器仍只执行 Docker Hub pull 和 compose up。
+84. 公网验证显示新版首页 HTML 已包含“默认申请额度”禁用输入、申请理由文本框和未登录禁用提交状态；`/api/health` 200，`/v1/models` 无 key 401，`/v1/embeddings` 404，签名加密 challenge 返回 `{"challenge":"ti-b2-card-fix-check-20260702"}`。
+85. 代码侧只能把 `Bot ability is not activated.` 转换为清晰中文提示；真正恢复交互卡片发送仍需要飞书开放平台应用后台启用 Bot/机器人能力，并确认应用发布或配置生效。
 
 ## 官方文档来源
 
