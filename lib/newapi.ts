@@ -46,7 +46,8 @@ function getNewApiHeaders(initHeaders?: HeadersInit) {
   const headers = new Headers(initHeaders);
   headers.set("content-type", "application/json; charset=utf-8");
   headers.set("authorization", credential);
-  headers.set("new-api-user", newapi.controlUserId);
+  headers.set("New-Api-User", newapi.controlUserId);
+  headers.set("LLMAPI-User", newapi.controlUserId);
   return headers;
 }
 

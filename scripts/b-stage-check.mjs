@@ -40,6 +40,17 @@ function has(name) {
   return env(name).length > 0;
 }
 
+function validSessionSecret() {
+  const value = env("TOKENINSIDE_SESSION_SECRET");
+  const normalized = value.toLowerCase();
+  return (
+    value.length >= 32 &&
+    !normalized.includes("replace") &&
+    !normalized.includes("example") &&
+    !normalized.includes("placeholder")
+  );
+}
+
 function status(label, ok, detail = "") {
   const mark = ok ? "ok" : "missing";
   console.log(`${mark.padEnd(7)} ${label}${detail ? ` - ${detail}` : ""}`);
@@ -63,7 +74,7 @@ async function parseJsonResponse(res, system) {
   return body.data ?? body;
 }
 
-async function checkFeishu() {
+async function getFeishuTenantAccessToken() {
   requireValues(["FEISHU_APP_ID", "FEISHU_APP_SECRET"]);
   const res = await fetch(
     "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
@@ -77,7 +88,48 @@ async function checkFeishu() {
     },
   );
   const data = await parseJsonResponse(res, "Feishu tenant token");
-  status("Feishu tenant_access_token", Boolean(data.tenant_access_token));
+  if (!data.tenant_access_token) {
+    throw new Error("Feishu tenant token response did not include tenant_access_token");
+  }
+  return data.tenant_access_token;
+}
+
+async function checkFeishu() {
+  const tenantAccessToken = await getFeishuTenantAccessToken();
+  status("Feishu tenant_access_token", Boolean(tenantAccessToken));
+}
+
+async function subscribeFeishuApprovalEvents() {
+  requireValues(["FEISHU_APPROVAL_CODE_TOKEN_REQUEST"]);
+  const tenantAccessToken = await getFeishuTenantAccessToken();
+  const approvalCode = encodeURIComponent(env("FEISHU_APPROVAL_CODE_TOKEN_REQUEST"));
+  const res = await fetch(
+    `https://open.feishu.cn/open-apis/approval/v4/approvals/${approvalCode}/subscribe`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        authorization: `Bearer ${tenantAccessToken}`,
+      },
+      body: JSON.stringify({}),
+    },
+  );
+  const text = await res.text();
+  const body = text ? JSON.parse(text) : {};
+  const message = body.message ?? body.msg ?? body.error ?? "";
+  const alreadySubscribed =
+    typeof message === "string" &&
+    message.toLowerCase().includes("subscription existed");
+  if ((!res.ok || body.code) && !alreadySubscribed) {
+    throw new Error(
+      `Feishu approval event subscribe request failed: ${message || res.status}`,
+    );
+  }
+  status(
+    "Feishu approval event subscribe",
+    true,
+    alreadySubscribed ? "already subscribed" : "subscribed",
+  );
 }
 
 function newApiHeaders() {
@@ -90,7 +142,8 @@ function newApiHeaders() {
   return {
     "content-type": "application/json; charset=utf-8",
     authorization: credential,
-    "new-api-user": env("NEWAPI_CONTROL_USER_ID"),
+    "New-Api-User": env("NEWAPI_CONTROL_USER_ID"),
+    "LLMAPI-User": env("NEWAPI_CONTROL_USER_ID"),
   };
 }
 
@@ -150,18 +203,31 @@ async function checkNewApiMutation() {
 
 async function main() {
   if (args.has("--help")) {
-    console.log("Usage: npm run b:check -- [--feishu] [--newapi] [--mutate-newapi] [--all]");
+    console.log("Usage: npm run b:check -- [--feishu] [--newapi] [--mutate-newapi] [--subscribe-approval] [--all]");
     console.log("--newapi only reads token list; --mutate-newapi creates one test token and disables it.");
+    console.log("--subscribe-approval binds FEISHU_APPROVAL_CODE_TOKEN_REQUEST to approval_instance events.");
     return;
   }
 
   console.log("TokenInside B-stage environment readiness");
-  status("TOKENINSIDE_SESSION_SECRET", has("TOKENINSIDE_SESSION_SECRET"));
+  status(
+    "TOKENINSIDE_SESSION_SECRET",
+    validSessionSecret(),
+    has("TOKENINSIDE_SESSION_SECRET")
+      ? "must be a real 32+ character secret, not a placeholder"
+      : "",
+  );
   status("FEISHU_APP_ID", has("FEISHU_APP_ID"));
   status("FEISHU_APP_SECRET", has("FEISHU_APP_SECRET"));
   status("FEISHU_APPROVAL_CODE_TOKEN_REQUEST", has("FEISHU_APPROVAL_CODE_TOKEN_REQUEST"));
   status("FEISHU_APPROVAL_EVENT_VERIFICATION_TOKEN", has("FEISHU_APPROVAL_EVENT_VERIFICATION_TOKEN"));
-  status("FEISHU_APPROVAL_EVENT_ENCRYPT_KEY", has("FEISHU_APPROVAL_EVENT_ENCRYPT_KEY"));
+  status(
+    "FEISHU_APPROVAL_EVENT_ENCRYPT_KEY",
+    true,
+    has("FEISHU_APPROVAL_EVENT_ENCRYPT_KEY")
+      ? "configured"
+      : "optional unless Feishu event encryption is enabled",
+  );
   status("NEWAPI_BASE_URL", has("NEWAPI_BASE_URL"), env("NEWAPI_BASE_URL") || "not set");
   status("NEWAPI_CONTROL_USER_ID", has("NEWAPI_CONTROL_USER_ID"));
   status(
@@ -177,6 +243,9 @@ async function main() {
   }
   if (args.has("--mutate-newapi")) {
     await checkNewApiMutation();
+  }
+  if (args.has("--subscribe-approval")) {
+    await subscribeFeishuApprovalEvents();
   }
 }
 

@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev --hostname 127.0.0.1 --port 16878",
     "build": "next build",
-    "start": "next start --hostname 127.0.0.1 --port 16878",
+    "start": "next start --hostname 0.0.0.0 --port 16878",
     "typecheck": "tsc --noEmit",
     "b:check": "node scripts/b-stage-check.mjs"
   },
