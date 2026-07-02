@@ -1,5 +1,5 @@
 import { getConfig } from "@/lib/config";
-import { sha256Hex, safeEqual } from "@/lib/crypto";
+import { decryptAes256CbcBase64, sha256Hex, safeEqual } from "@/lib/crypto";
 
 const feishuBaseUrl = "https://open.feishu.cn";
 
@@ -136,4 +136,22 @@ export function verifyFeishuEventSignature(input: {
     `${input.timestamp}${input.nonce}${feishu.eventEncryptKey}${input.rawBody}`,
   );
   return safeEqual(expected, input.signature);
+}
+
+export function decryptFeishuEventPayload(encrypt: string) {
+  const { feishu } = getConfig();
+  if (!feishu.eventEncryptKey) {
+    throw new Error("FEISHU_APPROVAL_EVENT_ENCRYPT_KEY is required for encrypted Feishu events");
+  }
+  return decryptAes256CbcBase64({
+    ciphertextBase64: encrypt,
+    keyMaterial: feishu.eventEncryptKey,
+  });
+}
+
+export function verifyFeishuEventVerificationToken(token?: string | null) {
+  const expected = getConfig().feishu.eventVerificationToken;
+  if (!expected) return true;
+  if (!token) return false;
+  return safeEqual(expected, token);
 }

@@ -1,41 +1,104 @@
 import { NextResponse } from "next/server";
-import { verifyFeishuEventSignature } from "@/lib/feishu";
+import {
+  decryptFeishuEventPayload,
+  verifyFeishuEventSignature,
+  verifyFeishuEventVerificationToken,
+} from "@/lib/feishu";
+import { sha256Hex } from "@/lib/crypto";
 import { provisionTokenForRequest } from "@/lib/provisioning";
 import {
   addFeishuEvent,
   findTokenRequestByInstance,
+  getFeishuEventByUuid,
   updateTokenRequest,
 } from "@/lib/store";
 
 export const runtime = "nodejs";
 
+type JsonRecord = Record<string, unknown>;
+
 type FeishuEventPayload = {
   challenge?: string;
+  encrypt?: string;
   schema?: string;
   header?: {
     event_id?: string;
     event_type?: string;
   };
-  event?: Record<string, unknown>;
+  event?: JsonRecord;
   type?: string;
   token?: string;
 };
+
+function isRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 function stringValue(value: unknown) {
   return typeof value === "string" ? value : undefined;
 }
 
+function nestedValue(source: unknown, path: string[]) {
+  let cursor = source;
+  for (const part of path) {
+    if (!isRecord(cursor)) return undefined;
+    cursor = cursor[part];
+  }
+  return stringValue(cursor);
+}
+
+function firstString(source: unknown, paths: string[][]) {
+  for (const path of paths) {
+    const value = nestedValue(source, path);
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function parseJsonPayload(rawBody: string) {
+  const wrapper = JSON.parse(rawBody) as FeishuEventPayload;
+  if (!wrapper.encrypt) {
+    return { payload: wrapper, encrypted: false };
+  }
+
+  const decrypted = decryptFeishuEventPayload(wrapper.encrypt);
+  return {
+    payload: JSON.parse(decrypted) as FeishuEventPayload,
+    encrypted: true,
+  };
+}
+
 function extractApprovalEvent(payload: FeishuEventPayload) {
-  const event = payload.event ?? {};
-  const instanceCode =
-    stringValue(event.instance_code) ??
-    stringValue(event.instanceCode) ??
-    stringValue(event.approval_instance_code);
-  const approvalStatus =
-    stringValue(event.status) ??
-    stringValue(event.approval_status) ??
-    stringValue(event.approvalStatus);
-  return { instanceCode, approvalStatus };
+  const instanceCode = firstString(payload, [
+    ["event", "instance_code"],
+    ["event", "instanceCode"],
+    ["event", "approval_instance_code"],
+    ["event", "approval_instance", "instance_code"],
+    ["event", "object", "instance_code"],
+    ["event", "data", "instance_code"],
+  ]);
+  const approvalStatus = firstString(payload, [
+    ["event", "status"],
+    ["event", "approval_status"],
+    ["event", "approvalStatus"],
+    ["event", "approval_instance", "status"],
+    ["event", "object", "status"],
+    ["event", "data", "status"],
+  ]);
+  const eventUuid =
+    firstString(payload, [
+      ["header", "event_id"],
+      ["event", "event_id"],
+      ["event", "uuid"],
+      ["uuid"],
+    ]) ?? sha256Hex(JSON.stringify(payload));
+  const eventType = firstString(payload, [
+    ["header", "event_type"],
+    ["event", "type"],
+    ["type"],
+  ]);
+
+  return { eventUuid, eventType, instanceCode, approvalStatus };
 }
 
 export async function POST(request: Request) {
@@ -51,28 +114,40 @@ export async function POST(request: Request) {
   }
 
   let payload: FeishuEventPayload;
+  let encrypted = false;
   try {
-    payload = JSON.parse(rawBody) as FeishuEventPayload;
+    const parsed = parseJsonPayload(rawBody);
+    payload = parsed.payload;
+    encrypted = parsed.encrypted;
   } catch {
-    return NextResponse.json({ error: "Invalid JSON payload" }, { status: 400 });
+    return NextResponse.json({ error: "Invalid Feishu event payload" }, { status: 400 });
+  }
+
+  if (!verifyFeishuEventVerificationToken(payload.token)) {
+    return NextResponse.json({ error: "Invalid Feishu event verification token" }, { status: 401 });
   }
 
   if (payload.challenge) {
     return NextResponse.json({ challenge: payload.challenge });
   }
 
-  const { instanceCode, approvalStatus } = extractApprovalEvent(payload);
-  const eventUuid =
-    payload.header?.event_id ??
-    `${instanceCode ?? "unknown"}:${approvalStatus ?? "unknown"}:${Date.now()}`;
+  const { eventUuid, eventType, instanceCode, approvalStatus } =
+    extractApprovalEvent(payload);
+  const existingEvent = await getFeishuEventByUuid(eventUuid);
+  if (
+    existingEvent &&
+    ["processed", "ignored"].includes(existingEvent.processingStatus)
+  ) {
+    return NextResponse.json({ ok: true, duplicate: true });
+  }
 
   try {
     if (!instanceCode || !approvalStatus) {
       await addFeishuEvent({
         eventUuid,
-        eventType: payload.header?.event_type,
+        eventType,
         processingStatus: "ignored",
-        payloadJson: payload,
+        payloadJson: { encrypted, payload },
       });
       return NextResponse.json({ ok: true, ignored: true });
     }
@@ -81,11 +156,11 @@ export async function POST(request: Request) {
     if (!tokenRequest) {
       await addFeishuEvent({
         eventUuid,
-        eventType: payload.header?.event_type,
+        eventType,
         instanceCode,
         approvalStatus,
         processingStatus: "ignored",
-        payloadJson: payload,
+        payloadJson: { encrypted, payload },
       });
       return NextResponse.json({ ok: true, ignored: true });
     }
@@ -102,22 +177,22 @@ export async function POST(request: Request) {
 
     await addFeishuEvent({
       eventUuid,
-      eventType: payload.header?.event_type,
+      eventType,
       instanceCode,
       approvalStatus,
       processingStatus: "processed",
-      payloadJson: payload,
+      payloadJson: { encrypted, payload },
     });
 
     return NextResponse.json({ ok: true });
   } catch (err) {
     await addFeishuEvent({
       eventUuid,
-      eventType: payload.header?.event_type,
+      eventType,
       instanceCode,
       approvalStatus,
       processingStatus: "failed",
-      payloadJson: payload,
+      payloadJson: { encrypted, payload },
       errorMessage: err instanceof Error ? err.message : "Event processing failed",
     });
     return NextResponse.json(

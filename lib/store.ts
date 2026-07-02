@@ -202,7 +202,10 @@ export async function addFeishuEvent(event: Omit<FeishuEvent, "id" | "createdAt"
     const existing = store.feishuEvents.find(
       (item) => item.eventUuid === event.eventUuid,
     );
-    if (existing) return existing;
+    if (existing) {
+      Object.assign(existing, event);
+      return existing;
+    }
 
     const stored: FeishuEvent = {
       id: randomId("fe"),
@@ -212,6 +215,11 @@ export async function addFeishuEvent(event: Omit<FeishuEvent, "id" | "createdAt"
     store.feishuEvents.push(stored);
     return stored;
   });
+}
+
+export async function getFeishuEventByUuid(eventUuid: string) {
+  const store = await readStore();
+  return store.feishuEvents.find((event) => event.eventUuid === eventUuid) ?? null;
 }
 
 export async function addProxyLog(log: Omit<ProxyRequestLog, "id" | "createdAt">) {

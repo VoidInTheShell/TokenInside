@@ -18,7 +18,7 @@ export async function provisionTokenForRequest(request: TokenRequest) {
 
   try {
     const token = await createNewApiToken({
-      name: `TokenInside ${request.feishuUserId} ${request.id}`,
+      name: `TI ${request.id.slice(0, 18)} ${request.feishuUserId.slice(0, 12)}`,
       remainQuota: request.requestedMonthlyQuota,
     });
     if (!token.key) {

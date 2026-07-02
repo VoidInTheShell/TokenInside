@@ -22,3 +22,16 @@ export function safeEqual(a: string, b: string) {
   if (left.length !== right.length) return false;
   return crypto.timingSafeEqual(left, right);
 }
+
+export function decryptAes256CbcBase64(input: {
+  ciphertextBase64: string;
+  keyMaterial: string;
+}) {
+  const key = crypto.createHash("sha256").update(input.keyMaterial).digest();
+  const iv = key.subarray(0, 16);
+  const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+  return Buffer.concat([
+    decipher.update(Buffer.from(input.ciphertextBase64, "base64")),
+    decipher.final(),
+  ]).toString("utf8");
+}

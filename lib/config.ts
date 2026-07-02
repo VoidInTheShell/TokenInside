@@ -13,6 +13,7 @@ export type RuntimeConfig = {
   };
   newapi: {
     baseUrl: string;
+    controlUserId?: string;
     accessToken?: string;
     adminAccessToken?: string;
     systemAk?: string;
@@ -44,6 +45,7 @@ export function getConfig(): RuntimeConfig {
     },
     newapi: {
       baseUrl: trimSlash(process.env.NEWAPI_BASE_URL ?? "https://new-api.550w.link"),
+      controlUserId: process.env.NEWAPI_CONTROL_USER_ID,
       accessToken: process.env.NEWAPI_ACCESS_TOKEN,
       adminAccessToken: process.env.NEWAPI_ADMIN_ACCESS_TOKEN,
       systemAk: process.env.NEWAPI_SYSTEM_AK,
