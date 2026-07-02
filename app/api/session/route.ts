@@ -52,6 +52,7 @@ export async function GET() {
     return NextResponse.json({
       authenticated: false,
       baseUrl: config.publicBaseUrl,
+      settings: store.settings,
       requests: [],
       proxyLogCount: store.proxyRequestLogs.length,
     });
@@ -71,6 +72,7 @@ export async function GET() {
   return NextResponse.json({
     authenticated: true,
     baseUrl: config.publicBaseUrl,
+    settings: store.settings,
     user: {
       id: user.id,
       name: user.name,

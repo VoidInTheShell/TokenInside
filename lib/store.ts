@@ -14,6 +14,9 @@ import type {
 
 const initialStore: StoreShape = {
   version: 1,
+  settings: {
+    defaultMonthlyQuota: 200,
+  },
   users: [],
   tokenRequests: [],
   tokenAccounts: [],
@@ -26,7 +29,15 @@ async function readStore(): Promise<StoreShape> {
   const filePath = getConfig().storePath;
   try {
     const raw = await readFile(filePath, "utf8");
-    return { ...initialStore, ...(JSON.parse(raw) as StoreShape) };
+    const parsed = JSON.parse(raw) as Partial<StoreShape>;
+    return {
+      ...initialStore,
+      ...parsed,
+      settings: {
+        ...initialStore.settings,
+        ...parsed.settings,
+      },
+    };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     await writeStore(initialStore);
@@ -51,6 +62,25 @@ async function mutate<T>(fn: (store: StoreShape) => T | Promise<T>) {
 
 export async function getStoreSnapshot() {
   return readStore();
+}
+
+export async function getAppSettings() {
+  const store = await readStore();
+  return store.settings;
+}
+
+export async function updateAppSettings(input: {
+  defaultMonthlyQuota: number;
+  updatedByFeishuUserId: string;
+}) {
+  return mutate((store) => {
+    store.settings = {
+      defaultMonthlyQuota: input.defaultMonthlyQuota,
+      updatedAt: nowIso(),
+      updatedByFeishuUserId: input.updatedByFeishuUserId,
+    };
+    return store.settings;
+  });
 }
 
 export async function upsertFeishuUser(input: {
@@ -289,6 +319,14 @@ function proxyLogInScope(
   return Boolean(user?.departmentId && user.departmentId === scope.departmentId);
 }
 
+export async function getScopedTokenRequest(scope: AdminScope, requestId: string) {
+  const store = await readStore();
+  const request = store.tokenRequests.find((item) => item.id === requestId);
+  if (!request) return null;
+  const usersById = new Map(store.users.map((user) => [user.id, user]));
+  return tokenRequestInScope(request, scope, usersById) ? request : null;
+}
+
 export async function getAdminOverview(scope: AdminScope) {
   const store = await readStore();
   const usersById = new Map(store.users.map((user) => [user.id, user]));
@@ -338,6 +376,7 @@ export async function getAdminOverview(scope: AdminScope) {
           status: request.status,
           reason: request.reason,
           requestedMonthlyQuota: request.requestedMonthlyQuota,
+          approvedMonthlyQuota: request.approvedMonthlyQuota,
           approvalInstanceCode: request.approvalInstanceCode,
           approvalCardMessageId: request.approvalCardMessageId,
           requesterName: user?.name,

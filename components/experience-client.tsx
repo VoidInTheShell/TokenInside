@@ -29,6 +29,9 @@ import { formatDateTime, maskSecret } from "@/lib/utils";
 type SessionResponse = {
   authenticated: boolean;
   baseUrl: string;
+  settings?: {
+    defaultMonthlyQuota: number;
+  };
   user?: {
     id: string;
     name?: string;
@@ -73,7 +76,7 @@ type ModelsResponse = {
 type WorkspacePanel = "account" | "models";
 
 const DEFAULT_REASON_PLACEHOLDER = "请说明使用场景、接入工具和预计调用方式。";
-const DEFAULT_MONTHLY_QUOTA = 200;
+const FALLBACK_MONTHLY_QUOTA = 200;
 
 const statusLabel: Record<string, string> = {
   pending_card_send: "发送审批卡片中",
@@ -183,6 +186,7 @@ export function ExperienceClient() {
   const latestRequest = requests[0];
   const hasActiveToken = Boolean(session?.activeToken);
   const title = hasActiveToken ? "用户后台" : "Token 申请";
+  const defaultMonthlyQuota = session?.settings?.defaultMonthlyQuota ?? FALLBACK_MONTHLY_QUOTA;
 
   const connectFeishu = useCallback(async () => {
     setError(null);
@@ -221,7 +225,6 @@ export function ExperienceClient() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           reason: reason.trim(),
-          requestedMonthlyQuota: DEFAULT_MONTHLY_QUOTA,
         }),
       });
       const body = await res.json().catch(() => ({}));
@@ -374,7 +377,7 @@ export function ExperienceClient() {
                     <label htmlFor="requestedMonthlyQuota">默认申请额度</label>
                     <Input
                       id="requestedMonthlyQuota"
-                      value={String(DEFAULT_MONTHLY_QUOTA)}
+                      value={String(defaultMonthlyQuota)}
                       disabled
                     />
                     <span className="field-description">当前 MVP 固定额度，用户不可修改。</span>

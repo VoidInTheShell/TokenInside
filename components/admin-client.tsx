@@ -8,7 +8,9 @@ import {
   KeyRoundIcon,
   RefreshCwIcon,
   RouteIcon,
+  SaveIcon,
   ShieldCheckIcon,
+  SlidersHorizontalIcon,
   UsersRoundIcon,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -20,6 +22,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
 import { formatDateTime, maskSecret } from "@/lib/utils";
 
@@ -58,6 +61,7 @@ type AdminOverviewResponse = {
       status: string;
       reason: string;
       requestedMonthlyQuota: number;
+      approvedMonthlyQuota?: number;
       approvalInstanceCode?: string;
       approvalCardMessageId?: string;
       requesterName?: string;
@@ -66,6 +70,10 @@ type AdminOverviewResponse = {
       updatedAt: string;
       createdAt: string;
     }>;
+  };
+  settings?: {
+    defaultMonthlyQuota: number;
+    updatedAt?: string;
   };
 };
 
@@ -113,12 +121,18 @@ function departmentLabel(user?: AdminOverviewResponse["user"]) {
   return user?.departmentName ?? user?.departmentId ?? "-";
 }
 
+function canEditQuota(status: string) {
+  return ["pending_card_send", "pending_card_approval", "approval_card_send_failed"].includes(status);
+}
+
 export function AdminClient() {
   const [data, setData] = useState<AdminOverviewResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [defaultQuotaDraft, setDefaultQuotaDraft] = useState("200");
+  const [quotaDrafts, setQuotaDrafts] = useState<Record<string, string>>({});
   const [feishuSdkReady, setFeishuSdkReady] = useState(false);
   const [autoLoginAttempted, setAutoLoginAttempted] = useState(false);
 
@@ -129,6 +143,19 @@ export function AdminClient() {
       const res = await fetch("/api/admin/overview?mode=soft", { cache: "no-store" });
       const body = (await res.json()) as AdminOverviewResponse;
       setData(body);
+      if (body.settings) {
+        setDefaultQuotaDraft(String(body.settings.defaultMonthlyQuota));
+      }
+      if (body.overview?.latestRequests) {
+        setQuotaDrafts(
+          Object.fromEntries(
+            body.overview.latestRequests.map((request) => [
+              request.id,
+              String(request.approvedMonthlyQuota ?? request.requestedMonthlyQuota),
+            ]),
+          ),
+        );
+      }
       if (!res.ok || (body.error && body.authenticated)) {
         setError(body.error ?? "读取管理概览失败");
       }
@@ -169,6 +196,63 @@ export function AdminClient() {
     setAutoLoginAttempted(true);
     void connectFeishu();
   }, [autoLoginAttempted, busy, connectFeishu, data?.authenticated, feishuSdkReady, loading]);
+
+  async function saveDefaultQuota() {
+    const defaultMonthlyQuota = Number(defaultQuotaDraft);
+    if (!Number.isInteger(defaultMonthlyQuota) || defaultMonthlyQuota <= 0) {
+      setError("默认额度必须是正整数");
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/admin/settings", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ defaultMonthlyQuota }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "保存默认额度失败");
+      setMessage("默认额度已保存。");
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存默认额度失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveRequestQuota(requestId: string) {
+    const approvedMonthlyQuota = Number(quotaDrafts[requestId]);
+    if (!Number.isInteger(approvedMonthlyQuota) || approvedMonthlyQuota <= 0) {
+      setError("最终额度必须是正整数");
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(
+        `/api/admin/token-requests/${encodeURIComponent(requestId)}/quota`,
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ approvedMonthlyQuota }),
+        },
+      );
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "保存最终额度失败");
+      setMessage("最终额度已保存。");
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存最终额度失败");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   const overview = data?.overview;
   const totals = overview?.totals;
@@ -364,6 +448,43 @@ export function AdminClient() {
               </div>
             </CardContent>
           </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>额度配置</CardTitle>
+              <CardDescription>申请单会保存提交时的默认额度快照。</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="field-group">
+                <div className="field">
+                  <label htmlFor="defaultMonthlyQuota">默认申请额度</label>
+                  <div className="quota-control">
+                    <Input
+                      id="defaultMonthlyQuota"
+                      min={1}
+                      step={1}
+                      type="number"
+                      value={defaultQuotaDraft}
+                      onChange={(event) => setDefaultQuotaDraft(event.target.value)}
+                      disabled={!data?.authorized || busy}
+                    />
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={!data?.authorized || busy}
+                      onClick={() => void saveDefaultQuota()}
+                    >
+                      <SaveIcon data-icon="inline-start" />
+                      保存
+                    </Button>
+                  </div>
+                  <span className="field-description">
+                    当前值：{data?.settings?.defaultMonthlyQuota ?? 200}
+                  </span>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
         </section>
 
         <Card>
@@ -385,6 +506,7 @@ export function AdminClient() {
                       <th>申请人</th>
                       <th>状态</th>
                       <th>额度</th>
+                      <th>最终额度</th>
                       <th>审批消息</th>
                       <th>更新时间</th>
                     </tr>
@@ -399,6 +521,33 @@ export function AdminClient() {
                           </Badge>
                         </td>
                         <td>{request.requestedMonthlyQuota}</td>
+                        <td>
+                          <div className="quota-control">
+                            <Input
+                              aria-label="最终额度"
+                              min={1}
+                              step={1}
+                              type="number"
+                              value={quotaDrafts[request.id] ?? String(request.requestedMonthlyQuota)}
+                              onChange={(event) =>
+                                setQuotaDrafts((current) => ({
+                                  ...current,
+                                  [request.id]: event.target.value,
+                                }))
+                              }
+                              disabled={!canEditQuota(request.status) || busy}
+                            />
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={!canEditQuota(request.status) || busy}
+                              onClick={() => void saveRequestQuota(request.id)}
+                            >
+                              <SlidersHorizontalIcon data-icon="inline-start" />
+                              保存
+                            </Button>
+                          </div>
+                        </td>
                         <td>{maskSecret(request.approvalCardMessageId ?? request.approvalInstanceCode)}</td>
                         <td>{formatDateTime(request.updatedAt)}</td>
                       </tr>

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getFeishuDepartmentNameById } from "@/lib/feishu";
 import { getCurrentUser } from "@/lib/session";
-import { getAdminOverview, getAdminScopeForUser } from "@/lib/store";
+import { getAdminOverview, getAdminScopeForUser, getAppSettings } from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -54,7 +54,10 @@ export async function GET(request: Request) {
     );
   }
 
-  const overview = await getAdminOverview(scope);
+  const [overview, settings] = await Promise.all([
+    getAdminOverview(scope),
+    getAppSettings(),
+  ]);
   const scopeDepartmentName = await resolveDepartmentName(overview.scope.departmentId);
   return NextResponse.json({
     authenticated: true,
@@ -75,5 +78,6 @@ export async function GET(request: Request) {
         departmentName: scopeDepartmentName,
       },
     },
+    settings,
   });
 }

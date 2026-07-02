@@ -98,6 +98,8 @@
 42. 最新额度配置需求已补入计划：管理后台需要提供默认申请额度配置，初始化值为 `200`；普通用户申请页只展示该值且不可修改；审批每条申请时可手动确认或覆盖最终额度，审批通过后以最终额度发放和进入账期统计。
 43. 用户卡片展示收尾已本地完成：首页用户卡移除“租户”，部门展示改为服务端从飞书部门详情解析出的 `departmentName`，管理后台当前用户与管理范围同样优先展示部门名称。
 44. 用户卡片展示收尾已部署到 USLA：当前运行镜像为 `voidintheshell/tokeninside:b2-user-card-dept-20260702`，digest `sha256:a2593de49c3564e23fdc36dd19703e59329ae42c370b1b0831f322ea2332d98e`，公网健康、未登录 session、无 key `/v1/models` 和飞书事件签名 challenge 均已复测。
+45. E 阶段额度配置已进入代码落地：默认申请额度改为 JSON store settings，由管理后台配置；普通申请接口只接受申请理由，额度从服务端默认值生成快照；管理后台可对待审批申请写入最终额度，发放时优先使用最终额度。
+46. E 阶段额度配置已部署到 USLA：当前运行镜像为 `voidintheshell/tokeninside:e-quota-config-20260702`，digest `sha256:fd3ddce9088e7cd8ff5edc09b70900183981981bd473e1b219ca8e86b25a3557`，公网健康、未登录 session settings、管理设置 401 和飞书事件签名 challenge 均已复测。
 
 ## 计划文档索引
 
@@ -115,7 +117,7 @@
 
 B 阶段优先执行顺序已调整为服务器优先：
 
-1. B0 代码、镜像、Hub 推送、USLA pull-only 部署和 BunkerWeb 错误体透传配置已完成；当前运行镜像为 `voidintheshell/tokeninside:b2-user-card-dept-20260702`，上一稳定卡片审批镜像为 `voidintheshell/tokeninside:b2-card-fix-20260702-2310`。
+1. B0 代码、镜像、Hub 推送、USLA pull-only 部署和 BunkerWeb 错误体透传配置已完成；当前运行镜像为 `voidintheshell/tokeninside:e-quota-config-20260702`，上一稳定用户卡片收尾镜像为 `voidintheshell/tokeninside:b2-user-card-dept-20260702`。
 2. B1 当前代码层修复已本地和公网验证通过：H5 JSSDK 加载、`h5sdk.ready()`、`requestAccess.appID`、`requestAuthCode` 回退、OAuth token 交换、自动免登、用户身份卡、无按钮 UI 和 `20029 invalid redirect uri` 明确诊断均已部署；公网事件回调加密 challenge 已通过。用户已在飞书后台补齐重定向 URL，并手动确认后台可获取飞书用户信息。
 3. B2/B3 主路径已调整为部门领导卡片审批；下一步提交 Token 申请，解析申请人所在部门领导，向该领导发送审批卡片，并通过 `card.action.trigger` 完成一次通过/拒绝来确认 payload、权限和幂等状态机。
 4. B5 使用审批通过后发放的 key 访问 `https://ti.kumiko-love.com/v1` 完成数据面透传验证。

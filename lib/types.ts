@@ -34,6 +34,7 @@ export type TokenRequest = {
   status: RequestStatus;
   reason: string;
   requestedMonthlyQuota: number;
+  approvedMonthlyQuota?: number;
   approvalCode?: string;
   approvalUuid: string;
   approvalInstanceCode?: string;
@@ -101,8 +102,15 @@ export type AdminScope = {
   updatedAt: string;
 };
 
+export type AppSettings = {
+  defaultMonthlyQuota: number;
+  updatedAt?: string;
+  updatedByFeishuUserId?: string;
+};
+
 export type StoreShape = {
   version: 1;
+  settings: AppSettings;
   users: FeishuUser[];
   tokenRequests: TokenRequest[];
   tokenAccounts: TokenAccount[];

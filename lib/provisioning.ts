@@ -17,9 +17,10 @@ export async function provisionTokenForRequest(request: TokenRequest) {
   await updateTokenRequest(request.id, { status: "approved_provisioning" });
 
   try {
+    const finalMonthlyQuota = request.approvedMonthlyQuota ?? request.requestedMonthlyQuota;
     const token = await createNewApiToken({
       name: `TI ${request.id.slice(0, 18)} ${request.feishuUserId.slice(0, 12)}`,
-      remainQuota: request.requestedMonthlyQuota,
+      remainQuota: finalMonthlyQuota,
     });
     if (!token.key) {
       throw new Error("NewAPI did not return a token key; cannot create proxy hash mapping");

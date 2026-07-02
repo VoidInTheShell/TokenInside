@@ -9,6 +9,7 @@ import { getCurrentUser } from "@/lib/session";
 import {
   createTokenRequest,
   getActiveTokenForUser,
+  getAppSettings,
   updateTokenRequest,
 } from "@/lib/store";
 
@@ -16,7 +17,6 @@ export const runtime = "nodejs";
 
 const requestSchema = z.object({
   reason: z.string().min(4).max(500),
-  requestedMonthlyQuota: z.number().positive().max(1000000),
 });
 
 export async function POST(request: Request) {
@@ -35,11 +35,13 @@ export async function POST(request: Request) {
     }
 
     const input = requestSchema.parse(await request.json());
+    const settings = await getAppSettings();
+    const requestedMonthlyQuota = settings.defaultMonthlyQuota;
     const nonce = randomId("card");
     const tokenRequest = await createTokenRequest({
       feishuUserId: user.id,
       reason: input.reason,
-      requestedMonthlyQuota: input.requestedMonthlyQuota,
+      requestedMonthlyQuota,
       approvalMode: "feishu_card",
       approvalActionNonceHash: sha256Hex(nonce),
       status: "pending_card_send",
@@ -61,7 +63,7 @@ export async function POST(request: Request) {
         nonce,
         applicantName: user.name,
         applicantOpenId: user.openId,
-        requestedMonthlyQuota: input.requestedMonthlyQuota,
+        requestedMonthlyQuota,
         reason: input.reason,
       });
       const updated = await updateTokenRequest(tokenRequest.id, {

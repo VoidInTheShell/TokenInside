@@ -479,6 +479,18 @@ a {
   overflow-wrap: anywhere;
 }
 
+.quota-control {
+  display: grid;
+  grid-template-columns: minmax(96px, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 190px;
+}
+
+.quota-control .input {
+  min-width: 96px;
+}
+
 .alert {
   border: 1px solid var(--border);
   border-radius: var(--radius);

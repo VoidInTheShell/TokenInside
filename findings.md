@@ -117,6 +117,8 @@
 86. 新增额度管理需求：默认申请额度不能继续只写死在申请表单中，管理后台应提供配置项，初始化值为 `200`；申请单创建时保存默认额度快照，审批每条申请时可手动确认或覆盖最终额度，审批通过后以最终额度创建 NewAPI token 并进入用户账期额度。
 87. 飞书用户卡片不需要展示租户信息；部门字段可通过已获取的 `departmentId` 再读取飞书部门详情并展示 `name`，前端不应把 `od-...` 一类原始部门 ID 作为正常用户可读展示。
 88. B2 用户卡片展示收尾镜像 `voidintheshell/tokeninside:b2-user-card-dept-20260702` 已部署到 USLA，digest `sha256:a2593de49c3564e23fdc36dd19703e59329ae42c370b1b0831f322ea2332d98e`；远端 compose 已备份为 `docker-compose.yml.before-b2-user-card-dept-20260702`，服务器仍只执行 Docker Hub pull 和 compose up。
+89. 默认申请额度应以服务端设置为权威来源，不能由普通前端请求提交；审批覆盖额度应作为申请单独立字段保存，并在 NewAPI token 发放时覆盖申请快照额度。
+90. E 阶段额度配置镜像 `voidintheshell/tokeninside:e-quota-config-20260702` 已部署到 USLA，digest `sha256:fd3ddce9088e7cd8ff5edc09b70900183981981bd473e1b219ca8e86b25a3557`；远端 compose 已备份为 `docker-compose.yml.before-e-quota-config-20260702`，服务器仍只执行 Docker Hub pull 和 compose up。
 
 ## 官方文档来源
 
