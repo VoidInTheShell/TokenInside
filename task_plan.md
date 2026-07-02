@@ -50,7 +50,7 @@
 | B | in_progress | 服务器优先真实链路：先产出 Docker 镜像并部署 USLA，再在 `ti.kumiko-love.com` 完成飞书 OAuth、部门领导解析、卡片审批回调、NewAPI token 管理和 `/v1` 代理实测 |
 | C | planned | 将 JSON MVP store 迁移到 PostgreSQL，并补齐唯一 active key、事件幂等和事务状态机 |
 | D | pulled_forward | 部署运维工作前置并合入 B0；测试阶段先用 Docker + USLA 公网域名解决飞书回调验证闭环 |
-| E | partially_pulled_forward | 已前置补齐 `/admin` 管理入口壳、管理范围数据结构和只读概览 API；后续需按最新口径补申请界面、用户后台、模型列表、管理员入口权限展示、部门主管同步、用量统计、调额、额度重置和 key 重置 |
+| E | in_progress | 已按最新口径前置补齐申请界面/用户后台分流、用户后台模型列表、管理员入口权限展示、`/admin` 入口壳、管理范围数据结构和只读概览 API；后续需补部门主管同步、用量统计、调额、额度重置和 key 重置 |
 
 ## 当前落地状态
 
@@ -82,9 +82,13 @@
 26. B1 飞书端内免登出现新阻塞：用户在飞书 H5/客户端内打开页面仍报“没有检测到飞书 H5 JSAPI”。已新增 `.agent-docs/TokenInside-B1飞书H5免登修复计划.md`，并已本地落地 JSSDK loader、`appID`、`requestAuthCode` 回退、OAuth v3 code 换 token、自动免登和用户身份卡。
 27. 按最新产品要求，首页和 `/admin` 已移除手动“飞书免登”按钮；端内入口只能走自动识别和自动登录流程，登录成功后展示飞书头像、姓名、open_id、租户/部门或管理范围。
 28. B1 修复已部署到 USLA：当前远端容器运行 `voidintheshell/tokeninside:b1-feishu-h5-redirect-20260702`，digest `sha256:117e94f6074d3a36dfb6d51e838b4499a153b2f8f04ea3ffdb70071f643f9dab`，容器 healthy；公网 `/`、`/admin`、`/api/health`、`/api/feishu/app-id` 和 `/v1/models` 无 key JSON 错误体已复测通过。
-29. B1 端内复测当前卡在飞书后台重定向 URL 配置：`requestAccess` 已被调用，但返回 `20029 invalid redirect uri in h5 case`。飞书安全设置需要把调用 JSAPI 的页面地址加入重定向 URL，至少包括 `https://ti.kumiko-love.com/` 和 `https://ti.kumiko-love.com/admin`；代码已补充更明确的 20029 诊断提示。
+29. B1 端内免登阻塞已解除：飞书后台重定向 URL 已配置成功，用户手动复测确认后台能够获取飞书用户信息；下一步可以基于真实飞书用户继续 B2/B3 卡片审批主链路。
 30. 飞书事件回调地址当前可通过生产形态 challenge：容器内构造签名加密 payload 后，公网 `POST https://ti.kumiko-love.com/api/feishu/events` 返回 200 `{"challenge":"ti-deploy-check-20260702"}`。
 31. 最新产品变更已补入文档：前端使用 shadcn 主题和白蓝配色；控制面只保留申请界面、用户后台、管理后台；申请界面只做申请和用户卡片；用户后台增加模型列表菜单并移除透传网关子菜单；管理后台入口只对管理员在用户卡片旁展示；数据面 MVP 只对接 NewAPI 的 OAI Chat、OAI Responses 和 Claude-compatible messages。
+32. E1/E2 前端信息架构已开始代码落地：未发放 key 的普通用户首页只保留飞书用户卡片和申请按钮；已有 active key 的用户进入用户后台，可在“账户”和“模型列表”之间切换；管理后台入口只在 `/api/session` 返回管理范围时显示在用户卡片旁。
+33. 已新增登录用户模型列表 API `/api/models`，服务端通过当前 active token 的 NewAPI token id 读取完整 key 后调用 NewAPI `/v1/models`，前端只接收模型元数据，不暴露明文 key。
+34. 数据面 MVP 范围已在 `/v1/[...path]` 代码层收口：仅允许 `GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`；其它路径返回 404，已知路径方法不匹配返回 405。
+35. JSON MVP store 写入临时文件名已改为每次写入唯一，修复并发代理日志写入时 `rename ENOENT` 的本地复现问题。
 
 ## 计划文档索引
 
@@ -103,9 +107,9 @@
 B 阶段优先执行顺序已调整为服务器优先：
 
 1. B0 代码、镜像、Hub 推送、USLA pull-only 部署和 BunkerWeb 错误体透传配置已完成；当前运行镜像为 `voidintheshell/tokeninside:b1-feishu-h5-redirect-20260702`，上一稳定镜像为 `voidintheshell/tokeninside:b1-feishu-h5-auto-20260702-2`。
-2. B1 当前代码层修复已本地和公网验证通过：H5 JSSDK 加载、`h5sdk.ready()`、`requestAccess.appID`、`requestAuthCode` 回退、OAuth token 交换、自动免登、用户身份卡、无按钮 UI 和 `20029 invalid redirect uri` 明确诊断均已部署；公网事件回调加密 challenge 已通过。下一步先在飞书后台安全设置补齐 `https://ti.kumiko-love.com/` 与 `https://ti.kumiko-love.com/admin` 重定向 URL，再用飞书端内真实用户复测自动登录。
-3. B2/B3 主路径已调整为部门领导卡片审批；必须等 B1 真实飞书用户自动登录成功后，才能提交 Token 申请，解析申请人所在部门领导，向该领导发送审批卡片，并通过 `card.action.trigger` 完成一次通过/拒绝来确认 payload、权限和幂等状态机。
+2. B1 当前代码层修复已本地和公网验证通过：H5 JSSDK 加载、`h5sdk.ready()`、`requestAccess.appID`、`requestAuthCode` 回退、OAuth token 交换、自动免登、用户身份卡、无按钮 UI 和 `20029 invalid redirect uri` 明确诊断均已部署；公网事件回调加密 challenge 已通过。用户已在飞书后台补齐重定向 URL，并手动确认后台可获取飞书用户信息。
+3. B2/B3 主路径已调整为部门领导卡片审批；下一步提交 Token 申请，解析申请人所在部门领导，向该领导发送审批卡片，并通过 `card.action.trigger` 完成一次通过/拒绝来确认 payload、权限和幂等状态机。
 4. B5 使用审批通过后发放的 key 访问 `https://ti.kumiko-love.com/v1` 完成数据面透传验证。
-5. E0 `/admin` 已部署到公网；后续 E 阶段应先按最新信息架构调整申请界面、用户后台、模型列表、管理员入口可见性和旧统计卡片，再继续补 `admin_scopes` 写入/同步、部门主管范围展开、用量统计、调额和 key/额度重置，不能把当前入口壳当成完整管理后台。
+5. E 阶段已从信息架构文档推进到本地代码：申请界面、用户后台、模型列表、管理员入口可见性和数据面 allowlist 已完成本地验证；后续继续补 `admin_scopes` 写入/同步、部门主管范围展开、用量统计、调额和 key/额度重置，不能把当前入口壳当成完整管理后台。
 
 继续 B 阶段外部实测前必须准备服务器私有环境变量，且不得将真实密钥写入仓库。

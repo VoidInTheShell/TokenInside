@@ -2,14 +2,15 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  ActivityIcon,
   CheckCircle2Icon,
   ClipboardCopyIcon,
   KeyRoundIcon,
+  LayoutDashboardIcon,
+  ListFilterIcon,
   RefreshCwIcon,
-  RouteIcon,
   SendIcon,
   ShieldCheckIcon,
+  SparklesIcon,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -20,8 +21,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
 import { formatDateTime, maskSecret } from "@/lib/utils";
 
@@ -42,6 +41,11 @@ type SessionResponse = {
     newapiTokenId?: string;
     createdAt: string;
   };
+  adminScope?: {
+    type: "global" | "department";
+    departmentId?: string;
+    source: "manual" | "department_supervisor";
+  } | null;
   requests: Array<{
     id: string;
     requestType: string;
@@ -52,6 +56,20 @@ type SessionResponse = {
   }>;
   proxyLogCount: number;
 };
+
+type ModelsResponse = {
+  models: Array<{
+    id: string;
+    object?: string;
+    ownedBy?: string;
+  }>;
+  error?: string;
+};
+
+type WorkspacePanel = "account" | "models";
+
+const DEFAULT_REASON = "申请个人 LLM 调用 Token，用于共绩内部工具接入。";
+const DEFAULT_MONTHLY_QUOTA = 200;
 
 const statusLabel: Record<string, string> = {
   pending_feishu_approval: "飞书审批中",
@@ -81,13 +99,21 @@ function avatarInitial(user?: SessionResponse["user"]) {
   return displayName(user).trim().slice(0, 1).toUpperCase() || "T";
 }
 
+function scopeLabel(scope?: SessionResponse["adminScope"]) {
+  if (!scope) return "";
+  if (scope.type === "global") return "全局管理";
+  return `部门 ${scope.departmentId ?? "-"}`;
+}
+
 export function ExperienceClient() {
   const [session, setSession] = useState<SessionResponse | null>(null);
+  const [models, setModels] = useState<ModelsResponse["models"]>([]);
+  const [modelsLoaded, setModelsLoaded] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [modelsLoading, setModelsLoading] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [reason, setReason] = useState("申请个人 LLM 调用 Token，用于共绩内部工具接入。");
-  const [quota, setQuota] = useState("200");
   const [key, setKey] = useState<string | null>(null);
+  const [panel, setPanel] = useState<WorkspacePanel>("account");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [feishuSdkReady, setFeishuSdkReady] = useState(false);
@@ -100,6 +126,12 @@ export function ExperienceClient() {
       const res = await fetch("/api/session", { cache: "no-store" });
       const data = (await res.json()) as SessionResponse;
       setSession(data);
+      if (!data.activeToken) {
+        setPanel("account");
+        setKey(null);
+        setModels([]);
+        setModelsLoaded(false);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "读取会话失败");
     } finally {
@@ -107,11 +139,37 @@ export function ExperienceClient() {
     }
   }, []);
 
+  const loadModels = useCallback(async () => {
+    if (!session?.activeToken) return;
+    setModelsLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/models", { cache: "no-store" });
+      const data = (await res.json()) as ModelsResponse;
+      if (!res.ok) throw new Error(data.error ?? "读取模型列表失败");
+      setModels(data.models);
+      setModelsLoaded(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取模型列表失败");
+    } finally {
+      setModelsLoading(false);
+    }
+  }, [session?.activeToken]);
+
   useEffect(() => {
     void refresh();
   }, [refresh]);
 
-  const usageRows = useMemo(() => session?.requests ?? [], [session]);
+  useEffect(() => {
+    if (panel === "models" && session?.activeToken && !modelsLoaded && !modelsLoading) {
+      void loadModels();
+    }
+  }, [loadModels, modelsLoaded, modelsLoading, panel, session?.activeToken]);
+
+  const requests = useMemo(() => session?.requests ?? [], [session]);
+  const latestRequest = requests[0];
+  const hasActiveToken = Boolean(session?.activeToken);
+  const title = hasActiveToken ? "用户后台" : "Token 申请";
 
   const connectFeishu = useCallback(async () => {
     setError(null);
@@ -149,13 +207,13 @@ export function ExperienceClient() {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          reason,
-          requestedMonthlyQuota: Number(quota),
+          reason: DEFAULT_REASON,
+          requestedMonthlyQuota: DEFAULT_MONTHLY_QUOTA,
         }),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error ?? "提交申请失败");
-      setMessage("申请已提交，后续由飞书审批流处理。");
+      setMessage("申请已提交。");
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "提交申请失败");
@@ -173,7 +231,7 @@ export function ExperienceClient() {
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error ?? "读取 key 失败");
       setKey(body.key);
-      setMessage("已从后端读取当前 active key。");
+      setMessage("已读取当前 active key。");
     } catch (err) {
       setError(err instanceof Error ? err.message : "读取 key 失败");
     } finally {
@@ -183,7 +241,7 @@ export function ExperienceClient() {
 
   async function copyBaseUrl() {
     await navigator.clipboard.writeText(`${session?.baseUrl ?? ""}/v1`);
-    setMessage("已复制 OpenAI-compatible Base URL。");
+    setMessage("已复制 Base URL。");
   }
 
   return (
@@ -193,262 +251,265 @@ export function ExperienceClient() {
         onError={(sdkError) => setError(sdkError)}
       />
       <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">TI</div>
-          <div>
-            <h1 className="brand-title">TokenInside</h1>
-            <p className="brand-subtitle">Feishu + NewAPI Gateway</p>
+        <aside className="sidebar">
+          <div className="brand">
+            <div className="brand-mark">TI</div>
+            <div>
+              <h1 className="brand-title">TokenInside</h1>
+              <p className="brand-subtitle">Feishu + NewAPI</p>
+            </div>
           </div>
-        </div>
 
-        <nav className="nav-list" aria-label="主导航">
-          <a className="nav-item active" href="/">
-            <KeyRoundIcon data-icon="inline-start" />
-            Token 控制台
-          </a>
-          <div className="nav-item">
-            <RouteIcon data-icon="inline-start" />
-            /v1 透传网关
-          </div>
-          <div className="nav-item">
-            <ActivityIcon data-icon="inline-start" />
-            审计与用量
-          </div>
-          <a className="nav-item" href="/admin">
-            <ShieldCheckIcon data-icon="inline-start" />
-            管理后台
-          </a>
-        </nav>
+          <nav className="nav-list" aria-label="主导航">
+            <button
+              className={panel === "account" ? "nav-item active nav-button" : "nav-item nav-button"}
+              type="button"
+              onClick={() => setPanel("account")}
+            >
+              <KeyRoundIcon data-icon="inline-start" />
+              {title}
+            </button>
+            {hasActiveToken && (
+              <button
+                className={panel === "models" ? "nav-item active nav-button" : "nav-item nav-button"}
+                type="button"
+                onClick={() => setPanel("models")}
+              >
+                <ListFilterIcon data-icon="inline-start" />
+                模型列表
+              </button>
+            )}
+          </nav>
 
-        <div className="sidebar-footer">
-          对外 Base URL 固定为 TokenInside 域名；NewAPI 直连地址与系统凭据只保存在服务端环境变量。
-        </div>
-      </aside>
-
-      <main className="main">
-        <header className="topbar">
-          <div>
-            <h2 className="page-title">共绩 Token 申请与透传控制面</h2>
-            <p className="page-description">
-              使用飞书 OAuth 绑定真实用户，通过飞书审批发放 NewAPI 原生 key，并强制客户端请求走 TokenInside
-              的 OpenAI-compatible 代理入口。
-            </p>
+          <div className="sidebar-footer">
+            {session?.adminScope
+              ? `管理范围：${scopeLabel(session.adminScope)}`
+              : "当前入口按飞书身份自动识别。"}
           </div>
-          <div className="toolbar">
-            <Badge variant={session?.authenticated ? "success" : "warning"}>
-              {loading || busy
-                ? "自动识别中"
-                : session?.authenticated
-                  ? displayName(session.user)
-                  : "等待飞书身份"}
-            </Badge>
-            <Button variant="outline" onClick={() => void refresh()} disabled={busy}>
-              <RefreshCwIcon data-icon="inline-start" />
-              刷新
-            </Button>
-          </div>
-        </header>
+        </aside>
 
-        {session?.authenticated && (
+        <main className="main">
+          <header className="topbar">
+            <div>
+              <h2 className="page-title">{title}</h2>
+              <p className="page-description">
+                {hasActiveToken ? "账户、key 与可用模型。" : "飞书用户身份与申请入口。"}
+              </p>
+            </div>
+            <div className="toolbar">
+              <Badge variant={session?.authenticated ? "success" : "warning"}>
+                {loading || busy
+                  ? "自动识别中"
+                  : session?.authenticated
+                    ? displayName(session.user)
+                    : "等待飞书身份"}
+              </Badge>
+              <Button variant="outline" onClick={() => void refresh()} disabled={busy}>
+                <RefreshCwIcon data-icon="inline-start" />
+                刷新
+              </Button>
+            </div>
+          </header>
+
+          {error && <div className="alert alert-danger">{error}</div>}
+          {message && <div className="alert">{message}</div>}
+
           <Card>
             <CardContent>
               <div className="user-card">
                 <div className="user-avatar" aria-hidden="true">
-                  {session.user?.avatarUrl ? (
+                  {session?.user?.avatarUrl ? (
                     <img src={session.user.avatarUrl} alt="" />
                   ) : (
-                    <span>{avatarInitial(session.user)}</span>
+                    <span>{avatarInitial(session?.user)}</span>
                   )}
                 </div>
                 <div className="user-card-main">
                   <span className="user-card-label">当前飞书用户</span>
-                  <strong>{displayName(session.user)}</strong>
-                  <span>{session.user?.openId ? maskSecret(session.user.openId) : "-"}</span>
+                  <strong>{session?.authenticated ? displayName(session.user) : "等待飞书身份"}</strong>
+                  <span>{session?.user?.openId ? maskSecret(session.user.openId) : "-"}</span>
                 </div>
                 <div className="user-card-meta">
                   <span>租户</span>
-                  <strong>{session.user?.tenantKey ?? "-"}</strong>
+                  <strong>{session?.user?.tenantKey ?? "-"}</strong>
                 </div>
                 <div className="user-card-meta">
                   <span>部门</span>
-                  <strong>{session.user?.departmentId ?? "-"}</strong>
+                  <strong>{session?.user?.departmentId ?? "-"}</strong>
                 </div>
+                {session?.adminScope && (
+                  <div className="user-card-action">
+                    <a className="button button-outline" href="/admin">
+                      <ShieldCheckIcon data-icon="inline-start" />
+                      管理后台
+                    </a>
+                  </div>
+                )}
               </div>
             </CardContent>
           </Card>
-        )}
 
-        {error && <div className="alert alert-danger">{error}</div>}
-        {message && <div className="alert">{message}</div>}
-
-        <section className="grid grid-4">
-          <Card>
-            <CardContent>
-              <div className="metric">
-                <span className="metric-label">当前 active key</span>
-                <span className="metric-value">{session?.activeToken ? "1" : "0"}</span>
-              </div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent>
-              <div className="metric">
-                <span className="metric-label">申请记录</span>
-                <span className="metric-value">{session?.requests.length ?? 0}</span>
-              </div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent>
-              <div className="metric">
-                <span className="metric-label">代理审计日志</span>
-                <span className="metric-value">{session?.proxyLogCount ?? 0}</span>
-              </div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent>
-              <div className="metric">
-                <span className="metric-label">网关状态</span>
-                <span className="metric-value">/v1</span>
-              </div>
-            </CardContent>
-          </Card>
-        </section>
-
-        <section className="grid grid-2">
-          <Card>
-            <CardHeader>
-              <CardTitle>Token 申请</CardTitle>
-              <CardDescription>
-                申请会进入飞书审批实例。审批通过后，后端再发放 NewAPI token。
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="field-group">
-                <div className="field">
-                  <label htmlFor="quota">月额度</label>
-                  <Input
-                    id="quota"
-                    inputMode="numeric"
-                    value={quota}
-                    onChange={(event) => setQuota(event.target.value)}
+          {!hasActiveToken ? (
+            <Card>
+              <CardHeader>
+                <CardTitle>申请 Token</CardTitle>
+                <CardDescription>
+                  {latestRequest
+                    ? `最近状态：${statusLabel[latestRequest.status] ?? latestRequest.status}`
+                    : "默认额度按当前 MVP 口径提交。"}
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="apply-panel">
+                  <div className="apply-status">
+                    <SparklesIcon data-icon="inline-start" />
+                    <span>{latestRequest ? formatDateTime(latestRequest.updatedAt) : "首次申请"}</span>
+                  </div>
+                  <Button
+                    onClick={() => void requestToken()}
                     disabled={!session?.authenticated || busy}
-                  />
-                  <span className="field-description">
-                    额度单位按 NewAPI 当前实例配置换算，审批记录是 TokenInside 侧权威口径。
-                  </span>
+                  >
+                    <SendIcon data-icon="inline-start" />
+                    申请 Token
+                  </Button>
                 </div>
-                <div className="field">
-                  <label htmlFor="reason">申请说明</label>
-                  <Textarea
-                    id="reason"
-                    value={reason}
-                    onChange={(event) => setReason(event.target.value)}
-                    disabled={!session?.authenticated || busy}
-                  />
-                </div>
+              </CardContent>
+            </Card>
+          ) : (
+            <>
+              <div className="subnav" aria-label="用户后台菜单">
                 <Button
-                  onClick={() => void requestToken()}
-                  disabled={!session?.authenticated || busy}
+                  variant={panel === "account" ? "default" : "outline"}
+                  onClick={() => setPanel("account")}
                 >
-                  <SendIcon data-icon="inline-start" />
-                  提交飞书审批
+                  <LayoutDashboardIcon data-icon="inline-start" />
+                  账户
+                </Button>
+                <Button
+                  variant={panel === "models" ? "default" : "outline"}
+                  onClick={() => setPanel("models")}
+                >
+                  <ListFilterIcon data-icon="inline-start" />
+                  模型列表
                 </Button>
               </div>
-            </CardContent>
-          </Card>
 
-          <Card>
-            <CardHeader>
-              <CardTitle>客户端接入</CardTitle>
-              <CardDescription>
-                客户端使用 NewAPI 原生 key，但 Base URL 必须指向 TokenInside。
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="field">
-                <label>OpenAI-compatible Base URL</label>
-                <div className="key-box">
-                  <span>{session?.baseUrl ? `${session.baseUrl}/v1` : "-"}</span>
-                  <Button variant="ghost" size="sm" onClick={() => void copyBaseUrl()}>
-                    <ClipboardCopyIcon data-icon="inline-start" />
-                    复制
-                  </Button>
-                </div>
-              </div>
-              <div className="field">
-                <label>当前 key</label>
-                <div className="key-box">
-                  <span>{key ? maskSecret(key) : maskSecret(session?.activeToken?.newapiTokenId)}</span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={!session?.activeToken || busy}
-                    onClick={() => void revealKey()}
-                  >
-                    <KeyRoundIcon data-icon="inline-start" />
-                    查看
-                  </Button>
-                </div>
-              </div>
+              {panel === "account" ? (
+                <section className="grid grid-2">
+                  <Card>
+                    <CardHeader>
+                      <CardTitle>当前 key</CardTitle>
+                      <CardDescription>active key 只绑定当前飞书用户。</CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="field">
+                        <label>Base URL</label>
+                        <div className="key-box">
+                          <span>{session?.baseUrl ? `${session.baseUrl}/v1` : "-"}</span>
+                          <Button variant="ghost" size="sm" onClick={() => void copyBaseUrl()}>
+                            <ClipboardCopyIcon data-icon="inline-start" />
+                            复制
+                          </Button>
+                        </div>
+                      </div>
+                      <div className="field">
+                        <label>NewAPI key</label>
+                        <div className="key-box">
+                          <span>{key ? maskSecret(key) : maskSecret(session?.activeToken?.newapiTokenId)}</span>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={busy}
+                            onClick={() => void revealKey()}
+                          >
+                            <KeyRoundIcon data-icon="inline-start" />
+                            查看
+                          </Button>
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card>
+                    <CardHeader>
+                      <CardTitle>代理范围</CardTitle>
+                      <CardDescription>本期仅开放 MVP 数据面。</CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="endpoint-list">
+                        <Badge variant="success">GET /v1/models</Badge>
+                        <Badge variant="success">POST /v1/chat/completions</Badge>
+                        <Badge variant="success">POST /v1/responses</Badge>
+                        <Badge variant="success">POST /v1/messages</Badge>
+                      </div>
+                    </CardContent>
+                  </Card>
+                </section>
+              ) : (
+                <Card>
+                  <CardHeader>
+                    <CardTitle>模型列表</CardTitle>
+                    <CardDescription>来自当前 active key 的 NewAPI `/v1/models`。</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="toolbar toolbar-left">
+                      <Button
+                        variant="outline"
+                        onClick={() => void loadModels()}
+                        disabled={modelsLoading}
+                      >
+                        <RefreshCwIcon data-icon="inline-start" />
+                        刷新模型
+                      </Button>
+                      <Badge variant={modelsLoaded ? "success" : "warning"}>
+                        {modelsLoading ? "读取中" : `${models.length} 个模型`}
+                      </Badge>
+                    </div>
+                    {models.length === 0 ? (
+                      <div className="empty">暂无模型</div>
+                    ) : (
+                      <div className="model-grid">
+                        {models.map((model) => (
+                          <div className="model-item" key={model.id}>
+                            <strong>{model.id}</strong>
+                            <span>{model.ownedBy ?? model.object ?? "model"}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              )}
+
+              {latestRequest && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle>最近申请</CardTitle>
+                    <CardDescription>状态更新时间：{formatDateTime(latestRequest.updatedAt)}</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="meta-list">
+                      <div className="meta-row">
+                        <span>类型</span>
+                        <strong>{latestRequest.requestType}</strong>
+                      </div>
+                      <div className="meta-row">
+                        <span>状态</span>
+                        <Badge variant={badgeVariant(latestRequest.status)}>
+                          {statusLabel[latestRequest.status] ?? latestRequest.status}
+                        </Badge>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+
               <div className="alert">
-                后端只按请求中的 Bearer key 做 hash 反查和归属校验，不给 LLM 客户端签发 TokenInside
-                自有凭证。
+                <CheckCircle2Icon data-icon="inline-start" /> 当前用户已有 active key。
               </div>
-            </CardContent>
-          </Card>
-        </section>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>审批与发放记录</CardTitle>
-            <CardDescription>审批状态由飞书 approval_instance 事件回写，NewAPI 发放过程做幂等保护。</CardDescription>
-          </CardHeader>
-          <CardContent>
-            {usageRows.length === 0 ? (
-              <div className="empty">暂无申请记录</div>
-            ) : (
-              <div className="table-wrap">
-                <table className="table">
-                  <thead>
-                    <tr>
-                      <th>类型</th>
-                      <th>状态</th>
-                      <th>说明</th>
-                      <th>创建时间</th>
-                      <th>更新时间</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {usageRows.map((row) => (
-                      <tr key={row.id}>
-                        <td>{row.requestType}</td>
-                        <td>
-                          <Badge variant={badgeVariant(row.status)}>
-                            {statusLabel[row.status] ?? row.status}
-                          </Badge>
-                        </td>
-                        <td>{row.reason}</td>
-                        <td>{formatDateTime(row.createdAt)}</td>
-                        <td>{formatDateTime(row.updatedAt)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        {session?.activeToken && (
-          <div className="alert">
-            <CheckCircle2Icon data-icon="inline-start" /> 当前用户已有 active key。再次申请不会绕过唯一
-            key 约束，key 重置和调额会走独立审批状态机。
-          </div>
-        )}
-      </main>
+            </>
+          )}
+        </main>
       </div>
     </>
   );

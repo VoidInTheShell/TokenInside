@@ -141,3 +141,15 @@
 137. 更新 `.agent-docs/TokenInside-E阶段管理后台与用量统计计划.md`：重排 E1-E7，新增申请界面，扩展用户后台模型列表，调整管理员默认进入用户后台和用户卡片旁管理入口，取消四个统计卡片作为管理后台首屏必需项。
 138. 更新 `.agent-docs/TokenInside-B阶段真实链路实测计划.md` 与 `.agent-docs/TokenInside-D阶段部署运维计划.md`：把 B5/D 阶段数据面验证范围同步为 `/v1/models`、`/v1/chat/completions`、`/v1/responses` 和 Claude-compatible messages，明确 embeddings、images、audio、Gemini-compatible 不属于本期 MVP 验收。
 139. 更新 `.agent-docs/TokenInside-实施总路线图.md`、`task_plan.md` 和 `findings.md`：将最新产品变更写入总路线、当前落地状态、下一阶段入口和研究结论；本轮未修改前端或服务端代码。
+140. 本轮继续使用 `planning-with-files-zh` 恢复计划；记忆库未发现 TokenInside 直接命中记录，后续依据项目内 `task_plan.md`、`findings.md`、`progress.md` 继续。
+141. Next MCP 初次自动发现未找到运行中的 dev server；后续启动本地 `npm run dev` 后使用端口 `16878` 连接成功，`get_errors` 返回 `configErrors: []`、`sessionErrors: []`。
+142. 根据最新产品口径开始 E 阶段代码落地：新增 `/api/models`，`lib/newapi.ts` 新增 `listModelsForNewApiToken()`，通过当前 active token 的 NewAPI token id 在服务端读取完整 key 并请求 `/v1/models`，前端只接收模型 id/object/ownedBy。
+143. 更新 `/api/session`，为已登录用户返回 `adminScope` 摘要；首页管理后台入口改为只在服务端确认管理范围时显示在用户卡片旁。
+144. 重写 `components/experience-client.tsx`：未发放 key 的用户首页只保留飞书用户卡片和申请按钮；已有 active key 的用户进入用户后台，支持“账户”和“模型列表”本地菜单；旧 `/v1 透传网关`、`审计与用量` 和全员可见 `/admin` 侧边入口已移除。
+145. 更新 `app/globals.css`：将主题调整为白蓝工作台风格，补齐模型列表、子菜单、申请面板和用户卡片管理入口布局样式。
+146. 更新 `/v1/[...path]` 代理 allowlist：仅允许 `GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`；其它路径返回 404 JSON，已知路径方法不匹配返回 405 JSON。
+147. 初次并发 HTTP 冒烟时发现 `GET /v1/chat/completions` 返回 500，读取 `next-dev.err` 确认为 JSON MVP store 并发写代理日志时两个请求共用 `tokeninside.json.<pid>.tmp`，其中一个请求 rename 后另一个请求 ENOENT。
+148. 修复 `lib/store.ts`：写 store 的临时文件名改为 `process.pid + randomId("tmp")`，避免并发写入抢同一 tmp 文件。
+149. 验证通过：`npm run typecheck` 通过；`npm run build` 通过，路由表包含新增 `/api/models`；本地 `GET /api/session` 未登录返回 200 JSON；`GET /api/models` 未登录返回 401 JSON；`GET /v1/models` 无 key 返回 401 JSON；`GET /v1/embeddings` 返回 404 JSON；`GET /v1/chat/completions` 返回 405 JSON；`POST /v1/responses` 无 key 返回 401 JSON。
+150. 浏览器验证通过：`http://127.0.0.1:16878/` 首页快照显示未登录态只有 Token 申请、用户身份卡和禁用的申请按钮；桌面/移动宽度 console 均无 error/warn；截图工具本轮超时，未保存截图。
+151. 用户确认飞书后台重定向 URL 已配置成功，手动测试能够在后台获取到用户信息；据此将 B1 从 `20029 invalid redirect uri` 配置阻塞推进为可继续 B2/B3 卡片审批真实链路。

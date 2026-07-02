@@ -37,7 +37,7 @@ async function readStore(): Promise<StoreShape> {
 async function writeStore(store: StoreShape) {
   const filePath = getConfig().storePath;
   await mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.${process.pid}.tmp`;
+  const tempPath = `${filePath}.${process.pid}.${randomId("tmp")}.tmp`;
   await writeFile(tempPath, `${JSON.stringify(store, null, 2)}\n`, "utf8");
   await rename(tempPath, filePath);
 }

@@ -98,6 +98,12 @@
 67. 用户后台必须增加模型列表子菜单，展示当前用户可用模型；信息密度参考 NewAPI 模型列表，但使用 TokenInside 的 shadcn 白蓝主题实现。
 68. 数据面 MVP 范围收缩为 NewAPI 的 OpenAI Chat Completions、OpenAI Responses 和 Claude-compatible messages；embeddings、images、audio、Gemini-compatible 等不作为本期透传和验收范围。
 69. 现有 E0 `/admin` 入口壳和只读概览仍是已部署状态，但后续实现应先按三页面信息架构调整导航、入口可见性和旧统计卡片首屏，再继续完整管理能力。
+70. E1/E2 本地代码落地后，普通未发放 key 用户首页只保留飞书身份卡和申请按钮；已有 active key 用户进入用户后台，用户后台通过本地菜单切换“账户”和“模型列表”；旧侧边栏中的 `/v1 透传网关`、`审计与用量` 和全员可见 `/admin` 入口已从首页移除。
+71. `/api/session` 现在返回当前登录用户的 `adminScope` 摘要，前端只在服务端确认管理范围时在用户卡片旁显示“管理后台”入口；入口可见性不改变 `/api/admin/overview` 的 401/403 服务端授权语义。
+72. `/api/models` 是登录用户后台的模型列表接口：后端先确认飞书 session 和 active token，再通过 NewAPI token id 读取完整 key 并请求 NewAPI `/v1/models`；响应只返回模型 id/object/ownedBy，不返回明文 key。
+73. `/v1/[...path]` 已加入 MVP 数据面 allowlist：`GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`；未纳入路径返回 404 JSON，已知路径方法不匹配返回 405 JSON。
+74. 本地并发冒烟暴露 JSON MVP store 写入临时文件名只用 `process.pid` 会导致并发 `rename ENOENT`；已改为 `process.pid + randomId("tmp")`，避免并发代理日志写入抢同一 tmp 文件。
+75. B1 飞书端内免登已由用户手动确认通过：飞书后台重定向 URL 配置成功，后台可以获取到飞书用户信息；后续真实链路应转入 B2/B3 的部门领导卡片审批和 `card.action.trigger` 回调实测。
 
 ## 官方文档来源
 

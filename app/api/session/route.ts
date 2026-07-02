@@ -3,6 +3,7 @@ import { getConfig } from "@/lib/config";
 import { getCurrentUser } from "@/lib/session";
 import {
   getActiveTokenForUser,
+  getAdminScopeForUser,
   getStoreSnapshot,
   listUserTokenRequests,
 } from "@/lib/store";
@@ -22,9 +23,10 @@ export async function GET() {
     });
   }
 
-  const [requests, activeToken, store] = await Promise.all([
+  const [requests, activeToken, adminScope, store] = await Promise.all([
     listUserTokenRequests(user.id),
     getActiveTokenForUser(user.id),
+    getAdminScopeForUser(user.id),
     getStoreSnapshot(),
   ]);
 
@@ -40,6 +42,13 @@ export async function GET() {
       departmentId: user.departmentId,
     },
     activeToken,
+    adminScope: adminScope
+      ? {
+          type: adminScope.scopeType,
+          departmentId: adminScope.departmentId,
+          source: adminScope.source,
+        }
+      : null,
     requests,
     proxyLogCount: store.proxyRequestLogs.length,
   });

@@ -28,6 +28,20 @@ type NewApiKeyResponse = {
   token?: string;
 };
 
+export type NewApiModel = {
+  id: string;
+  object?: string;
+  owned_by?: string;
+  permission?: unknown[];
+};
+
+type NewApiModelsResponse = {
+  object?: string;
+  data?: NewApiModel[];
+};
+
+type NewApiModelsEnvelope = NewApiModelsResponse | NewApiEnvelope<NewApiModel[]> | NewApiEnvelope<NewApiModelsResponse>;
+
 function getControlCredential() {
   const { newapi } = getConfig();
   return newapi.accessToken ?? newapi.adminAccessToken ?? newapi.systemAk;
@@ -142,6 +156,41 @@ export async function getNewApiTokenKey(newapiTokenId: string) {
     method: "POST",
   });
   return data.key ?? data.token;
+}
+
+export async function listModelsForNewApiToken(newapiTokenId: string) {
+  const { newapi } = getConfig();
+  if (newapi.mock) {
+    return [
+      { id: "gpt-4o-mini", object: "model", owned_by: "newapi" },
+      { id: "claude-3-5-sonnet", object: "model", owned_by: "newapi" },
+      { id: "deepseek-chat", object: "model", owned_by: "newapi" },
+    ] satisfies NewApiModel[];
+  }
+
+  const key = await getNewApiTokenKey(newapiTokenId);
+  if (!key) {
+    throw new Error("NewAPI token key is unavailable");
+  }
+
+  const res = await fetch(`${newapi.baseUrl}/v1/models`, {
+    headers: {
+      authorization: `Bearer ${key}`,
+    },
+    cache: "no-store",
+  });
+  const text = await res.text();
+  const body = parseNewApiBody<NewApiModelsEnvelope>(text, res.status);
+  if (!res.ok) {
+    throw new Error(body.message ?? body.error ?? `NewAPI models request failed: ${res.status}`);
+  }
+
+  if (Array.isArray(body.data)) return body.data;
+  if (body.data && "data" in body.data && Array.isArray(body.data.data)) {
+    return body.data.data;
+  }
+  if ("data" in body && Array.isArray(body.data)) return body.data;
+  return [];
 }
 
 export async function disableNewApiToken(newapiTokenId: string) {

@@ -26,6 +26,24 @@ function filteredProxyHeaders(request: Request, key: string) {
   return headers;
 }
 
+function getSupportedProxyError(method: string, path: string[]) {
+  const joined = path.join("/");
+  const allowed =
+    (method === "GET" && joined === "models") ||
+    (method === "POST" && joined === "chat/completions") ||
+    (method === "POST" && joined === "responses") ||
+    (method === "POST" && joined === "messages");
+
+  if (allowed) return null;
+
+  const knownPath = ["models", "chat/completions", "responses", "messages"].includes(joined);
+  return {
+    status: knownPath ? 405 : 404,
+    error:
+      "TokenInside MVP proxy only supports GET /v1/models, POST /v1/chat/completions, POST /v1/responses and POST /v1/messages",
+  };
+}
+
 async function proxy(request: Request, context: RouteContext) {
   const startedAt = Date.now();
   const params = await context.params;
@@ -33,6 +51,19 @@ async function proxy(request: Request, context: RouteContext) {
   const key = extractBearerKey(request);
   const requestUrl = new URL(request.url);
   const requestPath = `/v1/${path.join("/")}${requestUrl.search}`;
+  const unsupported = getSupportedProxyError(request.method, path);
+
+  if (unsupported) {
+    await addProxyLog({
+      requestPath,
+      method: request.method,
+      statusCode: unsupported.status,
+      durationMs: Date.now() - startedAt,
+      userAgent: request.headers.get("user-agent") ?? undefined,
+      clientIp: request.headers.get("x-forwarded-for") ?? undefined,
+    });
+    return NextResponse.json({ error: unsupported.error }, { status: unsupported.status });
+  }
 
   if (!key) {
     return NextResponse.json({ error: "Bearer NewAPI key is required" }, { status: 401 });
