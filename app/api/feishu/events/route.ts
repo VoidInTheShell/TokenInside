@@ -184,6 +184,14 @@ function cardToast(content: string, type: "success" | "error" = "success") {
   return NextResponse.json({ toast: { type, content } });
 }
 
+async function addFeishuEventBestEffort(event: Parameters<typeof addFeishuEvent>[0]) {
+  try {
+    await addFeishuEvent(event);
+  } catch (err) {
+    console.error("Failed to record Feishu event", err);
+  }
+}
+
 function payloadVerificationToken(payload: FeishuEventPayload) {
   return (
     payload.token ??
@@ -300,8 +308,23 @@ async function handleCardActionEvent(input: {
 
   const normalizedAction = cardAction.toLowerCase();
   if (normalizedAction === "approve" || normalizedAction === "approved") {
-    await updateTokenRequest(tokenRequest.id, { status: "approved" });
-    await provisionTokenForRequest({ ...tokenRequest, status: "approved" });
+    const approved = await updateTokenRequest(tokenRequest.id, { status: "approved" });
+    try {
+      await provisionTokenForRequest(approved ?? { ...tokenRequest, status: "approved" });
+    } catch (err) {
+      await addFeishuEventBestEffort({
+        eventUuid,
+        eventType,
+        cardRequestId,
+        cardAction,
+        operatorOpenId,
+        messageId,
+        processingStatus: "failed",
+        payloadJson: { encrypted, payload },
+        errorMessage: err instanceof Error ? err.message : "NewAPI token provisioning failed",
+      });
+      return cardToast("审批已通过，但发放失败，请到管理后台处理", "error");
+    }
   } else if (normalizedAction === "reject" || normalizedAction === "rejected") {
     await updateTokenRequest(tokenRequest.id, { status: "rejected" });
   } else {
@@ -345,20 +368,12 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Invalid Feishu event payload" }, { status: 400 });
   }
 
-  const wrapperTokenOk =
-    !wrapper.encrypt &&
-    hasFeishuEventVerificationToken() &&
-    verifyFeishuEventVerificationToken(payloadVerificationToken(wrapper));
   const signatureOk = verifyFeishuEventSignature({
     timestamp: request.headers.get("x-lark-request-timestamp"),
     nonce: request.headers.get("x-lark-request-nonce"),
     signature: request.headers.get("x-lark-signature"),
     rawBody,
   });
-  if (!signatureOk && !wrapperTokenOk) {
-    return NextResponse.json({ error: "Invalid Feishu event signature" }, { status: 401 });
-  }
-
   try {
     const parsed = parseFeishuPayloadWrapper(wrapper);
     payload = parsed.payload;
@@ -367,17 +382,41 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Invalid Feishu event payload" }, { status: 400 });
   }
 
-  if (!verifyFeishuEventVerificationToken(payloadVerificationToken(payload))) {
-    return NextResponse.json({ error: "Invalid Feishu event verification token" }, { status: 401 });
+  const wrapperTokenOk =
+    !wrapper.encrypt &&
+    hasFeishuEventVerificationToken() &&
+    verifyFeishuEventVerificationToken(payloadVerificationToken(wrapper));
+  const payloadTokenOk = verifyFeishuEventVerificationToken(payloadVerificationToken(payload));
+  const { eventUuid, eventType, instanceCode, approvalStatus } =
+    extractApprovalEvent(payload);
+  const cardActionEvent = extractCardActionEvent(payload);
+  const isCardAction =
+    isCardActionEventType(eventType) ||
+    isCardActionEventType(cardActionEvent.eventType) ||
+    Boolean(cardActionEvent.cardRequestId);
+
+  if (!signatureOk && !wrapperTokenOk && !payloadTokenOk) {
+    if (isCardAction) {
+      await addFeishuEventBestEffort({
+        eventUuid,
+        eventType: eventType ?? cardActionEvent.eventType,
+        cardRequestId: cardActionEvent.cardRequestId,
+        cardAction: cardActionEvent.cardAction,
+        operatorOpenId: cardActionEvent.operatorOpenId,
+        messageId: cardActionEvent.messageId,
+        processingStatus: "failed",
+        payloadJson: { encrypted, payload },
+        errorMessage: "Invalid Feishu card callback signature or verification token",
+      });
+      return cardToast("审批回调校验失败", "error");
+    }
+    return NextResponse.json({ error: "Invalid Feishu event signature" }, { status: 401 });
   }
 
   if (payload.challenge) {
     return NextResponse.json({ challenge: payload.challenge });
   }
 
-  const { eventUuid, eventType, instanceCode, approvalStatus } =
-    extractApprovalEvent(payload);
-  const cardActionEvent = extractCardActionEvent(payload);
   const existingEvent = await getFeishuEventByUuid(eventUuid);
   if (
     existingEvent &&
@@ -392,11 +431,26 @@ export async function POST(request: Request) {
       isCardActionEventType(cardActionEvent.eventType) ||
       cardActionEvent.cardRequestId
     ) {
-      return await handleCardActionEvent({
-        encrypted,
-        payload,
-        ...cardActionEvent,
-      });
+      try {
+        return await handleCardActionEvent({
+          encrypted,
+          payload,
+          ...cardActionEvent,
+        });
+      } catch (err) {
+        await addFeishuEventBestEffort({
+          eventUuid,
+          eventType: eventType ?? cardActionEvent.eventType,
+          cardRequestId: cardActionEvent.cardRequestId,
+          cardAction: cardActionEvent.cardAction,
+          operatorOpenId: cardActionEvent.operatorOpenId,
+          messageId: cardActionEvent.messageId,
+          processingStatus: "failed",
+          payloadJson: { encrypted, payload },
+          errorMessage: err instanceof Error ? err.message : "Card action processing failed",
+        });
+        return cardToast("审批处理失败，请到管理后台处理", "error");
+      }
     }
 
     if (!instanceCode || !approvalStatus) {

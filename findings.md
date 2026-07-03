@@ -215,6 +215,14 @@
 25. `https://open.feishu.cn/document/feishu-cards/card-callback-communication`
 26. `https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/event-subscription-guide/event-card-faq`
 
+## 2026-07-03 补充发现
+
+1. 飞书卡片 `code:200671` 仍应按“回调服务返回非 HTTP 200”优先排查；本轮确认 LA 上若 `feishu_events` 没有新增记录而飞书端报错，说明请求可能在签名、verification token、解密或 JSON 解析等入口层分支被 401/400 拦截。
+2. 卡片审批通过后同步调用 NewAPI 发放也是 `200671` 风险点：`provisionTokenForRequest()` 抛错会被外层 catch 转成 HTTP 500，飞书端只看到回调非 200。卡片回调应把业务发放失败记录为本地 failed 事件和申请错误，并对飞书返回 HTTP 200 toast。
+3. 当前 `/api/feishu/events` 已调整为卡片回调优先返回 HTTP 200：签名、明文 verification token、解密后 verification token 任一可信即可继续；识别为卡片回调但认证失败、发放失败或处理异常时尽量写入 `feishuEvents` 并返回 toast，避免再次触发 `200671`。
+4. LA 当前运行镜像为 `voidintheshell/tokeninside:card-callback-200671-final-20260703`，digest `sha256:87047f4db4df1860513bede62d9728421261be999b51752ca965e19e1af86c54`；LA 本机和公网新版 `card.action.trigger` 缺字段模拟均返回 HTTP 200 + toast，且 PG `feishu_events` 已写入测试记录。
+5. 该修复只证明回调接口不会因入口层/业务层常见异常向飞书返回非 200；真实 B3 完成仍需要审批目标领导在飞书内点击真实卡片，验证真实 payload、`operator.open_id`、nonce 幂等、状态回写和审批通过后的 NewAPI 发放。
+
 ## 本地计划文档
 
 1. `.agent-docs/TokenInside-实施总路线图.md`

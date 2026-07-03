@@ -128,14 +128,14 @@
 
 B 阶段优先执行顺序已调整为服务器优先：
 
-1. B0/D 生产部署保留在 `共绩TokenInside服务端机器`：生产机运行统一 compose 管理 PG/app，NPM 内网反代上游为 `tokeninside:16878`，health 已检查 PostgreSQL schema readiness。因生产机域名接入/云厂商拦截问题，当前开发调试入口临时仍走 GreenJP -> LA，但 LA 已从 JSON store 切换为 PG/app 双容器拓扑；两边当前 app 镜像均为 `voidintheshell/tokeninside:key-mask-copy-20260703`，PG 均为 `postgres:16-alpine` / PostgreSQL `16.14`，`tableCount=8`。
+1. B0/D 生产部署保留在 `共绩TokenInside服务端机器`：生产机运行统一 compose 管理 PG/app，NPM 内网反代上游为 `tokeninside:16878`，health 已检查 PostgreSQL schema readiness。因生产机域名接入/云厂商拦截问题，当前开发调试入口临时仍走 GreenJP -> LA；LA 已从 JSON store 切换为 PG/app 双容器拓扑，当前 app 镜像为 `voidintheshell/tokeninside:card-callback-200671-final-20260703`，digest `sha256:87047f4db4df1860513bede62d9728421261be999b51752ca965e19e1af86c54`，PG 为 `postgres:16-alpine` / PostgreSQL `16.14`，`tableCount=8`。
 2. B1 当前代码层修复已本地和公网验证通过：H5 JSSDK 加载、`h5sdk.ready()`、`requestAccess.appID`、`requestAuthCode` 回退、OAuth token 交换、自动免登、用户身份卡、无按钮 UI 和 `20029 invalid redirect uri` 明确诊断均已部署；公网事件回调加密 challenge 已通过。用户已在飞书后台补齐重定向 URL，并手动确认后台可获取飞书用户信息。
-3. B2/B3 主路径已调整为部门领导卡片审批；当前服务器已有 `pending_card_approval` 申请，说明发卡已通。已按飞书官方卡片回调文档修复 `code:200671`：事件入口兼容明文 Verification Token、新版 `card.action.trigger` 和旧版 `card.action.trigger_v1`，toast 响应体收口为官方格式；后续 LA 已升级到用户后台 key 展示修复镜像 `voidintheshell/tokeninside:key-mask-copy-20260703`，公网健康检查通过。下一步仍必须由审批目标领导点击真实卡片，完成通过/拒绝和幂等状态机确认；管理端人工审批已作为兜底链路验证通过，但不能替代真实飞书卡片点击证据。
+3. B2/B3 主路径已调整为部门领导卡片审批；当前服务器已有 `pending_card_approval` 申请，说明发卡已通。已按飞书官方卡片回调文档继续修复 `code:200671`：卡片回调认证兼容签名、明文 verification token 和解密后 verification token；识别为卡片回调但认证失败、发放失败或处理异常时返回 HTTP 200 toast 并写入本地审计，避免飞书端将业务失败显示为回调服务非 200。LA 本机和公网新版 `card.action.trigger` 缺字段模拟均返回 HTTP 200 + toast。下一步仍必须由审批目标领导点击真实卡片，完成通过/拒绝和幂等状态机确认；管理端人工审批已作为兜底链路验证通过，但不能替代真实飞书卡片点击证据。
 4. B5 数据面基础透传已通过管理端兜底发放的 key 完成公网验证：`GET /v1/models` 返回 200 且模型数量为 4，`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages` 均返回 200；后续仍需在真实卡片审批通过后复测同一数据面链路。
 5. E 阶段已从信息架构文档推进到可用代码和远端部署：申请界面、用户后台、模型列表、管理员入口可见性、数据面 allowlist、默认额度配置、审批单额度覆盖、环境管理员授权、管理端审批通过/拒绝、可见用户摘要、代理日志摘要、NewAPI 控制凭据非空选择、NewAPI 配额单位换算、已开通申请自愈归一化、代理 token usage 记录、历史 usage 总量回填、管理概览用量聚合、用户后台 key 头尾省略展示与点击查看复制、用户侧 key reset API/UI、用户侧额度重置申请 API/UI、部门主管自动同步、管理端主动调额、JSON store 基础账期同步汇总和默认关闭的月度账期重置执行入口均已完成代码落地；后续仍需在生产维护窗口开启并实测真实月度重置。生产 key reset 会禁用当前 active key，生产 quota reset 会发起真实审批并可能在通过后修改额度，生产管理端调额和月度重置会直接修改 active token quota，本轮只验证鉴权边界和 dry-run/关闭态，未擅自触发真实业务动作。
 
 ## 当前外部阻塞
 
-1. 真实 B3 卡片审批仍等待审批目标领导在飞书内点击交互卡片；当前事件入口已完成 `code:200671` 兼容修复并通过新旧卡片回调模拟，但还没有真实管理员点击后的成功 payload 证据。飞书后台建议只保留新版 `card.action.trigger`，移除旧版/重复卡片回调订阅，避免同一次点击产生多路请求干扰排障。TokenInside 事件入口、发卡后待审批状态、管理端人工兜底发放、公网数据面四条 MVP 路径和基础用量统计已经验证通过。
+1. 真实 B3 卡片审批仍等待审批目标领导在飞书内点击交互卡片；当前事件入口已完成 `code:200671` 二次修复并在 LA 通过公网新版卡片回调 HTTP 200 + toast 模拟，但还没有真实管理员点击后的成功 payload 证据。飞书后台建议只保留新版 `card.action.trigger`，移除旧版/重复卡片回调订阅，避免同一次点击产生多路请求干扰排障。TokenInside 事件入口、发卡后待审批状态、管理端人工兜底发放、公网数据面四条 MVP 路径和基础用量统计已经验证通过。
 
 继续 B 阶段外部实测前必须准备服务器私有环境变量，且不得将真实密钥写入仓库。
