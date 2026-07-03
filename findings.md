@@ -271,6 +271,17 @@
 47. 指标口径需要更明确：“当前账期额度”改为“当前账期发放额度”，并同时展示“当前账期剩余额度”；“管理用户”改为“总用户数”，统计当前已经获得 key 的用户数量。
 48. E8-8 本地实现口径：管理后台 `总用户数` 使用当前管理范围内 active key 去重飞书用户数 `keyedUsers`，避免继续展示泛化可见用户数；管理后台当前账期剩余额度当前按已有账期汇总 `monthlyQuota - totalTokens` 保守计算，后续若管理概览接入 NewAPI token remain quota，应替换为 NewAPI remain quota 汇总。
 
+## 2026-07-04 补充发现
+
+1. 本轮后台重做必须立即落地，不再停留在规划层。实现优先级调整为 E9：重组管理后台、补用户管理、部门统计/用户统计、用户侧和管理侧使用记录，并补禁用/删除重新申请链路。
+2. `fast_context_search` 已定位当前 TokenInside 管理后台核心仍在 `components/admin-client.tsx`、`app/api/admin/overview/route.ts` 和 `lib/store.ts`；当前旧导航仍包含“额度管理”“额度统计”“使用记录”“管理员”，需要合并到“用户管理”和新统计页。
+3. 当前 `getAdminOverview()` 已经能按 `global` / `department` 范围过滤 users、token requests、token accounts、proxy logs 和 user billing periods，适合作为 E9 scope helper 的基础，但后续列表 API 不应继续把完整大数组塞进 overview。
+4. Aether 侧可迁移的参考实现已定位：`frontend/src/views/admin/Users.vue` 用于用户表格和操作布局，`frontend/src/features/users/components/UserFormDialog.vue` 用于表单弹窗，`frontend/src/views/admin/UserStats.vue` 用于用户统计排行，`frontend/src/features/usage/components/UsageRecordsTable.vue` 用于复用使用记录表格。
+5. 部门管理员的“用户统计”必须先在服务端计算本部门下属用户集合，再聚合统计；不能返回全站排行后前端过滤，也不能复用系统管理员的全站统计口径。
+6. 系统管理员可以查看“部门统计”；部门管理员不能查看该页面或 API。部门管理员的用户管理和使用记录同样只能覆盖本部门下属用户，跨部门 userId/departmentId/logId 请求必须返回 403。
+7. “删除用户”不能物理删除历史数据，应实现为软删除或资格撤销：禁用 active key、清理当前可用资格、让用户重新进入申请流程，同时保留用户、申请、token account、账期汇总和代理日志的历史归属。
+8. 新调用应补写 `ProxyRequestLog.departmentId` 与 `departmentName` 快照，保证后续部门统计不因用户调岗追溯改写历史。旧日志没有快照时只能作为降级口径处理。
+
 ## 本地计划文档
 
 1. `.agent-docs/TokenInside-实施总路线图.md`

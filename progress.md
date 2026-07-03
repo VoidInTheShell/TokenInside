@@ -380,3 +380,10 @@
 373. E8-8 本地验证通过：`npm run typecheck` 成功；`npm run build` 成功，Next.js 16.2.10 生产构建通过且路由包含 `/admin`、`/api/admin/overview` 和管理相关 API；Next MCP `get_errors` 返回 `configErrors=[]`、`sessionErrors=[]`；浏览器打开 `http://localhost:16878/admin` 后桌面快照显示新指标文案且无独立管理范围卡片，移动端 390x844 截图显示管理范围文字与右下刷新/状态按钮同列对齐，控制台无 error/warn。
 374. E8-8 镜像已按项目部署约束完成本地构建和 Docker Hub 推送：`docker build -t tokeninside:e8-8-admin-layout-20260703 .` 成功；已推送 `voidintheshell/tokeninside:e8-8-admin-layout-20260703` 与 `voidintheshell/tokeninside:latest`，镜像 digest 为 `sha256:afbec682e0ad23bde848cba13cc6dead09424e6bbd3baede59afd0ad5d014aa2`。
 375. E8-8 已部署到 RemoteUSDMITLA/LA：远端 `/home/beihai/tokeninside/docker-compose.yml` 已备份为 `docker-compose.yml.before-e8-8-admin-layout-20260703`，app image 已切到 `voidintheshell/tokeninside:e8-8-admin-layout-20260703` 并 `docker compose pull/up -d tokeninside`；`docker compose ps` 显示 `tokeninside-tokeninside-1` healthy，远端 `http://127.0.0.1:16878/api/health` 返回 `200 application/json`，公开 `https://ti.kumiko-love.com/admin` 与 `https://ti.kumiko-love.com/api/health` 均返回 200，公开 `/admin` HTML 已包含“总用户数”“当前账期发放额度”“当前账期剩余额度”。
+
+## 2026-07-04
+
+376. 用户要求管理后台重做计划马上落地，并补充部门管理员的“用户统计”只能是该部门下属用户。本轮按要求先使用 `fast_context_search` 定位文件，再更新计划文档，然后开始实现。
+377. 已更新 `task_plan.md`：新增 E9 管理后台重做立即落地阶段，明确将旧“额度管理”“管理员”“额度统计”合并为“用户管理”，新增系统管理员专用“部门统计”、部门管理员范围内“用户统计”、用户侧/管理侧“使用记录”和禁用/删除重新申请链路。
+378. 已更新 `.agent-docs/TokenInside-E阶段管理后台与用量统计计划.md`：新增边界 19-25 和 E9 专项计划，写清页面信息架构、用户管理字段、系统管理员/部门管理员权限规则、部门统计、用户统计、使用记录、API、数据模型和验收标准。
+379. 已更新 `findings.md`：记录 fast-context 定位结果、Aether 参考文件、部门管理员统计范围、删除用户软删除语义和部门快照字段需求。下一步开始落地后端 scope/list/stats/usage/revoke API 与管理后台 UI。
