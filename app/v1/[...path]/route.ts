@@ -10,6 +10,10 @@ type RouteContext = {
   params: Promise<{ path: string[] }>;
 };
 
+function normalizeProxyPath(path: string[]) {
+  return path[0] === "v1" ? path.slice(1) : path;
+}
+
 function extractBearerKey(request: Request) {
   const authorization = request.headers.get("authorization");
   const match = authorization?.match(/^Bearer\s+(.+)$/i);
@@ -85,15 +89,17 @@ async function extractUsage(upstream: Response) {
 async function proxy(request: Request, context: RouteContext) {
   const startedAt = Date.now();
   const params = await context.params;
-  const path = params.path ?? [];
+  const rawPath = params.path ?? [];
+  const path = normalizeProxyPath(rawPath);
   const key = extractBearerKey(request);
   const requestUrl = new URL(request.url);
+  const rawRequestPath = `/v1/${rawPath.join("/")}${requestUrl.search}`;
   const requestPath = `/v1/${path.join("/")}${requestUrl.search}`;
   const unsupported = getSupportedProxyError(request.method, path);
 
   if (unsupported) {
     await addProxyLog({
-      requestPath,
+      requestPath: rawRequestPath,
       method: request.method,
       statusCode: unsupported.status,
       durationMs: Date.now() - startedAt,
