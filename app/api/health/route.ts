@@ -3,6 +3,7 @@ import { access, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
 import { getConfig } from "@/lib/config";
+import { checkPostgresSchema } from "@/lib/postgres-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -32,8 +33,22 @@ function configured(value: unknown) {
 
 export async function GET() {
   const config = getConfig();
-  const storeWritable = await canWriteStoreDirectory(config.storePath);
-  const status = storeWritable ? "ok" : "degraded";
+  const postgresSchema =
+    config.storeBackend === "postgres"
+      ? await checkPostgresSchema().catch(() => ({
+          ready: false,
+          missingTables: [],
+          tableCount: 0,
+          error: "connection_failed" as const,
+        }))
+      : undefined;
+  const storeWritable =
+    config.storeBackend === "postgres"
+      ? postgresSchema?.error !== "connection_failed"
+      : await canWriteStoreDirectory(config.storePath);
+  const storeReady =
+    config.storeBackend === "postgres" ? storeWritable && postgresSchema?.ready : storeWritable;
+  const status = storeReady ? "ok" : "degraded";
 
   return NextResponse.json(
     {
@@ -43,8 +58,26 @@ export async function GET() {
       publicBaseUrlHost: hostFromUrl(config.publicBaseUrl),
       newapiHost: hostFromUrl(config.newapi.baseUrl),
       store: {
-        type: "json",
+        type: config.storeBackend,
         writable: storeWritable,
+        databaseConfigured: config.storeBackend === "postgres" ? configured(config.databaseUrl) : undefined,
+        schema:
+          config.storeBackend === "postgres"
+            ? {
+                ready: Boolean(postgresSchema?.ready),
+                missingTables: postgresSchema?.missingTables ?? [],
+                tableCount: postgresSchema?.tableCount ?? 0,
+                error: postgresSchema?.error,
+              }
+            : undefined,
+        postgresPool:
+          config.storeBackend === "postgres"
+            ? {
+                max: config.postgres.poolMax,
+                idleTimeoutMs: config.postgres.poolIdleTimeoutMs,
+                connectionTimeoutMs: config.postgres.poolConnectionTimeoutMs,
+              }
+            : undefined,
       },
       configuration: {
         sessionSecret: configured(config.sessionSecret),
@@ -58,10 +91,13 @@ export async function GET() {
           configured(config.newapi.adminAccessToken),
         newapiControlUserId: configured(config.newapi.controlUserId),
         newapiMock: config.newapi.mock,
+        newapiQuotaPerUnit: config.newapi.quotaPerUnit,
+        environmentAdmins: config.admin.globalOpenIds.length > 0,
+        monthlyResetEnabled: config.billing.monthlyResetEnabled,
       },
     },
     {
-      status: storeWritable ? 200 : 503,
+      status: storeReady ? 200 : 503,
       headers: {
         "Cache-Control": "no-store",
       },

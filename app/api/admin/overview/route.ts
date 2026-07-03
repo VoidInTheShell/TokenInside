@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
+import { getEffectiveAdminScopeForUser, hydrateUserDepartment } from "@/lib/admin-sync";
 import { getCurrentUser } from "@/lib/session";
-import { getAdminOverview, getAdminScopeForUser, getAppSettings } from "@/lib/store";
+import { getAdminOverview, getAppSettings } from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -11,7 +12,7 @@ function responseStatus(request: Request, status: 401 | 403) {
 }
 
 export async function GET(request: Request) {
-  const user = await getCurrentUser();
+  const user = await hydrateUserDepartment(await getCurrentUser());
   if (!user) {
     return NextResponse.json(
       {
@@ -23,7 +24,7 @@ export async function GET(request: Request) {
     );
   }
 
-  const scope = await getAdminScopeForUser(user.id);
+  const scope = await getEffectiveAdminScopeForUser(user);
   if (!scope) {
     return NextResponse.json(
       {

@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
+import { readPostgresStore, writePostgresStore } from "@/lib/postgres-store";
 import type {
   AdminScope,
   FeishuEvent,
@@ -10,6 +11,7 @@ import type {
   StoreShape,
   TokenAccount,
   TokenRequest,
+  UserBillingPeriod,
 } from "@/lib/types";
 
 const initialStore: StoreShape = {
@@ -20,17 +22,27 @@ const initialStore: StoreShape = {
   users: [],
   tokenRequests: [],
   tokenAccounts: [],
+  userBillingPeriods: [],
   feishuEvents: [],
   proxyRequestLogs: [],
   adminScopes: [],
 };
 
 async function readStore(): Promise<StoreShape> {
-  const filePath = getConfig().storePath;
+  const config = getConfig();
+  if (config.storeBackend === "postgres") {
+    const store = await readPostgresStore();
+    if (normalizeStore(store)) {
+      await writePostgresStore(store);
+    }
+    return store;
+  }
+
+  const filePath = config.storePath;
   try {
     const raw = await readFile(filePath, "utf8");
     const parsed = JSON.parse(raw) as Partial<StoreShape>;
-    return {
+    const store = {
       ...initialStore,
       ...parsed,
       settings: {
@@ -38,6 +50,10 @@ async function readStore(): Promise<StoreShape> {
         ...parsed.settings,
       },
     };
+    if (normalizeStore(store)) {
+      await writeStore(store);
+    }
+    return store;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     await writeStore(initialStore);
@@ -45,8 +61,207 @@ async function readStore(): Promise<StoreShape> {
   }
 }
 
+function normalizeStore(store: StoreShape) {
+  let changed = false;
+  const accountsByRequestId = new Map(
+    store.tokenAccounts.map((account) => [account.tokenRequestId, account]),
+  );
+
+  for (const request of store.tokenRequests) {
+    if (request.status !== "provisioned") continue;
+    const account = accountsByRequestId.get(request.id);
+    if (account && request.tokenAccountId !== account.id) {
+      request.tokenAccountId = account.id;
+      changed = true;
+    }
+    if (request.errorMessage) {
+      delete request.errorMessage;
+      changed = true;
+    }
+  }
+
+  for (const log of store.proxyRequestLogs) {
+    if (
+      log.totalTokens === undefined &&
+      log.promptTokens !== undefined &&
+      log.completionTokens !== undefined
+    ) {
+      log.totalTokens = log.promptTokens + log.completionTokens;
+      changed = true;
+    }
+  }
+
+  if (syncBillingPeriods(store)) {
+    changed = true;
+  }
+
+  return changed;
+}
+
+function periodFromIso(value?: string) {
+  return value?.slice(0, 7) || nowIso().slice(0, 7);
+}
+
+function latestIso(...values: Array<string | undefined>) {
+  const sorted = values.filter(Boolean).sort();
+  return sorted.length ? sorted[sorted.length - 1] : nowIso();
+}
+
+function billingKey(feishuUserId: string, period: string) {
+  return `${feishuUserId}:${period}`;
+}
+
+function sameStringArray(left: string[], right: string[]) {
+  return left.length === right.length && left.every((item, index) => item === right[index]);
+}
+
+function syncBillingPeriods(store: StoreShape) {
+  let changed = false;
+  const existingByKey = new Map(
+    store.userBillingPeriods.map((period) => [
+      billingKey(period.feishuUserId, period.period),
+      period,
+    ]),
+  );
+  const requestById = new Map(store.tokenRequests.map((request) => [request.id, request]));
+  const accountById = new Map(store.tokenAccounts.map((account) => [account.id, account]));
+  const computed = new Map<
+    string,
+    UserBillingPeriod & { quotaUpdatedAt?: string; sourceUpdatedAt?: string }
+  >();
+
+  function ensure(feishuUserId: string, period: string) {
+    const key = billingKey(feishuUserId, period);
+    const existing = existingByKey.get(key);
+    let summary = computed.get(key);
+    if (!summary) {
+      summary = {
+        id: existing?.id ?? randomId("bp"),
+        feishuUserId,
+        period,
+        monthlyQuota: existing?.monthlyQuota ?? initialStore.settings.defaultMonthlyQuota,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        proxyLogCount: 0,
+        activeTokenAccountId: undefined,
+        tokenAccountIds: [],
+        updatedAt: existing?.updatedAt ?? nowIso(),
+        quotaUpdatedAt: undefined,
+        sourceUpdatedAt: existing?.updatedAt,
+      };
+      computed.set(key, summary);
+    }
+    return summary;
+  }
+
+  function setQuota(summary: UserBillingPeriod & { quotaUpdatedAt?: string }, quota: number, at: string) {
+    if (!Number.isFinite(quota) || quota <= 0) return;
+    if (!summary.quotaUpdatedAt || at.localeCompare(summary.quotaUpdatedAt) >= 0) {
+      summary.monthlyQuota = quota;
+      summary.quotaUpdatedAt = at;
+    }
+  }
+
+  for (const account of store.tokenAccounts) {
+    const period = account.billingPeriod || periodFromIso(account.createdAt);
+    const summary = ensure(account.feishuUserId, period);
+    summary.tokenAccountIds.push(account.id);
+    if (account.status === "active") {
+      summary.activeTokenAccountId = account.id;
+    }
+    summary.sourceUpdatedAt = latestIso(summary.sourceUpdatedAt, account.createdAt, account.disabledAt);
+
+    const request = requestById.get(account.tokenRequestId);
+    if (request) {
+      setQuota(
+        summary,
+        request.approvedMonthlyQuota ?? request.requestedMonthlyQuota,
+        request.updatedAt,
+      );
+      summary.sourceUpdatedAt = latestIso(summary.sourceUpdatedAt, request.updatedAt);
+    }
+  }
+
+  for (const request of store.tokenRequests) {
+    if (
+      request.status !== "provisioned" ||
+      (request.requestType !== "quota_reset" &&
+        request.requestType !== "quota_adjust" &&
+        request.requestType !== "monthly_reset") ||
+      !request.tokenAccountId
+    ) {
+      continue;
+    }
+    const account = accountById.get(request.tokenAccountId);
+    if (!account) continue;
+    const summary = ensure(account.feishuUserId, account.billingPeriod || periodFromIso(account.createdAt));
+    setQuota(
+      summary,
+      request.approvedMonthlyQuota ?? request.requestedMonthlyQuota,
+      request.updatedAt,
+    );
+    summary.sourceUpdatedAt = latestIso(summary.sourceUpdatedAt, request.updatedAt);
+  }
+
+  for (const log of store.proxyRequestLogs) {
+    if (!log.feishuUserId) continue;
+    const period = periodFromIso(log.createdAt);
+    const summary = ensure(log.feishuUserId, period);
+    summary.promptTokens += log.promptTokens ?? 0;
+    summary.completionTokens += log.completionTokens ?? 0;
+    summary.totalTokens += log.totalTokens ?? 0;
+    summary.proxyLogCount += 1;
+    summary.sourceUpdatedAt = latestIso(summary.sourceUpdatedAt, log.createdAt);
+  }
+
+  for (const summary of computed.values()) {
+    summary.tokenAccountIds = [...new Set(summary.tokenAccountIds)].sort();
+    summary.updatedAt = summary.sourceUpdatedAt ?? summary.updatedAt;
+    delete summary.quotaUpdatedAt;
+    delete summary.sourceUpdatedAt;
+  }
+
+  for (const summary of computed.values()) {
+    const key = billingKey(summary.feishuUserId, summary.period);
+    const existing = existingByKey.get(key);
+    if (!existing) {
+      store.userBillingPeriods.push(summary);
+      changed = true;
+      continue;
+    }
+    const patch: Partial<UserBillingPeriod> = {};
+    if (existing.monthlyQuota !== summary.monthlyQuota) patch.monthlyQuota = summary.monthlyQuota;
+    if (existing.promptTokens !== summary.promptTokens) patch.promptTokens = summary.promptTokens;
+    if (existing.completionTokens !== summary.completionTokens) {
+      patch.completionTokens = summary.completionTokens;
+    }
+    if (existing.totalTokens !== summary.totalTokens) patch.totalTokens = summary.totalTokens;
+    if (existing.proxyLogCount !== summary.proxyLogCount) patch.proxyLogCount = summary.proxyLogCount;
+    if (existing.activeTokenAccountId !== summary.activeTokenAccountId) {
+      patch.activeTokenAccountId = summary.activeTokenAccountId;
+    }
+    if (!sameStringArray(existing.tokenAccountIds, summary.tokenAccountIds)) {
+      patch.tokenAccountIds = summary.tokenAccountIds;
+    }
+    if (existing.updatedAt !== summary.updatedAt) patch.updatedAt = summary.updatedAt;
+    if (Object.keys(patch).length) {
+      Object.assign(existing, patch);
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
 async function writeStore(store: StoreShape) {
-  const filePath = getConfig().storePath;
+  const config = getConfig();
+  if (config.storeBackend === "postgres") {
+    await writePostgresStore(store);
+    return;
+  }
+
+  const filePath = config.storePath;
   await mkdir(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${randomId("tmp")}.tmp`;
   await writeFile(tempPath, `${JSON.stringify(store, null, 2)}\n`, "utf8");
@@ -134,14 +349,18 @@ export async function getUserById(id: string) {
 
 export async function createTokenRequest(input: {
   feishuUserId: string;
+  requestType?: TokenRequest["requestType"];
   reason: string;
   requestedMonthlyQuota: number;
+  approvedMonthlyQuota?: number;
   approvalCode?: string;
   approvalDepartmentId?: string;
   approvalMode?: TokenRequest["approvalMode"];
   approvalTargetOpenId?: string;
   approvalTargetSource?: TokenRequest["approvalTargetSource"];
   approvalActionNonceHash?: string;
+  approvalOperatorOpenId?: string;
+  approvalOperatedAt?: string;
   status?: TokenRequest["status"];
 }) {
   return mutate((store) => {
@@ -149,10 +368,11 @@ export async function createTokenRequest(input: {
     const request: TokenRequest = {
       id: randomId("tr"),
       feishuUserId: input.feishuUserId,
-      requestType: "first_apply",
+      requestType: input.requestType ?? "first_apply",
       status: input.status ?? "pending_feishu_approval",
       reason: input.reason,
       requestedMonthlyQuota: input.requestedMonthlyQuota,
+      approvedMonthlyQuota: input.approvedMonthlyQuota,
       approvalCode: input.approvalCode,
       approvalUuid: randomId("approval"),
       approvalDepartmentId: input.approvalDepartmentId,
@@ -160,6 +380,8 @@ export async function createTokenRequest(input: {
       approvalTargetOpenId: input.approvalTargetOpenId,
       approvalTargetSource: input.approvalTargetSource,
       approvalActionNonceHash: input.approvalActionNonceHash,
+      approvalOperatorOpenId: input.approvalOperatorOpenId,
+      approvalOperatedAt: input.approvalOperatedAt,
       createdAt: now,
       updatedAt: now,
     };
@@ -209,6 +431,26 @@ export async function getActiveTokenForUser(feishuUserId: string) {
   );
 }
 
+export async function listActiveTokenAccounts() {
+  const store = await readStore();
+  const usersById = new Map(store.users.map((user) => [user.id, user]));
+  return store.tokenAccounts
+    .filter((account) => account.status === "active")
+    .map((account) => ({
+      account,
+      user: usersById.get(account.feishuUserId) ?? null,
+    }));
+}
+
+export async function getUserBillingPeriod(feishuUserId: string, period: string) {
+  const store = await readStore();
+  return (
+    store.userBillingPeriods.find(
+      (item) => item.feishuUserId === feishuUserId && item.period === period,
+    ) ?? null
+  );
+}
+
 export async function findActiveTokenByHash(keyHash: string) {
   const store = await readStore();
   return (
@@ -237,6 +479,101 @@ export async function addTokenAccount(input: {
       billingPeriod: input.billingPeriod ?? now.slice(0, 7),
       createdAt: now,
     };
+    store.tokenAccounts.push(account);
+    return account;
+  });
+}
+
+export async function recordMonthlyResetApplied(input: {
+  tokenAccountId: string;
+  feishuUserId: string;
+  period: string;
+  monthlyQuota: number;
+  operatedByFeishuUserId: string;
+}) {
+  return mutate((store) => {
+    const account = store.tokenAccounts.find(
+      (item) =>
+        item.id === input.tokenAccountId &&
+        item.feishuUserId === input.feishuUserId &&
+        item.status === "active",
+    );
+    if (!account) {
+      return {
+        applied: false,
+        reason: "active_token_not_found",
+        account: null,
+        request: null,
+      };
+    }
+    if (account.billingPeriod === input.period) {
+      return {
+        applied: false,
+        reason: "already_current_period",
+        account,
+        request: null,
+      };
+    }
+
+    const now = nowIso();
+    const request: TokenRequest = {
+      id: randomId("tr"),
+      feishuUserId: input.feishuUserId,
+      requestType: "monthly_reset",
+      status: "provisioned",
+      reason: `monthly billing reset ${input.period}`,
+      requestedMonthlyQuota: input.monthlyQuota,
+      approvedMonthlyQuota: input.monthlyQuota,
+      approvalUuid: randomId("approval"),
+      approvalMode: "manual",
+      approvalOperatorOpenId: input.operatedByFeishuUserId,
+      approvalOperatedAt: now,
+      tokenAccountId: account.id,
+      createdAt: now,
+      updatedAt: now,
+    };
+    account.billingPeriod = input.period;
+    store.tokenRequests.push(request);
+    return {
+      applied: true,
+      reason: "applied",
+      account,
+      request,
+    };
+  });
+}
+
+export async function replaceActiveTokenAccount(input: {
+  oldTokenAccountId: string;
+  feishuUserId: string;
+  tokenRequestId: string;
+  keyHash: string;
+  newapiTokenId?: string;
+  billingPeriod?: string;
+}) {
+  return mutate((store) => {
+    const oldAccount = store.tokenAccounts.find(
+      (account) =>
+        account.id === input.oldTokenAccountId &&
+        account.feishuUserId === input.feishuUserId &&
+        account.status === "active",
+    );
+    if (!oldAccount) return null;
+
+    const now = nowIso();
+    const account: TokenAccount = {
+      id: randomId("ta"),
+      feishuUserId: input.feishuUserId,
+      tokenRequestId: input.tokenRequestId,
+      keyHash: input.keyHash,
+      newapiTokenId: input.newapiTokenId,
+      status: "active",
+      billingPeriod: input.billingPeriod ?? oldAccount.billingPeriod ?? now.slice(0, 7),
+      createdAt: now,
+    };
+    oldAccount.status = "replaced";
+    oldAccount.disabledAt = now;
+    oldAccount.replacedByTokenAccountId = account.id;
     store.tokenAccounts.push(account);
     return account;
   });
@@ -281,11 +618,69 @@ export async function addProxyLog(log: Omit<ProxyRequestLog, "id" | "createdAt">
 
 export async function getAdminScopeForUser(feishuUserId: string) {
   const store = await readStore();
-  return (
+  const storedScope =
     store.adminScopes.find(
       (scope) => scope.feishuUserId === feishuUserId && scope.status === "active",
-    ) ?? null
-  );
+    ) ?? null;
+  if (storedScope) return storedScope;
+
+  const user = store.users.find((item) => item.id === feishuUserId);
+  if (!user || !getConfig().admin.globalOpenIds.includes(user.openId)) return null;
+
+  const now = nowIso();
+  return {
+    id: `env-admin-${feishuUserId}`,
+    feishuUserId,
+    scopeType: "global",
+    source: "environment",
+    status: "active",
+    createdAt: now,
+    updatedAt: now,
+  } satisfies AdminScope;
+}
+
+export async function syncDepartmentSupervisorAdminScope(input: {
+  feishuUserId: string;
+  departmentId: string;
+  isSupervisor: boolean;
+}) {
+  return mutate((store) => {
+    const now = nowIso();
+    const existing = store.adminScopes.find(
+      (scope) =>
+        scope.feishuUserId === input.feishuUserId &&
+        scope.scopeType === "department" &&
+        scope.departmentId === input.departmentId &&
+        scope.source === "department_supervisor",
+    );
+
+    if (!input.isSupervisor) {
+      if (existing && existing.status !== "disabled") {
+        existing.status = "disabled";
+        existing.updatedAt = now;
+      }
+      return null;
+    }
+
+    if (existing) {
+      existing.status = "active";
+      existing.updatedAt = now;
+      return existing;
+    }
+
+    const scope: AdminScope = {
+      id: randomId("as"),
+      feishuUserId: input.feishuUserId,
+      scopeType: "department",
+      departmentId: input.departmentId,
+      source: "department_supervisor",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    };
+    store.adminScopes.push(scope);
+    return scope;
+  });
 }
 
 function tokenRequestInScope(
@@ -327,8 +722,17 @@ export async function getScopedTokenRequest(scope: AdminScope, requestId: string
   return tokenRequestInScope(request, scope, usersById) ? request : null;
 }
 
+export async function getScopedUser(scope: AdminScope, feishuUserId: string) {
+  const store = await readStore();
+  const user = store.users.find((item) => item.id === feishuUserId);
+  if (!user) return null;
+  if (scope.scopeType === "global") return user;
+  return user.departmentId === scope.departmentId ? user : null;
+}
+
 export async function getAdminOverview(scope: AdminScope) {
   const store = await readStore();
+  const currentPeriod = nowIso().slice(0, 7);
   const usersById = new Map(store.users.map((user) => [user.id, user]));
   const scopedUsers =
     scope.scopeType === "global"
@@ -343,6 +747,59 @@ export async function getAdminOverview(scope: AdminScope) {
   const scopedProxyLogs = store.proxyRequestLogs.filter((log) =>
     proxyLogInScope(log, scope, usersById),
   );
+  const scopedBillingPeriods =
+    scope.scopeType === "global"
+      ? store.userBillingPeriods
+      : store.userBillingPeriods.filter((period) => {
+          const user = usersById.get(period.feishuUserId);
+          return user?.departmentId === scope.departmentId;
+        });
+  const billingByUserAndPeriod = new Map(
+    scopedBillingPeriods.map((period) => [
+      billingKey(period.feishuUserId, period.period),
+      period,
+    ]),
+  );
+  const currentBillingPeriods = scopedBillingPeriods.filter(
+    (period) => period.period === currentPeriod,
+  );
+  const activeAccountsByUserId = new Map(
+    scopedAccounts
+      .filter((account) => account.status === "active")
+      .map((account) => [account.feishuUserId, account]),
+  );
+  const requestCountsByUserId = new Map<string, number>();
+  for (const request of scopedRequests) {
+    requestCountsByUserId.set(
+      request.feishuUserId,
+      (requestCountsByUserId.get(request.feishuUserId) ?? 0) + 1,
+    );
+  }
+  const proxyLogCountsByUserId = new Map<string, number>();
+  const tokenUsageByUserId = new Map<string, number>();
+  for (const log of scopedProxyLogs) {
+    if (!log.feishuUserId) continue;
+    proxyLogCountsByUserId.set(
+      log.feishuUserId,
+      (proxyLogCountsByUserId.get(log.feishuUserId) ?? 0) + 1,
+    );
+    tokenUsageByUserId.set(
+      log.feishuUserId,
+      (tokenUsageByUserId.get(log.feishuUserId) ?? 0) + (log.totalTokens ?? 0),
+    );
+  }
+  const totalPromptTokens = scopedProxyLogs.reduce(
+    (sum, log) => sum + (log.promptTokens ?? 0),
+    0,
+  );
+  const totalCompletionTokens = scopedProxyLogs.reduce(
+    (sum, log) => sum + (log.completionTokens ?? 0),
+    0,
+  );
+  const totalTokens = scopedProxyLogs.reduce(
+    (sum, log) => sum + (log.totalTokens ?? 0),
+    0,
+  );
 
   return {
     scope: {
@@ -354,7 +811,10 @@ export async function getAdminOverview(scope: AdminScope) {
       users: scopedUsers.length,
       tokenRequests: scopedRequests.length,
       pendingRequests: scopedRequests.filter(
-        (request) => request.status === "pending_feishu_approval",
+        (request) =>
+          request.status === "pending_feishu_approval" ||
+          request.status === "pending_card_send" ||
+          request.status === "pending_card_approval",
       ).length,
       provisionedRequests: scopedRequests.filter(
         (request) => request.status === "provisioned",
@@ -364,6 +824,30 @@ export async function getAdminOverview(scope: AdminScope) {
       ).length,
       activeTokens: scopedAccounts.filter((account) => account.status === "active").length,
       proxyLogs: scopedProxyLogs.length,
+      promptTokens: totalPromptTokens,
+      completionTokens: totalCompletionTokens,
+      totalTokens,
+      currentBillingPeriod: currentPeriod,
+      currentPeriodMonthlyQuota: currentBillingPeriods.reduce(
+        (sum, period) => sum + period.monthlyQuota,
+        0,
+      ),
+      currentPeriodProxyLogs: currentBillingPeriods.reduce(
+        (sum, period) => sum + period.proxyLogCount,
+        0,
+      ),
+      currentPeriodPromptTokens: currentBillingPeriods.reduce(
+        (sum, period) => sum + period.promptTokens,
+        0,
+      ),
+      currentPeriodCompletionTokens: currentBillingPeriods.reduce(
+        (sum, period) => sum + period.completionTokens,
+        0,
+      ),
+      currentPeriodTotalTokens: currentBillingPeriods.reduce(
+        (sum, period) => sum + period.totalTokens,
+        0,
+      ),
     },
     latestRequests: [...scopedRequests]
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
@@ -378,12 +862,66 @@ export async function getAdminOverview(scope: AdminScope) {
           requestedMonthlyQuota: request.requestedMonthlyQuota,
           approvedMonthlyQuota: request.approvedMonthlyQuota,
           approvalInstanceCode: request.approvalInstanceCode,
+          approvalTargetSource: request.approvalTargetSource,
+          approvalTargetOpenId: request.approvalTargetOpenId,
           approvalCardMessageId: request.approvalCardMessageId,
+          approvalOperatorOpenId: request.approvalOperatorOpenId,
+          approvalOperatedAt: request.approvalOperatedAt,
+          tokenAccountId: request.tokenAccountId,
+          errorMessage: request.errorMessage,
           requesterName: user?.name,
           requesterOpenId: user?.openId,
           departmentId: user?.departmentId,
           updatedAt: request.updatedAt,
           createdAt: request.createdAt,
+        };
+      }),
+    users: [...scopedUsers]
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+      .slice(0, 50)
+      .map((user) => {
+        const activeAccount = activeAccountsByUserId.get(user.id);
+        const billingPeriod = activeAccount?.billingPeriod ?? currentPeriod;
+        const billingSummary = billingByUserAndPeriod.get(billingKey(user.id, billingPeriod));
+        return {
+          id: user.id,
+          name: user.name,
+          openId: user.openId,
+          departmentId: user.departmentId,
+          activeTokenStatus: activeAccount?.status,
+          activeTokenCreatedAt: activeAccount?.createdAt,
+          billingPeriod,
+          billingMonthlyQuota: billingSummary?.monthlyQuota,
+          billingPromptTokens: billingSummary?.promptTokens,
+          billingCompletionTokens: billingSummary?.completionTokens,
+          billingTotalTokens: billingSummary?.totalTokens,
+          billingProxyLogCount: billingSummary?.proxyLogCount,
+          requestCount: requestCountsByUserId.get(user.id) ?? 0,
+          proxyLogCount: proxyLogCountsByUserId.get(user.id) ?? 0,
+          totalTokens: tokenUsageByUserId.get(user.id) ?? 0,
+          updatedAt: user.updatedAt,
+          createdAt: user.createdAt,
+        };
+      }),
+    latestProxyLogs: [...scopedProxyLogs]
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, 50)
+      .map((log) => {
+        const user = log.feishuUserId ? usersById.get(log.feishuUserId) : undefined;
+        return {
+          id: log.id,
+          requestPath: log.requestPath,
+          method: log.method,
+          statusCode: log.statusCode,
+          durationMs: log.durationMs,
+          promptTokens: log.promptTokens,
+          completionTokens: log.completionTokens,
+          totalTokens: log.totalTokens,
+          clientIp: log.clientIp,
+          userAgent: log.userAgent,
+          requesterName: user?.name,
+          requesterOpenId: user?.openId,
+          createdAt: log.createdAt,
         };
       }),
   };

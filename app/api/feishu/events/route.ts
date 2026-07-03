@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import {
   decryptFeishuEventPayload,
+  hasFeishuEventVerificationToken,
   verifyFeishuEventSignature,
   verifyFeishuEventVerificationToken,
 } from "@/lib/feishu";
@@ -65,8 +66,17 @@ function firstString(source: unknown, paths: string[][]) {
   return undefined;
 }
 
-function parseJsonPayload(rawBody: string) {
-  const wrapper = JSON.parse(rawBody) as FeishuEventPayload;
+function normalizedActionValue(value: unknown) {
+  if (typeof value !== "string") return value;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed;
+  } catch {
+    return value;
+  }
+}
+
+function parseFeishuPayloadWrapper(wrapper: FeishuEventPayload) {
   if (!wrapper.encrypt) {
     return { payload: wrapper, encrypted: false };
   }
@@ -112,10 +122,15 @@ function extractApprovalEvent(payload: FeishuEventPayload) {
 }
 
 function extractCardActionEvent(payload: FeishuEventPayload) {
-  const actionValue =
+  const actionValue = normalizedActionValue(
     nestedUnknown(payload, ["event", "action", "value"]) ??
     nestedUnknown(payload, ["event", "action", "values"]) ??
-    nestedUnknown(payload, ["event", "action"]);
+    nestedUnknown(payload, ["event", "action"]) ??
+    nestedUnknown(payload, ["action", "value"]) ??
+    nestedUnknown(payload, ["action", "values"]) ??
+    nestedUnknown(payload, ["action_value"]) ??
+    nestedUnknown(payload, ["action"]),
+  );
   const eventUuid =
     firstString(payload, [
       ["header", "event_id"],
@@ -133,11 +148,18 @@ function extractCardActionEvent(payload: FeishuEventPayload) {
     ["event", "operator", "operator_id", "open_id"],
     ["event", "operator_id", "open_id"],
     ["event", "open_id"],
+    ["operator", "open_id"],
+    ["operator", "operator_id", "open_id"],
+    ["operator_id", "open_id"],
+    ["open_id"],
   ]);
   const messageId = firstString(payload, [
     ["event", "message_id"],
     ["event", "context", "open_message_id"],
     ["event", "open_message_id"],
+    ["context", "open_message_id"],
+    ["message_id"],
+    ["open_message_id"],
   ]);
   const cardRequestId = firstString(actionValue, [
     ["requestId"],
@@ -159,7 +181,21 @@ function extractCardActionEvent(payload: FeishuEventPayload) {
 }
 
 function cardToast(content: string, type: "success" | "error" = "success") {
-  return NextResponse.json({ ok: type === "success", toast: { type, content } });
+  return NextResponse.json({ toast: { type, content } });
+}
+
+function payloadVerificationToken(payload: FeishuEventPayload) {
+  return (
+    payload.token ??
+    firstString(payload, [
+      ["event", "token"],
+      ["header", "token"],
+    ])
+  );
+}
+
+function isCardActionEventType(eventType?: string) {
+  return eventType === "card.action.trigger" || eventType === "card.action.trigger_v1";
 }
 
 async function handleCardActionEvent(input: {
@@ -299,27 +335,39 @@ async function handleCardActionEvent(input: {
 
 export async function POST(request: Request) {
   const rawBody = await request.text();
+
+  let payload: FeishuEventPayload;
+  let encrypted = false;
+  let wrapper: FeishuEventPayload;
+  try {
+    wrapper = JSON.parse(rawBody) as FeishuEventPayload;
+  } catch {
+    return NextResponse.json({ error: "Invalid Feishu event payload" }, { status: 400 });
+  }
+
+  const wrapperTokenOk =
+    !wrapper.encrypt &&
+    hasFeishuEventVerificationToken() &&
+    verifyFeishuEventVerificationToken(payloadVerificationToken(wrapper));
   const signatureOk = verifyFeishuEventSignature({
     timestamp: request.headers.get("x-lark-request-timestamp"),
     nonce: request.headers.get("x-lark-request-nonce"),
     signature: request.headers.get("x-lark-signature"),
     rawBody,
   });
-  if (!signatureOk) {
+  if (!signatureOk && !wrapperTokenOk) {
     return NextResponse.json({ error: "Invalid Feishu event signature" }, { status: 401 });
   }
 
-  let payload: FeishuEventPayload;
-  let encrypted = false;
   try {
-    const parsed = parseJsonPayload(rawBody);
+    const parsed = parseFeishuPayloadWrapper(wrapper);
     payload = parsed.payload;
     encrypted = parsed.encrypted;
   } catch {
     return NextResponse.json({ error: "Invalid Feishu event payload" }, { status: 400 });
   }
 
-  if (!verifyFeishuEventVerificationToken(payload.token)) {
+  if (!verifyFeishuEventVerificationToken(payloadVerificationToken(payload))) {
     return NextResponse.json({ error: "Invalid Feishu event verification token" }, { status: 401 });
   }
 
@@ -340,8 +388,8 @@ export async function POST(request: Request) {
 
   try {
     if (
-      eventType === "card.action.trigger" ||
-      cardActionEvent.eventType === "card.action.trigger" ||
+      isCardActionEventType(eventType) ||
+      isCardActionEventType(cardActionEvent.eventType) ||
       cardActionEvent.cardRequestId
     ) {
       return await handleCardActionEvent({

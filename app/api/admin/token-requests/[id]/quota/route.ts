@@ -1,11 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { getCurrentUser } from "@/lib/session";
-import {
-  getAdminScopeForUser,
-  getScopedTokenRequest,
-  updateTokenRequest,
-} from "@/lib/store";
+import { requireAdminScope } from "@/lib/admin";
+import { getScopedTokenRequest, updateTokenRequest } from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,21 +14,11 @@ export async function PATCH(
   request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const user = await getCurrentUser();
-  if (!user) {
-    return NextResponse.json({ error: "需要飞书 OAuth 会话" }, { status: 401 });
-  }
-
-  const scope = await getAdminScopeForUser(user.id);
-  if (!scope) {
-    return NextResponse.json(
-      { error: "当前飞书用户没有启用的 TokenInside 管理范围" },
-      { status: 403 },
-    );
-  }
+  const auth = await requireAdminScope();
+  if (auth.error) return auth.error;
 
   const { id } = await params;
-  const tokenRequest = await getScopedTokenRequest(scope, id);
+  const tokenRequest = await getScopedTokenRequest(auth.scope, id);
   if (!tokenRequest) {
     return NextResponse.json({ error: "申请单不存在或不在当前管理范围内" }, { status: 404 });
   }

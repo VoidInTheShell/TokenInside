@@ -44,6 +44,44 @@ function getSupportedProxyError(method: string, path: string[]) {
   };
 }
 
+function numberFromUsage(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+async function extractUsage(upstream: Response) {
+  const contentType = upstream.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) return {};
+  try {
+    const body = (await upstream.clone().json()) as {
+      usage?: {
+        prompt_tokens?: unknown;
+        completion_tokens?: unknown;
+        total_tokens?: unknown;
+        input_tokens?: unknown;
+        output_tokens?: unknown;
+      };
+    };
+    const usage = body.usage;
+    if (!usage) return {};
+    const promptTokens = numberFromUsage(usage.prompt_tokens ?? usage.input_tokens);
+    const completionTokens = numberFromUsage(
+      usage.completion_tokens ?? usage.output_tokens,
+    );
+    const explicitTotalTokens = numberFromUsage(usage.total_tokens);
+    return {
+      promptTokens,
+      completionTokens,
+      totalTokens:
+        explicitTotalTokens ??
+        (promptTokens !== undefined && completionTokens !== undefined
+          ? promptTokens + completionTokens
+          : undefined),
+    };
+  } catch {
+    return {};
+  }
+}
+
 async function proxy(request: Request, context: RouteContext) {
   const startedAt = Date.now();
   const params = await context.params;
@@ -99,6 +137,7 @@ async function proxy(request: Request, context: RouteContext) {
     body,
     cache: "no-store",
   });
+  const usage = await extractUsage(upstream);
 
   await addProxyLog({
     feishuUserId: user.id,
@@ -107,6 +146,7 @@ async function proxy(request: Request, context: RouteContext) {
     method: request.method,
     statusCode: upstream.status,
     durationMs: Date.now() - startedAt,
+    ...usage,
     userAgent: request.headers.get("user-agent") ?? undefined,
     clientIp: request.headers.get("x-forwarded-for") ?? undefined,
   });

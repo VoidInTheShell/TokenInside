@@ -12,6 +12,7 @@ import {
   ShieldCheckIcon,
   SlidersHorizontalIcon,
   UsersRoundIcon,
+  XCircleIcon,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -42,7 +43,7 @@ type AdminOverviewResponse = {
     scope: {
       type: "global" | "department";
       departmentId?: string;
-      source: "manual" | "department_supervisor";
+      source: "manual" | "department_supervisor" | "environment";
     };
     totals: {
       users: number;
@@ -52,6 +53,15 @@ type AdminOverviewResponse = {
       failedRequests: number;
       activeTokens: number;
       proxyLogs: number;
+      promptTokens?: number;
+      completionTokens?: number;
+      totalTokens?: number;
+      currentBillingPeriod?: string;
+      currentPeriodMonthlyQuota?: number;
+      currentPeriodProxyLogs?: number;
+      currentPeriodPromptTokens?: number;
+      currentPeriodCompletionTokens?: number;
+      currentPeriodTotalTokens?: number;
     };
     latestRequests: Array<{
       id: string;
@@ -61,11 +71,51 @@ type AdminOverviewResponse = {
       requestedMonthlyQuota: number;
       approvedMonthlyQuota?: number;
       approvalInstanceCode?: string;
+      approvalTargetSource?: string;
+      approvalTargetOpenId?: string;
       approvalCardMessageId?: string;
+      approvalOperatorOpenId?: string;
+      approvalOperatedAt?: string;
+      tokenAccountId?: string;
+      errorMessage?: string;
       requesterName?: string;
       requesterOpenId?: string;
       departmentId?: string;
       updatedAt: string;
+      createdAt: string;
+    }>;
+    users: Array<{
+      id: string;
+      name?: string;
+      openId: string;
+      departmentId?: string;
+      activeTokenStatus?: string;
+      activeTokenCreatedAt?: string;
+      billingPeriod?: string;
+      billingMonthlyQuota?: number;
+      billingPromptTokens?: number;
+      billingCompletionTokens?: number;
+      billingTotalTokens?: number;
+      billingProxyLogCount?: number;
+      requestCount: number;
+      proxyLogCount: number;
+      totalTokens?: number;
+      updatedAt: string;
+      createdAt: string;
+    }>;
+    latestProxyLogs: Array<{
+      id: string;
+      requestPath: string;
+      method: string;
+      statusCode: number;
+      durationMs: number;
+      promptTokens?: number;
+      completionTokens?: number;
+      totalTokens?: number;
+      clientIp?: string;
+      userAgent?: string;
+      requesterName?: string;
+      requesterOpenId?: string;
       createdAt: string;
     }>;
   };
@@ -90,6 +140,14 @@ const statusLabel: Record<string, string> = {
   rejected: "已拒绝",
   cancelled: "已取消",
   draft_pending_approval_config: "待配置审批",
+};
+
+const requestTypeLabel: Record<string, string> = {
+  first_apply: "首次申请",
+  quota_reset: "额度重置",
+  key_reset: "key 重置",
+  quota_adjust: "额度调整",
+  monthly_reset: "月度重置",
 };
 
 function badgeVariant(status?: string) {
@@ -117,6 +175,17 @@ function avatarInitial(user?: AdminOverviewResponse["user"]) {
 
 function canEditQuota(status: string) {
   return ["pending_card_send", "pending_card_approval", "approval_card_send_failed"].includes(status);
+}
+
+function canDecideRequest(status: string) {
+  return [
+    "pending_card_send",
+    "pending_card_approval",
+    "approval_card_send_failed",
+    "approval_route_failed",
+    "pending_feishu_approval",
+    "approved_provision_failed",
+  ].includes(status);
 }
 
 export function AdminClient() {
@@ -243,6 +312,72 @@ export function AdminClient() {
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存最终额度失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function decideRequest(requestId: string, action: "approve" | "reject") {
+    const approvedMonthlyQuota = Number(quotaDrafts[requestId]);
+    if (action === "approve" && (!Number.isInteger(approvedMonthlyQuota) || approvedMonthlyQuota <= 0)) {
+      setError("通过审批前需要填写正整数最终额度");
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(
+        `/api/admin/token-requests/${encodeURIComponent(requestId)}/decision`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            action,
+            approvedMonthlyQuota: action === "approve" ? approvedMonthlyQuota : undefined,
+          }),
+        },
+      );
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "处理审批失败");
+      setMessage(action === "approve" ? "审批已通过，已触发发放。" : "申请已拒绝。");
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "处理审批失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function adjustUserQuota(userId: string) {
+    const approvedMonthlyQuota = Number(quotaDrafts[userId]);
+    if (!Number.isInteger(approvedMonthlyQuota) || approvedMonthlyQuota <= 0) {
+      setError("调额额度必须是正整数");
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(
+        `/api/admin/users/${encodeURIComponent(userId)}/quota-adjust`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            approvedMonthlyQuota,
+            reason: `管理后台调额为 ${approvedMonthlyQuota}`,
+          }),
+        },
+      );
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "调额失败");
+      setMessage("额度已调整。");
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "调额失败");
     } finally {
       setBusy(false);
     }
@@ -395,6 +530,30 @@ export function AdminClient() {
               </div>
             </CardContent>
           </Card>
+          <Card>
+            <CardContent>
+              <div className="metric">
+                <span className="metric-label">总 tokens</span>
+                <span className="metric-value">{totals?.totalTokens ?? 0}</span>
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent>
+              <div className="metric">
+                <span className="metric-label">当前账期 tokens</span>
+                <span className="metric-value">{totals?.currentPeriodTotalTokens ?? 0}</span>
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent>
+              <div className="metric">
+                <span className="metric-label">当前账期额度</span>
+                <span className="metric-value">{totals?.currentPeriodMonthlyQuota ?? 0}</span>
+              </div>
+            </CardContent>
+          </Card>
         </section>
 
         <section className="grid grid-2">
@@ -445,6 +604,22 @@ export function AdminClient() {
                 <div className="meta-row">
                   <span>发放失败</span>
                   <strong>{totals?.failedRequests ?? 0}</strong>
+                </div>
+                <div className="meta-row">
+                  <span>输入 tokens</span>
+                  <strong>{totals?.promptTokens ?? 0}</strong>
+                </div>
+                <div className="meta-row">
+                  <span>输出 tokens</span>
+                  <strong>{totals?.completionTokens ?? 0}</strong>
+                </div>
+                <div className="meta-row">
+                  <span>当前账期</span>
+                  <strong>{totals?.currentBillingPeriod ?? "-"}</strong>
+                </div>
+                <div className="meta-row">
+                  <span>账期请求</span>
+                  <strong>{totals?.currentPeriodProxyLogs ?? 0}</strong>
                 </div>
               </div>
             </CardContent>
@@ -505,17 +680,21 @@ export function AdminClient() {
                   <thead>
                     <tr>
                       <th>申请人</th>
+                      <th>类型</th>
                       <th>状态</th>
                       <th>额度</th>
                       <th>最终额度</th>
                       <th>审批消息</th>
+                      <th>错误</th>
                       <th>更新时间</th>
+                      <th>操作</th>
                     </tr>
                   </thead>
                   <tbody>
                     {overview.latestRequests.map((request) => (
                       <tr key={request.id}>
                         <td>{request.requesterName ?? maskSecret(request.requesterOpenId)}</td>
+                        <td>{requestTypeLabel[request.requestType] ?? request.requestType}</td>
                         <td>
                           <Badge variant={badgeVariant(request.status)}>
                             {statusLabel[request.status] ?? request.status}
@@ -550,7 +729,30 @@ export function AdminClient() {
                           </div>
                         </td>
                         <td>{maskSecret(request.approvalCardMessageId ?? request.approvalInstanceCode)}</td>
+                        <td>{request.errorMessage ? maskSecret(request.errorMessage) : "-"}</td>
                         <td>{formatDateTime(request.updatedAt)}</td>
+                        <td>
+                          <div className="toolbar toolbar-left">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={!canDecideRequest(request.status) || busy}
+                              onClick={() => void decideRequest(request.id, "approve")}
+                            >
+                              <CheckCircle2Icon data-icon="inline-start" />
+                              通过
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={!canDecideRequest(request.status) || busy}
+                              onClick={() => void decideRequest(request.id, "reject")}
+                            >
+                              <XCircleIcon data-icon="inline-start" />
+                              拒绝
+                            </Button>
+                          </div>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -559,6 +761,127 @@ export function AdminClient() {
             )}
           </CardContent>
         </Card>
+
+        <section className="grid grid-2">
+          <Card>
+            <CardHeader>
+              <CardTitle>可见用户</CardTitle>
+              <CardDescription>按当前管理范围过滤后的用户、申请和代理日志摘要。</CardDescription>
+            </CardHeader>
+            <CardContent>
+              {!overview?.users.length ? (
+                <div className="empty">暂无可见用户</div>
+              ) : (
+                <div className="table-wrap">
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th>用户</th>
+                        <th>active key</th>
+                        <th>申请</th>
+                        <th>日志</th>
+                        <th>tokens</th>
+                        <th>账期</th>
+                        <th>账期 tokens</th>
+                        <th>调额</th>
+                        <th>更新时间</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {overview.users.map((user) => (
+                        <tr key={user.id}>
+                          <td>{user.name ?? maskSecret(user.openId)}</td>
+                          <td>{user.activeTokenStatus ?? "-"}</td>
+                          <td>{user.requestCount}</td>
+                          <td>{user.proxyLogCount}</td>
+                          <td>{user.totalTokens ?? 0}</td>
+                          <td>
+                            <div className="meta-stack">
+                              <strong>{user.billingPeriod ?? "-"}</strong>
+                              <span>额度 {user.billingMonthlyQuota ?? "-"}</span>
+                            </div>
+                          </td>
+                          <td>
+                            <div className="meta-stack">
+                              <strong>{user.billingTotalTokens ?? 0}</strong>
+                              <span>{user.billingProxyLogCount ?? 0} 次</span>
+                            </div>
+                          </td>
+                          <td>
+                            <div className="quota-control">
+                              <Input
+                                min={1}
+                                step={1}
+                                type="number"
+                                value={quotaDrafts[user.id] ?? ""}
+                                placeholder="额度"
+                                onChange={(event) =>
+                                  setQuotaDrafts((current) => ({
+                                    ...current,
+                                    [user.id]: event.target.value,
+                                  }))
+                                }
+                                disabled={busy || user.activeTokenStatus !== "active"}
+                              />
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={busy || user.activeTokenStatus !== "active"}
+                                onClick={() => void adjustUserQuota(user.id)}
+                              >
+                                调整
+                              </Button>
+                            </div>
+                          </td>
+                          <td>{formatDateTime(user.updatedAt)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>代理日志</CardTitle>
+              <CardDescription>只显示当前管理范围内的最近代理请求，不显示 Authorization。</CardDescription>
+            </CardHeader>
+            <CardContent>
+              {!overview?.latestProxyLogs.length ? (
+                <div className="empty">暂无代理日志</div>
+              ) : (
+                <div className="table-wrap">
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th>用户</th>
+                        <th>路径</th>
+                        <th>状态</th>
+                        <th>耗时</th>
+                        <th>tokens</th>
+                        <th>时间</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {overview.latestProxyLogs.map((log) => (
+                        <tr key={log.id}>
+                          <td>{log.requesterName ?? maskSecret(log.requesterOpenId)}</td>
+                          <td>{log.method} {log.requestPath}</td>
+                          <td>{log.statusCode}</td>
+                          <td>{log.durationMs} ms</td>
+                          <td>{log.totalTokens ?? "-"}</td>
+                          <td>{formatDateTime(log.createdAt)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </section>
 
         {data?.authorized && (
           <div className="alert">

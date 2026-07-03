@@ -44,8 +44,17 @@ type SessionResponse = {
     id: string;
     status: string;
     newapiTokenId?: string;
+    billingPeriod: string;
     createdAt: string;
   };
+  billingPeriod?: {
+    period: string;
+    monthlyQuota: number;
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    proxyLogCount: number;
+  } | null;
   adminScope?: {
     type: "global" | "department";
     departmentId?: string;
@@ -91,6 +100,14 @@ const statusLabel: Record<string, string> = {
   draft_pending_approval_config: "待配置审批",
 };
 
+const requestTypeLabel: Record<string, string> = {
+  first_apply: "首次申请",
+  quota_reset: "额度重置",
+  key_reset: "key 重置",
+  quota_adjust: "额度调整",
+  monthly_reset: "月度重置",
+};
+
 function badgeVariant(status?: string) {
   if (!status) return "default";
   if (["provisioned", "approved"].includes(status)) return "success";
@@ -123,6 +140,7 @@ export function ExperienceClient() {
   const [busy, setBusy] = useState(false);
   const [key, setKey] = useState<string | null>(null);
   const [reason, setReason] = useState("");
+  const [quotaResetReason, setQuotaResetReason] = useState("");
   const [panel, setPanel] = useState<WorkspacePanel>("account");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -181,6 +199,9 @@ export function ExperienceClient() {
   const hasActiveToken = Boolean(session?.activeToken);
   const title = hasActiveToken ? "用户后台" : "Token 申请";
   const defaultMonthlyQuota = session?.settings?.defaultMonthlyQuota ?? FALLBACK_MONTHLY_QUOTA;
+  const currentBillingPeriod = session?.billingPeriod ?? null;
+  const currentBillingPeriodName =
+    currentBillingPeriod?.period ?? session?.activeToken?.billingPeriod ?? "-";
 
   const connectFeishu = useCallback(async () => {
     setError(null);
@@ -244,6 +265,53 @@ export function ExperienceClient() {
       setMessage("已读取当前 active key。");
     } catch (err) {
       setError(err instanceof Error ? err.message : "读取 key 失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resetKey() {
+    if (!window.confirm("重置后旧 key 将失效，并生成新的 active key。")) return;
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/token/reset", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reason: "用户在 TokenInside 用户后台发起 key reset" }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "重置 key 失败");
+      setKey(body.key ?? null);
+      setModels([]);
+      setModelsLoaded(false);
+      setMessage("key 已重置。");
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重置 key 失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function requestQuotaReset() {
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/token/quota-reset", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reason: quotaResetReason.trim() }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "提交额度重置申请失败");
+      setQuotaResetReason("");
+      setMessage("额度重置申请已提交。");
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "提交额度重置申请失败");
     } finally {
       setBusy(false);
     }
@@ -458,15 +526,26 @@ export function ExperienceClient() {
                         <label>NewAPI key</label>
                         <div className="key-box">
                           <span>{key ? maskSecret(key) : maskSecret(session?.activeToken?.newapiTokenId)}</span>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={busy}
-                            onClick={() => void revealKey()}
-                          >
-                            <KeyRoundIcon data-icon="inline-start" />
-                            查看
-                          </Button>
+                          <div className="key-actions">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={busy}
+                              onClick={() => void revealKey()}
+                            >
+                              <KeyRoundIcon data-icon="inline-start" />
+                              查看
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={busy}
+                              onClick={() => void resetKey()}
+                            >
+                              <RefreshCwIcon data-icon="inline-start" />
+                              重置
+                            </Button>
+                          </div>
                         </div>
                       </div>
                     </CardContent>
@@ -483,6 +562,77 @@ export function ExperienceClient() {
                         <Badge variant="success">POST /v1/chat/completions</Badge>
                         <Badge variant="success">POST /v1/responses</Badge>
                         <Badge variant="success">POST /v1/messages</Badge>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card>
+                    <CardHeader>
+                      <CardTitle>当前账期</CardTitle>
+                      <CardDescription>{currentBillingPeriodName}</CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="meta-list">
+                        <div className="meta-row">
+                          <span>账期额度</span>
+                          <strong>{currentBillingPeriod?.monthlyQuota ?? "-"}</strong>
+                        </div>
+                        <div className="meta-row">
+                          <span>总 tokens</span>
+                          <strong>{currentBillingPeriod?.totalTokens ?? 0}</strong>
+                        </div>
+                        <div className="meta-row">
+                          <span>输入 tokens</span>
+                          <strong>{currentBillingPeriod?.promptTokens ?? 0}</strong>
+                        </div>
+                        <div className="meta-row">
+                          <span>输出 tokens</span>
+                          <strong>{currentBillingPeriod?.completionTokens ?? 0}</strong>
+                        </div>
+                        <div className="meta-row">
+                          <span>代理请求</span>
+                          <strong>{currentBillingPeriod?.proxyLogCount ?? 0}</strong>
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card>
+                    <CardHeader>
+                      <CardTitle>额度重置</CardTitle>
+                      <CardDescription>
+                        提交后由部门负责人审批，审批通过后重置当前 active key 额度。
+                      </CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="field-group">
+                        <div className="field">
+                          <label htmlFor="quotaResetAmount">重置目标额度</label>
+                          <Input
+                            id="quotaResetAmount"
+                            value={String(defaultMonthlyQuota)}
+                            disabled
+                          />
+                          <span className="field-description">以管理后台当前默认额度为准。</span>
+                        </div>
+                        <div className="field">
+                          <label htmlFor="quotaResetReason">申请理由</label>
+                          <Textarea
+                            id="quotaResetReason"
+                            placeholder="请说明额度用尽原因、当前业务场景和预期恢复时间。"
+                            value={quotaResetReason}
+                            onChange={(event) => setQuotaResetReason(event.target.value)}
+                            disabled={busy}
+                          />
+                        </div>
+                        <Button
+                          variant="outline"
+                          disabled={busy || quotaResetReason.trim().length < 4}
+                          onClick={() => void requestQuotaReset()}
+                        >
+                          <RefreshCwIcon data-icon="inline-start" />
+                          申请额度重置
+                        </Button>
                       </div>
                     </CardContent>
                   </Card>
@@ -533,7 +683,9 @@ export function ExperienceClient() {
                     <div className="meta-list">
                       <div className="meta-row">
                         <span>类型</span>
-                        <strong>{latestRequest.requestType}</strong>
+                        <strong>
+                          {requestTypeLabel[latestRequest.requestType] ?? latestRequest.requestType}
+                        </strong>
                       </div>
                       <div className="meta-row">
                         <span>状态</span>

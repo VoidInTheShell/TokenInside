@@ -2,8 +2,15 @@ import path from "node:path";
 
 export type RuntimeConfig = {
   publicBaseUrl: string;
+  storeBackend: "json" | "postgres";
   sessionSecret?: string;
   storePath: string;
+  databaseUrl?: string;
+  postgres: {
+    poolMax: number;
+    poolIdleTimeoutMs: number;
+    poolConnectionTimeoutMs: number;
+  };
   feishu: {
     appId?: string;
     appSecret?: string;
@@ -17,12 +24,30 @@ export type RuntimeConfig = {
     accessToken?: string;
     adminAccessToken?: string;
     systemAk?: string;
+    quotaPerUnit: number;
     mock: boolean;
+  };
+  admin: {
+    globalOpenIds: string[];
+  };
+  billing: {
+    monthlyResetEnabled: boolean;
   };
 };
 
 function trimSlash(value: string) {
   return value.replace(/\/+$/, "");
+}
+
+function positiveIntegerFromEnv(value: string | undefined, fallback: number) {
+  if (!value) return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+function storeBackendFromEnv(value: string | undefined): RuntimeConfig["storeBackend"] {
+  return value === "postgres" ? "postgres" : "json";
 }
 
 export function getConfig(): RuntimeConfig {
@@ -31,11 +56,24 @@ export function getConfig(): RuntimeConfig {
 
   return {
     publicBaseUrl: trimSlash(publicBaseUrl),
+    storeBackend: storeBackendFromEnv(process.env.TOKENINSIDE_STORE_BACKEND),
     sessionSecret: process.env.TOKENINSIDE_SESSION_SECRET,
     storePath: path.resolve(
       /* turbopackIgnore: true */ process.cwd(),
       process.env.TOKENINSIDE_STORE_PATH ?? ".local-data/tokeninside.json",
     ),
+    databaseUrl: process.env.DATABASE_URL,
+    postgres: {
+      poolMax: positiveIntegerFromEnv(process.env.DATABASE_POOL_MAX, 10),
+      poolIdleTimeoutMs: positiveIntegerFromEnv(
+        process.env.DATABASE_POOL_IDLE_TIMEOUT_MS,
+        30000,
+      ),
+      poolConnectionTimeoutMs: positiveIntegerFromEnv(
+        process.env.DATABASE_POOL_CONNECTION_TIMEOUT_MS,
+        5000,
+      ),
+    },
     feishu: {
       appId: process.env.FEISHU_APP_ID,
       appSecret: process.env.FEISHU_APP_SECRET,
@@ -49,7 +87,17 @@ export function getConfig(): RuntimeConfig {
       accessToken: process.env.NEWAPI_ACCESS_TOKEN,
       adminAccessToken: process.env.NEWAPI_ADMIN_ACCESS_TOKEN,
       systemAk: process.env.NEWAPI_SYSTEM_AK,
+      quotaPerUnit: positiveIntegerFromEnv(process.env.NEWAPI_QUOTA_PER_UNIT, 500000),
       mock: process.env.TOKENINSIDE_MOCK_NEWAPI === "true",
+    },
+    admin: {
+      globalOpenIds: (process.env.TOKENINSIDE_ADMIN_OPEN_IDS ?? "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean),
+    },
+    billing: {
+      monthlyResetEnabled: process.env.TOKENINSIDE_MONTHLY_RESET_ENABLED === "true",
     },
   };
 }

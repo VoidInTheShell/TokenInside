@@ -380,3 +380,7 @@ export function verifyFeishuEventVerificationToken(token?: string | null) {
   if (!token) return false;
   return safeEqual(expected, token);
 }
+
+export function hasFeishuEventVerificationToken() {
+  return Boolean(getConfig().feishu.eventVerificationToken);
+}

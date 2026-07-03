@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 FROM node:22-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -24,6 +22,7 @@ RUN addgroup -S nodejs && adduser -S nextjs -G nodejs
 
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --from=builder --chown=nextjs:nodejs /app/scripts ./scripts
 
 RUN mkdir -p /app/.local-data && chown -R nextjs:nodejs /app/.local-data
 

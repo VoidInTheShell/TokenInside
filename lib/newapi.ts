@@ -44,7 +44,17 @@ type NewApiModelsEnvelope = NewApiModelsResponse | NewApiEnvelope<NewApiModel[]>
 
 function getControlCredential() {
   const { newapi } = getConfig();
-  return newapi.accessToken ?? newapi.adminAccessToken ?? newapi.systemAk;
+  return [newapi.accessToken, newapi.adminAccessToken, newapi.systemAk].find(
+    (credential) => typeof credential === "string" && credential.length > 0,
+  );
+}
+
+export function toNewApiQuota(displayQuota: number) {
+  return Math.round(displayQuota * getConfig().newapi.quotaPerUnit);
+}
+
+export function fromNewApiQuota(internalQuota: number) {
+  return internalQuota / getConfig().newapi.quotaPerUnit;
 }
 
 function getNewApiHeaders(initHeaders?: HeadersInit) {
@@ -156,6 +166,13 @@ export async function getNewApiTokenKey(newapiTokenId: string) {
     method: "POST",
   });
   return data.key ?? data.token;
+}
+
+export async function getNewApiTokenRemainQuota(newapiTokenId: string) {
+  const { newapi } = getConfig();
+  if (newapi.mock) return toNewApiQuota(200);
+  const record = await getNewApiToken(newapiTokenId);
+  return typeof record.remain_quota === "number" ? record.remain_quota : undefined;
 }
 
 export async function listModelsForNewApiToken(newapiTokenId: string) {

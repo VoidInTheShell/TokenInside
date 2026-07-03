@@ -12,6 +12,8 @@ progress.md
 task_plan.md
 
 .local-data
+.deploy
+.agent-temp
 *.log
 *.err
 *.tsbuildinfo

@@ -30,7 +30,7 @@ export type FeishuUser = {
 export type TokenRequest = {
   id: string;
   feishuUserId: string;
-  requestType: "first_apply" | "quota_reset" | "key_reset" | "quota_adjust";
+  requestType: "first_apply" | "quota_reset" | "key_reset" | "quota_adjust" | "monthly_reset";
   status: RequestStatus;
   reason: string;
   requestedMonthlyQuota: number;
@@ -44,6 +44,9 @@ export type TokenRequest = {
   approvalTargetSource?: "department_leader" | "parent_department_leader" | "manual_fallback";
   approvalCardMessageId?: string;
   approvalActionNonceHash?: string;
+  approvalOperatorOpenId?: string;
+  approvalOperatedAt?: string;
+  tokenAccountId?: string;
   errorMessage?: string;
   createdAt: string;
   updatedAt: string;
@@ -86,9 +89,26 @@ export type ProxyRequestLog = {
   method: string;
   statusCode: number;
   durationMs: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
   clientIp?: string;
   userAgent?: string;
   createdAt: string;
+};
+
+export type UserBillingPeriod = {
+  id: string;
+  feishuUserId: string;
+  period: string;
+  monthlyQuota: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  proxyLogCount: number;
+  activeTokenAccountId?: string;
+  tokenAccountIds: string[];
+  updatedAt: string;
 };
 
 export type AdminScope = {
@@ -96,7 +116,7 @@ export type AdminScope = {
   feishuUserId: string;
   scopeType: "global" | "department";
   departmentId?: string;
-  source: "manual" | "department_supervisor";
+  source: "manual" | "department_supervisor" | "environment";
   status: "active" | "disabled";
   createdAt: string;
   updatedAt: string;
@@ -114,6 +134,7 @@ export type StoreShape = {
   users: FeishuUser[];
   tokenRequests: TokenRequest[];
   tokenAccounts: TokenAccount[];
+  userBillingPeriods: UserBillingPeriod[];
   feishuEvents: FeishuEvent[];
   proxyRequestLogs: ProxyRequestLog[];
   adminScopes: AdminScope[];
