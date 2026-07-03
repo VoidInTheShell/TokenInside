@@ -1,4 +1,5 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
+import { nowIso } from "@/lib/crypto";
 import {
   decryptFeishuEventPayload,
   hasFeishuEventVerificationToken,
@@ -14,6 +15,7 @@ import {
   getFeishuEventByUuid,
   updateTokenRequest,
 } from "@/lib/store";
+import type { TokenRequest } from "@/lib/types";
 
 export const runtime = "nodejs";
 
@@ -73,6 +75,35 @@ function normalizedActionValue(value: unknown) {
     return parsed;
   } catch {
     return value;
+  }
+}
+
+function parseRawFeishuPayload(rawBody: string, contentType?: string | null) {
+  try {
+    return JSON.parse(rawBody) as FeishuEventPayload;
+  } catch (jsonError) {
+    const canTryForm =
+      contentType?.includes("application/x-www-form-urlencoded") ||
+      rawBody.includes("=");
+    if (!canTryForm) throw jsonError;
+
+    const params = new URLSearchParams(rawBody);
+    const jsonCandidate =
+      params.get("payload") ??
+      params.get("event") ??
+      params.get("data") ??
+      params.get("body");
+    if (jsonCandidate) {
+      try {
+        return JSON.parse(jsonCandidate) as FeishuEventPayload;
+      } catch {
+        // Fall back to key/value extraction below.
+      }
+    }
+
+    const entries = Object.fromEntries(params.entries()) as FeishuEventPayload;
+    if (Object.keys(entries).length > 0) return entries;
+    throw jsonError;
   }
 }
 
@@ -184,6 +215,41 @@ function cardToast(content: string, type: "success" | "error" = "success") {
   return NextResponse.json({ toast: { type, content } });
 }
 
+function rawPreview(rawBody: string) {
+  return rawBody
+    .slice(0, 1000)
+    .replace(/("token"\s*:\s*")[^"]+(")/gi, "$1[redacted]$2")
+    .replace(/("app_secret"\s*:\s*")[^"]+(")/gi, "$1[redacted]$2")
+    .replace(/([?&]token=)[^&]+/gi, "$1[redacted]")
+    .replace(/(^|&)token=[^&]+/gi, "$1token=[redacted]");
+}
+
+async function recordInvalidFeishuPayload(input: {
+  rawBody: string;
+  request: Request;
+  stage: "raw_parse" | "payload_parse";
+  wrapper?: FeishuEventPayload;
+}) {
+  await addFeishuEventBestEffort({
+    eventUuid: `invalid-${sha256Hex(`${input.stage}:${input.rawBody}`).slice(0, 32)}`,
+    eventType: "invalid_payload",
+    processingStatus: "failed",
+    payloadJson: {
+      stage: input.stage,
+      rawLength: input.rawBody.length,
+      rawPreview: rawPreview(input.rawBody),
+      contentType: input.request.headers.get("content-type"),
+      userAgent: input.request.headers.get("user-agent"),
+      wrapperKeys: input.wrapper ? Object.keys(input.wrapper) : undefined,
+      hasEncrypt: Boolean(input.wrapper?.encrypt),
+      encryptLength:
+        typeof input.wrapper?.encrypt === "string" ? input.wrapper.encrypt.length : undefined,
+    },
+    errorMessage: "Invalid Feishu event payload",
+  });
+  return cardToast("审批回调格式无法识别，已记录", "error");
+}
+
 async function addFeishuEventBestEffort(event: Parameters<typeof addFeishuEvent>[0]) {
   try {
     await addFeishuEvent(event);
@@ -204,6 +270,38 @@ function payloadVerificationToken(payload: FeishuEventPayload) {
 
 function isCardActionEventType(eventType?: string) {
   return eventType === "card.action.trigger" || eventType === "card.action.trigger_v1";
+}
+
+function scheduleTokenProvisionAfterResponse(input: {
+  request: TokenRequest;
+  eventUuid: string;
+  eventType?: string;
+  cardRequestId: string;
+  cardAction: string;
+  operatorOpenId: string;
+  messageId?: string;
+}) {
+  after(async () => {
+    try {
+      await provisionTokenForRequest(input.request);
+    } catch (err) {
+      await addFeishuEventBestEffort({
+        eventUuid: `${input.eventUuid}:provision`,
+        eventType: input.eventType,
+        cardRequestId: input.cardRequestId,
+        cardAction: input.cardAction,
+        operatorOpenId: input.operatorOpenId,
+        messageId: input.messageId,
+        processingStatus: "failed",
+        payloadJson: {
+          sourceEventUuid: input.eventUuid,
+          tokenRequestId: input.request.id,
+          source: "card_action_after_response_provisioning",
+        },
+        errorMessage: err instanceof Error ? err.message : "NewAPI token provisioning failed",
+      });
+    }
+  });
 }
 
 async function handleCardActionEvent(input: {
@@ -307,26 +405,33 @@ async function handleCardActionEvent(input: {
   }
 
   const normalizedAction = cardAction.toLowerCase();
+  const operatedAt = nowIso();
   if (normalizedAction === "approve" || normalizedAction === "approved") {
-    const approved = await updateTokenRequest(tokenRequest.id, { status: "approved" });
-    try {
-      await provisionTokenForRequest(approved ?? { ...tokenRequest, status: "approved" });
-    } catch (err) {
-      await addFeishuEventBestEffort({
-        eventUuid,
-        eventType,
-        cardRequestId,
-        cardAction,
-        operatorOpenId,
-        messageId,
-        processingStatus: "failed",
-        payloadJson: { encrypted, payload },
-        errorMessage: err instanceof Error ? err.message : "NewAPI token provisioning failed",
-      });
-      return cardToast("审批已通过，但发放失败，请到管理后台处理", "error");
-    }
+    const approved = await updateTokenRequest(tokenRequest.id, {
+      status: "approved",
+      approvalOperatorOpenId: operatorOpenId,
+      approvalOperatedAt: operatedAt,
+    });
+    scheduleTokenProvisionAfterResponse({
+      request: approved ?? {
+        ...tokenRequest,
+        status: "approved",
+        approvalOperatorOpenId: operatorOpenId,
+        approvalOperatedAt: operatedAt,
+      },
+      eventUuid,
+      eventType,
+      cardRequestId,
+      cardAction,
+      operatorOpenId,
+      messageId,
+    });
   } else if (normalizedAction === "reject" || normalizedAction === "rejected") {
-    await updateTokenRequest(tokenRequest.id, { status: "rejected" });
+    await updateTokenRequest(tokenRequest.id, {
+      status: "rejected",
+      approvalOperatorOpenId: operatorOpenId,
+      approvalOperatedAt: operatedAt,
+    });
   } else {
     await addFeishuEvent({
       eventUuid,
@@ -363,9 +468,9 @@ export async function POST(request: Request) {
   let encrypted = false;
   let wrapper: FeishuEventPayload;
   try {
-    wrapper = JSON.parse(rawBody) as FeishuEventPayload;
+    wrapper = parseRawFeishuPayload(rawBody, request.headers.get("content-type"));
   } catch {
-    return NextResponse.json({ error: "Invalid Feishu event payload" }, { status: 400 });
+    return recordInvalidFeishuPayload({ rawBody, request, stage: "raw_parse" });
   }
 
   const signatureOk = verifyFeishuEventSignature({
@@ -379,7 +484,12 @@ export async function POST(request: Request) {
     payload = parsed.payload;
     encrypted = parsed.encrypted;
   } catch {
-    return NextResponse.json({ error: "Invalid Feishu event payload" }, { status: 400 });
+    return recordInvalidFeishuPayload({
+      rawBody,
+      request,
+      stage: "payload_parse",
+      wrapper,
+    });
   }
 
   const wrapperTokenOk =
@@ -422,6 +532,9 @@ export async function POST(request: Request) {
     existingEvent &&
     ["processed", "ignored"].includes(existingEvent.processingStatus)
   ) {
+    if (isCardAction) {
+      return cardToast("该申请已处理", "success");
+    }
     return NextResponse.json({ ok: true, duplicate: true });
   }
 

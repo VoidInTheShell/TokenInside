@@ -28,10 +28,16 @@ export function decryptAes256CbcBase64(input: {
   keyMaterial: string;
 }) {
   const key = crypto.createHash("sha256").update(input.keyMaterial).digest();
-  const iv = key.subarray(0, 16);
-  const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
-  return Buffer.concat([
-    decipher.update(Buffer.from(input.ciphertextBase64, "base64")),
-    decipher.final(),
-  ]).toString("utf8");
+  const encrypted = Buffer.from(input.ciphertextBase64, "base64");
+
+  try {
+    const decipher = crypto.createDecipheriv("aes-256-cbc", key, encrypted.subarray(0, 16));
+    return Buffer.concat([
+      decipher.update(encrypted.subarray(16)),
+      decipher.final(),
+    ]).toString("utf8");
+  } catch (err) {
+    const decipher = crypto.createDecipheriv("aes-256-cbc", key, key.subarray(0, 16));
+    return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+  }
 }
