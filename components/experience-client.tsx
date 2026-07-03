@@ -2,15 +2,20 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  BarChart3Icon,
   CheckCircle2Icon,
   ClipboardCopyIcon,
+  HistoryIcon,
   KeyRoundIcon,
-  LayoutDashboardIcon,
   ListFilterIcon,
+  MenuIcon,
   RefreshCwIcon,
   SendIcon,
   ShieldCheckIcon,
+  SlidersHorizontalIcon,
   SparklesIcon,
+  XCircleIcon,
+  XIcon,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -44,6 +49,7 @@ type SessionResponse = {
     id: string;
     status: string;
     newapiTokenId?: string;
+    maskedKey?: string;
     billingPeriod: string;
     createdAt: string;
   };
@@ -80,7 +86,30 @@ type ModelsResponse = {
   error?: string;
 };
 
-type WorkspacePanel = "account" | "models";
+type QuickApprovalRequest = {
+  id: string;
+  requestType: string;
+  status: string;
+  reason: string;
+  requestedMonthlyQuota: number;
+  approvedMonthlyQuota?: number;
+  requesterName?: string;
+  requesterOpenId?: string;
+  errorMessage?: string;
+  updatedAt: string;
+  createdAt: string;
+};
+
+type AdminOverviewResponse = {
+  authenticated: boolean;
+  authorized: boolean;
+  error?: string;
+  overview?: {
+    latestRequests: QuickApprovalRequest[];
+  };
+};
+
+type WorkspacePanel = "account" | "usage" | "models" | "requests";
 
 const DEFAULT_REASON_PLACEHOLDER = "请说明使用场景、接入工具和预计调用方式。";
 const FALLBACK_MONTHLY_QUOTA = 200;
@@ -131,17 +160,33 @@ function scopeLabel(scope?: SessionResponse["adminScope"]) {
   return "部门管理";
 }
 
+function canDecideRequest(status: string) {
+  return [
+    "pending_card_send",
+    "pending_card_approval",
+    "approval_card_send_failed",
+    "approval_route_failed",
+    "pending_feishu_approval",
+    "approved_provision_failed",
+  ].includes(status);
+}
+
 export function ExperienceClient() {
   const [session, setSession] = useState<SessionResponse | null>(null);
   const [models, setModels] = useState<ModelsResponse["models"]>([]);
+  const [quickApproval, setQuickApproval] = useState<QuickApprovalRequest | null>(null);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [modelsLoading, setModelsLoading] = useState(false);
+  const [quickApprovalLoading, setQuickApprovalLoading] = useState(false);
+  const [quickApprovalBusy, setQuickApprovalBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [key, setKey] = useState<string | null>(null);
   const [reason, setReason] = useState("");
   const [quotaResetReason, setQuotaResetReason] = useState("");
+  const [quickApprovalQuotaDraft, setQuickApprovalQuotaDraft] = useState("");
   const [panel, setPanel] = useState<WorkspacePanel>("account");
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [feishuSdkReady, setFeishuSdkReady] = useState(false);
@@ -184,9 +229,46 @@ export function ExperienceClient() {
     }
   }, [session?.activeToken]);
 
+  const loadQuickApproval = useCallback(async () => {
+    if (!session?.adminScope) {
+      setQuickApproval(null);
+      setQuickApprovalQuotaDraft("");
+      return;
+    }
+
+    setQuickApprovalLoading(true);
+    try {
+      const res = await fetch("/api/admin/overview?mode=soft", { cache: "no-store" });
+      const data = (await res.json()) as AdminOverviewResponse;
+      if (!res.ok || (data.error && data.authenticated)) {
+        throw new Error(data.error ?? "读取最新审批请求失败");
+      }
+      const latestRequest =
+        data.overview?.latestRequests.find((request) => canDecideRequest(request.status)) ??
+        data.overview?.latestRequests[0] ??
+        null;
+      setQuickApproval(latestRequest);
+      setQuickApprovalQuotaDraft(
+        latestRequest
+          ? String(latestRequest.approvedMonthlyQuota ?? latestRequest.requestedMonthlyQuota)
+          : "",
+      );
+    } catch (err) {
+      setQuickApproval(null);
+      setQuickApprovalQuotaDraft("");
+      setError(err instanceof Error ? err.message : "读取最新审批请求失败");
+    } finally {
+      setQuickApprovalLoading(false);
+    }
+  }, [session?.adminScope]);
+
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    void loadQuickApproval();
+  }, [loadQuickApproval]);
 
   useEffect(() => {
     if (panel === "models" && session?.activeToken && !modelsLoaded && !modelsLoading) {
@@ -202,6 +284,12 @@ export function ExperienceClient() {
   const currentBillingPeriod = session?.billingPeriod ?? null;
   const currentBillingPeriodName =
     currentBillingPeriod?.period ?? session?.activeToken?.billingPeriod ?? "-";
+  const quickApprovalCanDecide = quickApproval ? canDecideRequest(quickApproval.status) : false;
+
+  function selectPanel(nextPanel: WorkspacePanel) {
+    setPanel(nextPanel);
+    setMobileNavOpen(false);
+  }
 
   const connectFeishu = useCallback(async () => {
     setError(null);
@@ -258,11 +346,21 @@ export function ExperienceClient() {
     setError(null);
     setMessage(null);
     try {
-      const res = await fetch("/api/token/key", { cache: "no-store" });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.error ?? "读取 key 失败");
-      setKey(body.key);
-      setMessage("已读取当前 active key。");
+      let fullKey = key;
+      if (!fullKey) {
+        const res = await fetch("/api/token/key", { cache: "no-store" });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.error ?? "读取 key 失败");
+        fullKey = body.key;
+      }
+      if (!fullKey) throw new Error("读取 key 失败");
+      setKey(fullKey);
+      try {
+        await navigator.clipboard.writeText(fullKey);
+        setMessage("已复制并展示当前 active key。");
+      } catch {
+        setMessage("已展示当前 active key，浏览器未允许自动复制。");
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "读取 key 失败");
     } finally {
@@ -322,6 +420,41 @@ export function ExperienceClient() {
     setMessage("已复制 Base URL。");
   }
 
+  async function decideQuickApproval(action: "approve" | "reject") {
+    if (!quickApproval) return;
+
+    const approvedMonthlyQuota = Number(quickApprovalQuotaDraft);
+    if (action === "approve" && (!Number.isInteger(approvedMonthlyQuota) || approvedMonthlyQuota <= 0)) {
+      setError("通过审批前需要填写正整数最终额度");
+      return;
+    }
+
+    setQuickApprovalBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(
+        `/api/admin/token-requests/${encodeURIComponent(quickApproval.id)}/decision`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            action,
+            approvedMonthlyQuota: action === "approve" ? approvedMonthlyQuota : undefined,
+          }),
+        },
+      );
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "处理审批失败");
+      setMessage(action === "approve" ? "最新审批请求已通过，已触发发放。" : "最新审批请求已拒绝。");
+      await Promise.all([refresh(), loadQuickApproval()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "处理审批失败");
+    } finally {
+      setQuickApprovalBusy(false);
+    }
+  }
+
   return (
     <>
       <FeishuSdkScript
@@ -329,40 +462,77 @@ export function ExperienceClient() {
         onError={(sdkError) => setError(sdkError)}
       />
       <div className="app-shell">
-        <aside className="sidebar">
-          <div className="brand">
-            <div className="brand-mark">TI</div>
-            <div>
-              <h1 className="brand-title">TokenInside</h1>
-              <p className="brand-subtitle">Feishu + NewAPI</p>
+        <aside className={mobileNavOpen ? "sidebar sidebar-open" : "sidebar"}>
+          <div className="sidebar-head">
+            <div className="brand">
+              <div className="brand-mark">TI</div>
+              <div>
+                <h1 className="brand-title">TokenInside</h1>
+                <p className="brand-subtitle">Feishu + NewAPI</p>
+              </div>
             </div>
+            <button
+              className="sidebar-toggle"
+              type="button"
+              aria-label={mobileNavOpen ? "收起菜单" : "展开菜单"}
+              aria-expanded={mobileNavOpen}
+              onClick={() => setMobileNavOpen((open) => !open)}
+            >
+              {mobileNavOpen ? <XIcon /> : <MenuIcon />}
+            </button>
           </div>
 
-          <nav className="nav-list" aria-label="主导航">
-            <button
-              className={panel === "account" ? "nav-item active nav-button" : "nav-item nav-button"}
-              type="button"
-              onClick={() => setPanel("account")}
-            >
-              <KeyRoundIcon data-icon="inline-start" />
-              {title}
-            </button>
-            {hasActiveToken && (
+          <div className="sidebar-menu">
+            <nav className="nav-list" aria-label="用户后台菜单">
               <button
-                className={panel === "models" ? "nav-item active nav-button" : "nav-item nav-button"}
+                className={panel === "account" ? "nav-item active nav-button" : "nav-item nav-button"}
                 type="button"
-                onClick={() => setPanel("models")}
+                onClick={() => selectPanel("account")}
               >
-                <ListFilterIcon data-icon="inline-start" />
-                模型列表
+                <KeyRoundIcon data-icon="inline-start" />
+                {hasActiveToken ? "账户密钥" : title}
               </button>
-            )}
-          </nav>
+              {hasActiveToken && (
+                <>
+                  <button
+                    className={panel === "usage" ? "nav-item active nav-button" : "nav-item nav-button"}
+                    type="button"
+                    onClick={() => selectPanel("usage")}
+                  >
+                    <BarChart3Icon data-icon="inline-start" />
+                    额度用量
+                  </button>
+                  <button
+                    className={panel === "models" ? "nav-item active nav-button" : "nav-item nav-button"}
+                    type="button"
+                    onClick={() => selectPanel("models")}
+                  >
+                    <ListFilterIcon data-icon="inline-start" />
+                    模型列表
+                  </button>
+                  <button
+                    className={panel === "requests" ? "nav-item active nav-button" : "nav-item nav-button"}
+                    type="button"
+                    onClick={() => selectPanel("requests")}
+                  >
+                    <HistoryIcon data-icon="inline-start" />
+                    申请记录
+                  </button>
+                </>
+              )}
+              {session?.adminScope && (
+                <a className="nav-item" href="/admin">
+                  <ShieldCheckIcon data-icon="inline-start" />
+                  管理后台
+                </a>
+              )}
+            </nav>
 
-          <div className="sidebar-footer">
-            {session?.adminScope
-              ? `管理范围：${scopeLabel(session.adminScope)}`
-              : "当前入口按飞书身份自动识别。"}
+            <div className="sidebar-footer">
+              {session?.adminScope
+                ? `管理范围：${scopeLabel(session.adminScope)}`
+                : "当前入口按飞书身份自动识别。"}
+            </div>
           </div>
         </aside>
 
@@ -438,6 +608,112 @@ export function ExperienceClient() {
             </CardContent>
           </Card>
 
+          {session?.adminScope && (
+            <Card>
+              <CardHeader>
+                <CardTitle>最新审批请求</CardTitle>
+                <CardDescription>
+                  {quickApproval
+                    ? `更新时间：${formatDateTime(quickApproval.updatedAt)}`
+                    : "当前管理范围内暂无可处理申请。"}
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                {quickApprovalLoading ? (
+                  <div className="empty">读取最新审批请求中</div>
+                ) : !quickApproval ? (
+                  <div className="empty">暂无审批请求</div>
+                ) : (
+                  <div className="quick-approval">
+                    <div className="quick-approval-main">
+                      <div className="meta-list">
+                        <div className="meta-row">
+                          <span>申请人</span>
+                          <strong>
+                            {quickApproval.requesterName ?? maskSecret(quickApproval.requesterOpenId)}
+                          </strong>
+                        </div>
+                        <div className="meta-row">
+                          <span>类型</span>
+                          <strong>
+                            {requestTypeLabel[quickApproval.requestType] ?? quickApproval.requestType}
+                          </strong>
+                        </div>
+                        <div className="meta-row">
+                          <span>状态</span>
+                          <Badge variant={badgeVariant(quickApproval.status)}>
+                            {statusLabel[quickApproval.status] ?? quickApproval.status}
+                          </Badge>
+                        </div>
+                        <div className="meta-row">
+                          <span>申请额度</span>
+                          <strong>{quickApproval.requestedMonthlyQuota}</strong>
+                        </div>
+                        <div className="meta-row">
+                          <span>申请理由</span>
+                          <strong>{quickApproval.reason || "-"}</strong>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="quick-approval-actions">
+                      <div className="field">
+                        <label htmlFor="quickApprovalQuota">最终额度</label>
+                        <div className="quota-control">
+                          <Input
+                            id="quickApprovalQuota"
+                            min={1}
+                            step={1}
+                            type="number"
+                            value={quickApprovalQuotaDraft}
+                            onChange={(event) => setQuickApprovalQuotaDraft(event.target.value)}
+                            disabled={!quickApprovalCanDecide || quickApprovalBusy}
+                          />
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={!quickApprovalCanDecide || quickApprovalBusy}
+                            onClick={() => void decideQuickApproval("approve")}
+                          >
+                            <CheckCircle2Icon data-icon="inline-start" />
+                            通过
+                          </Button>
+                        </div>
+                        <span className="field-description">
+                          {quickApprovalCanDecide ? "通过时会按最终额度发放或更新。" : "该请求当前不可直接审批。"}
+                        </span>
+                      </div>
+                      <div className="toolbar toolbar-left">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={!quickApprovalCanDecide || quickApprovalBusy}
+                          onClick={() => void decideQuickApproval("reject")}
+                        >
+                          <XCircleIcon data-icon="inline-start" />
+                          拒绝
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={quickApprovalLoading || quickApprovalBusy}
+                          onClick={() => void loadQuickApproval()}
+                        >
+                          <RefreshCwIcon data-icon="inline-start" />
+                          刷新
+                        </Button>
+                        <a className="button button-outline button-sm" href="/admin">
+                          <SlidersHorizontalIcon data-icon="inline-start" />
+                          进入审批
+                        </a>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
+
           {!hasActiveToken ? (
             <Card>
               <CardHeader>
@@ -487,24 +763,7 @@ export function ExperienceClient() {
             </Card>
           ) : (
             <>
-              <div className="subnav" aria-label="用户后台菜单">
-                <Button
-                  variant={panel === "account" ? "default" : "outline"}
-                  onClick={() => setPanel("account")}
-                >
-                  <LayoutDashboardIcon data-icon="inline-start" />
-                  账户
-                </Button>
-                <Button
-                  variant={panel === "models" ? "default" : "outline"}
-                  onClick={() => setPanel("models")}
-                >
-                  <ListFilterIcon data-icon="inline-start" />
-                  模型列表
-                </Button>
-              </div>
-
-              {panel === "account" ? (
+              {panel === "account" && (
                 <section className="grid grid-2">
                   <Card>
                     <CardHeader>
@@ -525,7 +784,7 @@ export function ExperienceClient() {
                       <div className="field">
                         <label>NewAPI key</label>
                         <div className="key-box">
-                          <span>{key ? maskSecret(key) : maskSecret(session?.activeToken?.newapiTokenId)}</span>
+                          <span>{key ?? session?.activeToken?.maskedKey ?? "已发放"}</span>
                           <div className="key-actions">
                             <Button
                               variant="outline"
@@ -565,7 +824,11 @@ export function ExperienceClient() {
                       </div>
                     </CardContent>
                   </Card>
+                </section>
+              )}
 
+              {panel === "usage" && (
+                <section className="grid grid-2">
                   <Card>
                     <CardHeader>
                       <CardTitle>当前账期</CardTitle>
@@ -637,7 +900,9 @@ export function ExperienceClient() {
                     </CardContent>
                   </Card>
                 </section>
-              ) : (
+              )}
+
+              {panel === "models" && (
                 <Card>
                   <CardHeader>
                     <CardTitle>模型列表</CardTitle>
@@ -673,27 +938,43 @@ export function ExperienceClient() {
                 </Card>
               )}
 
-              {latestRequest && (
+              {panel === "requests" && (
                 <Card>
                   <CardHeader>
-                    <CardTitle>最近申请</CardTitle>
-                    <CardDescription>状态更新时间：{formatDateTime(latestRequest.updatedAt)}</CardDescription>
+                    <CardTitle>申请记录</CardTitle>
+                    <CardDescription>
+                      {latestRequest
+                        ? `状态更新时间：${formatDateTime(latestRequest.updatedAt)}`
+                        : "当前用户暂无申请记录。"}
+                    </CardDescription>
                   </CardHeader>
                   <CardContent>
-                    <div className="meta-list">
-                      <div className="meta-row">
-                        <span>类型</span>
-                        <strong>
-                          {requestTypeLabel[latestRequest.requestType] ?? latestRequest.requestType}
-                        </strong>
+                    {!latestRequest ? (
+                      <div className="empty">暂无申请记录</div>
+                    ) : (
+                      <div className="meta-list">
+                        <div className="meta-row">
+                          <span>类型</span>
+                          <strong>
+                            {requestTypeLabel[latestRequest.requestType] ?? latestRequest.requestType}
+                          </strong>
+                        </div>
+                        <div className="meta-row">
+                          <span>状态</span>
+                          <Badge variant={badgeVariant(latestRequest.status)}>
+                            {statusLabel[latestRequest.status] ?? latestRequest.status}
+                          </Badge>
+                        </div>
+                        <div className="meta-row">
+                          <span>申请理由</span>
+                          <strong>{latestRequest.reason || "-"}</strong>
+                        </div>
+                        <div className="meta-row">
+                          <span>创建时间</span>
+                          <strong>{formatDateTime(latestRequest.createdAt)}</strong>
+                        </div>
                       </div>
-                      <div className="meta-row">
-                        <span>状态</span>
-                        <Badge variant={badgeVariant(latestRequest.status)}>
-                          {statusLabel[latestRequest.status] ?? latestRequest.status}
-                        </Badge>
-                      </div>
-                    </div>
+                    )}
                   </CardContent>
                 </Card>
               )}

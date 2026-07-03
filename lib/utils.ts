@@ -21,3 +21,9 @@ export function maskSecret(value?: string | null) {
   if (value.length <= 12) return value;
   return `${value.slice(0, 7)}...${value.slice(-5)}`;
 }
+
+export function maskApiKey(value?: string | null) {
+  if (!value) return "未发放";
+  if (value.length <= 14) return value;
+  return `${value.slice(0, 8)}...${value.slice(-6)}`;
+}

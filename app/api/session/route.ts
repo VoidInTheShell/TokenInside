@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getEffectiveAdminScopeForUser, hydrateUserDepartment } from "@/lib/admin-sync";
 import { getConfig } from "@/lib/config";
+import { getNewApiTokenKey } from "@/lib/newapi";
 import { getCurrentUser } from "@/lib/session";
 import {
   getActiveTokenForUser,
@@ -8,6 +9,7 @@ import {
   getUserBillingPeriod,
   listUserTokenRequests,
 } from "@/lib/store";
+import { maskApiKey } from "@/lib/utils";
 
 export const runtime = "nodejs";
 
@@ -34,6 +36,22 @@ export async function GET() {
   const billingPeriod = activeToken
     ? await getUserBillingPeriod(user.id, activeToken.billingPeriod)
     : null;
+  let activeTokenResponse:
+    | (typeof activeToken & {
+        maskedKey?: string;
+      })
+    | null = activeToken;
+  if (activeToken?.newapiTokenId) {
+    try {
+      const key = await getNewApiTokenKey(activeToken.newapiTokenId);
+      activeTokenResponse = {
+        ...activeToken,
+        maskedKey: maskApiKey(key),
+      };
+    } catch {
+      activeTokenResponse = { ...activeToken };
+    }
+  }
   return NextResponse.json({
     authenticated: true,
     baseUrl: config.publicBaseUrl,
@@ -46,7 +64,7 @@ export async function GET() {
       openId: user.openId,
       departmentId: user.departmentId,
     },
-    activeToken,
+    activeToken: activeTokenResponse,
     billingPeriod,
     adminScope: adminScope
       ? {

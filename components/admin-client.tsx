@@ -2,17 +2,18 @@
 
 import { useCallback, useEffect, useState } from "react";
 import {
-  ActivityIcon,
   ArrowLeftIcon,
+  BarChart3Icon,
   CheckCircle2Icon,
-  KeyRoundIcon,
+  ClipboardListIcon,
+  GaugeIcon,
+  MenuIcon,
   RefreshCwIcon,
-  RouteIcon,
   SaveIcon,
-  ShieldCheckIcon,
   SlidersHorizontalIcon,
   UsersRoundIcon,
   XCircleIcon,
+  XIcon,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -127,6 +128,8 @@ type AdminOverviewResponse = {
 
 type AdminScopeSummary = NonNullable<AdminOverviewResponse["overview"]>["scope"];
 
+type AdminPanel = "overview" | "approvals" | "quotas" | "quotaStats" | "usageLogs";
+
 const statusLabel: Record<string, string> = {
   pending_card_send: "发送审批卡片中",
   pending_card_approval: "卡片审批中",
@@ -194,6 +197,8 @@ export function AdminClient() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [panel, setPanel] = useState<AdminPanel>("overview");
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [defaultQuotaDraft, setDefaultQuotaDraft] = useState("200");
   const [quotaDrafts, setQuotaDrafts] = useState<Record<string, string>>({});
   const [feishuSdkReady, setFeishuSdkReady] = useState(false);
@@ -385,6 +390,12 @@ export function AdminClient() {
 
   const overview = data?.overview;
   const totals = overview?.totals;
+
+  function selectPanel(nextPanel: AdminPanel) {
+    setPanel(nextPanel);
+    setMobileNavOpen(false);
+  }
+
   return (
     <>
       <FeishuSdkScript
@@ -392,36 +403,73 @@ export function AdminClient() {
         onError={(sdkError) => setError(sdkError)}
       />
       <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">TI</div>
-          <div>
-            <h1 className="brand-title">TokenInside</h1>
-            <p className="brand-subtitle">Admin Workspace</p>
+      <aside className={mobileNavOpen ? "sidebar sidebar-open" : "sidebar"}>
+        <div className="sidebar-head">
+          <div className="brand">
+            <div className="brand-mark">TI</div>
+            <div>
+              <h1 className="brand-title">TokenInside</h1>
+              <p className="brand-subtitle">Admin Workspace</p>
+            </div>
           </div>
+          <button
+            className="sidebar-toggle"
+            type="button"
+            aria-label={mobileNavOpen ? "收起菜单" : "展开菜单"}
+            aria-expanded={mobileNavOpen}
+            onClick={() => setMobileNavOpen((open) => !open)}
+          >
+            {mobileNavOpen ? <XIcon /> : <MenuIcon />}
+          </button>
         </div>
 
-        <nav className="nav-list" aria-label="主导航">
-          <a className="nav-item" href="/">
-            <KeyRoundIcon data-icon="inline-start" />
-            Token 控制台
-          </a>
-          <a className="nav-item active" href="/admin">
-            <ShieldCheckIcon data-icon="inline-start" />
-            管理后台
-          </a>
-          <div className="nav-item">
-            <RouteIcon data-icon="inline-start" />
-            /v1 透传网关
-          </div>
-          <div className="nav-item">
-            <ActivityIcon data-icon="inline-start" />
-            审计与用量
-          </div>
-        </nav>
+        <div className="sidebar-menu">
+          <nav className="nav-list" aria-label="管理后台菜单">
+            <button
+              className={panel === "overview" ? "nav-item active nav-button" : "nav-item nav-button"}
+              type="button"
+              onClick={() => selectPanel("overview")}
+            >
+              <GaugeIcon data-icon="inline-start" />
+              状态总览
+            </button>
+            <button
+              className={panel === "approvals" ? "nav-item active nav-button" : "nav-item nav-button"}
+              type="button"
+              onClick={() => selectPanel("approvals")}
+            >
+              <ClipboardListIcon data-icon="inline-start" />
+              请求审批
+            </button>
+            <button
+              className={panel === "quotas" ? "nav-item active nav-button" : "nav-item nav-button"}
+              type="button"
+              onClick={() => selectPanel("quotas")}
+            >
+              <SlidersHorizontalIcon data-icon="inline-start" />
+              额度管理
+            </button>
+            <button
+              className={panel === "quotaStats" ? "nav-item active nav-button" : "nav-item nav-button"}
+              type="button"
+              onClick={() => selectPanel("quotaStats")}
+            >
+              <UsersRoundIcon data-icon="inline-start" />
+              额度统计
+            </button>
+            <button
+              className={panel === "usageLogs" ? "nav-item active nav-button" : "nav-item nav-button"}
+              type="button"
+              onClick={() => selectPanel("usageLogs")}
+            >
+              <BarChart3Icon data-icon="inline-start" />
+              使用记录
+            </button>
+          </nav>
 
-        <div className="sidebar-footer">
-          管理入口只复用当前飞书会话；管理范围由服务端保存的 TokenInside 管理范围记录决定。
+          <div className="sidebar-footer">
+            管理入口只复用当前飞书会话；管理范围由服务端保存的 TokenInside 管理范围记录决定。
+          </div>
         </div>
       </aside>
 
@@ -497,343 +545,230 @@ export function AdminClient() {
         {error && <div className="alert alert-danger">{error}</div>}
         {message && <div className="alert">{message}</div>}
 
-        <section className="grid grid-4">
-          <Card>
-            <CardContent>
-              <div className="metric">
-                <span className="metric-label">管理用户</span>
-                <span className="metric-value">{totals?.users ?? 0}</span>
-              </div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent>
-              <div className="metric">
-                <span className="metric-label">待审批</span>
-                <span className="metric-value">{totals?.pendingRequests ?? 0}</span>
-              </div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent>
-              <div className="metric">
-                <span className="metric-label">active key</span>
-                <span className="metric-value">{totals?.activeTokens ?? 0}</span>
-              </div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent>
-              <div className="metric">
-                <span className="metric-label">代理审计日志</span>
-                <span className="metric-value">{totals?.proxyLogs ?? 0}</span>
-              </div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent>
-              <div className="metric">
-                <span className="metric-label">总 tokens</span>
-                <span className="metric-value">{totals?.totalTokens ?? 0}</span>
-              </div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent>
-              <div className="metric">
-                <span className="metric-label">当前账期 tokens</span>
-                <span className="metric-value">{totals?.currentPeriodTotalTokens ?? 0}</span>
-              </div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent>
-              <div className="metric">
-                <span className="metric-label">当前账期额度</span>
-                <span className="metric-value">{totals?.currentPeriodMonthlyQuota ?? 0}</span>
-              </div>
-            </CardContent>
-          </Card>
-        </section>
-
-        <section className="grid grid-2">
-          <Card>
-            <CardHeader>
-              <CardTitle>管理范围</CardTitle>
-              <CardDescription>服务端基于当前飞书用户匹配 TokenInside 管理范围记录。</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="meta-list">
-                <div className="meta-row">
-                  <span>授权状态</span>
-                  <Badge variant={data?.authorized ? "success" : "warning"}>
-                    {data?.authorized ? "已授权" : "未授权"}
-                  </Badge>
-                </div>
-                <div className="meta-row">
-                  <span>范围</span>
-                  <strong>{scopeLabel(overview?.scope)}</strong>
-                </div>
-                <div className="meta-row">
-                  <span>来源</span>
-                  <strong>{overview?.scope.source ?? "-"}</strong>
-                </div>
-                <div className="meta-row">
-                  <span>当前用户</span>
-                  <strong>{data?.user ? (data.user.name ?? maskSecret(data.user.openId)) : "-"}</strong>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>状态概览</CardTitle>
-              <CardDescription>审批与发放状态来自 TokenInside 本地状态机。</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="meta-list">
-                <div className="meta-row">
-                  <span>申请总数</span>
-                  <strong>{totals?.tokenRequests ?? 0}</strong>
-                </div>
-                <div className="meta-row">
-                  <span>已发放</span>
-                  <strong>{totals?.provisionedRequests ?? 0}</strong>
-                </div>
-                <div className="meta-row">
-                  <span>发放失败</span>
-                  <strong>{totals?.failedRequests ?? 0}</strong>
-                </div>
-                <div className="meta-row">
-                  <span>输入 tokens</span>
-                  <strong>{totals?.promptTokens ?? 0}</strong>
-                </div>
-                <div className="meta-row">
-                  <span>输出 tokens</span>
-                  <strong>{totals?.completionTokens ?? 0}</strong>
-                </div>
-                <div className="meta-row">
-                  <span>当前账期</span>
-                  <strong>{totals?.currentBillingPeriod ?? "-"}</strong>
-                </div>
-                <div className="meta-row">
-                  <span>账期请求</span>
-                  <strong>{totals?.currentPeriodProxyLogs ?? 0}</strong>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>额度配置</CardTitle>
-              <CardDescription>申请单会保存提交时的默认额度快照。</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="field-group">
-                <div className="field">
-                  <label htmlFor="defaultMonthlyQuota">默认申请额度</label>
-                  <div className="quota-control">
-                    <Input
-                      id="defaultMonthlyQuota"
-                      min={1}
-                      step={1}
-                      type="number"
-                      value={defaultQuotaDraft}
-                      onChange={(event) => setDefaultQuotaDraft(event.target.value)}
-                      disabled={!data?.authorized || busy}
-                    />
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={!data?.authorized || busy}
-                      onClick={() => void saveDefaultQuota()}
-                    >
-                      <SaveIcon data-icon="inline-start" />
-                      保存
-                    </Button>
+        {panel === "overview" && (
+          <>
+            <section className="grid grid-4">
+              <Card>
+                <CardContent>
+                  <div className="metric">
+                    <span className="metric-label">管理用户</span>
+                    <span className="metric-value">{totals?.users ?? 0}</span>
                   </div>
-                  <span className="field-description">
-                    当前值：{data?.settings?.defaultMonthlyQuota ?? 200}
-                  </span>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        </section>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardContent>
+                  <div className="metric">
+                    <span className="metric-label">待审批</span>
+                    <span className="metric-value">{totals?.pendingRequests ?? 0}</span>
+                  </div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardContent>
+                  <div className="metric">
+                    <span className="metric-label">active key</span>
+                    <span className="metric-value">{totals?.activeTokens ?? 0}</span>
+                  </div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardContent>
+                  <div className="metric">
+                    <span className="metric-label">代理请求</span>
+                    <span className="metric-value">{totals?.proxyLogs ?? 0}</span>
+                  </div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardContent>
+                  <div className="metric">
+                    <span className="metric-label">总 tokens</span>
+                    <span className="metric-value">{totals?.totalTokens ?? 0}</span>
+                  </div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardContent>
+                  <div className="metric">
+                    <span className="metric-label">当前账期 tokens</span>
+                    <span className="metric-value">{totals?.currentPeriodTotalTokens ?? 0}</span>
+                  </div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardContent>
+                  <div className="metric">
+                    <span className="metric-label">当前账期额度</span>
+                    <span className="metric-value">{totals?.currentPeriodMonthlyQuota ?? 0}</span>
+                  </div>
+                </CardContent>
+              </Card>
+            </section>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>最新申请</CardTitle>
-            <CardDescription>仅展示当前管理范围内的申请记录，不显示 NewAPI 明文 key。</CardDescription>
-          </CardHeader>
-          <CardContent>
-            {!overview?.latestRequests.length ? (
-              <div className="empty">
-                <UsersRoundIcon data-icon="inline-start" />
-                暂无可查看申请
-              </div>
-            ) : (
-              <div className="table-wrap">
-                <table className="table">
-                  <thead>
-                    <tr>
-                      <th>申请人</th>
-                      <th>类型</th>
-                      <th>状态</th>
-                      <th>额度</th>
-                      <th>最终额度</th>
-                      <th>审批消息</th>
-                      <th>错误</th>
-                      <th>更新时间</th>
-                      <th>操作</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {overview.latestRequests.map((request) => (
-                      <tr key={request.id}>
-                        <td>{request.requesterName ?? maskSecret(request.requesterOpenId)}</td>
-                        <td>{requestTypeLabel[request.requestType] ?? request.requestType}</td>
-                        <td>
-                          <Badge variant={badgeVariant(request.status)}>
-                            {statusLabel[request.status] ?? request.status}
-                          </Badge>
-                        </td>
-                        <td>{request.requestedMonthlyQuota}</td>
-                        <td>
-                          <div className="quota-control">
-                            <Input
-                              aria-label="最终额度"
-                              min={1}
-                              step={1}
-                              type="number"
-                              value={quotaDrafts[request.id] ?? String(request.requestedMonthlyQuota)}
-                              onChange={(event) =>
-                                setQuotaDrafts((current) => ({
-                                  ...current,
-                                  [request.id]: event.target.value,
-                                }))
-                              }
-                              disabled={!canEditQuota(request.status) || busy}
-                            />
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={!canEditQuota(request.status) || busy}
-                              onClick={() => void saveRequestQuota(request.id)}
-                            >
-                              <SlidersHorizontalIcon data-icon="inline-start" />
-                              保存
-                            </Button>
-                          </div>
-                        </td>
-                        <td>{maskSecret(request.approvalCardMessageId ?? request.approvalInstanceCode)}</td>
-                        <td>{request.errorMessage ? maskSecret(request.errorMessage) : "-"}</td>
-                        <td>{formatDateTime(request.updatedAt)}</td>
-                        <td>
-                          <div className="toolbar toolbar-left">
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={!canDecideRequest(request.status) || busy}
-                              onClick={() => void decideRequest(request.id, "approve")}
-                            >
-                              <CheckCircle2Icon data-icon="inline-start" />
-                              通过
-                            </Button>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={!canDecideRequest(request.status) || busy}
-                              onClick={() => void decideRequest(request.id, "reject")}
-                            >
-                              <XCircleIcon data-icon="inline-start" />
-                              拒绝
-                            </Button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </CardContent>
-        </Card>
+            <section className="grid grid-2">
+              <Card>
+                <CardHeader>
+                  <CardTitle>管理范围</CardTitle>
+                  <CardDescription>服务端基于当前飞书用户匹配 TokenInside 管理范围记录。</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="meta-list">
+                    <div className="meta-row">
+                      <span>授权状态</span>
+                      <Badge variant={data?.authorized ? "success" : "warning"}>
+                        {data?.authorized ? "已授权" : "未授权"}
+                      </Badge>
+                    </div>
+                    <div className="meta-row">
+                      <span>范围</span>
+                      <strong>{scopeLabel(overview?.scope)}</strong>
+                    </div>
+                    <div className="meta-row">
+                      <span>来源</span>
+                      <strong>{overview?.scope.source ?? "-"}</strong>
+                    </div>
+                    <div className="meta-row">
+                      <span>当前用户</span>
+                      <strong>{data?.user ? (data.user.name ?? maskSecret(data.user.openId)) : "-"}</strong>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
 
-        <section className="grid grid-2">
+              <Card>
+                <CardHeader>
+                  <CardTitle>状态概览</CardTitle>
+                  <CardDescription>审批与发放状态来自 TokenInside 本地状态机。</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="meta-list">
+                    <div className="meta-row">
+                      <span>申请总数</span>
+                      <strong>{totals?.tokenRequests ?? 0}</strong>
+                    </div>
+                    <div className="meta-row">
+                      <span>已发放</span>
+                      <strong>{totals?.provisionedRequests ?? 0}</strong>
+                    </div>
+                    <div className="meta-row">
+                      <span>发放失败</span>
+                      <strong>{totals?.failedRequests ?? 0}</strong>
+                    </div>
+                    <div className="meta-row">
+                      <span>输入 tokens</span>
+                      <strong>{totals?.promptTokens ?? 0}</strong>
+                    </div>
+                    <div className="meta-row">
+                      <span>输出 tokens</span>
+                      <strong>{totals?.completionTokens ?? 0}</strong>
+                    </div>
+                    <div className="meta-row">
+                      <span>当前账期</span>
+                      <strong>{totals?.currentBillingPeriod ?? "-"}</strong>
+                    </div>
+                    <div className="meta-row">
+                      <span>账期请求</span>
+                      <strong>{totals?.currentPeriodProxyLogs ?? 0}</strong>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            </section>
+          </>
+        )}
+
+        {panel === "approvals" && (
           <Card>
             <CardHeader>
-              <CardTitle>可见用户</CardTitle>
-              <CardDescription>按当前管理范围过滤后的用户、申请和代理日志摘要。</CardDescription>
+              <CardTitle>请求审批</CardTitle>
+              <CardDescription>仅展示当前管理范围内的申请记录，不显示 NewAPI 明文 key。</CardDescription>
             </CardHeader>
             <CardContent>
-              {!overview?.users.length ? (
-                <div className="empty">暂无可见用户</div>
+              {!overview?.latestRequests.length ? (
+                <div className="empty">
+                  <UsersRoundIcon data-icon="inline-start" />
+                  暂无可查看申请
+                </div>
               ) : (
                 <div className="table-wrap">
                   <table className="table">
                     <thead>
                       <tr>
-                        <th>用户</th>
-                        <th>active key</th>
-                        <th>申请</th>
-                        <th>日志</th>
-                        <th>tokens</th>
-                        <th>账期</th>
-                        <th>账期 tokens</th>
-                        <th>调额</th>
+                        <th>申请人</th>
+                        <th>类型</th>
+                        <th>状态</th>
+                        <th>额度</th>
+                        <th>最终额度</th>
+                        <th>审批消息</th>
+                        <th>错误</th>
                         <th>更新时间</th>
+                        <th>操作</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {overview.users.map((user) => (
-                        <tr key={user.id}>
-                          <td>{user.name ?? maskSecret(user.openId)}</td>
-                          <td>{user.activeTokenStatus ?? "-"}</td>
-                          <td>{user.requestCount}</td>
-                          <td>{user.proxyLogCount}</td>
-                          <td>{user.totalTokens ?? 0}</td>
+                      {overview.latestRequests.map((request) => (
+                        <tr key={request.id}>
+                          <td>{request.requesterName ?? maskSecret(request.requesterOpenId)}</td>
+                          <td>{requestTypeLabel[request.requestType] ?? request.requestType}</td>
                           <td>
-                            <div className="meta-stack">
-                              <strong>{user.billingPeriod ?? "-"}</strong>
-                              <span>额度 {user.billingMonthlyQuota ?? "-"}</span>
-                            </div>
+                            <Badge variant={badgeVariant(request.status)}>
+                              {statusLabel[request.status] ?? request.status}
+                            </Badge>
                           </td>
-                          <td>
-                            <div className="meta-stack">
-                              <strong>{user.billingTotalTokens ?? 0}</strong>
-                              <span>{user.billingProxyLogCount ?? 0} 次</span>
-                            </div>
-                          </td>
+                          <td>{request.requestedMonthlyQuota}</td>
                           <td>
                             <div className="quota-control">
                               <Input
+                                aria-label="最终额度"
                                 min={1}
                                 step={1}
                                 type="number"
-                                value={quotaDrafts[user.id] ?? ""}
-                                placeholder="额度"
+                                value={quotaDrafts[request.id] ?? String(request.requestedMonthlyQuota)}
                                 onChange={(event) =>
                                   setQuotaDrafts((current) => ({
                                     ...current,
-                                    [user.id]: event.target.value,
+                                    [request.id]: event.target.value,
                                   }))
                                 }
-                                disabled={busy || user.activeTokenStatus !== "active"}
+                                disabled={!canEditQuota(request.status) || busy}
                               />
                               <Button
                                 variant="outline"
                                 size="sm"
-                                disabled={busy || user.activeTokenStatus !== "active"}
-                                onClick={() => void adjustUserQuota(user.id)}
+                                disabled={!canEditQuota(request.status) || busy}
+                                onClick={() => void saveRequestQuota(request.id)}
                               >
-                                调整
+                                <SlidersHorizontalIcon data-icon="inline-start" />
+                                保存
                               </Button>
                             </div>
                           </td>
-                          <td>{formatDateTime(user.updatedAt)}</td>
+                          <td>{maskSecret(request.approvalCardMessageId ?? request.approvalInstanceCode)}</td>
+                          <td>{request.errorMessage ? maskSecret(request.errorMessage) : "-"}</td>
+                          <td>{formatDateTime(request.updatedAt)}</td>
+                          <td>
+                            <div className="toolbar toolbar-left">
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={!canDecideRequest(request.status) || busy}
+                                onClick={() => void decideRequest(request.id, "approve")}
+                              >
+                                <CheckCircle2Icon data-icon="inline-start" />
+                                通过
+                              </Button>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={!canDecideRequest(request.status) || busy}
+                                onClick={() => void decideRequest(request.id, "reject")}
+                              >
+                                <XCircleIcon data-icon="inline-start" />
+                                拒绝
+                              </Button>
+                            </div>
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -842,15 +777,172 @@ export function AdminClient() {
               )}
             </CardContent>
           </Card>
+        )}
 
+        {panel === "quotas" && (
+          <section className="grid grid-2">
+            <Card>
+              <CardHeader>
+                <CardTitle>额度配置</CardTitle>
+                <CardDescription>申请单会保存提交时的默认额度快照。</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="field-group">
+                  <div className="field">
+                    <label htmlFor="defaultMonthlyQuota">默认申请额度</label>
+                    <div className="quota-control">
+                      <Input
+                        id="defaultMonthlyQuota"
+                        min={1}
+                        step={1}
+                        type="number"
+                        value={defaultQuotaDraft}
+                        onChange={(event) => setDefaultQuotaDraft(event.target.value)}
+                        disabled={!data?.authorized || busy}
+                      />
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={!data?.authorized || busy}
+                        onClick={() => void saveDefaultQuota()}
+                      >
+                        <SaveIcon data-icon="inline-start" />
+                        保存
+                      </Button>
+                    </div>
+                    <span className="field-description">
+                      当前值：{data?.settings?.defaultMonthlyQuota ?? 200}
+                    </span>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle>分用户调整额度</CardTitle>
+                <CardDescription>仅 active key 用户可直接调整当前账期额度。</CardDescription>
+              </CardHeader>
+              <CardContent>
+                {!overview?.users.length ? (
+                  <div className="empty">暂无可调整用户</div>
+                ) : (
+                  <div className="table-wrap">
+                    <table className="table">
+                      <thead>
+                        <tr>
+                          <th>用户</th>
+                          <th>active key</th>
+                          <th>当前额度</th>
+                          <th>调额</th>
+                          <th>更新时间</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {overview.users.map((user) => (
+                          <tr key={user.id}>
+                            <td>{user.name ?? maskSecret(user.openId)}</td>
+                            <td>{user.activeTokenStatus ?? "-"}</td>
+                            <td>{user.billingMonthlyQuota ?? "-"}</td>
+                            <td>
+                              <div className="quota-control">
+                                <Input
+                                  min={1}
+                                  step={1}
+                                  type="number"
+                                  value={quotaDrafts[user.id] ?? ""}
+                                  placeholder="额度"
+                                  onChange={(event) =>
+                                    setQuotaDrafts((current) => ({
+                                      ...current,
+                                      [user.id]: event.target.value,
+                                    }))
+                                  }
+                                  disabled={busy || user.activeTokenStatus !== "active"}
+                                />
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={busy || user.activeTokenStatus !== "active"}
+                                  onClick={() => void adjustUserQuota(user.id)}
+                                >
+                                  调整
+                                </Button>
+                              </div>
+                            </td>
+                            <td>{formatDateTime(user.updatedAt)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </section>
+        )}
+
+        {panel === "quotaStats" && (
           <Card>
             <CardHeader>
-              <CardTitle>代理日志</CardTitle>
-              <CardDescription>只显示当前管理范围内的最近代理请求，不显示 Authorization。</CardDescription>
+              <CardTitle>用户统计</CardTitle>
+              <CardDescription>按当前管理范围展示部门内成员的当前账期额度、已用 tokens 和剩余额度。</CardDescription>
+            </CardHeader>
+            <CardContent>
+              {!overview?.users.length ? (
+                <div className="empty">暂无用户统计</div>
+              ) : (
+                <div className="table-wrap">
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th>用户</th>
+                        <th>active key</th>
+                        <th>账期</th>
+                        <th>当前额度</th>
+                        <th>已用 tokens</th>
+                        <th>剩余额度</th>
+                        <th>请求数</th>
+                        <th>申请数</th>
+                        <th>更新时间</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {overview.users.map((user) => {
+                        const quota = user.billingMonthlyQuota ?? 0;
+                        const usedTokens = user.billingTotalTokens ?? 0;
+                        const remainingQuota = Math.max(quota - usedTokens, 0);
+                        return (
+                          <tr key={user.id}>
+                            <td>{user.name ?? maskSecret(user.openId)}</td>
+                            <td>{user.activeTokenStatus ?? "-"}</td>
+                            <td>{user.billingPeriod ?? "-"}</td>
+                            <td>{user.billingMonthlyQuota ?? "-"}</td>
+                            <td>{usedTokens}</td>
+                            <td>{user.billingMonthlyQuota == null ? "-" : remainingQuota}</td>
+                            <td>{user.billingProxyLogCount ?? user.proxyLogCount}</td>
+                            <td>{user.requestCount}</td>
+                            <td>{formatDateTime(user.updatedAt)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
+
+        {panel === "usageLogs" && (
+          <Card>
+            <CardHeader>
+              <CardTitle>使用记录</CardTitle>
+              <CardDescription>展示当前管理范围内的最近代理请求，不显示 Authorization。</CardDescription>
             </CardHeader>
             <CardContent>
               {!overview?.latestProxyLogs.length ? (
-                <div className="empty">暂无代理日志</div>
+                <div className="empty">暂无使用记录</div>
               ) : (
                 <div className="table-wrap">
                   <table className="table">
@@ -881,7 +973,7 @@ export function AdminClient() {
               )}
             </CardContent>
           </Card>
-        </section>
+        )}
 
         {data?.authorized && (
           <div className="alert">
