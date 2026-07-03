@@ -154,7 +154,7 @@
 123. `共绩TokenInside服务端机器` 当前硬件画像为 2 vCPU、约 2GiB 内存、约 50G 根盘，空闲负载很低且无 swap；PG 默认参数应按 2C2G 小机保守配置，避免 PostgreSQL 与 Next.js 应用争抢内存。
 124. 60 人左右、峰值并发 100 的 TokenInside 场景不需要默认引入 PgBouncer；应用侧 PG pool 默认 `10`，PostgreSQL `max_connections=30` 更适合 2C2G 且 PG 容器 `mem_limit=768m` 的生产初始值，后续如果出现连接等待、多 app 副本或短连接膨胀，再单独评估 PgBouncer。
 125. 2C2G 默认 PostgreSQL 容器参数采用 `postgres:16-alpine`、`shared_buffers=256MB`、`effective_cache_size=768MB`、`work_mem=4MB`、`maintenance_work_mem=64MB`、`max_connections=30`、`autovacuum_max_workers=2`、`statement_timeout=30s`、`lock_timeout=5s`、`log_min_duration_statement=500ms`，容器建议 `cpus: "1.0"`、`mem_limit: 768m`、`shm_size: 128m`。
-126. 当前运行镜像为 `voidintheshell/tokeninside:c-postgres-pool-20260703`，digest `sha256:44ef9befca97ff5678d0f1000bc12d6a850b29d35478f778a882ca563e51adbc`；远端容器 healthy，测试部署仍使用 JSON store，PostgreSQL 生产参数已进入代码/env/compose 模板但尚未在最终生产机切换启用。
+126. 历史状态：运行镜像曾为 `voidintheshell/tokeninside:c-postgres-pool-20260703`，digest `sha256:44ef9befca97ff5678d0f1000bc12d6a850b29d35478f778a882ca563e51adbc`；当时远端容器 healthy，测试部署仍使用 JSON store，PostgreSQL 生产参数已进入代码/env/compose 模板但尚未在最终生产机切换启用。
 127. `共绩TokenInside服务端机器` 只读巡检确认当前没有可用 `docker` / `docker compose` 命令；内存可用约 1.4GiB、根盘可用约 43G，监听端口包含 22 和现有 `gongji-newapi-g` 的 8088。生产部署前必须先确认是否允许安装 Docker，或提供已有容器运行环境。
 128. 月度账期重置应默认关闭并显式开启：`TOKENINSIDE_MONTHLY_RESET_ENABLED=false` 时只允许全局管理员做 dry-run，不允许真实修改 NewAPI active token quota；开启后才允许执行非 dry-run。
 129. 月度账期重置当前以 active token account 的 `billingPeriod` 作为幂等标记：目标账期相同则跳过，目标账期不同才把 NewAPI `remain_quota` 重置为当前默认月额度并写入 `requestType=monthly_reset` 审计记录，然后把 account `billingPeriod` 切到目标账期。
@@ -168,15 +168,23 @@
 137. 生产 PostgreSQL 备份应从宿主机对 `tokeninside-postgres` 执行 `pg_dump -Fc`，并保存 sha256 校验文件；恢复必须要求显式 `TOKENINSIDE_CONFIRM_RESTORE=true`，默认拒绝执行，避免误覆盖生产库。
 138. 生产机启用 mihomo 后，宿主机解析自身域名可能得到 `198.18.*` 代理假 IP，直接 `curl https://ti.kumiko-love.com` 可能出现 TLS EOF；生产自测应优先使用 NPM 容器访问 `http://tokeninside:16878/api/health`，或宿主机用 `curl --resolve ti.kumiko-love.com:443:127.0.0.1 https://ti.kumiko-love.com/api/health` 验证 NPM HTTPS/SNI。
 139. PostgreSQL 健康检查不能只验证连接成功；compose project name 或 volume 名变化可能让应用连到空库。生产 health 必须包含 schema readiness，至少检查 required tables 并在缺表时返回 degraded/503。
-140. 当前生产运行镜像为 `voidintheshell/tokeninside:prod-health-schema-20260703`，digest `sha256:7655935ac1e539151cf61cb47db4ba2f8c49c72bc3cad13a489ffa82d9ee786b`；远端通过 Docker Hub pull 部署成功，schema health 显示 8 张 required tables 均就绪。
+140. 历史状态：生产运行镜像曾为 `voidintheshell/tokeninside:prod-health-schema-20260703`，digest `sha256:7655935ac1e539151cf61cb47db4ba2f8c49c72bc3cad13a489ffa82d9ee786b`；远端通过 Docker Hub pull 部署成功，schema health 显示 8 张 required tables 均就绪。
 141. 生产机上的 mihomo 不能常驻：TUN 模式会创建 `Meta` 接口、`198.18.*` DNS/路由和 policy routing，可能影响公网入站连接回包。生产发布需要拉 Docker Hub 镜像时才临时启用，拉取完成后应停止并禁用。
-142. `ti.kumiko-love.com` 临时开发入口已切回 GreenJP -> LA；LA 仍使用 JSON store 开发数据，当前镜像与生产机一致为 `voidintheshell/tokeninside:prod-health-schema-20260703`。生产机 PostgreSQL 版本保留不动，后续域名/云厂商拦截处理完再切回。
+142. 历史状态：`ti.kumiko-love.com` 临时开发入口曾切回 GreenJP -> LA，且 LA 当时仍使用 JSON store 开发数据；该状态已被后续 LA PG 迁移取代。
 143. 生产机 Docker Hub 拉取必须使用 `scripts/production-docker-pull-with-mihomo.sh` 或等价流程，而不是手工 `systemctl start mihomo` 后直接操作；脚本已验证能在 pull 成功后自动恢复 `mihomo inactive/disabled`，避免再次留下 `Meta` TUN 和 policy routing。
 144. 飞书卡片交互错误 `code:200671` 的官方含义是卡片回调服务返回了非 HTTP 200 状态码；`code:200672` 才是响应体格式错误。因此若飞书端点击卡片出现 `200671`，优先查 `/api/feishu/events` 在公网反代日志中的状态码，重点定位 401 签名/token、400 payload/解密或 500 业务异常。
 145. 飞书新版卡片回传交互 `card.action.trigger` 的请求体使用 `schema=2.0`、`header.token`、`header.event_type`、`event.operator.open_id`、`event.action.value`、`event.context.open_message_id` 等字段；旧版 `card.action.trigger_v1` 结构不同。若同时订阅新旧回调，飞书会发送两类请求，官方建议删除多余请求方式。
-146. TokenInside 当前 `/api/feishu/events` 已兼容新版与旧版卡片回调字段路径：新版/旧版明文卡片回调均可在 verification token 正确时返回 HTTP 200 + 官方 toast，签名加密 challenge 链路仍保持 AES 解密与签名校验。当前 LA 运行镜像为 `voidintheshell/tokeninside:card-callback-200671-fix-20260703`，digest `sha256:b77686b1a09ae5fd2b27de1590885e5e239d8f8f6759e51e767a88873bc4b038`。
+146. TokenInside `/api/feishu/events` 已兼容新版与旧版卡片回调字段路径：新版/旧版明文卡片回调均可在 verification token 正确时返回 HTTP 200 + 官方 toast，签名加密 challenge 链路仍保持 AES 解密与签名校验。历史 LA 镜像曾为 `voidintheshell/tokeninside:card-callback-200671-fix-20260703`，digest `sha256:b77686b1a09ae5fd2b27de1590885e5e239d8f8f6759e51e767a88873bc4b038`。
 147. 为降低卡片点击边缘风险，飞书后台 `开发配置 -> 事件与回调 -> 回调配置` 应只保留新版 `card.action.trigger`，移除 `card.action.trigger_v1` 和重复订阅后发布应用版本；代码层兼容旧版只是兜底，不应依赖重复回调作为主路径。
 148. 北海管理员在飞书内置浏览器打开 `/admin` 报 `ERR_CONNECTION_RESET(-6)` 与卡片 `200671` 不属于同一类问题；前者更像端内浏览器到域名/反代/TLS/网络链路重置。排查时应让飞书内置浏览器分别打开 `/api/health`、`/` 和 `/admin`，并对照 BunkerWeb 是否出现访问日志。
+149. 用户后台隐藏 key 时不能展示 NewAPI token 数字 ID；数字 ID 不是用户可用凭证，展示它会造成“已隐藏但看到数字”的误导。隐藏态应展示完整 key 的头尾省略形式，当前实现由 `/api/session` 后端实时读取 key 后返回 `maskedKey`，不返回明文 key。
+150. 用户点击“查看”key 时，完整 key 仍通过 `/api/token/key` 实时读取；前端读取成功后展示完整 key 并尝试写入剪切板。浏览器拒绝剪切板权限时不应把动作误报成读取失败，而是保留完整 key 展示并提示未允许自动复制。
+151. `maskSecret()` 仍用于 open_id、错误信息等普通脱敏场景；NewAPI key 使用独立 `maskApiKey()`，避免不同标识符的脱敏展示规则互相影响。
+152. 当前 LA 运行镜像已更新为 `voidintheshell/tokeninside:key-mask-copy-20260703`，digest `sha256:17da0640f6adfe1ab32f9e137b999536415f0e511728058692df2cb1fb5dba56`；公网 `/api/health` 返回 200，容器 healthy。
+153. LA 调试入口已从单 app + JSON store 切换为 PG/app 双容器：`tokeninside-postgres` 使用 `postgres:16-alpine` / PostgreSQL `16.14`，app 使用 `voidintheshell/tokeninside:key-mask-copy-20260703`；原 JSON store 已备份到 `/home/beihai/tokeninside/backups/json/tokeninside-20260703T070055Z.json`，并导入 PG。
+154. LA JSON -> PG 导入校验通过：`db:import-json -- --confirm-replace` 导入 users=3、tokenRequests=10、tokenAccounts=2、userBillingPeriods=2、feishuEvents=3、proxyRequestLogs=28、adminScopes=0；`db:verify-import` 返回 `ok:true` 且所有集合/表计数匹配。
+155. LA 与生产机当前均已使用 PostgreSQL backend，`/api/health` 均显示 `store.type=postgres`、`schema.ready=true`、`missingTables=[]`、`tableCount=8`、`postgresPool.max=10`；两边 PG 参数均为 `max_connections=30`、`shared_buffers=256MB`、`effective_cache_size=768MB`、`work_mem=4MB`、`statement_timeout=30s`。
+156. 生产机 compose 已修正为 postgres 服务通过 `env_file: .env.production` 接收 `POSTGRES_PASSWORD`，不再依赖 `${POSTGRES_PASSWORD}` 插值；仓库 `docker-compose.production.example.yml` 已同步同样写法，避免后续普通 `docker compose` 操作出现空密码插值警告或重建风险。
 
 ## 官方文档来源
 

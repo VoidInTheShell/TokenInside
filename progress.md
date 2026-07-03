@@ -288,3 +288,19 @@
 284. 镜像已按本地构建、Docker Hub 推送、LA 服务器 pull-only 路径部署：`voidintheshell/tokeninside:card-callback-200671-fix-20260703` 与 `latest` 均指向 digest `sha256:b77686b1a09ae5fd2b27de1590885e5e239d8f8f6759e51e767a88873bc4b038`；RemoteUSDMITLA compose 已备份为 `docker-compose.yml.before-card-callback-200671-fix-20260703` 并切到新 tag，容器 running/healthy。
 285. 远端和公网验收通过：远端本机与公网 `/api/health` 返回 `status: ok`；从容器内经公网域名模拟新版和旧版卡片回调均返回 HTTP 200 + toast；签名加密 challenge 返回 `{"challenge":"ti-card-callback-fix-check-20260703"}`；BunkerWeb 最近三条 `/api/feishu/events` 模拟请求均为 200。
 286. 官方文档对照结论已同步：飞书后台最好在 `开发配置 -> 事件与回调 -> 回调配置` 中只保留新版 `card.action.trigger`，删除 `card.action.trigger_v1` 和重复订阅并发布应用版本；代码已兼容新旧两种结构，但后台减少重复回调可以降低边缘风险。
+
+## 2026-07-03
+
+287. 按用户后台 key 展示细节要求完成窄范围修复：新增 `maskApiKey()`，`/api/session` 为 active token 返回 `maskedKey`，用户后台隐藏态不再展示 NewAPI token 数字 ID，而是展示完整 key 的头尾省略形式。
+288. 用户点击“查看”时仍走 `/api/token/key` 实时读取完整 key；前端读取成功后展示完整 key，并尝试自动写入剪切板。若浏览器拒绝剪切板权限，会保留完整 key 展示并提示“浏览器未允许自动复制”。
+289. 本地验证通过：`npm run typecheck`、`npm run build`、Docker 构建均成功；Next MCP `get_errors` 无 config/session 错误。
+290. 本地构建并推送镜像 `voidintheshell/tokeninside:key-mask-copy-20260703`，digest 为 `sha256:17da0640f6adfe1ab32f9e137b999536415f0e511728058692df2cb1fb5dba56`。
+291. LA/RemoteUSDMITLA `/home/beihai/tokeninside/docker-compose.yml` 已备份为 `docker-compose.yml.before-key-mask-copy-20260703`，compose image 已切换为 `voidintheshell/tokeninside:key-mask-copy-20260703`；远端只执行 Docker Hub pull 和 compose up，未进行源码构建。
+292. 远端和公网验收通过：容器 `tokeninside-tokeninside-1` healthy；远端本机 `/api/health` 返回 200；公网 `https://ti.kumiko-love.com/api/health` 返回 200，配置显示 `newapiMock=false`、`publicBaseUrlHost=ti.kumiko-love.com`；容器日志仅有 Next Ready 信息。
+293. 按用户要求将后续开发两边全部转向 PG：确认 LA 端原先只有 app 容器且 `/api/health` 为 `store.type=json`，生产机已是 PG；决定迁移 LA 并修正生产机 compose env 插值风险。
+294. LA/RemoteUSDMITLA 迁移前已备份 `docker-compose.yml`、`.env.production` 和 JSON store，备份时间戳为 `20260703T070055Z`；新增 `tokeninside-postgres` 服务，PG 参数与生产机一致，app 镜像同步为 `voidintheshell/tokeninside:key-mask-copy-20260703`。
+295. LA 迁移执行通过：`npm run db:migrate` 应用 24 条迁移语句，`npm run db:import-json -- --confirm-replace .local-data/tokeninside.json` 导入 users=3、tokenRequests=10、tokenAccounts=2、userBillingPeriods=2、feishuEvents=3、proxyRequestLogs=28、adminScopes=0；`npm run db:verify-import -- .local-data/tokeninside.json` 返回 `ok:true`。
+296. LA 验收通过：`tokeninside-postgres` 与 `tokeninside-tokeninside-1` 均 healthy，PostgreSQL `16.14`，`max_connections=30`、`shared_buffers=256MB`、`effective_cache_size=768MB`、`work_mem=4MB`、`statement_timeout=30s`、`table_count=8`；远端本机和公网 `/api/health` 均显示 `store.type=postgres`、`schema.ready=true`、`postgresPool.max=10`。
+297. 生产机 `/home/ubuntu/tokeninside` 已备份 compose/env，修正 compose 为 postgres 服务通过 `env_file: .env.production` 接收 `POSTGRES_PASSWORD`，并补齐 `POSTGRES_PASSWORD` 与 PG pool 变量；第一次脚本因 `set -u` 下 `dburl` 未初始化退出，未写入 compose 或重建容器，第二次修正变量初始化后执行成功。
+298. 生产机 app 镜像同步为 `voidintheshell/tokeninside:key-mask-copy-20260703`，通过 `production-docker-pull-with-mihomo.sh` 拉取后 compose up；`tokeninside` 与 `tokeninside-postgres` 均 healthy，PostgreSQL `16.14`，`table_count=8`，app `/api/health` 显示 `store.type=postgres`、`schema.ready=true`、`postgresPool.max=10`。
+299. 仓库 `docker-compose.production.example.yml` 已同步生产机写法：postgres 服务增加 `env_file: .env.production` 并移除 `POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}` 插值，避免后续部署模板继续产生空变量警告。
