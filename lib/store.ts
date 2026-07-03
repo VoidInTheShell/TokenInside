@@ -963,6 +963,19 @@ export async function getAdminOverview(scope: AdminScope) {
     (sum, log) => sum + (log.totalTokens ?? 0),
     0,
   );
+  const activeScopedAccounts = scopedAccounts.filter((account) => account.status === "active");
+  const currentPeriodMonthlyQuota = currentBillingPeriods.reduce(
+    (sum, period) => sum + period.monthlyQuota,
+    0,
+  );
+  const currentPeriodTotalTokens = currentBillingPeriods.reduce(
+    (sum, period) => sum + period.totalTokens,
+    0,
+  );
+  const currentPeriodRemainingQuota = currentBillingPeriods.reduce(
+    (sum, period) => sum + Math.max(period.monthlyQuota - period.totalTokens, 0),
+    0,
+  );
 
   return {
     scope: {
@@ -972,6 +985,7 @@ export async function getAdminOverview(scope: AdminScope) {
     },
     totals: {
       users: scopedUsers.length,
+      keyedUsers: new Set(activeScopedAccounts.map((account) => account.feishuUserId)).size,
       tokenRequests: scopedRequests.length,
       pendingRequests: scopedRequests.filter(
         (request) =>
@@ -985,16 +999,14 @@ export async function getAdminOverview(scope: AdminScope) {
       failedRequests: scopedRequests.filter(
         (request) => request.status === "approved_provision_failed",
       ).length,
-      activeTokens: scopedAccounts.filter((account) => account.status === "active").length,
+      activeTokens: activeScopedAccounts.length,
       proxyLogs: scopedProxyLogs.length,
       promptTokens: totalPromptTokens,
       completionTokens: totalCompletionTokens,
       totalTokens,
       currentBillingPeriod: currentPeriod,
-      currentPeriodMonthlyQuota: currentBillingPeriods.reduce(
-        (sum, period) => sum + period.monthlyQuota,
-        0,
-      ),
+      currentPeriodMonthlyQuota,
+      currentPeriodRemainingQuota,
       currentPeriodProxyLogs: currentBillingPeriods.reduce(
         (sum, period) => sum + period.proxyLogCount,
         0,
@@ -1007,10 +1019,7 @@ export async function getAdminOverview(scope: AdminScope) {
         (sum, period) => sum + period.completionTokens,
         0,
       ),
-      currentPeriodTotalTokens: currentBillingPeriods.reduce(
-        (sum, period) => sum + period.totalTokens,
-        0,
-      ),
+      currentPeriodTotalTokens,
     },
     latestRequests: [...scopedRequests]
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))

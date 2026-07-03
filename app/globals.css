@@ -301,7 +301,13 @@ a {
   gap: 8px;
   justify-self: end;
   justify-content: flex-end;
-  align-self: end;
+  align-self: center;
+}
+
+.user-card-action {
+  align-items: flex-end;
+  align-self: center;
+  justify-self: end;
 }
 
 .user-card:not(.user-card-with-action) .user-card-controls {
@@ -333,18 +339,40 @@ a {
 .metric {
   display: flex;
   flex-direction: column;
+  justify-content: center;
   gap: 8px;
+  min-width: 0;
+  height: 100%;
 }
 
 .metric-label {
   color: var(--muted-foreground);
   font-size: 12px;
+  line-height: 1.35;
 }
 
 .metric-value {
   font-size: 26px;
   font-weight: 650;
   line-height: 1;
+  overflow-wrap: anywhere;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 148px));
+  gap: 16px;
+  justify-content: start;
+}
+
+.metric-grid > .card {
+  aspect-ratio: 1 / 1;
+  min-height: 132px;
+}
+
+.metric-grid > .card > .card-content {
+  height: 100%;
+  justify-content: center;
 }
 
 .button {
@@ -774,18 +802,23 @@ a {
   .user-card-meta,
   .user-card-action,
   .user-card-controls {
-    grid-column: 1 / -1;
+    grid-column: 2 / -1;
   }
 
   .user-card-controls {
-    align-items: flex-start;
-    justify-self: start;
-    justify-content: flex-start;
+    align-items: flex-end;
+    justify-self: end;
+    justify-content: flex-end;
+    align-self: end;
   }
 
   .grid-4,
   .grid-2 {
     grid-template-columns: 1fr;
+  }
+
+  .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .quick-approval {

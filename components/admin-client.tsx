@@ -50,6 +50,7 @@ type AdminOverviewResponse = {
     };
     totals: {
       users: number;
+      keyedUsers?: number;
       tokenRequests: number;
       pendingRequests: number;
       provisionedRequests: number;
@@ -61,6 +62,7 @@ type AdminOverviewResponse = {
       totalTokens?: number;
       currentBillingPeriod?: string;
       currentPeriodMonthlyQuota?: number;
+      currentPeriodRemainingQuota?: number;
       currentPeriodProxyLogs?: number;
       currentPeriodPromptTokens?: number;
       currentPeriodCompletionTokens?: number;
@@ -677,12 +679,12 @@ export function AdminClient() {
 
         {panel === "overview" && (
           <>
-            <section className="grid grid-4">
+            <section className="metric-grid" aria-label="管理概览数据">
               <Card>
                 <CardContent>
                   <div className="metric">
-                    <span className="metric-label">管理用户</span>
-                    <span className="metric-value">{totals?.users ?? 0}</span>
+                    <span className="metric-label">总用户数</span>
+                    <span className="metric-value">{totals?.keyedUsers ?? totals?.activeTokens ?? 0}</span>
                   </div>
                 </CardContent>
               </Card>
@@ -731,45 +733,26 @@ export function AdminClient() {
               <Card>
                 <CardContent>
                   <div className="metric">
-                    <span className="metric-label">当前账期额度</span>
+                    <span className="metric-label">当前账期发放额度</span>
                     <span className="metric-value">
                       {formatTokenAmount(totals?.currentPeriodMonthlyQuota, "0")}
                     </span>
                   </div>
                 </CardContent>
               </Card>
-            </section>
-
-            <section className="grid grid-2">
               <Card>
-                <CardHeader>
-                  <CardTitle>管理范围</CardTitle>
-                  <CardDescription>服务端基于当前飞书用户匹配 TokenInside 管理范围记录。</CardDescription>
-                </CardHeader>
                 <CardContent>
-                  <div className="meta-list">
-                    <div className="meta-row">
-                      <span>授权状态</span>
-                      <Badge variant={data?.authorized ? "success" : "warning"}>
-                        {data?.authorized ? "已授权" : "未授权"}
-                      </Badge>
-                    </div>
-                    <div className="meta-row">
-                      <span>范围</span>
-                      <strong>{scopeLabel(overview?.scope)}</strong>
-                    </div>
-                    <div className="meta-row">
-                      <span>来源</span>
-                      <strong>{overview?.scope.source ?? "-"}</strong>
-                    </div>
-                    <div className="meta-row">
-                      <span>当前用户</span>
-                      <strong>{data?.user ? (data.user.name ?? maskSecret(data.user.openId)) : "-"}</strong>
-                    </div>
+                  <div className="metric">
+                    <span className="metric-label">当前账期剩余额度</span>
+                    <span className="metric-value">
+                      {formatTokenAmount(totals?.currentPeriodRemainingQuota, "0")}
+                    </span>
                   </div>
                 </CardContent>
               </Card>
+            </section>
 
+            <section className="grid">
               <Card>
                 <CardHeader>
                   <CardTitle>状态概览</CardTitle>
