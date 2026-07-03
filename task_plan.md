@@ -4,6 +4,19 @@
 
 将飞书官方文档确认的网页应用免登、用户信息字段权限、飞书卡片请求回调、指定用户消息发送、通讯录部门负责人字段、`offline_access`、敏感通讯录字段权限等结论，补充进 TokenInside 实现方案，形成可落地的权限边界和实现链路。
 
+## 当前优先级（2026-07-03 调整）
+
+当前 P0 目标仍然要求真实飞书卡片审批流程闭环，并把飞书侧审批动作与 TokenInside App 内申请状态、NewAPI 发放状态保持同步。用户最新提出的系统管理员兜底、管理员治理、用户后台额度展示和 UI 收口问题，已经调整为审批闭环后的立即优先修复包；其中“部门主管无法识别时发送给系统管理员”直接影响审批路由，优先级等同 P0 兜底链路。
+
+| 优先级 | 状态 | 内容 |
+|---|---|---|
+| P0 | in_progress | 真实审批闭环：申请人提交申请 -> 服务端解析部门领导 -> 飞书卡片发送给审批目标 -> 审批目标在飞书内通过/拒绝 -> `/api/feishu/events` 写入事件审计 -> App 申请单同步为 `provisioned` / `rejected` / `approved_provision_failed` -> 通过/失败结果在 App 管理端可追踪 |
+| P0 | in_progress | 飞书与 App 状态一致性：飞书卡片点击必须返回 HTTP 200 toast；通过后若 NewAPI 发放成功，App 必须变为 `provisioned` 并生成 active key；若发放失败，App 必须保留 `approved_provision_failed` 和错误原因，不能让飞书端只看到 `200671`；拒绝后 App 必须变为 `rejected` 且不得发放 key |
+| P0 | pending | 系统管理员兜底审批：全局管理角色统一命名为“系统管理员”；初始化环境变量必须可手动配置系统管理员；当用户不属于任何组织、部门负责人缺失、负责人等于申请人或通讯录无法安全解析主管时，不再静默不发送请求，而是把申请发送给系统管理员，并在用户界面提示“您当前不属于任何组织，请求将发送给系统管理员，请联系系统管理员审批” |
+| P1 | pending | 用真实卡片审批发放出来的 key 复测 `/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`，确认数据面不再只依赖管理端人工兜底发放证据 |
+| P1 | pending | 管理员治理与用户后台收口：系统管理员可查看全部管理员、指派管理员；用户后台补当前账期剩余额度，调整 active key 提示、刷新按钮、自动识别动画、管理入口、最新审批请求显示位置、品牌副标题和模型列表说明文案 |
+| P2 | pending | 审批闭环完成后再继续管理员取消用户权限、部门归属历史快照、真实月度重置和更完整报表；这些任务保留在 E 阶段，但暂不抢占 P0 |
+
 ## 阶段
 
 | 阶段 | 状态 | 内容 |
@@ -47,10 +60,10 @@
 | A3 | complete | 实现飞书 OAuth 回调、当前会话、Token 申请、key 查看、审批事件回写 API |
 | A4 | complete | 实现根路径 `/v1/[...path]` NewAPI 透传代理、key hash 绑定校验和代理审计 |
 | A5 | complete | 完成依赖安装、类型检查、生产构建、依赖审计和本地页面/API 冒烟验证 |
-| B | in_progress | 服务器优先真实链路：`ti.kumiko-love.com` 已迁移到 `共绩TokenInside服务端机器`，后续在生产机完成飞书 OAuth、部门领导解析、卡片审批回调、NewAPI token 管理和 `/v1` 代理实测，不再使用 LA/USLA 继续开发 |
+| B | in_progress | P0：服务器优先真实链路当前聚焦审批闭环与状态同步；`ti.kumiko-love.com` 当前调试入口仍以可访问公网链路为准，必须完成真实飞书卡片点击、事件审计、App 状态回写、NewAPI 发放/失败补偿和 `/v1` 复测后才能把 B3/B5 视为闭环 |
 | C | in_progress | PostgreSQL foundation 已落地并在生产机切换启用：新增 schema 迁移脚本、JSON 导入脚本、可选 Postgres store、健康检查和 2C2G 默认容器/连接池参数；后续仍需补齐行级事务状态机和备份/恢复运维 |
 | D | pulled_forward | 部署运维工作前置并合入 B0；当前生产机使用统一 compose 管理 PG/app、Nginx Proxy Manager 内网反代 `tokeninside:16878`，后续发布路径为本地构建、推送 Docker Hub、生产机通过 `production-docker-pull-with-mihomo.sh` 临时启用 mihomo 拉镜像后立即停用，再 compose up；save/load 仅作回退 |
-| E | in_progress | 已按最新口径前置补齐申请界面/用户后台分流、用户后台模型列表、管理员入口权限展示、`/admin` 入口壳、管理范围数据结构和只读概览 API；已继续补齐默认额度配置、审批单额度覆盖、管理端审批、基础用量统计、用户后台 key 头尾省略展示与点击查看复制、key 重置、用户侧额度重置申请、部门主管自动同步、管理端主动调额、基础账期同步汇总和默认关闭的月度账期重置执行入口；后续仍需在生产维护窗口开启并实测真实月度重置 |
+| E | in_progress | P1/P2：已按最新口径前置补齐申请界面/用户后台分流、用户后台模型列表、管理员入口权限展示、`/admin` 入口壳、管理范围数据结构和只读概览 API；已继续补齐默认额度配置、审批单额度覆盖、管理端审批、基础用量统计、用户后台 key 头尾省略展示与点击查看复制、key 重置、用户侧额度重置申请、部门主管自动同步、管理端主动调额、基础账期同步汇总和默认关闭的月度账期重置执行入口；已补入管理员取消用户权限/禁用 active key 的计划任务、被取消资格触发条件和跨部门调动额度继承规则。下一步新增 E8 近期优先修复包：系统管理员兜底审批、系统管理员配置/命名/指派能力、用户后台剩余额度和 UI 文案布局收口 |
 
 ## 当前落地状态
 
@@ -111,6 +124,15 @@
 55. PostgreSQL 生产备份/恢复护栏已落地：支持宿主机 `pg_dump -Fc` 备份和 sha256，恢复脚本默认拒绝执行并要求显式确认。
 56. 用户后台 key 展示细节已落地并部署到 LA：隐藏态由服务端实时读取 NewAPI key 后返回 `maskedKey`，前端展示 key 头尾省略形式，不再展示数字 token id；点击“查看”会展示完整 key 并尝试自动复制到剪切板。当前 LA 运行镜像为 `voidintheshell/tokeninside:key-mask-copy-20260703`，digest `sha256:17da0640f6adfe1ab32f9e137b999536415f0e511728058692df2cb1fb5dba56`，远端和公网 `/api/health` 均返回 200。
 57. LA 调试入口和生产机均已收敛到 PostgreSQL backend：LA 已新增 `tokeninside-postgres`，从原 JSON store 备份导入 PG 并通过 `db:verify-import` 计数校验；生产机继续使用 `tokeninside-postgres`，并已修正 compose 对 `POSTGRES_PASSWORD` 插值的依赖。两边 app 镜像均同步为 `voidintheshell/tokeninside:key-mask-copy-20260703`，两边 `/api/health` 均显示 `store.type=postgres`、`schema.ready=true`、`tableCount=8`、`postgresPool.max=10`。
+58. P0 审批同步代码收口已本地落地：飞书卡片通过/拒绝分支会把审批操作人 `approvalOperatorOpenId` 和操作时间 `approvalOperatedAt` 写回申请单；重复卡片回调返回飞书卡片 toast 而不是普通 `{ ok: true }` JSON，避免重复事件触发响应体格式风险。本地 `npm run typecheck`、`npm run build` 和 Next MCP `get_errors` 已通过；仍需真实审批目标领导点击卡片完成外部验收。
+59. P0 审批同步修复已部署到当前公网调试入口：镜像 `voidintheshell/tokeninside:p0-approval-sync-20260703` 与 `latest` 均推送到 Docker Hub，digest 为 `sha256:36a5f6e200df0778c5c0950795398eadd8d465191528c9b2fda1f63024d11afe`；LA `docker-compose.yml` 已备份为 `docker-compose.yml.before-p0-approval-sync-20260703` 并切换到新 tag，容器 healthy，远端本机和公网 `/api/health` 均返回 `status: ok`。公网模拟同一 `card.action.trigger` 事件两次均返回 HTTP 200，第一次为参数不完整 error toast，第二次为重复事件 success toast。
+60. P0 审批回调入口层观测修复已部署到当前公网调试入口：镜像 `voidintheshell/tokeninside:p0-feishu-invalid-payload-20260703` 与 `latest` 均推送到 Docker Hub，digest 为 `sha256:7044e3e27e2424405024d32a667faf4965725f114539c2d1203d4ce130d88a17`；LA `docker-compose.yml` 已备份为 `docker-compose.yml.before-p0-feishu-invalid-payload-20260703` 并切换到新 tag，容器 healthy，远端本机和公网 `/api/health` 均返回 200。
+61. 当前入口已把 raw JSON / 解密 payload 解析失败从 HTTP 400 改为 HTTP 200 toast + `invalid_payload` 审计记录；公网 `text/plain` 模拟已写入 PG `feishu_events`，BunkerWeb 同一请求状态码为 200。下一次袁旗真实点击如果仍失败，应优先查最新 `invalid_payload` 或 `card.action.trigger` 记录，而不是只依赖飞书客户端错误码。
+62. P0 飞书真实加密体解密修复已部署到当前公网调试入口：镜像 `voidintheshell/tokeninside:p0-feishu-decrypt-20260703` 与 `latest` 均推送到 Docker Hub，digest 为 `sha256:1beadd69edc3fc6060faacf900cf52cdafddef9fb97faaaad0ecd3ed57d23059`；LA `docker-compose.yml` 已备份为 `docker-compose.yml.before-p0-feishu-decrypt-20260703` 并切换到新 tag，容器 healthy，远端本机和公网 `/api/health` 均返回 200。
+63. 最新根因已收敛：飞书真实请求为 `{ encrypt }` 加密体，项目旧 AES 解密实现使用错误 IV；已按飞书官方 Node SDK 改为使用密文 base64 解码后的前 16 字节作为 IV。部署后公网官方 IV 规则加密 challenge 返回正确 challenge，加密 `card.action.trigger` 缺字段返回卡片 toast 并写入 `card.action.trigger` 事件，不再写 `invalid_payload`。
+64. 用户最新真实点击返回飞书端 `200341`，但远端 PG 显示本次审批业务已成功闭环：事件 `card.action.trigger` 为 `processed`，申请 `tr_8efb4f5f2001b5fc5a49138a` 已 `provisioned` 并绑定 `ta_f8ac4cce23bbcd445baf4b61`；BunkerWeb 对真实请求记录 HTTP `499`，说明问题是响应超时而不是审批/发放失败。
+65. P0 快速 ACK 修复已部署：`/api/feishu/events` 的卡片 approve 分支现在先写 App 审批状态和飞书事件审计，再返回 HTTP 200 toast；NewAPI 发放通过 Next 16 `after()` 在响应后继续执行，失败时保留 `approved_provision_failed` 和派生 `eventUuid:provision` 记录。当前运行镜像为 `voidintheshell/tokeninside:p0-feishu-fast-card-20260703`，digest `sha256:f50343d940c64f063c9b7bf1f0c8dd93ba0ccb517dfdf639e5bb939760a30799`。
+66. 部署验收通过：RemoteUSDMITLA `tokeninside-tokeninside-1` healthy，远端本机和公网 `/api/health` 均返回 200，公网官方 IV 加密 challenge 返回 `{\"challenge\":\"ti-fast-card-check-20260703\"}`。下一步需用新的真实点击验证飞书端不再出现 `200341`，并继续核对后台发放最终状态。
 
 ## 计划文档索引
 
@@ -126,16 +148,24 @@
 
 ## 下一阶段入口
 
-B 阶段优先执行顺序已调整为服务器优先：
+当前优先级改为审批闭环优先：
 
-1. B0/D 生产部署保留在 `共绩TokenInside服务端机器`：生产机运行统一 compose 管理 PG/app，NPM 内网反代上游为 `tokeninside:16878`，health 已检查 PostgreSQL schema readiness。因生产机域名接入/云厂商拦截问题，当前开发调试入口临时仍走 GreenJP -> LA；LA 已从 JSON store 切换为 PG/app 双容器拓扑，当前 app 镜像为 `voidintheshell/tokeninside:card-callback-200671-final-20260703`，digest `sha256:87047f4db4df1860513bede62d9728421261be999b51752ca965e19e1af86c54`，PG 为 `postgres:16-alpine` / PostgreSQL `16.14`，`tableCount=8`。
-2. B1 当前代码层修复已本地和公网验证通过：H5 JSSDK 加载、`h5sdk.ready()`、`requestAccess.appID`、`requestAuthCode` 回退、OAuth token 交换、自动免登、用户身份卡、无按钮 UI 和 `20029 invalid redirect uri` 明确诊断均已部署；公网事件回调加密 challenge 已通过。用户已在飞书后台补齐重定向 URL，并手动确认后台可获取飞书用户信息。
-3. B2/B3 主路径已调整为部门领导卡片审批；当前服务器已有 `pending_card_approval` 申请，说明发卡已通。已按飞书官方卡片回调文档继续修复 `code:200671`：卡片回调认证兼容签名、明文 verification token 和解密后 verification token；识别为卡片回调但认证失败、发放失败或处理异常时返回 HTTP 200 toast 并写入本地审计，避免飞书端将业务失败显示为回调服务非 200。LA 本机和公网新版 `card.action.trigger` 缺字段模拟均返回 HTTP 200 + toast。下一步仍必须由审批目标领导点击真实卡片，完成通过/拒绝和幂等状态机确认；管理端人工审批已作为兜底链路验证通过，但不能替代真实飞书卡片点击证据。
-4. B5 数据面基础透传已通过管理端兜底发放的 key 完成公网验证：`GET /v1/models` 返回 200 且模型数量为 4，`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages` 均返回 200；后续仍需在真实卡片审批通过后复测同一数据面链路。
-5. E 阶段已从信息架构文档推进到可用代码和远端部署：申请界面、用户后台、模型列表、管理员入口可见性、数据面 allowlist、默认额度配置、审批单额度覆盖、环境管理员授权、管理端审批通过/拒绝、可见用户摘要、代理日志摘要、NewAPI 控制凭据非空选择、NewAPI 配额单位换算、已开通申请自愈归一化、代理 token usage 记录、历史 usage 总量回填、管理概览用量聚合、用户后台 key 头尾省略展示与点击查看复制、用户侧 key reset API/UI、用户侧额度重置申请 API/UI、部门主管自动同步、管理端主动调额、JSON store 基础账期同步汇总和默认关闭的月度账期重置执行入口均已完成代码落地；后续仍需在生产维护窗口开启并实测真实月度重置。生产 key reset 会禁用当前 active key，生产 quota reset 会发起真实审批并可能在通过后修改额度，生产管理端调额和月度重置会直接修改 active token quota，本轮只验证鉴权边界和 dry-run/关闭态，未擅自触发真实业务动作。
+1. P0-1：已完成一条真实 approve 业务闭环证据：`tr_8efb4f5f2001b5fc5a49138a` 由袁旗点击后写入 `card.action.trigger processed`，申请最终为 `provisioned`，绑定 `ta_f8ac4cce23bbcd445baf4b61`。本次飞书端仍显示 `200341` 的原因是响应超时，已通过快速 ACK 修复。
+2. P0-2：当前仍可复用旧真实 `pending_card_approval` 申请 `tr_e51e61df74ed36cccdf11b06`，申请人为高成，审批目标已通过飞书通讯录 API 和部门接口确认是袁旗；也可以重新由高成发起一条新申请。下一次袁旗点击时，预期飞书端应快速收到 HTTP 200 toast，不再出现 `200341`。
+3. P0-3：继续核对 App 状态与飞书动作同步：通过后申请单必须先进入 `approved`，随后后台发放最终进入 `provisioned` 并绑定 active key；若 NewAPI 发放失败，则申请单必须为 `approved_provision_failed`，派生事件记录发放错误，飞书端仍收到 HTTP 200 toast；拒绝后申请单必须为 `rejected` 且不得发放 key。
+4. P0-4：执行反向和幂等检查：非审批目标点击不能改变申请状态；重复点击或飞书重试不能重复发放 NewAPI key；旧版/重复订阅若产生多路回调，必须以本地幂等状态为准。
+5. P1：用真实卡片审批通过后发放的 key 复测 `GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`，并确认代理日志、账期 usage 和管理概览均归属到同一飞书用户。
+6. E8-1：优先实现系统管理员兜底审批。`TOKENINSIDE_ADMIN_OPEN_IDS` 当前语义需要收口为系统管理员初始化配置，建议新增更明确的 `TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS` 并兼容旧变量；服务端审批目标解析失败时必须发送给系统管理员，不能再让申请停在不发送状态。
+7. E8-2：优先实现系统管理员治理页/API。系统管理员可查看全部管理员范围记录，并可指派或撤销管理员；普通部门主管不能越权指派系统管理员。
+8. E8-3：优先收口用户后台 UI：管理后台入口只保留在用户卡片处；最新审批请求只在管理员用户后台首屏、用户卡片下方展示，切换到账户/额度/模型/申请记录子菜单后不常驻；底部小字移除；左上副标题改为“共绩科技”；模型列表说明改为“当前可用的模型ID”。
+9. E8-4：优先补齐额度展示：用户后台当前账期卡片既显示账期额度，也显示当前账期剩余额度；剩余额度必须使用统一 quota 单位和账期口径，不能简单把 display quota 与 token 数相减造成单位错误。
+10. E8-5：优先修复用户卡片交互细节：已有 key 用户的“当前用户已有 active key”提示移动到用户卡片刷新按钮旁绿色小勾左侧；刷新按钮固定在用户卡片右下方；“自动识别中”文字改为不越界的动画状态，组件尺寸保持稳定。
+11. P2：审批闭环、数据面复测和 E8 近期优先修复包完成后，再继续管理员取消用户权限/禁用 active key、部门归属历史快照、真实月度账期重置和部门报表。
 
 ## 当前外部阻塞
 
-1. 真实 B3 卡片审批仍等待审批目标领导在飞书内点击交互卡片；当前事件入口已完成 `code:200671` 二次修复并在 LA 通过公网新版卡片回调 HTTP 200 + toast 模拟，但还没有真实管理员点击后的成功 payload 证据。飞书后台建议只保留新版 `card.action.trigger`，移除旧版/重复卡片回调订阅，避免同一次点击产生多路请求干扰排障。TokenInside 事件入口、发卡后待审批状态、管理端人工兜底发放、公网数据面四条 MVP 路径和基础用量统计已经验证通过。
+1. 真实 approve 业务链路已经跑通过一次，但飞书端当时仍显示 `200341`；当前阻塞已变成“用快速 ACK 新版本复测飞书客户端体验”。下一次袁旗点击后应同时确认飞书端 toast、BunkerWeb HTTP 状态、`feishu_events`、`token_requests` 和 NewAPI 发放结果。
+2. 当前必须把“飞书审批动作”和“App 申请状态”作为同一个验收项：飞书点击通过、TokenInside 事件审计、申请单状态、NewAPI 发放结果、用户 active key 和 `/v1` 可用性必须能串成同一条链路。管理端人工审批只保留为兜底，不能替代真实飞书卡片审批同步证据。
+3. 飞书后台建议只保留新版 `card.action.trigger`，移除旧版/重复卡片回调订阅并发布应用版本，避免同一次点击产生多路请求干扰排障。用户已确认后台目前只保留 `card.action.trigger`，当前代码也已兼容真实新版加密回调。
 
 继续 B 阶段外部实测前必须准备服务器私有环境变量，且不得将真实密钥写入仓库。

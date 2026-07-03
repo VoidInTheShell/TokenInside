@@ -214,6 +214,11 @@
 24. `https://open.feishu.cn/document/uYjL24iN/uYjN3QjL2YzN04iN2cDN`
 25. `https://open.feishu.cn/document/feishu-cards/card-callback-communication`
 26. `https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/event-subscription-guide/event-card-faq`
+27. `https://open.feishu.cn/document/event-subscription-guide/callback-subscription/add-callback`
+28. `https://open.feishu.cn/document/event-subscription-guide/callback-subscription/receive-and-handle-callbacks`
+29. `https://open.feishu.cn/document/event-subscription-guide/callback-subscription/step-1-choose-a-subscription-mode/send-callbacks-to-developers-server`
+30. `https://open.feishu.cn/document/feishu-cards/configuring-card-interactions`
+31. `https://open.feishu.cn/document/server-docs/im-v1/message/create`
 
 ## 2026-07-03 补充发现
 
@@ -222,6 +227,37 @@
 3. 当前 `/api/feishu/events` 已调整为卡片回调优先返回 HTTP 200：签名、明文 verification token、解密后 verification token 任一可信即可继续；识别为卡片回调但认证失败、发放失败或处理异常时尽量写入 `feishuEvents` 并返回 toast，避免再次触发 `200671`。
 4. LA 当前运行镜像为 `voidintheshell/tokeninside:card-callback-200671-final-20260703`，digest `sha256:87047f4db4df1860513bede62d9728421261be999b51752ca965e19e1af86c54`；LA 本机和公网新版 `card.action.trigger` 缺字段模拟均返回 HTTP 200 + toast，且 PG `feishu_events` 已写入测试记录。
 5. 该修复只证明回调接口不会因入口层/业务层常见异常向飞书返回非 200；真实 B3 完成仍需要审批目标领导在飞书内点击真实卡片，验证真实 payload、`operator.open_id`、nonce 幂等、状态回写和审批通过后的 NewAPI 发放。
+6. 当前管理后台缺失“取消用户权限”独立能力：现有路由只有 overview、settings、审批 decision/quota、用户 quota-adjust 和月度账期重置，没有 revoke/disable 用户 active key 的管理端 API。该任务已补入 E 阶段计划，口径为管理员禁用或撤销目标用户当前 active key，但保留用户、token account 历史映射、代理日志、账期汇总和 NewAPI 历史 logs 归属，确保取消权限后历史耗费仍可归属原飞书用户。
+7. 被取消资格触发条件此前未完善进计划；已补充为：成员主动离职、被动离职、被解除劳动关系、飞书账号停用/删除、调离 TokenInside 允许服务范围且无其它有效范围、管理员手动取消、安全事件或 key 泄露、违规使用、误审批/误发放修正、成员主动要求停用。额度用完、单次请求失败、上游或网络临时错误、部门主管权限变化本身、仍在允许服务范围内的普通调岗或汇报线变化、通讯录临时读取失败或数据权限不足，不应直接触发取消资格。
+8. 用户调离部门后的额度继承此前未完善进计划；已补充为：TokenInside key 和额度按飞书用户绑定，调离后仍有资格时 active key 不轮换，当前账期剩余额度默认随用户进入新部门；调动前已发生调用和已消耗额度按调用发生时部门快照留在原部门。部门总额度不能按当前部门成员追溯重算，应拆成历史已用、当前剩余和调入调出调整；未来若有部门预算池，调动只迁移未用余额，不复制额度。
+9. 本轮按“审批流程优先”重新核对代码与路由：`/api/token/request` 已按服务端默认额度创建申请，解析部门领导并发送飞书卡片，成功后进入 `pending_card_approval`；失败时区分 `approval_route_failed` 与 `approval_card_send_failed`。`/api/feishu/events` 已处理 `card.action.trigger` / `card.action.trigger_v1`，会校验 requestId、nonce hash 和审批人 open_id。
+10. 当前审批与飞书同步的 P0 缺口不是“没有代码入口”，而是缺少真实飞书卡片点击后的同链路证据：飞书点击动作、`feishu_events` 新增记录、申请单状态、NewAPI 发放结果、用户 active key 和 `/v1` 可用性必须指向同一条申请。管理端人工审批已经可作为兜底，但不能替代真实飞书审批同步验收。
+11. 审批通过后的同步语义已明确为三种结果：`provisioned` 表示飞书通过且 NewAPI 发放成功；`approved_provision_failed` 表示飞书通过但 NewAPI 发放失败，需要 App 留存错误并由管理后台兜底；`rejected` 表示飞书拒绝且不得发放 key。飞书端无论业务成功或失败都应收到 HTTP 200 toast，避免再次表现为 `200671`。
+12. Next MCP 当前可发现审批相关路由：`/api/token/request`、`/api/feishu/events`、`/api/admin/token-requests/[id]/decision`、`/api/admin/token-requests/[id]/quota`、`/api/token/quota-reset` 和 `/v1/[...path]`；`get_errors` 返回 config/session 均为空。后续若继续实现，仍需在代码变更后单独跑 `npm run typecheck` 和 `npm run build`。
+13. 代码核对发现真实飞书卡片审批分支此前只更新申请状态，未把卡片操作者和操作时间写回申请单；这会削弱 App 侧审计和“飞书动作与 App 状态同步”的可追踪性。已在 `/api/feishu/events` 的通过/拒绝分支补写 `approvalOperatorOpenId` 与 `approvalOperatedAt`。
+14. 代码核对还发现卡片回调重复事件会在进入 card handler 前返回普通 `{ ok: true, duplicate: true }` JSON；已改为卡片事件重复时返回官方 toast 格式，继续保持飞书端 HTTP 200 且降低响应体格式风险。
+15. 用户再次反馈真实卡片点击仍为 `200671` 后，GreenJP/BunkerWeb 日志显示飞书 `Go-http-client/1.1` 请求 `/api/feishu/events` 曾收到 `400 51`；这与旧代码 raw JSON / 解密 payload 解析失败返回 `{"error":"Invalid Feishu event payload"}` 的响应体长度吻合。该问题不是发卡失败，发卡已经产生 `approvalCardMessageId`，而是点击回调早期解析阶段没有给飞书 HTTP 200。
+16. 当前入口已补强为可观测失败：raw parse 或 payload decrypt/parse 失败时写入 `feishu_events.event_type=invalid_payload`，记录脱敏 `rawPreview`、`contentType`、`userAgent`、`wrapperKeys`、`hasEncrypt` 和 `encryptLength`，并对飞书返回 HTTP 200 toast。公网 `text/plain` 模拟已证明 BunkerWeb 最终状态码为 200，PG 留下 `invalid_payload` 记录。
+17. 子 agent 查阅飞书官方文档后确认：`200671` 的官方含义是回调服务返回非 HTTP 200；`200340` 更偏未配置/地址无效，`200341` 是超时，`200342/200343` 是连接/DNS，`200672` 是响应体格式，`200673` 是返回卡片错误。因此本轮代码修复方向应继续围绕“所有卡片点击路径都先 200 并落审计”，而不是先怀疑 action.value 或 NewAPI 发放本身。
+18. 官方配置前置条件应逐项复核：新版 `card.action.trigger` 在飞书开放平台 `开发配置 -> 事件与回调 -> 回调配置` 中选择 Webhook 回调地址，并在页面底部 `已订阅的回调` 添加 `卡片回传交互`；保存 URL 时会发送 `url_verification`，服务端需 1 秒内返回 challenge；回调处理需 3 秒内返回 HTTP 200；配置变更需要创建并发布应用版本后生效。
+19. 官方文档同时说明旧版 `card.action.trigger_v1` / 历史消息卡片请求网址在 `应用能力 -> 机器人 -> 消息卡片回调请求方式`，属于历史路径；如果同时配置新版和旧版，会产生两类请求。TokenInside 当前兼容新旧结构，但飞书后台主路径建议只保留新版 `card.action.trigger`，清掉旧版/重复订阅并发布版本，避免同一次点击出现多路结构干扰。
+20. 机器人发卡和用户点击回调是两条链路：应用机器人能点对点发送 `interactive` 卡片，只能证明发卡能力、机器人可用范围和消息接口可用；用户点击按钮触发的是 `卡片回传交互` 回调订阅，仍依赖回调 URL、事件订阅、verification token / encrypt key / signature、响应码和响应体格式。
+21. 当前高成申请的审批目标与用户补充一致：`tr_e51e61df74ed36cccdf11b06` 的 `approval_target_open_id=ou_9ca199a8a099f88b32d337e7c714062f`，飞书通讯录用户接口确认姓名为袁旗，部门 `od-d8521bd193d26e3ccf9e6bec08b5bff1` 的部门接口确认 `leader_user_id` 也是袁旗 open_id。数据库本地 `feishu_users` 只缓存了高成，不缓存袁旗；审批目标确认需要依赖飞书通讯录 API 或申请单里的 open_id。
+22. 用户最新测试显示“审批回调格式无法识别，已记录”后，PG 真实记录明确为 `contentType=application/json`、`wrapperKeys=[\"encrypt\"]`、`hasEncrypt=true`、`encryptLength=1004`、`stage=payload_parse`。因此飞书后台订阅模式已正确进入新版加密回调，问题不是 `card.action.trigger` 未保留，而是服务端 AES 解密算法不匹配真实飞书加密体。
+23. 飞书官方 Node SDK `@larksuiteoapi/node-sdk` 1.68.0 的 `AESCipher` 实现显示：`key=sha256(encryptKey)`，IV 取 `Buffer.from(encrypt, 'base64').slice(0, 16)`，ciphertext 取第 16 字节之后再 AES-256-CBC 解密。TokenInside 旧实现使用 `sha256(encryptKey).slice(0, 16)` 作为 IV，导致真实 `{ encrypt }` 解密失败；旧本地加密 challenge 是按错误算法自造的，只能证明反代可达，不能证明真实飞书解密正确。
+24. 当前 `lib/crypto.ts` 已改为优先使用飞书 SDK 同款 IV 规则，并保留旧规则 fallback；部署后用官方 IV 规则构造的公网加密 challenge 能返回正确 challenge，加密 `card.action.trigger` 缺字段能返回 `审批卡片参数不完整` toast，并在 PG 写入 `event_type=card.action.trigger` 而不是 `invalid_payload`。
+25. 飞书端 `200341` 在本次真实点击中不是业务失败：PG 已显示真实 `card.action.trigger` 事件 `processed`，申请 `tr_8efb4f5f2001b5fc5a49138a` 已 `provisioned` 并绑定 `ta_f8ac4cce23bbcd445baf4b61`。BunkerWeb 同一请求为 HTTP `499`，说明飞书客户端等待过久后断开；根因是回调中同步等待 NewAPI 发放完成才返回 toast。
+26. 卡片点击回调的正确工程策略应为“快速 ACK + 后台发放”：飞书点击动作先同步落库为 App 侧审批状态和事件审计，并立刻返回 HTTP 200 toast；NewAPI 创建/调额等慢操作放到响应后的后台任务。TokenInside 当前已用 Next 16 `after()` 实现该策略，发放失败仍由申请状态 `approved_provision_failed` 和派生事件保留可观测性。
+27. 子 agent 查阅飞书官方文档后确认：`200341` 表示卡片回调服务未在规定时间内响应飞书卡片服务端，官方要求 `card.action.trigger` 在 3 秒内返回 HTTP 200；Webhook 回调是同步操作，超时会被判定失败并在飞书客户端展示错误。官方响应体允许返回 `{}`、toast，或 toast + card；返回非 200 对应 `200671`，响应体格式错误对应 `200672`。
+28. 用户最新产品口径要求把“全局管理”统一改为“系统管理员”。现有代码和配置中 `scopeType=global`、`TOKENINSIDE_ADMIN_OPEN_IDS` 可作为内部兼容实现，但前端显示、计划文档、初始化环境变量说明和管理员能力应使用“系统管理员”。
+29. 当前 `lib/admin-sync.ts` 的部门主管自动同步只在用户有 `departmentId` 且部门 `leader_user_id` 等于当前用户时授予部门管理员范围；当申请人无组织、无部门、部门无负责人、负责人等于申请人或通讯录读取失败时，现有主链路需要补系统管理员兜底，不能继续让申请停在不发送请求或无法路由状态。
+30. 系统管理员兜底审批应优先进入近期实现：初始化环境变量应支持手动配置系统管理员，建议新增 `TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS` 并兼容旧 `TOKENINSIDE_ADMIN_OPEN_IDS`；审批目标解析失败时写入 `approvalTargetSource=system_admin_fallback`，并把卡片发送给系统管理员。
+31. 用户界面必须在无组织/主管不可识别兜底时提示固定文案：“您当前不属于任何组织，请求将发送给系统管理员，请联系系统管理员审批”。该提示是业务状态提示，不是错误 toast，用户仍应能提交申请。
+32. 系统管理员能力需要补“查看全部管理员”和“指派管理员”：系统管理员可查看环境变量、手动和自动同步产生的全部管理员范围；可指派系统管理员或部门管理员；部门主管不能越权创建系统管理员或扩大自己的部门范围。
+33. 当前用户后台已经有账期额度、token usage 和代理请求统计，但用户要求补“剩余额度”。实现时不能简单用 `monthlyQuota - totalTokens`，因为 display quota、NewAPI 内部 quota 和 token usage 不是同一单位；应按 TokenInside 账期额度口径和 NewAPI quota 单位换算后展示。
+34. 当前用户后台代码中“最新审批请求”卡片只要存在 `adminScope` 就常驻，且管理后台入口同时存在于用户卡片和子菜单；用户要求收口为：管理后台入口只在用户卡片处展示，最新审批请求只在管理员用户后台首屏用户卡片下方展示，切换子菜单后不常驻。
+35. 当前用户卡片状态在 loading/busy 时直接显示“自动识别中”，用户指出文字会超出圆圈边界；应改为加载动画或旋转图标，保持组件尺寸稳定，并通过 aria-label/title 表达自动识别状态。
+36. 用户后台 UI 收口还包括：左上 TokenInside 下方小字改为“共绩科技”；用户后台底部小字去掉；已有 active key 的提示移动到用户卡片刷新按钮旁绿色小勾左侧；刷新按钮固定在用户卡片右下方；模型列表下方小字改为“当前可用的模型ID”。
 
 ## 本地计划文档
 
