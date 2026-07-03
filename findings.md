@@ -119,6 +119,64 @@
 88. B2 用户卡片展示收尾镜像 `voidintheshell/tokeninside:b2-user-card-dept-20260702` 已部署到 USLA，digest `sha256:a2593de49c3564e23fdc36dd19703e59329ae42c370b1b0831f322ea2332d98e`；远端 compose 已备份为 `docker-compose.yml.before-b2-user-card-dept-20260702`，服务器仍只执行 Docker Hub pull 和 compose up。
 89. 默认申请额度应以服务端设置为权威来源，不能由普通前端请求提交；审批覆盖额度应作为申请单独立字段保存，并在 NewAPI token 发放时覆盖申请快照额度。
 90. E 阶段额度配置镜像 `voidintheshell/tokeninside:e-quota-config-20260702` 已部署到 USLA，digest `sha256:fd3ddce9088e7cd8ff5edc09b70900183981981bd473e1b219ca8e86b25a3557`；远端 compose 已备份为 `docker-compose.yml.before-e-quota-config-20260702`，服务器仍只执行 Docker Hub pull 和 compose up。
+91. 续跑时远端实际镜像已是 `voidintheshell/tokeninside:hide-department-20260703`，容器 healthy，store 中已有 `pending_card_approval` 申请；这证明飞书机器人发卡已通过，B3 剩余关键证据是审批目标领导真实点击卡片后的 `card.action.trigger` 回调、NewAPI key 发放和 `/v1` 成功代理。
+92. 远端生产 session secret 曾为示例占位值，已在服务器私有 `.env.production` 生成随机值并重建容器；后续部署检查必须把 `TOKENINSIDE_SESSION_SECRET` 是否为占位符纳入验收，而不仅检查 `/api/health` 的布尔值。
+93. `TOKENINSIDE_ADMIN_OPEN_IDS` 是飞书 OAuth 后的服务端授权白名单，只决定当前飞书用户是否有 TokenInside 全局管理范围，不新增用户名密码、magic link 或其它认证方式；管理 API 仍必须先通过飞书 session。
+94. E 阶段管理端审批决策接口允许授权管理员在当前管理范围内通过/拒绝申请；通过时以 `approvedMonthlyQuota ?? requestedMonthlyQuota` 触发 NewAPI token 发放。该路径可作为卡片审批不可操作时的人工兜底，但不能替代 B 阶段真实 `card.action.trigger` payload 验证。
+95. NewAPI 控制面凭据不能用 nullish coalescing 直接选择：空字符串环境变量会遮蔽后续有效 `NEWAPI_SYSTEM_AK`。当前实现必须选择第一个非空字符串，否则 `/api/health` 的 `newapiControl: true` 也可能掩盖实际发放失败。
+96. 管理端人工审批兜底已在远端真实发放过一条 active token，且公网 `GET /v1/models` 使用该 key 返回 200、模型数量为 4；数据面代理、key hash 绑定和代理日志写入链路已经有线上证据。
+97. 已开通申请应回填 `tokenAccountId` 并清理旧 `errorMessage`，否则管理后台会显示“已开通但仍带错误”的混合状态；当前代码在发放成功路径和 store 读取自愈中都处理了该一致性问题。
+98. 当前运行镜像为 `voidintheshell/tokeninside:e-admin-decision-normalize-20260703`，digest `sha256:f59936168a60efcd5afdc8fcb82a31a48ee620a6af72a177d14106d54d71d700`；远端容器 healthy，事件 challenge、管理概览授权、token key 获取和公网 `/v1/models` 均已复测通过。
+99. B 阶段尚不能标记真实卡片审批完成：缺少审批目标领导真实点击产生的 `card.action.trigger` 成功回调证据。管理端兜底成功只能证明 NewAPI 发放和数据面可用，不能证明飞书卡片回调主路径闭环。
+100. NewAPI quota 需要按内部单位写入：upstream 默认 `QuotaPerUnit=500000`，因此 TokenInside 的展示额度 `200` 应写入 `remain_quota=100000000`；直接写 `200` 会让新 token 只剩极小余额并触发模型调用额度不足。
+101. `NEWAPI_QUOTA_PER_UNIT` 应保留为环境配置，默认 `500000`，便于未来 NewAPI 实例若调整单位时不需要改业务代码；健康检查展示该单位有助于部署验收。
+102. B5 MVP 数据面在当前 active key 上已覆盖 `GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`；embeddings/images/audio/Gemini-compatible 仍按计划不纳入本期 allowlist。
+103. NewAPI/OpenAI-compatible usage 字段不完全一致：Chat/Responses 返回 `prompt_tokens`、`completion_tokens`、`total_tokens`，Claude-compatible messages 可能只返回 `input_tokens` 与 `output_tokens`，TokenInside 应在代理层统一映射并在缺少总量时补算。
+104. 管理概览的 token 聚合应以代理日志为基础，先作为 E 阶段基础用量统计；更完整的额度重置、账期统计和 NewAPI logs 校准仍属于后续生产化工作。
+105. 当前运行镜像为 `voidintheshell/tokeninside:e-quota-unit-usage-3-20260703`，digest `sha256:5a91b949118e1a97e92f6c264756e8cc918f774aed8ae0a84d680e55a86565cf`；远端容器 healthy，公网 B5 三条 POST 路径和管理概览 usage 聚合均已复测通过。
+106. key 重置应以旧 NewAPI token 的当前 `remain_quota` 为继承来源，而不是重新发放默认月额度；否则 key reset 会意外重置额度，违反“key 重置只轮换凭证不重置额度”的计费口径。
+107. TokenInside 侧替换 active key 时，应把旧 `token_accounts` 标记为 `replaced` 并保留 `replacedByTokenAccountId`，这样旧 key 的代理日志仍能归属到同一飞书用户，新 key 成为唯一 active 映射。
+108. 生产环境实际触发 `POST /api/token/reset` 会禁用当前 active key，属于破坏性业务动作；除非用户明确要求或测试窗口确认，否则只验证部署健康和未登录 401，不擅自对生产 active key 执行真实 reset。
+109. 当前运行镜像为 `voidintheshell/tokeninside:e-key-reset-20260703`，digest `sha256:7cdf25a5287df668cf55c7b9a33b40e49c200b83548d3a169334d6785607d67c`；远端容器 healthy，公网 `/api/health` 正常，公网未登录 `POST /api/token/reset` 返回 401。
+110. 额度重置和 key 重置是不同业务动作：key 重置轮换凭证并继承当前剩余额度；额度重置不轮换凭证，只在审批通过后把当前 active NewAPI token 的 `remain_quota` 更新为审批最终额度。
+111. 额度重置应复用既有飞书卡片审批和管理端兜底审批状态机，不新增认证方式，也不允许用户自报审批人；申请路由只生成 `quota_reset` 待审批单，实际 quota update 必须发生在审批通过后的 `provisionTokenForRequest()` 分支中。
+112. 当前运行镜像为 `voidintheshell/tokeninside:e-quota-reset-20260703`，digest `sha256:12da5c45cfdcf1348288bd75c794ee1cede971e2e08cc8c1b28cb2a2abcf7687`；远端容器 healthy，远端本机和公网未登录 `POST /api/token/quota-reset` 均返回 401。本轮未擅自提交生产 quota reset 申请或修改生产额度。
+113. 部门主管自动同步应只授予当前用户所在部门的 department scope：TokenInside 读取飞书部门详情并比较 `department.leader_user_id` 与当前 OAuth 用户 `openId`，匹配才写入 `department_supervisor` 范围；这不引入新认证方式，也不相信前端传入的管理范围。
+114. 自动同步范围必须和手工/环境授权分离：`department_supervisor` 可由同步禁用或激活，但不得覆盖 `manual` 或 `environment` 管理范围，否则会破坏已有兜底管理员路径。
+115. 当前运行镜像为 `voidintheshell/tokeninside:e-dept-sync-20260703`，digest `sha256:124d44165aaf13f028b6e33a64990238735bba52148a6174da1efbcc784d9618`；远端容器 healthy，公网 `/api/health` 正常，公网 `/api/admin/overview` 未登录 401、soft 200 均正常。
+116. 管理端主动调额应记录为 `quota_adjust` 申请单，而不是只直接改 NewAPI quota；这样管理后台和后续数据库迁移能保留操作人、操作时间、目标用户和最终额度的审计轨迹。
+117. 所有管理端写接口应统一使用 `requireAdminScope()`，否则部门主管自动同步后的管理范围无法覆盖设置、审批额度覆盖和调额等写路径。
+118. 当前运行镜像为 `voidintheshell/tokeninside:e-quota-adjust-20260703`，digest `sha256:406a8d9d8b64b2e9eb2dcccdde2d5e6ca1abc021e819738a778334bfb549b63b`；远端容器 healthy，公网 `/api/health` 正常，公网未登录管理端调额返回 401。
+119. JSON MVP 阶段的账期同步可以先做成派生汇总：从 `tokenAccounts.billingPeriod` 确定账期归属，从已发放的首次申请、额度重置和管理端调额申请确定账期额度，从代理日志聚合 usage；这样能为用户后台和管理后台提供当前账期视图，同时避免自动月度重置误改生产 quota。
+120. `userBillingPeriods` 作为 JSON store 内的同步结果应使用源数据最新时间作为 `updatedAt`，不能每次 read 用当前时间刷新，否则会导致读取 API 反复写文件。
+121. 当前运行镜像为 `voidintheshell/tokeninside:e-billing-sync-20260703`，digest `sha256:b444712f9bd62f15718a059231708300a901f1c2919345c3a1479f78fcc169ed`；远端容器 healthy，公网 `/api/health` 正常，远端 store 已生成当前 `2026-07` 账期汇总。本轮仍未启用自动月度 quota reset。
+122. PostgreSQL 生产目标机不是 USLA 测试机，而是 SSH MCP 配置中的 `共绩TokenInside服务端机器`；USLA/RemoteUSDMITLA 仍作为 `ti.kumiko-love.com` 当前测试部署机使用，不能据此推导最终生产 PG 容器参数。
+123. `共绩TokenInside服务端机器` 当前硬件画像为 2 vCPU、约 2GiB 内存、约 50G 根盘，空闲负载很低且无 swap；PG 默认参数应按 2C2G 小机保守配置，避免 PostgreSQL 与 Next.js 应用争抢内存。
+124. 60 人左右、峰值并发 100 的 TokenInside 场景不需要默认引入 PgBouncer；应用侧 PG pool 默认 `10`，PostgreSQL `max_connections=30` 更适合 2C2G 且 PG 容器 `mem_limit=768m` 的生产初始值，后续如果出现连接等待、多 app 副本或短连接膨胀，再单独评估 PgBouncer。
+125. 2C2G 默认 PostgreSQL 容器参数采用 `postgres:16-alpine`、`shared_buffers=256MB`、`effective_cache_size=768MB`、`work_mem=4MB`、`maintenance_work_mem=64MB`、`max_connections=30`、`autovacuum_max_workers=2`、`statement_timeout=30s`、`lock_timeout=5s`、`log_min_duration_statement=500ms`，容器建议 `cpus: "1.0"`、`mem_limit: 768m`、`shm_size: 128m`。
+126. 当前运行镜像为 `voidintheshell/tokeninside:c-postgres-pool-20260703`，digest `sha256:44ef9befca97ff5678d0f1000bc12d6a850b29d35478f778a882ca563e51adbc`；远端容器 healthy，测试部署仍使用 JSON store，PostgreSQL 生产参数已进入代码/env/compose 模板但尚未在最终生产机切换启用。
+127. `共绩TokenInside服务端机器` 只读巡检确认当前没有可用 `docker` / `docker compose` 命令；内存可用约 1.4GiB、根盘可用约 43G，监听端口包含 22 和现有 `gongji-newapi-g` 的 8088。生产部署前必须先确认是否允许安装 Docker，或提供已有容器运行环境。
+128. 月度账期重置应默认关闭并显式开启：`TOKENINSIDE_MONTHLY_RESET_ENABLED=false` 时只允许全局管理员做 dry-run，不允许真实修改 NewAPI active token quota；开启后才允许执行非 dry-run。
+129. 月度账期重置当前以 active token account 的 `billingPeriod` 作为幂等标记：目标账期相同则跳过，目标账期不同才把 NewAPI `remain_quota` 重置为当前默认月额度并写入 `requestType=monthly_reset` 审计记录，然后把 account `billingPeriod` 切到目标账期。
+130. 月度账期重置仍不新增认证方式：执行入口复用飞书 OAuth session + TokenInside 全局管理员授权，部门管理员不能执行全局账期重置；机器级定时触发要等生产运维路径明确后再接入，不能先引入独立 secret auth。
+131. 当前运行镜像为 `voidintheshell/tokeninside:e-monthly-reset-20260703`，digest `sha256:8626a69ae09421ab181fbfb6e233f4996053e94aaca522ed92332aa19f7f8c9f`；测试部署 health 显示 `monthlyResetEnabled=false`，未登录月度重置 dry-run 返回 401，本轮未触发真实月度重置或修改 NewAPI quota。
+132. `共绩TokenInside服务端机器` 生产部署前置条件：系统为 Ubuntu 22.04，`apt-get`、`curl`、`ufw` 可用，`sudo -n` 可用，端口 16878 当前未监听；但 Docker/Compose 仍不可用，需要用户确认后才能安装或接入现有容器运行环境。
+133. JSON 到 PostgreSQL 导入脚本是替换式导入，不能默认可执行；当前已改为必须 `--confirm-replace`，并新增 dry-run 与 `db:verify-import`，把“备份后显式确认导入”和“导入后计数校验”变成生产切换验收条件。
+134. `ti.kumiko-love.com` 已迁移到 `共绩TokenInside服务端机器` 继续开发；后续不再使用 LA/USLA 作为 TokenInside 开发部署目标。生产机通过 Nginx Proxy Manager 反代内部上游 `tokeninside:16878`，TokenInside 统一 compose 必须保持 app 容器名/网络别名 `tokeninside` 且不需要发布宿主机 16878。
+135. 生产机已通过 mihomo 恢复 Docker Hub/官方 Docker registry 拉取能力；后续部署仍按本地构建并推送 `voidintheshell` Docker Hub，生产机优先 `docker pull` + `docker compose up -d`，只有远端 pull 失败时才回退到本地 `docker save`、上传 tar、生产机 `docker load`。
+136. 生产 NPM 容器已接入 `tokeninside_net` 后，nginx 仍一度返回 502；原因是 NPM 生成的 nginx resolver 使用外部 DNS，不能解析 Docker 服务名 `tokeninside`。已在 NPM 数据卷 `/data/nginx/custom/server_proxy.conf` 持久化 `resolver 127.0.0.11 valid=10s ipv6=off;`，让 proxy host 能解析内部容器名。
+137. 生产 PostgreSQL 备份应从宿主机对 `tokeninside-postgres` 执行 `pg_dump -Fc`，并保存 sha256 校验文件；恢复必须要求显式 `TOKENINSIDE_CONFIRM_RESTORE=true`，默认拒绝执行，避免误覆盖生产库。
+138. 生产机启用 mihomo 后，宿主机解析自身域名可能得到 `198.18.*` 代理假 IP，直接 `curl https://ti.kumiko-love.com` 可能出现 TLS EOF；生产自测应优先使用 NPM 容器访问 `http://tokeninside:16878/api/health`，或宿主机用 `curl --resolve ti.kumiko-love.com:443:127.0.0.1 https://ti.kumiko-love.com/api/health` 验证 NPM HTTPS/SNI。
+139. PostgreSQL 健康检查不能只验证连接成功；compose project name 或 volume 名变化可能让应用连到空库。生产 health 必须包含 schema readiness，至少检查 required tables 并在缺表时返回 degraded/503。
+140. 当前生产运行镜像为 `voidintheshell/tokeninside:prod-health-schema-20260703`，digest `sha256:7655935ac1e539151cf61cb47db4ba2f8c49c72bc3cad13a489ffa82d9ee786b`；远端通过 Docker Hub pull 部署成功，schema health 显示 8 张 required tables 均就绪。
+141. 生产机上的 mihomo 不能常驻：TUN 模式会创建 `Meta` 接口、`198.18.*` DNS/路由和 policy routing，可能影响公网入站连接回包。生产发布需要拉 Docker Hub 镜像时才临时启用，拉取完成后应停止并禁用。
+142. `ti.kumiko-love.com` 临时开发入口已切回 GreenJP -> LA；LA 仍使用 JSON store 开发数据，当前镜像与生产机一致为 `voidintheshell/tokeninside:prod-health-schema-20260703`。生产机 PostgreSQL 版本保留不动，后续域名/云厂商拦截处理完再切回。
+143. 生产机 Docker Hub 拉取必须使用 `scripts/production-docker-pull-with-mihomo.sh` 或等价流程，而不是手工 `systemctl start mihomo` 后直接操作；脚本已验证能在 pull 成功后自动恢复 `mihomo inactive/disabled`，避免再次留下 `Meta` TUN 和 policy routing。
+144. 飞书卡片交互错误 `code:200671` 的官方含义是卡片回调服务返回了非 HTTP 200 状态码；`code:200672` 才是响应体格式错误。因此若飞书端点击卡片出现 `200671`，优先查 `/api/feishu/events` 在公网反代日志中的状态码，重点定位 401 签名/token、400 payload/解密或 500 业务异常。
+145. 飞书新版卡片回传交互 `card.action.trigger` 的请求体使用 `schema=2.0`、`header.token`、`header.event_type`、`event.operator.open_id`、`event.action.value`、`event.context.open_message_id` 等字段；旧版 `card.action.trigger_v1` 结构不同。若同时订阅新旧回调，飞书会发送两类请求，官方建议删除多余请求方式。
+146. TokenInside 当前 `/api/feishu/events` 已兼容新版与旧版卡片回调字段路径：新版/旧版明文卡片回调均可在 verification token 正确时返回 HTTP 200 + 官方 toast，签名加密 challenge 链路仍保持 AES 解密与签名校验。当前 LA 运行镜像为 `voidintheshell/tokeninside:card-callback-200671-fix-20260703`，digest `sha256:b77686b1a09ae5fd2b27de1590885e5e239d8f8f6759e51e767a88873bc4b038`。
+147. 为降低卡片点击边缘风险，飞书后台 `开发配置 -> 事件与回调 -> 回调配置` 应只保留新版 `card.action.trigger`，移除 `card.action.trigger_v1` 和重复订阅后发布应用版本；代码层兼容旧版只是兜底，不应依赖重复回调作为主路径。
+148. 北海管理员在飞书内置浏览器打开 `/admin` 报 `ERR_CONNECTION_RESET(-6)` 与卡片 `200671` 不属于同一类问题；前者更像端内浏览器到域名/反代/TLS/网络链路重置。排查时应让飞书内置浏览器分别打开 `/api/health`、`/` 和 `/admin`，并对照 BunkerWeb 是否出现访问日志。
 
 ## 官方文档来源
 
@@ -146,6 +204,8 @@
 22. `https://open.feishu.cn/document/server-docs/contact-v3/user/field-overview`
 23. `https://open.feishu.cn/document/server-docs/contact-v3/department/field-overview`
 24. `https://open.feishu.cn/document/uYjL24iN/uYjN3QjL2YzN04iN2cDN`
+25. `https://open.feishu.cn/document/feishu-cards/card-callback-communication`
+26. `https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/event-subscription-guide/event-card-faq`
 
 ## 本地计划文档
 

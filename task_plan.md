@@ -47,10 +47,10 @@
 | A3 | complete | 实现飞书 OAuth 回调、当前会话、Token 申请、key 查看、审批事件回写 API |
 | A4 | complete | 实现根路径 `/v1/[...path]` NewAPI 透传代理、key hash 绑定校验和代理审计 |
 | A5 | complete | 完成依赖安装、类型检查、生产构建、依赖审计和本地页面/API 冒烟验证 |
-| B | in_progress | 服务器优先真实链路：先产出 Docker 镜像并部署 USLA，再在 `ti.kumiko-love.com` 完成飞书 OAuth、部门领导解析、卡片审批回调、NewAPI token 管理和 `/v1` 代理实测 |
-| C | planned | 将 JSON MVP store 迁移到 PostgreSQL，并补齐唯一 active key、事件幂等和事务状态机 |
-| D | pulled_forward | 部署运维工作前置并合入 B0；测试阶段先用 Docker + USLA 公网域名解决飞书回调验证闭环 |
-| E | in_progress | 已按最新口径前置补齐申请界面/用户后台分流、用户后台模型列表、管理员入口权限展示、`/admin` 入口壳、管理范围数据结构和只读概览 API；后续需补部门主管同步、用量统计、默认额度配置、审批单额度覆盖、调额、额度重置和 key 重置 |
+| B | in_progress | 服务器优先真实链路：`ti.kumiko-love.com` 已迁移到 `共绩TokenInside服务端机器`，后续在生产机完成飞书 OAuth、部门领导解析、卡片审批回调、NewAPI token 管理和 `/v1` 代理实测，不再使用 LA/USLA 继续开发 |
+| C | in_progress | PostgreSQL foundation 已落地并在生产机切换启用：新增 schema 迁移脚本、JSON 导入脚本、可选 Postgres store、健康检查和 2C2G 默认容器/连接池参数；后续仍需补齐行级事务状态机和备份/恢复运维 |
+| D | pulled_forward | 部署运维工作前置并合入 B0；当前生产机使用统一 compose 管理 PG/app、Nginx Proxy Manager 内网反代 `tokeninside:16878`，后续发布路径为本地构建、推送 Docker Hub、生产机通过 `production-docker-pull-with-mihomo.sh` 临时启用 mihomo 拉镜像后立即停用，再 compose up；save/load 仅作回退 |
+| E | in_progress | 已按最新口径前置补齐申请界面/用户后台分流、用户后台模型列表、管理员入口权限展示、`/admin` 入口壳、管理范围数据结构和只读概览 API；已继续补齐默认额度配置、审批单额度覆盖、管理端审批、基础用量统计、key 重置、用户侧额度重置申请、部门主管自动同步、管理端主动调额、基础账期同步汇总和默认关闭的月度账期重置执行入口；后续仍需在生产维护窗口开启并实测真实月度重置 |
 
 ## 当前落地状态
 
@@ -99,7 +99,16 @@
 43. 用户卡片展示收尾已本地完成：首页用户卡移除“租户”，部门展示改为服务端从飞书部门详情解析出的 `departmentName`，管理后台当前用户与管理范围同样优先展示部门名称。
 44. 用户卡片展示收尾已部署到 USLA：当前运行镜像为 `voidintheshell/tokeninside:b2-user-card-dept-20260702`，digest `sha256:a2593de49c3564e23fdc36dd19703e59329ae42c370b1b0831f322ea2332d98e`，公网健康、未登录 session、无 key `/v1/models` 和飞书事件签名 challenge 均已复测。
 45. E 阶段额度配置已进入代码落地：默认申请额度改为 JSON store settings，由管理后台配置；普通申请接口只接受申请理由，额度从服务端默认值生成快照；管理后台可对待审批申请写入最终额度，发放时优先使用最终额度。
-46. E 阶段额度配置已部署到 USLA：当前运行镜像为 `voidintheshell/tokeninside:e-quota-config-20260702`，digest `sha256:fd3ddce9088e7cd8ff5edc09b70900183981981bd473e1b219ca8e86b25a3557`，公网健康、未登录 session settings、管理设置 401 和飞书事件签名 challenge 均已复测。
+46. E 阶段额度配置已部署到 USLA：当前运行镜像为 `voidintheshell/tokeninside:e-quota-config-20260702` 的后续收尾镜像已被 `voidintheshell/tokeninside:hide-department-20260703` 替换；公网健康、未登录 session settings、管理设置 401 和飞书事件签名 challenge 均已复测。
+47. 远端生产 `TOKENINSIDE_SESSION_SECRET` 已从示例占位符替换为服务器随机值，并重建容器恢复 healthy；新密钥只存在服务器私有 `.env.production`，未写入仓库。
+48. E 阶段继续补齐管理能力：新增 `TOKENINSIDE_ADMIN_OPEN_IDS` 作为飞书 OAuth 后的服务端全局管理员授权白名单；新增 `POST /api/admin/token-requests/[id]/decision`，授权管理员可在当前管理范围内通过/拒绝申请，通过时按最终额度触发 NewAPI token 发放。
+49. 管理概览已扩展可见用户、最近代理日志、申请错误、审批目标、操作人和操作时间；`pendingRequests` 已包含卡片审批中的申请，避免管理后台把 B2/B3 待处理项显示为 0。
+50. `ti.kumiko-love.com` 已迁移到 `共绩TokenInside服务端机器` 生产机继续开发；生产机已部署 `tokeninside-postgres` 与 `tokeninside` 两个容器，NPM 通过内部网络访问 `tokeninside:16878`。
+51. 生产 PostgreSQL 已按 2C2G 收敛参数启动：`max_connections=30`、`effective_cache_size=768MB`、`shared_buffers=256MB`、`work_mem=4MB`、`statement_timeout=30s`，app pool `max=10`。
+52. 生产部署方式已调整：镜像同步推送到 `voidintheshell` Docker Hub；生产机 mihomo 部署后远端 pull 已恢复，后续优先 `docker pull` + `docker compose up -d`，本地 `docker save` 上传 tar 后 `docker load` 作为回退路径。
+53. NPM 内部服务名解析已修复：在 NPM 数据卷持久化 Docker DNS resolver 后，`https://ti.kumiko-love.com/api/health` 在生产机公网路径返回 200。
+54. 生产机实际部署已收敛为一份 `/home/ubuntu/tokeninside/docker-compose.yml`，统一管理 `tokeninside-postgres` 和 `tokeninside`；compose volume 显式固定为 `tokeninside_pg_data` 与 `tokeninside_app_data`。
+55. PostgreSQL 生产备份/恢复护栏已落地：支持宿主机 `pg_dump -Fc` 备份和 sha256，恢复脚本默认拒绝执行并要求显式确认。
 
 ## 计划文档索引
 
@@ -117,14 +126,14 @@
 
 B 阶段优先执行顺序已调整为服务器优先：
 
-1. B0 代码、镜像、Hub 推送、USLA pull-only 部署和 BunkerWeb 错误体透传配置已完成；当前运行镜像为 `voidintheshell/tokeninside:e-quota-config-20260702`，上一稳定用户卡片收尾镜像为 `voidintheshell/tokeninside:b2-user-card-dept-20260702`。
+1. B0/D 生产部署保留在 `共绩TokenInside服务端机器`：当前生产镜像为 `voidintheshell/tokeninside:prod-health-schema-20260703`，digest `sha256:7655935ac1e539151cf61cb47db4ba2f8c49c72bc3cad13a489ffa82d9ee786b`；生产机运行统一 compose 管理 PG/app，NPM 内网反代上游为 `tokeninside:16878`，health 已检查 PostgreSQL schema readiness。因生产机域名接入/云厂商拦截问题，当前开发调试入口临时切回 GreenJP -> LA，LA 运行同一镜像但仍使用 JSON store；后续处理完 DNS/备案/接入后再切回生产机。
 2. B1 当前代码层修复已本地和公网验证通过：H5 JSSDK 加载、`h5sdk.ready()`、`requestAccess.appID`、`requestAuthCode` 回退、OAuth token 交换、自动免登、用户身份卡、无按钮 UI 和 `20029 invalid redirect uri` 明确诊断均已部署；公网事件回调加密 challenge 已通过。用户已在飞书后台补齐重定向 URL，并手动确认后台可获取飞书用户信息。
-3. B2/B3 主路径已调整为部门领导卡片审批；下一步提交 Token 申请，解析申请人所在部门领导，向该领导发送审批卡片，并通过 `card.action.trigger` 完成一次通过/拒绝来确认 payload、权限和幂等状态机。
-4. B5 使用审批通过后发放的 key 访问 `https://ti.kumiko-love.com/v1` 完成数据面透传验证。
-5. E 阶段已从信息架构文档推进到本地代码：申请界面、用户后台、模型列表、管理员入口可见性和数据面 allowlist 已完成本地验证；后续继续补 `admin_scopes` 写入/同步、部门主管范围展开、用量统计、默认额度配置、审批单额度覆盖、调额和 key/额度重置，不能把当前入口壳当成完整管理后台。
+3. B2/B3 主路径已调整为部门领导卡片审批；当前服务器已有 `pending_card_approval` 申请，说明发卡已通。本轮已按飞书官方卡片回调文档修复 `code:200671`：事件入口兼容明文 Verification Token、新版 `card.action.trigger` 和旧版 `card.action.trigger_v1`，toast 响应体收口为官方格式；LA 镜像 `voidintheshell/tokeninside:card-callback-200671-fix-20260703` 已部署，新旧卡片回调模拟均返回 HTTP 200。下一步仍必须由审批目标领导点击真实卡片，完成通过/拒绝和幂等状态机确认；管理端人工审批已作为兜底链路验证通过，但不能替代真实飞书卡片点击证据。
+4. B5 数据面基础透传已通过管理端兜底发放的 key 完成公网验证：`GET /v1/models` 返回 200 且模型数量为 4，`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages` 均返回 200；后续仍需在真实卡片审批通过后复测同一数据面链路。
+5. E 阶段已从信息架构文档推进到可用代码和远端部署：申请界面、用户后台、模型列表、管理员入口可见性、数据面 allowlist、默认额度配置、审批单额度覆盖、环境管理员授权、管理端审批通过/拒绝、可见用户摘要、代理日志摘要、NewAPI 控制凭据非空选择、NewAPI 配额单位换算、已开通申请自愈归一化、代理 token usage 记录、历史 usage 总量回填、管理概览用量聚合、用户侧 key reset API/UI、用户侧额度重置申请 API/UI、部门主管自动同步、管理端主动调额、JSON store 基础账期同步汇总和默认关闭的月度账期重置执行入口均已完成代码落地；后续仍需在生产维护窗口开启并实测真实月度重置。生产 key reset 会禁用当前 active key，生产 quota reset 会发起真实审批并可能在通过后修改额度，生产管理端调额和月度重置会直接修改 active token quota，本轮只验证鉴权边界和 dry-run/关闭态，未擅自触发真实业务动作。
 
 ## 当前外部阻塞
 
-1. 飞书应用需要启用 Bot/机器人能力。当前真实申请发卡返回 `Bot ability is not activated.`，这不是 TokenInside 代码权限判断，而是飞书应用后台能力开关未启用或未发布生效。
+1. 真实 B3 卡片审批仍等待审批目标领导在飞书内点击交互卡片；当前事件入口已完成 `code:200671` 兼容修复并通过新旧卡片回调模拟，但还没有真实管理员点击后的成功 payload 证据。飞书后台建议只保留新版 `card.action.trigger`，移除旧版/重复卡片回调订阅，避免同一次点击产生多路请求干扰排障。TokenInside 事件入口、发卡后待审批状态、管理端人工兜底发放、公网数据面四条 MVP 路径和基础用量统计已经验证通过。
 
 继续 B 阶段外部实测前必须准备服务器私有环境变量，且不得将真实密钥写入仓库。
