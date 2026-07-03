@@ -71,7 +71,7 @@ export async function POST(request: Request) {
         status: "pending_card_approval",
       });
 
-      return NextResponse.json({ request: updated });
+      return NextResponse.json({ request: updated, notice: target.notice });
     } catch (err) {
       const errorMessage =
         err instanceof Error ? err.message : "Send Feishu approval card failed";

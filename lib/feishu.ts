@@ -50,8 +50,13 @@ type FeishuDepartment = {
 type ApprovalTarget = {
   departmentId: string;
   leaderOpenId: string;
-  source: "department_leader" | "parent_department_leader";
+  source: "department_leader" | "parent_department_leader" | "system_admin_fallback";
+  notice?: string;
+  fallbackReason?: string;
 };
+
+export const SYSTEM_ADMIN_FALLBACK_NOTICE =
+  "您当前不属于任何组织，请求将发送给系统管理员，请联系系统管理员审批";
 
 function feishuErrorMessage(body: {
   msg?: string;
@@ -196,7 +201,26 @@ export async function getFeishuDepartmentNameById(departmentId?: string) {
   return department.name ?? department.i18n_name?.zh_cn ?? department.i18n_name?.en_us;
 }
 
-export async function resolveApprovalTargetForUser(openId: string): Promise<ApprovalTarget> {
+function resolveSystemAdminFallback(error: unknown): ApprovalTarget {
+  const systemAdminOpenId = getConfig().admin.systemAdminOpenIds[0];
+  const fallbackReason =
+    error instanceof Error ? error.message : "Unable to resolve Feishu department leader";
+  if (!systemAdminOpenId) {
+    throw new Error(
+      `${fallbackReason}; TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS is required for system administrator fallback`,
+    );
+  }
+
+  return {
+    departmentId: "system-admin-fallback",
+    leaderOpenId: systemAdminOpenId,
+    source: "system_admin_fallback",
+    notice: SYSTEM_ADMIN_FALLBACK_NOTICE,
+    fallbackReason,
+  };
+}
+
+async function resolveDepartmentApprovalTargetForUser(openId: string): Promise<ApprovalTarget> {
   const user = await getFeishuContactUserByOpenId(openId);
   const departmentIds = user.department_ids?.filter(Boolean) ?? [];
   if (departmentIds.length === 0) {
@@ -229,6 +253,14 @@ export async function resolveApprovalTargetForUser(openId: string): Promise<Appr
   }
 
   throw new Error("No valid Feishu department leader found for current user");
+}
+
+export async function resolveApprovalTargetForUser(openId: string): Promise<ApprovalTarget> {
+  try {
+    return await resolveDepartmentApprovalTargetForUser(openId);
+  } catch (err) {
+    return resolveSystemAdminFallback(err);
+  }
 }
 
 export async function sendTokenApprovalCard(input: {

@@ -28,6 +28,7 @@ export type RuntimeConfig = {
     mock: boolean;
   };
   admin: {
+    systemAdminOpenIds: string[];
     globalOpenIds: string[];
   };
   billing: {
@@ -48,6 +49,17 @@ function positiveIntegerFromEnv(value: string | undefined, fallback: number) {
 
 function storeBackendFromEnv(value: string | undefined): RuntimeConfig["storeBackend"] {
   return value === "postgres" ? "postgres" : "json";
+}
+
+function csvFromEnv(...values: Array<string | undefined>) {
+  return [
+    ...new Set(
+      values
+        .flatMap((value) => (value ?? "").split(","))
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  ];
 }
 
 export function getConfig(): RuntimeConfig {
@@ -91,10 +103,14 @@ export function getConfig(): RuntimeConfig {
       mock: process.env.TOKENINSIDE_MOCK_NEWAPI === "true",
     },
     admin: {
-      globalOpenIds: (process.env.TOKENINSIDE_ADMIN_OPEN_IDS ?? "")
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean),
+      systemAdminOpenIds: csvFromEnv(
+        process.env.TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS,
+        process.env.TOKENINSIDE_ADMIN_OPEN_IDS,
+      ),
+      globalOpenIds: csvFromEnv(
+        process.env.TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS,
+        process.env.TOKENINSIDE_ADMIN_OPEN_IDS,
+      ),
     },
     billing: {
       monthlyResetEnabled: process.env.TOKENINSIDE_MONTHLY_RESET_ENABLED === "true",

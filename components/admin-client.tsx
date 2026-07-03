@@ -7,9 +7,11 @@ import {
   CheckCircle2Icon,
   ClipboardListIcon,
   GaugeIcon,
+  LoaderCircleIcon,
   MenuIcon,
   RefreshCwIcon,
   SaveIcon,
+  ShieldCheckIcon,
   SlidersHorizontalIcon,
   UsersRoundIcon,
   XCircleIcon,
@@ -26,7 +28,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
-import { formatDateTime, maskSecret } from "@/lib/utils";
+import { formatDateTime, formatTokenAmount, maskSecret } from "@/lib/utils";
 
 type AdminOverviewResponse = {
   authenticated: boolean;
@@ -128,7 +130,31 @@ type AdminOverviewResponse = {
 
 type AdminScopeSummary = NonNullable<AdminOverviewResponse["overview"]>["scope"];
 
-type AdminPanel = "overview" | "approvals" | "quotas" | "quotaStats" | "usageLogs";
+type AdminPanel = "overview" | "approvals" | "quotas" | "quotaStats" | "usageLogs" | "admins";
+
+type AdminRecord = {
+  id: string;
+  feishuUserId: string;
+  scopeType: "global" | "department";
+  departmentId?: string;
+  source: "manual" | "department_supervisor" | "environment";
+  status: "active" | "disabled";
+  createdAt: string;
+  updatedAt: string;
+  configuredOpenId?: string;
+  readonly?: boolean;
+  user?: {
+    id: string;
+    name?: string;
+    openId: string;
+    departmentId?: string;
+  } | null;
+};
+
+type AdminsResponse = {
+  admins: AdminRecord[];
+  error?: string;
+};
 
 const statusLabel: Record<string, string> = {
   pending_card_send: "发送审批卡片中",
@@ -165,8 +191,18 @@ function badgeVariant(status?: string) {
 
 function scopeLabel(scope?: AdminScopeSummary) {
   if (!scope) return "无管理范围";
-  if (scope.type === "global") return "全局管理";
+  if (scope.type === "global") return "系统管理员";
   return "部门管理";
+}
+
+function adminScopeLabel(scopeType: AdminRecord["scopeType"]) {
+  return scopeType === "global" ? "系统管理员" : "部门管理员";
+}
+
+function adminSourceLabel(source: AdminRecord["source"]) {
+  if (source === "environment") return "初始化环境变量";
+  if (source === "department_supervisor") return "部门主管自动识别";
+  return "手动指派";
 }
 
 function displayName(user?: AdminOverviewResponse["user"]) {
@@ -202,6 +238,10 @@ export function AdminClient() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [defaultQuotaDraft, setDefaultQuotaDraft] = useState("200");
   const [quotaDrafts, setQuotaDrafts] = useState<Record<string, string>>({});
+  const [adminRecords, setAdminRecords] = useState<AdminRecord[]>([]);
+  const [adminLoading, setAdminLoading] = useState(false);
+  const [adminTargetOpenId, setAdminTargetOpenId] = useState("");
+  const [adminDepartmentId, setAdminDepartmentId] = useState("");
   const [feishuSdkReady, setFeishuSdkReady] = useState(false);
   const [autoLoginAttempted, setAutoLoginAttempted] = useState(false);
 
@@ -238,6 +278,35 @@ export function AdminClient() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  const overview = data?.overview;
+  const totals = overview?.totals;
+  const isSystemAdmin = overview?.scope.type === "global";
+
+  const loadAdmins = useCallback(async () => {
+    if (!isSystemAdmin) {
+      setAdminRecords([]);
+      return;
+    }
+    setAdminLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/admin/admins", { cache: "no-store" });
+      const body = (await res.json()) as AdminsResponse;
+      if (!res.ok) throw new Error(body.error ?? "读取管理员列表失败");
+      setAdminRecords(body.admins);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取管理员列表失败");
+    } finally {
+      setAdminLoading(false);
+    }
+  }, [isSystemAdmin]);
+
+  useEffect(() => {
+    if (panel === "admins") {
+      void loadAdmins();
+    }
+  }, [loadAdmins, panel]);
 
   const connectFeishu = useCallback(async () => {
     setError(null);
@@ -389,8 +458,62 @@ export function AdminClient() {
     }
   }
 
-  const overview = data?.overview;
-  const totals = overview?.totals;
+  async function assignAdmin(scopeType: "global" | "department") {
+    if (!adminTargetOpenId.trim()) {
+      setError("需要填写目标用户 open_id");
+      return;
+    }
+    if (scopeType === "department" && !adminDepartmentId.trim()) {
+      setError("指派部门管理员需要填写 departmentId");
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/admin/admins", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          targetOpenId: adminTargetOpenId.trim(),
+          scopeType,
+          departmentId: scopeType === "department" ? adminDepartmentId.trim() : undefined,
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "指派管理员失败");
+      setMessage("管理员已指派。");
+      setAdminTargetOpenId("");
+      setAdminDepartmentId("");
+      await loadAdmins();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "指派管理员失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updateAdminStatus(adminId: string, status: "active" | "disabled") {
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(`/api/admin/admins/${encodeURIComponent(adminId)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "更新管理员状态失败");
+      setMessage(status === "active" ? "管理员范围已启用。" : "管理员范围已停用。");
+      await loadAdmins();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "更新管理员状态失败");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   function selectPanel(nextPanel: AdminPanel) {
     setPanel(nextPanel);
@@ -410,7 +533,7 @@ export function AdminClient() {
             <div className="brand-mark">TI</div>
             <div>
               <h1 className="brand-title">TokenInside</h1>
-              <p className="brand-subtitle">Admin Workspace</p>
+              <p className="brand-subtitle">共绩科技</p>
             </div>
           </div>
           <button
@@ -466,9 +589,17 @@ export function AdminClient() {
               <BarChart3Icon data-icon="inline-start" />
               使用记录
             </button>
+            {isSystemAdmin && (
+              <button
+                className={panel === "admins" ? "nav-item active nav-button" : "nav-item nav-button"}
+                type="button"
+                onClick={() => selectPanel("admins")}
+              >
+                <ShieldCheckIcon data-icon="inline-start" />
+                管理员
+              </button>
+            )}
           </nav>
-
-          <div className="sidebar-footer">{data?.authorized ? scopeLabel(overview?.scope) : "等待飞书身份"}</div>
         </div>
       </aside>
 
@@ -525,11 +656,11 @@ export function AdminClient() {
                   variant={data?.authenticated ? "success" : "warning"}
                 >
                   {loading || busy ? (
-                    "自动识别中"
+                    <LoaderCircleIcon className="spin-icon" data-icon="inline-start" />
                   ) : data?.authenticated ? (
                     <CheckCircle2Icon data-icon="inline-start" />
                   ) : (
-                    "等待飞书身份"
+                    <XCircleIcon data-icon="inline-start" />
                   )}
                 </Badge>
                 <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={busy}>
@@ -583,7 +714,7 @@ export function AdminClient() {
                 <CardContent>
                   <div className="metric">
                     <span className="metric-label">总 tokens</span>
-                    <span className="metric-value">{totals?.totalTokens ?? 0}</span>
+                    <span className="metric-value">{formatTokenAmount(totals?.totalTokens, "0")}</span>
                   </div>
                 </CardContent>
               </Card>
@@ -591,7 +722,9 @@ export function AdminClient() {
                 <CardContent>
                   <div className="metric">
                     <span className="metric-label">当前账期 tokens</span>
-                    <span className="metric-value">{totals?.currentPeriodTotalTokens ?? 0}</span>
+                    <span className="metric-value">
+                      {formatTokenAmount(totals?.currentPeriodTotalTokens, "0")}
+                    </span>
                   </div>
                 </CardContent>
               </Card>
@@ -599,7 +732,9 @@ export function AdminClient() {
                 <CardContent>
                   <div className="metric">
                     <span className="metric-label">当前账期额度</span>
-                    <span className="metric-value">{totals?.currentPeriodMonthlyQuota ?? 0}</span>
+                    <span className="metric-value">
+                      {formatTokenAmount(totals?.currentPeriodMonthlyQuota, "0")}
+                    </span>
                   </div>
                 </CardContent>
               </Card>
@@ -656,11 +791,11 @@ export function AdminClient() {
                     </div>
                     <div className="meta-row">
                       <span>输入 tokens</span>
-                      <strong>{totals?.promptTokens ?? 0}</strong>
+                      <strong>{formatTokenAmount(totals?.promptTokens, "0")}</strong>
                     </div>
                     <div className="meta-row">
                       <span>输出 tokens</span>
-                      <strong>{totals?.completionTokens ?? 0}</strong>
+                      <strong>{formatTokenAmount(totals?.completionTokens, "0")}</strong>
                     </div>
                     <div className="meta-row">
                       <span>当前账期</span>
@@ -715,7 +850,7 @@ export function AdminClient() {
                               {statusLabel[request.status] ?? request.status}
                             </Badge>
                           </td>
-                          <td>{request.requestedMonthlyQuota}</td>
+                          <td>{formatTokenAmount(request.requestedMonthlyQuota)}</td>
                           <td>
                             <div className="quota-control">
                               <Input
@@ -810,7 +945,7 @@ export function AdminClient() {
                       </Button>
                     </div>
                     <span className="field-description">
-                      当前值：{data?.settings?.defaultMonthlyQuota ?? 200}
+                      当前值：{formatTokenAmount(data?.settings?.defaultMonthlyQuota ?? 200)}
                     </span>
                   </div>
                 </div>
@@ -842,7 +977,7 @@ export function AdminClient() {
                           <tr key={user.id}>
                             <td>{user.name ?? maskSecret(user.openId)}</td>
                             <td>{user.activeTokenStatus ?? "-"}</td>
-                            <td>{user.billingMonthlyQuota ?? "-"}</td>
+                            <td>{formatTokenAmount(user.billingMonthlyQuota)}</td>
                             <td>
                               <div className="quota-control">
                                 <Input
@@ -916,9 +1051,9 @@ export function AdminClient() {
                             <td>{user.name ?? maskSecret(user.openId)}</td>
                             <td>{user.activeTokenStatus ?? "-"}</td>
                             <td>{user.billingPeriod ?? "-"}</td>
-                            <td>{user.billingMonthlyQuota ?? "-"}</td>
-                            <td>{usedTokens}</td>
-                            <td>{user.billingMonthlyQuota == null ? "-" : remainingQuota}</td>
+                            <td>{formatTokenAmount(user.billingMonthlyQuota)}</td>
+                            <td>{formatTokenAmount(usedTokens, "0")}</td>
+                            <td>{user.billingMonthlyQuota == null ? "-" : formatTokenAmount(remainingQuota)}</td>
                             <td>{user.billingProxyLogCount ?? user.proxyLogCount}</td>
                             <td>{user.requestCount}</td>
                             <td>{formatDateTime(user.updatedAt)}</td>
@@ -931,6 +1066,134 @@ export function AdminClient() {
               )}
             </CardContent>
           </Card>
+        )}
+
+        {panel === "admins" && (
+          <section className="grid grid-2">
+            <Card>
+              <CardHeader>
+                <CardTitle>指派管理员</CardTitle>
+                <CardDescription>目标用户需要先通过飞书进入过 TokenInside。</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="field-group">
+                  <div className="field">
+                    <label htmlFor="adminTargetOpenId">目标 open_id</label>
+                    <Input
+                      id="adminTargetOpenId"
+                      value={adminTargetOpenId}
+                      onChange={(event) => setAdminTargetOpenId(event.target.value)}
+                      disabled={!isSystemAdmin || busy}
+                    />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="adminDepartmentId">部门 departmentId</label>
+                    <Input
+                      id="adminDepartmentId"
+                      value={adminDepartmentId}
+                      onChange={(event) => setAdminDepartmentId(event.target.value)}
+                      disabled={!isSystemAdmin || busy}
+                      placeholder="仅部门管理员需要"
+                    />
+                  </div>
+                  <div className="toolbar toolbar-left">
+                    <Button
+                      variant="outline"
+                      disabled={!isSystemAdmin || busy}
+                      onClick={() => void assignAdmin("global")}
+                    >
+                      <ShieldCheckIcon data-icon="inline-start" />
+                      指派系统管理员
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={!isSystemAdmin || busy}
+                      onClick={() => void assignAdmin("department")}
+                    >
+                      <UsersRoundIcon data-icon="inline-start" />
+                      指派部门管理员
+                    </Button>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle>全部管理员</CardTitle>
+                <CardDescription>包含初始化环境变量、手动指派和部门主管自动识别。</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="toolbar toolbar-left">
+                  <Button variant="outline" disabled={adminLoading} onClick={() => void loadAdmins()}>
+                    <RefreshCwIcon data-icon="inline-start" />
+                    刷新
+                  </Button>
+                  <Badge variant={isSystemAdmin ? "success" : "warning"}>
+                    {adminRecords.length} 条范围
+                  </Badge>
+                </div>
+                {!adminRecords.length ? (
+                  <div className="empty">{adminLoading ? "读取管理员列表中" : "暂无管理员记录"}</div>
+                ) : (
+                  <div className="table-wrap">
+                    <table className="table">
+                      <thead>
+                        <tr>
+                          <th>管理员</th>
+                          <th>角色</th>
+                          <th>部门</th>
+                          <th>来源</th>
+                          <th>状态</th>
+                          <th>更新时间</th>
+                          <th>操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {adminRecords.map((admin) => {
+                          const openId = admin.user?.openId ?? admin.configuredOpenId;
+                          return (
+                            <tr key={admin.id}>
+                              <td>
+                                <div className="meta-stack">
+                                  <strong>{admin.user?.name ?? maskSecret(openId)}</strong>
+                                  <span>{openId ? maskSecret(openId) : "-"}</span>
+                                </div>
+                              </td>
+                              <td>{adminScopeLabel(admin.scopeType)}</td>
+                              <td>{admin.departmentId ?? "-"}</td>
+                              <td>{adminSourceLabel(admin.source)}</td>
+                              <td>
+                                <Badge variant={admin.status === "active" ? "success" : "warning"}>
+                                  {admin.status === "active" ? "启用" : "停用"}
+                                </Badge>
+                              </td>
+                              <td>{formatDateTime(admin.updatedAt)}</td>
+                              <td>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={busy || admin.readonly}
+                                  onClick={() =>
+                                    void updateAdminStatus(
+                                      admin.id,
+                                      admin.status === "active" ? "disabled" : "active",
+                                    )
+                                  }
+                                >
+                                  {admin.status === "active" ? "停用" : "启用"}
+                                </Button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </section>
         )}
 
         {panel === "usageLogs" && (
@@ -962,7 +1225,7 @@ export function AdminClient() {
                           <td>{log.method} {log.requestPath}</td>
                           <td>{log.statusCode}</td>
                           <td>{log.durationMs} ms</td>
-                          <td>{log.totalTokens ?? "-"}</td>
+                          <td>{formatTokenAmount(log.totalTokens)}</td>
                           <td>{formatDateTime(log.createdAt)}</td>
                         </tr>
                       ))}

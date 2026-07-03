@@ -301,6 +301,7 @@ a {
   gap: 8px;
   justify-self: end;
   justify-content: flex-end;
+  align-self: end;
 }
 
 .user-card:not(.user-card-with-action) .user-card-controls {
@@ -431,6 +432,20 @@ a {
   height: 32px;
   justify-content: center;
   padding: 0;
+}
+
+.active-key-status {
+  min-height: 32px;
+}
+
+.spin-icon {
+  animation: ti-spin 0.9s linear infinite;
+}
+
+@keyframes ti-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .field-group {

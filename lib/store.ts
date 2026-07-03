@@ -359,6 +359,11 @@ export async function getUserById(id: string) {
   return store.users.find((user) => user.id === id) ?? null;
 }
 
+export async function getUserByOpenId(openId: string) {
+  const store = await readStore();
+  return store.users.find((user) => user.openId === openId) ?? null;
+}
+
 export async function createTokenRequest(input: {
   feishuUserId: string;
   requestType?: TokenRequest["requestType"];
@@ -662,16 +667,10 @@ export async function addProxyLog(log: Omit<ProxyRequestLog, "id" | "createdAt">
 
 export async function getAdminScopeForUser(feishuUserId: string) {
   const store = await readStore();
-  const storedScope =
-    store.adminScopes.find(
-      (scope) => scope.feishuUserId === feishuUserId && scope.status === "active",
-    ) ?? null;
-  if (storedScope) return storedScope;
-
   const user = store.users.find((item) => item.id === feishuUserId);
   if (!user) return null;
 
-  if (getConfig().admin.globalOpenIds.includes(user.openId)) {
+  if (getConfig().admin.systemAdminOpenIds.includes(user.openId)) {
     const now = nowIso();
     return {
       id: `env-admin-${feishuUserId}`,
@@ -683,6 +682,12 @@ export async function getAdminScopeForUser(feishuUserId: string) {
       updatedAt: now,
     } satisfies AdminScope;
   }
+
+  const storedScope =
+    store.adminScopes.find(
+      (scope) => scope.feishuUserId === feishuUserId && scope.status === "active",
+    ) ?? null;
+  if (storedScope) return storedScope;
 
   const assignedRequest = store.tokenRequests
     .filter((request) => request.approvalTargetOpenId === user.openId)
@@ -701,6 +706,96 @@ export async function getAdminScopeForUser(feishuUserId: string) {
     } satisfies AdminScope;
   }
   return null;
+}
+
+export async function listAdminScopes() {
+  const store = await readStore();
+  const usersById = new Map(store.users.map((user) => [user.id, user]));
+  const stored = store.adminScopes.map((scope) => ({
+    ...scope,
+    user: usersById.get(scope.feishuUserId) ?? null,
+    readonly: false,
+  }));
+  const configuredOpenIds = getConfig().admin.systemAdminOpenIds;
+  const synthetic = configuredOpenIds.map((openId) => {
+    const user = store.users.find((item) => item.openId === openId) ?? null;
+    const now = nowIso();
+    return {
+      id: user ? `env-admin-${user.id}` : `env-admin-open-id-${openId}`,
+      feishuUserId: user?.id ?? "",
+      scopeType: "global" as const,
+      source: "environment" as const,
+      status: "active" as const,
+      createdAt: user?.createdAt ?? now,
+      updatedAt: user?.updatedAt ?? now,
+      user,
+      configuredOpenId: openId,
+      readonly: true,
+    };
+  });
+  return [...synthetic, ...stored].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+export async function upsertManualAdminScope(input: {
+  targetOpenId: string;
+  scopeType: AdminScope["scopeType"];
+  departmentId?: string;
+}) {
+  return mutate((store) => {
+    const targetUser = store.users.find((user) => user.openId === input.targetOpenId);
+    if (!targetUser) {
+      return {
+        scope: null,
+        error: "target_user_not_found" as const,
+      };
+    }
+
+    const now = nowIso();
+    const existing = store.adminScopes.find(
+      (scope) =>
+        scope.feishuUserId === targetUser.id &&
+        scope.source === "manual" &&
+        scope.scopeType === input.scopeType &&
+        (input.scopeType === "global" || scope.departmentId === input.departmentId),
+    );
+
+    if (existing) {
+      existing.status = "active";
+      existing.departmentId = input.scopeType === "department" ? input.departmentId : undefined;
+      existing.updatedAt = now;
+      return { scope: existing, error: null };
+    }
+
+    const scope: AdminScope = {
+      id: randomId("as"),
+      feishuUserId: targetUser.id,
+      scopeType: input.scopeType,
+      departmentId: input.scopeType === "department" ? input.departmentId : undefined,
+      source: "manual",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    };
+    store.adminScopes.push(scope);
+    return { scope, error: null };
+  });
+}
+
+export async function updateManualAdminScope(input: {
+  scopeId: string;
+  status?: AdminScope["status"];
+  departmentId?: string;
+}) {
+  return mutate((store) => {
+    const scope = store.adminScopes.find((item) => item.id === input.scopeId);
+    if (!scope || scope.source === "environment") return null;
+    if (input.status) scope.status = input.status;
+    if (scope.scopeType === "department" && input.departmentId !== undefined) {
+      scope.departmentId = input.departmentId;
+    }
+    scope.updatedAt = nowIso();
+    return scope;
+  });
 }
 
 export async function syncDepartmentSupervisorAdminScope(input: {

@@ -8,6 +8,7 @@ import {
   HistoryIcon,
   KeyRoundIcon,
   ListFilterIcon,
+  LoaderCircleIcon,
   MenuIcon,
   RefreshCwIcon,
   SendIcon,
@@ -29,7 +30,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
-import { formatDateTime, maskSecret } from "@/lib/utils";
+import { formatDateTime, formatTokenAmount, maskSecret } from "@/lib/utils";
 
 type SessionResponse = {
   authenticated: boolean;
@@ -50,6 +51,7 @@ type SessionResponse = {
     status: string;
     newapiTokenId?: string;
     maskedKey?: string;
+    remainingQuota?: number;
     billingPeriod: string;
     createdAt: string;
   };
@@ -60,17 +62,19 @@ type SessionResponse = {
     completionTokens: number;
     totalTokens: number;
     proxyLogCount: number;
+    remainingQuota?: number;
   } | null;
   adminScope?: {
     type: "global" | "department";
     departmentId?: string;
-    source: "manual" | "department_supervisor";
+    source: "manual" | "department_supervisor" | "environment";
   } | null;
   requests: Array<{
     id: string;
     requestType: string;
     status: string;
     reason: string;
+    approvalTargetSource?: string;
     createdAt: string;
     updatedAt: string;
   }>;
@@ -157,7 +161,7 @@ function avatarInitial(user?: SessionResponse["user"]) {
 
 function scopeLabel(scope?: SessionResponse["adminScope"]) {
   if (!scope) return "";
-  if (scope.type === "global") return "全局管理";
+  if (scope.type === "global") return "系统管理员";
   return "部门管理";
 }
 
@@ -285,7 +289,13 @@ export function ExperienceClient() {
   const currentBillingPeriod = session?.billingPeriod ?? null;
   const currentBillingPeriodName =
     currentBillingPeriod?.period ?? session?.activeToken?.billingPeriod ?? "-";
+  const remainingQuota =
+    currentBillingPeriod?.remainingQuota ?? session?.activeToken?.remainingQuota;
   const quickApprovalCanDecide = quickApproval ? canDecideRequest(quickApproval.status) : false;
+  const fallbackNotice =
+    latestRequest?.approvalTargetSource === "system_admin_fallback"
+      ? "您当前不属于任何组织，请求将发送给系统管理员，请联系系统管理员审批"
+      : null;
 
   function selectPanel(nextPanel: WorkspacePanel) {
     setPanel(nextPanel);
@@ -333,7 +343,7 @@ export function ExperienceClient() {
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error ?? "提交申请失败");
-      setMessage("申请已提交。");
+      setMessage(body.notice ?? "申请已提交。");
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "提交申请失败");
@@ -407,7 +417,7 @@ export function ExperienceClient() {
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error ?? "提交额度重置申请失败");
       setQuotaResetReason("");
-      setMessage("额度重置申请已提交。");
+      setMessage(body.notice ?? "额度重置申请已提交。");
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "提交额度重置申请失败");
@@ -469,7 +479,7 @@ export function ExperienceClient() {
               <div className="brand-mark">TI</div>
               <div>
                 <h1 className="brand-title">TokenInside</h1>
-                <p className="brand-subtitle">Feishu + NewAPI</p>
+                <p className="brand-subtitle">共绩科技</p>
               </div>
             </div>
             <button
@@ -521,19 +531,7 @@ export function ExperienceClient() {
                   </button>
                 </>
               )}
-              {session?.adminScope && (
-                <a className="nav-item" href="/admin">
-                  <ShieldCheckIcon data-icon="inline-start" />
-                  管理后台
-                </a>
-              )}
             </nav>
-
-            <div className="sidebar-footer">
-              {session?.adminScope
-                ? `管理范围：${scopeLabel(session.adminScope)}`
-                : "当前入口按飞书身份自动识别。"}
-            </div>
           </div>
         </aside>
 
@@ -541,9 +539,6 @@ export function ExperienceClient() {
           <header className="topbar">
             <div>
               <h2 className="page-title">{title}</h2>
-              <p className="page-description">
-                {hasActiveToken ? "账户、key 与可用模型。" : "飞书用户身份与申请入口。"}
-              </p>
             </div>
           </header>
 
@@ -574,6 +569,11 @@ export function ExperienceClient() {
                   </div>
                 )}
                 <div className="user-card-controls">
+                  {hasActiveToken && (
+                    <Badge variant="success" className="active-key-status">
+                      当前用户已有 active key
+                    </Badge>
+                  )}
                   <Badge
                     className="identity-status"
                     aria-label={
@@ -593,11 +593,11 @@ export function ExperienceClient() {
                     variant={session?.authenticated ? "success" : "warning"}
                   >
                     {loading || busy ? (
-                      "自动识别中"
+                      <LoaderCircleIcon className="spin-icon" data-icon="inline-start" />
                     ) : session?.authenticated ? (
                       <CheckCircle2Icon data-icon="inline-start" />
                     ) : (
-                      "等待飞书身份"
+                      <XCircleIcon data-icon="inline-start" />
                     )}
                   </Badge>
                   <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={busy}>
@@ -609,7 +609,9 @@ export function ExperienceClient() {
             </CardContent>
           </Card>
 
-          {session?.adminScope && (
+          {fallbackNotice && <div className="alert">{fallbackNotice}</div>}
+
+          {session?.adminScope && panel === "account" && (
             <Card>
               <CardHeader>
                 <CardTitle>最新审批请求</CardTitle>
@@ -648,7 +650,7 @@ export function ExperienceClient() {
                         </div>
                         <div className="meta-row">
                           <span>申请额度</span>
-                          <strong>{quickApproval.requestedMonthlyQuota}</strong>
+                          <strong>{formatTokenAmount(quickApproval.requestedMonthlyQuota)}</strong>
                         </div>
                         <div className="meta-row">
                           <span>申请理由</span>
@@ -839,19 +841,23 @@ export function ExperienceClient() {
                       <div className="meta-list">
                         <div className="meta-row">
                           <span>账期额度</span>
-                          <strong>{currentBillingPeriod?.monthlyQuota ?? "-"}</strong>
+                          <strong>{formatTokenAmount(currentBillingPeriod?.monthlyQuota)}</strong>
+                        </div>
+                        <div className="meta-row">
+                          <span>剩余额度</span>
+                          <strong>{formatTokenAmount(remainingQuota)}</strong>
                         </div>
                         <div className="meta-row">
                           <span>总 tokens</span>
-                          <strong>{currentBillingPeriod?.totalTokens ?? 0}</strong>
+                          <strong>{formatTokenAmount(currentBillingPeriod?.totalTokens, "0")}</strong>
                         </div>
                         <div className="meta-row">
                           <span>输入 tokens</span>
-                          <strong>{currentBillingPeriod?.promptTokens ?? 0}</strong>
+                          <strong>{formatTokenAmount(currentBillingPeriod?.promptTokens, "0")}</strong>
                         </div>
                         <div className="meta-row">
                           <span>输出 tokens</span>
-                          <strong>{currentBillingPeriod?.completionTokens ?? 0}</strong>
+                          <strong>{formatTokenAmount(currentBillingPeriod?.completionTokens, "0")}</strong>
                         </div>
                         <div className="meta-row">
                           <span>代理请求</span>
@@ -907,7 +913,7 @@ export function ExperienceClient() {
                 <Card>
                   <CardHeader>
                     <CardTitle>模型列表</CardTitle>
-                    <CardDescription>来自当前 active key 的 NewAPI `/v1/models`。</CardDescription>
+                    <CardDescription>当前可用的模型ID</CardDescription>
                   </CardHeader>
                   <CardContent>
                     <div className="toolbar toolbar-left">
@@ -979,10 +985,6 @@ export function ExperienceClient() {
                   </CardContent>
                 </Card>
               )}
-
-              <div className="alert">
-                <CheckCircle2Icon data-icon="inline-start" /> 当前用户已有 active key。
-              </div>
             </>
           )}
         </main>

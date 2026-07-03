@@ -42,7 +42,11 @@ export type TokenRequest = {
   approvalDepartmentId?: string;
   approvalMode?: "feishu_card" | "feishu_approval_legacy" | "manual";
   approvalTargetOpenId?: string;
-  approvalTargetSource?: "department_leader" | "parent_department_leader" | "manual_fallback";
+  approvalTargetSource?:
+    | "department_leader"
+    | "parent_department_leader"
+    | "manual_fallback"
+    | "system_admin_fallback";
   approvalCardMessageId?: string;
   approvalActionNonceHash?: string;
   approvalOperatorOpenId?: string;

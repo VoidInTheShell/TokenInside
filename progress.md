@@ -361,3 +361,16 @@
 354. 已更新 `task_plan.md`：把系统管理员兜底审批加入 P0 pending，把管理员治理与用户后台收口加入 P1 pending，并在下一阶段入口加入 E8-1 到 E8-5 优先修复包。
 355. 已更新 `.agent-docs/TokenInside-E阶段管理后台与用量统计计划.md`：新增边界 15-18、用户后台 UI 收口优先项、系统管理员初始化/查看/指派管理员规格、系统管理员兜底审批规格，并把交付物扩展为系统管理员兜底、管理员初始化配置和用户后台剩余额度/布局收口。
 356. 已更新 `findings.md`：记录“全局管理”改名“系统管理员”、系统管理员兜底审批、固定用户提示文案、查看/指派管理员、用户后台剩余额度单位风险和 UI 收口要求。本轮未触发任何生产审批、调额、key reset 或管理员变更动作。
+357. 按用户要求开始落地 E8 近期优先修复包：新增 `TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS` 配置并兼容旧 `TOKENINSIDE_ADMIN_OPEN_IDS`；服务端管理范围展示统一为“系统管理员”，环境变量系统管理员优先级高于存储中的手动/部门管理员范围。
+358. 已本地实现系统管理员兜底审批：部门主管解析失败、用户无组织、无负责人、负责人等于申请人或通讯录读取异常时，`resolveApprovalTargetForUser()` 回退到系统管理员 open_id；申请和额度重置接口会把固定提示随响应返回给前端。
+359. 已本地实现系统管理员查看和指派管理员：新增 `/api/admin/admins` 与 `/api/admin/admins/[id]`，系统管理员可查看全部管理员来源并指派系统管理员或部门管理员；环境变量管理员为只读来源，不能被接口修改。
+360. 已本地收口用户后台：管理后台入口只保留在用户卡片处；最新审批请求只在管理员用户后台首屏展示；active key 状态提示移动到用户卡片状态区；刷新按钮固定在用户卡片右下方；自动识别状态改为旋转动画；用户后台底部小字移除；品牌副标题改为“共绩科技”；模型列表说明改为“当前可用的模型ID”。
+361. 已本地补齐用户后台剩余额度：`/api/session` 在 active key 存在且有 `newapiTokenId` 时读取 NewAPI 当前 token `remain_quota`，按 `NEWAPI_QUOTA_PER_UNIT` 换算后写入 `activeToken.remainingQuota` 和 `billingPeriod.remainingQuota`，用户后台当前账期卡片展示账期额度与剩余额度。
+362. 已按用户要求把 `.env.example` 和 `.env.production.example` 改为中文变量说明，逐项说明变量用途和获取位置，覆盖飞书凭证/事件、系统管理员 open_id、NewAPI 控制凭证、PostgreSQL、session、账期和 mock 开关。
+363. 本地验证通过：`npm run typecheck` 成功；`npm run build` 成功，路由表包含新增 `/api/admin/admins` 和 `/api/admin/admins/[id]`；Next MCP `get_errors` 返回 `configErrors=[]`、`sessionErrors=[]`。本轮尚未构建 Docker 镜像、推送 Docker Hub 或部署到公网实例。
+364. 按用户补充要求，将 token/额度只读展示改为参考 Aether 的紧凑单位口径：新增 `formatCompactNumber()` / `formatTokenAmount()`，按十进制 K/M/B/T 自动缩写大数，1000 以下保持原样。
+365. 已替换用户后台和管理后台展示点：当前账期额度、剩余额度、总/输入/输出 tokens、管理概览总 tokens、当前账期 tokens、当前账期额度、审批申请额度、默认额度当前值、用户额度统计和使用记录 tokens 均改为紧凑展示；输入框和请求体仍保持原始数字。
+366. 补充验证通过：`npm run typecheck` 成功；`npm run build` 成功；Next MCP `get_errors` 返回 `configErrors=[]`、`sessionErrors=[]`。本轮仍未构建 Docker 镜像、推送 Docker Hub 或部署到公网实例。
+367. 已按本地构建、Docker Hub 推送、LA pull-only 路径部署 E8 修复包：本地 `docker build -t tokeninside:e8-system-admin-compact-tokens-20260703 .` 成功，构建阶段 Next 生产构建通过；已推送 `voidintheshell/tokeninside:e8-system-admin-compact-tokens-20260703` 和 `voidintheshell/tokeninside:latest`，digest 均为 `sha256:b127d76d4edd7cbba6fd251d1f59a249f91c8b18f4e4cbb84458b35fe423e70e`。
+368. RemoteUSDMITLA `/home/beihai/tokeninside/docker-compose.yml` 已备份为 `docker-compose.yml.before-e8-system-admin-compact-tokens-20260703`，compose image 已切换到 `voidintheshell/tokeninside:e8-system-admin-compact-tokens-20260703`；远端只执行 `sudo -n docker compose pull tokeninside` 和 `up -d tokeninside`，PostgreSQL 容器与数据卷未重建。
+369. LA 部署验收通过：`tokeninside-tokeninside-1` 运行新 tag 且 healthy；远端本机和公网 `https://ti.kumiko-love.com/api/health` 均返回 `status: ok`，`store.type=postgres`、`schema.ready=true`、`systemAdmins=1`、`newapiQuotaPerUnit=500000`；公网 `/` 和 `/admin` 均返回 HTTP 200；公网 `/v1/models` 无认证返回 HTTP 401 JSON `Bearer NewAPI key is required`；公网 `/api/session` 未登录返回正常 JSON。
