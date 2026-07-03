@@ -10,6 +10,7 @@ export type RequestStatus =
   | "provisioned"
   | "rejected"
   | "cancelled"
+  | "invalidated"
   | "draft_pending_approval_config";
 
 export type TokenStatus = "active" | "disabled" | "revoked" | "replaced";

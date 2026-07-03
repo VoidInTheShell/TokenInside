@@ -126,6 +126,7 @@ const statusLabel: Record<string, string> = {
   provisioned: "已发放",
   rejected: "已拒绝",
   cancelled: "已取消",
+  invalidated: "其他请求已通过",
   draft_pending_approval_config: "待配置审批",
 };
 
@@ -140,7 +141,7 @@ const requestTypeLabel: Record<string, string> = {
 function badgeVariant(status?: string) {
   if (!status) return "default";
   if (["provisioned", "approved"].includes(status)) return "success";
-  if (["rejected", "cancelled", "approved_provision_failed"].includes(status)) {
+  if (["rejected", "cancelled", "invalidated", "approved_provision_failed"].includes(status)) {
     return "danger";
   }
   return "warning";

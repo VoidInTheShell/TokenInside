@@ -142,6 +142,7 @@ const statusLabel: Record<string, string> = {
   provisioned: "已发放",
   rejected: "已拒绝",
   cancelled: "已取消",
+  invalidated: "其他请求已通过",
   draft_pending_approval_config: "待配置审批",
 };
 
@@ -156,7 +157,7 @@ const requestTypeLabel: Record<string, string> = {
 function badgeVariant(status?: string) {
   if (!status) return "default";
   if (["provisioned", "approved"].includes(status)) return "success";
-  if (["rejected", "cancelled", "approved_provision_failed"].includes(status)) {
+  if (["rejected", "cancelled", "invalidated", "approved_provision_failed"].includes(status)) {
     return "danger";
   }
   return "warning";
@@ -467,9 +468,7 @@ export function AdminClient() {
             </button>
           </nav>
 
-          <div className="sidebar-footer">
-            管理入口只复用当前飞书会话；管理范围由服务端保存的 TokenInside 管理范围记录决定。
-          </div>
+          <div className="sidebar-footer">{data?.authorized ? scopeLabel(overview?.scope) : "等待飞书身份"}</div>
         </div>
       </aside>
 
@@ -975,12 +974,6 @@ export function AdminClient() {
           </Card>
         )}
 
-        {data?.authorized && (
-          <div className="alert">
-            <CheckCircle2Icon data-icon="inline-start" /> 当前管理范围已由服务端确认。调额、重置和部门主管同步仍按 E
-            阶段继续补齐。
-          </div>
-        )}
       </main>
       </div>
     </>

@@ -8,6 +8,7 @@ import type {
   FeishuEvent,
   FeishuUser,
   ProxyRequestLog,
+  RequestStatus,
   StoreShape,
   TokenAccount,
   TokenRequest,
@@ -27,6 +28,17 @@ const initialStore: StoreShape = {
   proxyRequestLogs: [],
   adminScopes: [],
 };
+
+const invalidatableFirstApplyStatuses = new Set<RequestStatus>([
+  "pending_card_send",
+  "pending_card_approval",
+  "approval_card_send_failed",
+  "approval_route_failed",
+  "pending_feishu_approval",
+  "approved",
+  "approved_provisioning",
+  "approved_provision_failed",
+]);
 
 async function readStore(): Promise<StoreShape> {
   const config = getConfig();
@@ -402,6 +414,38 @@ export async function updateTokenRequest(
   });
 }
 
+export async function invalidateOtherOpenFirstApplyRequests(input: {
+  feishuUserId: string;
+  approvedRequestId: string;
+  approvalOperatorOpenId?: string;
+  approvalOperatedAt?: string;
+}) {
+  return mutate((store) => {
+    const now = nowIso();
+    const invalidated: TokenRequest[] = [];
+    for (const request of store.tokenRequests) {
+      if (
+        request.feishuUserId !== input.feishuUserId ||
+        request.id === input.approvedRequestId ||
+        request.requestType !== "first_apply" ||
+        !invalidatableFirstApplyStatuses.has(request.status)
+      ) {
+        continue;
+      }
+
+      request.status = "invalidated";
+      request.errorMessage = undefined;
+      request.approvalOperatorOpenId =
+        request.approvalOperatorOpenId ?? input.approvalOperatorOpenId;
+      request.approvalOperatedAt =
+        request.approvalOperatedAt ?? input.approvalOperatedAt ?? now;
+      request.updatedAt = now;
+      invalidated.push(request);
+    }
+    return invalidated;
+  });
+}
+
 export async function findTokenRequestByInstance(instanceCode: string) {
   const store = await readStore();
   return (
@@ -625,18 +669,38 @@ export async function getAdminScopeForUser(feishuUserId: string) {
   if (storedScope) return storedScope;
 
   const user = store.users.find((item) => item.id === feishuUserId);
-  if (!user || !getConfig().admin.globalOpenIds.includes(user.openId)) return null;
+  if (!user) return null;
 
-  const now = nowIso();
-  return {
-    id: `env-admin-${feishuUserId}`,
-    feishuUserId,
-    scopeType: "global",
-    source: "environment",
-    status: "active",
-    createdAt: now,
-    updatedAt: now,
-  } satisfies AdminScope;
+  if (getConfig().admin.globalOpenIds.includes(user.openId)) {
+    const now = nowIso();
+    return {
+      id: `env-admin-${feishuUserId}`,
+      feishuUserId,
+      scopeType: "global",
+      source: "environment",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    } satisfies AdminScope;
+  }
+
+  const assignedRequest = store.tokenRequests
+    .filter((request) => request.approvalTargetOpenId === user.openId)
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+  if (assignedRequest?.approvalDepartmentId) {
+    const now = nowIso();
+    return {
+      id: `assigned-admin-${feishuUserId}`,
+      feishuUserId,
+      scopeType: "department",
+      departmentId: assignedRequest.approvalDepartmentId,
+      source: "department_supervisor",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    } satisfies AdminScope;
+  }
+  return null;
 }
 
 export async function syncDepartmentSupervisorAdminScope(input: {
@@ -689,6 +753,10 @@ function tokenRequestInScope(
   usersById: Map<string, FeishuUser>,
 ) {
   if (scope.scopeType === "global") return true;
+  const adminUser = usersById.get(scope.feishuUserId);
+  if (request.approvalTargetOpenId) {
+    return request.approvalTargetOpenId === adminUser?.openId;
+  }
   const user = usersById.get(request.feishuUserId);
   return Boolean(user?.departmentId && user.departmentId === scope.departmentId);
 }

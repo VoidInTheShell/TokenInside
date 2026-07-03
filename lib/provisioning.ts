@@ -11,10 +11,21 @@ import {
   addTokenAccount,
   createTokenRequest,
   getActiveTokenForUser,
+  invalidateOtherOpenFirstApplyRequests,
   replaceActiveTokenAccount,
   updateTokenRequest,
 } from "@/lib/store";
 import type { FeishuUser, TokenRequest } from "@/lib/types";
+
+async function invalidateOtherFirstApplyRequestsAfterProvision(request: TokenRequest) {
+  if (request.requestType !== "first_apply") return;
+  await invalidateOtherOpenFirstApplyRequests({
+    feishuUserId: request.feishuUserId,
+    approvedRequestId: request.id,
+    approvalOperatorOpenId: request.approvalOperatorOpenId,
+    approvalOperatedAt: request.approvalOperatedAt,
+  });
+}
 
 async function updateActiveTokenQuotaForRequest(request: TokenRequest) {
   const existing = await getActiveTokenForUser(request.feishuUserId);
@@ -38,6 +49,7 @@ async function updateActiveTokenQuotaForRequest(request: TokenRequest) {
       tokenAccountId: existing.id,
       errorMessage: undefined,
     });
+    await invalidateOtherFirstApplyRequestsAfterProvision(request);
     return existing;
   } catch (err) {
     await updateTokenRequest(request.id, {
@@ -64,6 +76,7 @@ export async function provisionTokenForRequest(request: TokenRequest) {
       tokenAccountId: existing.id,
       errorMessage: undefined,
     });
+    await invalidateOtherFirstApplyRequestsAfterProvision(request);
     return existing;
   }
 
@@ -94,6 +107,7 @@ export async function provisionTokenForRequest(request: TokenRequest) {
       tokenAccountId: account.id,
       errorMessage: undefined,
     });
+    await invalidateOtherFirstApplyRequestsAfterProvision(request);
     return account;
   } catch (err) {
     await updateTokenRequest(request.id, {
