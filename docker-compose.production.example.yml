@@ -4,7 +4,7 @@ services:
     container_name: tokeninside-postgres
     restart: unless-stopped
     env_file:
-      - .env.production
+      - ${TOKENINSIDE_ENV_FILE:-.env.production}
     environment:
       POSTGRES_DB: tokeninside
       POSTGRES_USER: tokeninside
@@ -78,7 +78,7 @@ services:
     container_name: tokeninside
     restart: unless-stopped
     env_file:
-      - .env.production
+      - ${TOKENINSIDE_ENV_FILE:-.env.production}
     depends_on:
       postgres:
         condition: service_healthy

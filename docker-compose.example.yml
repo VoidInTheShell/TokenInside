@@ -1,14 +1,96 @@
+# TokenInside standalone compose example.
+#
+# Usage:
+#   cp .env.example .env
+#   # edit `.env` and fill every replace-with-* value
+#   docker compose -f docker-compose.example.yml up -d
+#   docker compose -f docker-compose.example.yml exec tokeninside npm run db:migrate
+#
+# The app listens on host port 16878. Put your reverse proxy in front of it and
+# set TOKENINSIDE_PUBLIC_BASE_URL in `.env` to the public HTTPS URL.
+
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tokeninside-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tokeninside}
+      POSTGRES_USER: ${POSTGRES_USER:-tokeninside}
+    command:
+      - postgres
+      - -c
+      - max_connections=30
+      - -c
+      - superuser_reserved_connections=3
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - checkpoint_timeout=10min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - max_wal_size=512MB
+      - -c
+      - min_wal_size=128MB
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - wal_compression=on
+      - -c
+      - autovacuum=on
+      - -c
+      - autovacuum_max_workers=2
+      - -c
+      - autovacuum_naptime=30s
+      - -c
+      - autovacuum_vacuum_scale_factor=0.05
+      - -c
+      - autovacuum_analyze_scale_factor=0.02
+      - -c
+      - autovacuum_vacuum_threshold=50
+      - -c
+      - autovacuum_analyze_threshold=50
+      - -c
+      - idle_in_transaction_session_timeout=30s
+      - -c
+      - statement_timeout=30s
+      - -c
+      - lock_timeout=5s
+      - -c
+      - log_min_duration_statement=500ms
+    shm_size: 128m
+    volumes:
+      - tokeninside_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tokeninside} -d ${POSTGRES_DB:-tokeninside}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
   tokeninside:
-    image: voidintheshell/tokeninside:b0-20260702-1526
+    image: voidintheshell/tokeninside:latest
+    container_name: tokeninside
     restart: unless-stopped
     pull_policy: always
     env_file:
-      - .env.production
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "16878:16878"
     volumes:
-      - tokeninside_data:/app/.local-data
+      - tokeninside_app_data:/app/.local-data
     healthcheck:
       test:
         [
@@ -17,10 +99,13 @@ services:
           "-e",
           "fetch('http://127.0.0.1:16878/api/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
         ]
-      interval: 30s
+      interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 12
       start_period: 20s
 
 volumes:
-  tokeninside_data:
+  tokeninside_app_data:
+    name: tokeninside_app_data
+  tokeninside_pg_data:
+    name: tokeninside_pg_data
