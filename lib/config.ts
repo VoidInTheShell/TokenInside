@@ -94,7 +94,7 @@ export function getConfig(): RuntimeConfig {
       eventVerificationToken: process.env.FEISHU_APPROVAL_EVENT_VERIFICATION_TOKEN,
     },
     newapi: {
-      baseUrl: trimSlash(process.env.NEWAPI_BASE_URL ?? "https://new-api.550w.link"),
+      baseUrl: trimSlash(process.env.NEWAPI_BASE_URL ?? "http://localhost:3000"),
       controlUserId: process.env.NEWAPI_CONTROL_USER_ID,
       accessToken: process.env.NEWAPI_ACCESS_TOKEN,
       adminAccessToken: process.env.NEWAPI_ADMIN_ACCESS_TOKEN,

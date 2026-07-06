@@ -5,12 +5,6 @@ coverage
 dist
 build
 
-.agent-docs
-AGENTS.md
-findings.md
-progress.md
-task_plan.md
-
 .local-data
 .deploy
 .agent-temp
@@ -24,8 +18,6 @@ pnpm-debug.log*
 
 .env
 .env.*
-!.env.example
-!.env.production.example
 
 .DS_Store
 Thumbs.db
