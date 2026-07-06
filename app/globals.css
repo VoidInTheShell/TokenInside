@@ -209,6 +209,12 @@ a {
   gap: 16px;
 }
 
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
 .grid-4 {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }

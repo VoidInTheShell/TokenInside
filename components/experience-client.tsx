@@ -30,6 +30,10 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
+import {
+  UsageRecordsTable,
+  type UsageRecordRow,
+} from "@/components/usage-records-table";
 import { formatDateTime, formatTokenAmount, maskSecret } from "@/lib/utils";
 
 type SessionResponse = {
@@ -87,6 +91,11 @@ type ModelsResponse = {
     object?: string;
     ownedBy?: string;
   }>;
+  error?: string;
+};
+
+type UsageRecordsResponse = {
+  records: UsageRecordRow[];
   error?: string;
 };
 
@@ -179,10 +188,12 @@ function canDecideRequest(status: string) {
 export function ExperienceClient() {
   const [session, setSession] = useState<SessionResponse | null>(null);
   const [models, setModels] = useState<ModelsResponse["models"]>([]);
+  const [usageRecords, setUsageRecords] = useState<UsageRecordRow[]>([]);
   const [quickApproval, setQuickApproval] = useState<QuickApprovalRequest | null>(null);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [modelsLoading, setModelsLoading] = useState(false);
+  const [usageLoading, setUsageLoading] = useState(false);
   const [quickApprovalLoading, setQuickApprovalLoading] = useState(false);
   const [quickApprovalBusy, setQuickApprovalBusy] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -234,6 +245,22 @@ export function ExperienceClient() {
     }
   }, [session?.activeToken]);
 
+  const loadUsageRecords = useCallback(async () => {
+    if (!session?.activeToken) return;
+    setUsageLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/usage-records?limit=100", { cache: "no-store" });
+      const data = (await res.json()) as UsageRecordsResponse;
+      if (!res.ok) throw new Error(data.error ?? "读取使用记录失败");
+      setUsageRecords(data.records);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取使用记录失败");
+    } finally {
+      setUsageLoading(false);
+    }
+  }, [session?.activeToken]);
+
   const loadQuickApproval = useCallback(async () => {
     if (!session?.adminScope) {
       setQuickApproval(null);
@@ -280,6 +307,12 @@ export function ExperienceClient() {
       void loadModels();
     }
   }, [loadModels, modelsLoaded, modelsLoading, panel, session?.activeToken]);
+
+  useEffect(() => {
+    if (panel === "usage" && session?.activeToken) {
+      void loadUsageRecords();
+    }
+  }, [loadUsageRecords, panel, session?.activeToken]);
 
   const requests = useMemo(() => session?.requests ?? [], [session]);
   const latestRequest = requests[0];
@@ -831,82 +864,112 @@ export function ExperienceClient() {
               )}
 
               {panel === "usage" && (
-                <section className="grid grid-2">
-                  <Card>
-                    <CardHeader>
-                      <CardTitle>当前账期</CardTitle>
-                      <CardDescription>{currentBillingPeriodName}</CardDescription>
-                    </CardHeader>
-                    <CardContent>
-                      <div className="meta-list">
-                        <div className="meta-row">
-                          <span>账期额度</span>
-                          <strong>{formatTokenAmount(currentBillingPeriod?.monthlyQuota)}</strong>
+                <div className="stack">
+                  <section className="grid grid-2">
+                    <Card>
+                      <CardHeader>
+                        <CardTitle>当前账期</CardTitle>
+                        <CardDescription>{currentBillingPeriodName}</CardDescription>
+                      </CardHeader>
+                      <CardContent>
+                        <div className="meta-list">
+                          <div className="meta-row">
+                            <span>账期额度</span>
+                            <strong>{formatTokenAmount(currentBillingPeriod?.monthlyQuota)}</strong>
+                          </div>
+                          <div className="meta-row">
+                            <span>剩余额度</span>
+                            <strong>{formatTokenAmount(remainingQuota)}</strong>
+                          </div>
+                          <div className="meta-row">
+                            <span>总 tokens</span>
+                            <strong>{formatTokenAmount(currentBillingPeriod?.totalTokens, "0")}</strong>
+                          </div>
+                          <div className="meta-row">
+                            <span>输入 tokens</span>
+                            <strong>{formatTokenAmount(currentBillingPeriod?.promptTokens, "0")}</strong>
+                          </div>
+                          <div className="meta-row">
+                            <span>输出 tokens</span>
+                            <strong>{formatTokenAmount(currentBillingPeriod?.completionTokens, "0")}</strong>
+                          </div>
+                          <div className="meta-row">
+                            <span>代理请求</span>
+                            <strong>{currentBillingPeriod?.proxyLogCount ?? 0}</strong>
+                          </div>
                         </div>
-                        <div className="meta-row">
-                          <span>剩余额度</span>
-                          <strong>{formatTokenAmount(remainingQuota)}</strong>
+                      </CardContent>
+                    </Card>
+
+                    <Card>
+                      <CardHeader>
+                        <CardTitle>额度重置</CardTitle>
+                        <CardDescription>
+                          提交后由部门负责人审批，审批通过后重置当前 active key 额度。
+                        </CardDescription>
+                      </CardHeader>
+                      <CardContent>
+                        <div className="field-group">
+                          <div className="field">
+                            <label htmlFor="quotaResetAmount">重置目标额度</label>
+                            <Input
+                              id="quotaResetAmount"
+                              value={String(defaultMonthlyQuota)}
+                              disabled
+                            />
+                            <span className="field-description">以管理后台当前默认额度为准。</span>
+                          </div>
+                          <div className="field">
+                            <label htmlFor="quotaResetReason">申请理由</label>
+                            <Textarea
+                              id="quotaResetReason"
+                              placeholder="请说明额度用尽原因、当前业务场景和预期恢复时间。"
+                              value={quotaResetReason}
+                              onChange={(event) => setQuotaResetReason(event.target.value)}
+                              disabled={busy}
+                            />
+                          </div>
+                          <Button
+                            variant="outline"
+                            disabled={busy || quotaResetReason.trim().length < 4}
+                            onClick={() => void requestQuotaReset()}
+                          >
+                            <RefreshCwIcon data-icon="inline-start" />
+                            申请额度重置
+                          </Button>
                         </div>
-                        <div className="meta-row">
-                          <span>总 tokens</span>
-                          <strong>{formatTokenAmount(currentBillingPeriod?.totalTokens, "0")}</strong>
-                        </div>
-                        <div className="meta-row">
-                          <span>输入 tokens</span>
-                          <strong>{formatTokenAmount(currentBillingPeriod?.promptTokens, "0")}</strong>
-                        </div>
-                        <div className="meta-row">
-                          <span>输出 tokens</span>
-                          <strong>{formatTokenAmount(currentBillingPeriod?.completionTokens, "0")}</strong>
-                        </div>
-                        <div className="meta-row">
-                          <span>代理请求</span>
-                          <strong>{currentBillingPeriod?.proxyLogCount ?? 0}</strong>
-                        </div>
-                      </div>
-                    </CardContent>
-                  </Card>
+                      </CardContent>
+                    </Card>
+                  </section>
 
                   <Card>
                     <CardHeader>
-                      <CardTitle>额度重置</CardTitle>
-                      <CardDescription>
-                        提交后由部门负责人审批，审批通过后重置当前 active key 额度。
-                      </CardDescription>
+                      <CardTitle>使用记录</CardTitle>
+                      <CardDescription>当前飞书用户通过 TokenInside 产生的最近调用。</CardDescription>
                     </CardHeader>
                     <CardContent>
-                      <div className="field-group">
-                        <div className="field">
-                          <label htmlFor="quotaResetAmount">重置目标额度</label>
-                          <Input
-                            id="quotaResetAmount"
-                            value={String(defaultMonthlyQuota)}
-                            disabled
-                          />
-                          <span className="field-description">以管理后台当前默认额度为准。</span>
-                        </div>
-                        <div className="field">
-                          <label htmlFor="quotaResetReason">申请理由</label>
-                          <Textarea
-                            id="quotaResetReason"
-                            placeholder="请说明额度用尽原因、当前业务场景和预期恢复时间。"
-                            value={quotaResetReason}
-                            onChange={(event) => setQuotaResetReason(event.target.value)}
-                            disabled={busy}
-                          />
-                        </div>
+                      <div className="toolbar toolbar-left">
                         <Button
                           variant="outline"
-                          disabled={busy || quotaResetReason.trim().length < 4}
-                          onClick={() => void requestQuotaReset()}
+                          disabled={usageLoading}
+                          onClick={() => void loadUsageRecords()}
                         >
                           <RefreshCwIcon data-icon="inline-start" />
-                          申请额度重置
+                          刷新记录
                         </Button>
+                        <Badge variant={usageLoading ? "warning" : "default"}>
+                          {usageLoading ? "读取中" : `${usageRecords.length} 条`}
+                        </Badge>
                       </div>
+                      <UsageRecordsTable
+                        records={usageRecords}
+                        showUser={false}
+                        showDepartment={false}
+                        emptyText="暂无个人使用记录"
+                      />
                     </CardContent>
                   </Card>
-                </section>
+                </div>
               )}
 
               {panel === "models" && (

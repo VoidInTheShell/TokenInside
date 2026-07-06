@@ -11,6 +11,7 @@ import type {
   RequestStatus,
   StoreShape,
   TokenAccount,
+  TokenStatus,
   TokenRequest,
   UserBillingPeriod,
 } from "@/lib/types";
@@ -346,6 +347,7 @@ export async function upsertFeishuUser(input: {
       name: input.name,
       avatarUrl: input.avatarUrl,
       departmentId: input.departmentId,
+      status: "active",
       createdAt: now,
       updatedAt: now,
     };
@@ -382,10 +384,11 @@ export async function createTokenRequest(input: {
 }) {
   return mutate((store) => {
     const now = nowIso();
+    const requestType = input.requestType ?? "first_apply";
     const request: TokenRequest = {
       id: randomId("tr"),
       feishuUserId: input.feishuUserId,
-      requestType: input.requestType ?? "first_apply",
+      requestType,
       status: input.status ?? "pending_feishu_approval",
       reason: input.reason,
       requestedMonthlyQuota: input.requestedMonthlyQuota,
@@ -403,6 +406,15 @@ export async function createTokenRequest(input: {
       updatedAt: now,
     };
     store.tokenRequests.push(request);
+    if (requestType === "first_apply") {
+      const user = store.users.find((item) => item.id === input.feishuUserId);
+      if (user?.status === "deleted") {
+        user.status = "active";
+        user.deletedAt = undefined;
+        user.deletedReason = undefined;
+        user.updatedAt = now;
+      }
+    }
     return request;
   });
 }
@@ -872,9 +884,57 @@ function proxyLogInScope(
   usersById: Map<string, FeishuUser>,
 ) {
   if (scope.scopeType === "global") return true;
+  if (log.departmentId) return log.departmentId === scope.departmentId;
   if (!log.feishuUserId) return false;
   const user = usersById.get(log.feishuUserId);
   return Boolean(user?.departmentId && user.departmentId === scope.departmentId);
+}
+
+function userInAdminScope(user: FeishuUser, scope: AdminScope) {
+  if (scope.scopeType === "global") return true;
+  return Boolean(user.departmentId && user.departmentId === scope.departmentId);
+}
+
+function activeAdminScopesForUser(user: FeishuUser, store: StoreShape) {
+  const scopes = store.adminScopes.filter(
+    (scope) => scope.feishuUserId === user.id && scope.status === "active",
+  );
+  if (getConfig().admin.systemAdminOpenIds.includes(user.openId)) {
+    scopes.push({
+      id: `env-admin-${user.id}`,
+      feishuUserId: user.id,
+      scopeType: "global",
+      source: "environment",
+      status: "active",
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    });
+  }
+  return scopes;
+}
+
+function userRoleLabel(user: FeishuUser, store: StoreShape) {
+  const scopes = activeAdminScopesForUser(user, store);
+  if (scopes.some((scope) => scope.scopeType === "global")) return "系统管理员";
+  if (scopes.some((scope) => scope.scopeType === "department")) return "部门管理员";
+  return "普通用户";
+}
+
+function latestByUser<T extends { feishuUserId: string; updatedAt?: string; createdAt?: string }>(
+  rows: T[],
+) {
+  const byUser = new Map<string, T>();
+  for (const row of rows) {
+    const current = byUser.get(row.feishuUserId);
+    const rowTime = row.updatedAt ?? row.createdAt ?? "";
+    const currentTime = current?.updatedAt ?? current?.createdAt ?? "";
+    if (!current || rowTime.localeCompare(currentTime) > 0) byUser.set(row.feishuUserId, row);
+  }
+  return byUser;
+}
+
+function scopedUsersForStore(store: StoreShape, scope: AdminScope) {
+  return store.users.filter((user) => userInAdminScope(user, scope));
 }
 
 export async function getScopedTokenRequest(scope: AdminScope, requestId: string) {
@@ -889,8 +949,293 @@ export async function getScopedUser(scope: AdminScope, feishuUserId: string) {
   const store = await readStore();
   const user = store.users.find((item) => item.id === feishuUserId);
   if (!user) return null;
-  if (scope.scopeType === "global") return user;
-  return user.departmentId === scope.departmentId ? user : null;
+  return userInAdminScope(user, scope) ? user : null;
+}
+
+export async function updateUserAccessStatus(input: {
+  feishuUserId: string;
+  status: "disabled" | "deleted";
+  reason?: string;
+  tokenStatus: Extract<TokenStatus, "disabled" | "revoked">;
+}) {
+  return mutate((store) => {
+    const now = nowIso();
+    const user = store.users.find((item) => item.id === input.feishuUserId);
+    if (!user) return null;
+
+    const activeAccount =
+      store.tokenAccounts.find(
+        (account) => account.feishuUserId === input.feishuUserId && account.status === "active",
+      ) ?? null;
+    if (activeAccount) {
+      activeAccount.status = input.tokenStatus;
+      activeAccount.disabledAt = now;
+    }
+
+    user.status = input.status;
+    user.updatedAt = now;
+    if (input.status === "disabled") {
+      user.disabledAt = now;
+      user.disabledReason = input.reason;
+    } else {
+      user.deletedAt = now;
+      user.deletedReason = input.reason;
+      user.disabledAt = user.disabledAt ?? now;
+      user.disabledReason = user.disabledReason ?? input.reason;
+    }
+
+    return { user, tokenAccount: activeAccount };
+  });
+}
+
+export async function listAdminUsers(scope: AdminScope) {
+  const store = await readStore();
+  const users = scopedUsersForStore(store, scope);
+  const activeAccountsByUserId = new Map(
+    store.tokenAccounts
+      .filter((account) => account.status === "active")
+      .map((account) => [account.feishuUserId, account]),
+  );
+  const latestRequestsByUserId = latestByUser(store.tokenRequests);
+  const latestLogsByUserId = latestByUser(
+    store.proxyRequestLogs.filter((log): log is ProxyRequestLog & { feishuUserId: string } =>
+      Boolean(log.feishuUserId),
+    ),
+  );
+  const currentPeriod = nowIso().slice(0, 7);
+  const billingByUserAndPeriod = new Map(
+    store.userBillingPeriods.map((period) => [
+      billingKey(period.feishuUserId, period.period),
+      period,
+    ]),
+  );
+
+  return users
+    .map((user) => {
+      const activeAccount = activeAccountsByUserId.get(user.id);
+      const billingPeriod = activeAccount?.billingPeriod ?? currentPeriod;
+      const billing = billingByUserAndPeriod.get(billingKey(user.id, billingPeriod));
+      const latestRequest = latestRequestsByUserId.get(user.id);
+      const latestLog = latestLogsByUserId.get(user.id);
+      return {
+        id: user.id,
+        name: user.name,
+        openId: user.openId,
+        departmentId: user.departmentId,
+        status: user.status ?? "active",
+        role: userRoleLabel(user, store),
+        activeTokenStatus: activeAccount?.status,
+        activeTokenCreatedAt: activeAccount?.createdAt,
+        billingPeriod,
+        billingMonthlyQuota: billing?.monthlyQuota,
+        billingRemainingQuota:
+          billing?.monthlyQuota === undefined
+            ? undefined
+            : Math.max(billing.monthlyQuota - billing.totalTokens, 0),
+        billingTotalTokens: billing?.totalTokens,
+        billingPromptTokens: billing?.promptTokens,
+        billingCompletionTokens: billing?.completionTokens,
+        billingProxyLogCount: billing?.proxyLogCount,
+        latestRequestStatus: latestRequest?.status,
+        latestRequestType: latestRequest?.requestType,
+        latestRequestUpdatedAt: latestRequest?.updatedAt,
+        latestProxyLogAt: latestLog?.createdAt,
+        updatedAt: user.updatedAt,
+        createdAt: user.createdAt,
+      };
+    })
+    .sort((a, b) => {
+      const left = a.latestProxyLogAt ?? a.latestRequestUpdatedAt ?? a.updatedAt;
+      const right = b.latestProxyLogAt ?? b.latestRequestUpdatedAt ?? b.updatedAt;
+      return right.localeCompare(left);
+    });
+}
+
+export async function listAdminUserStats(scope: AdminScope) {
+  const users = await listAdminUsers(scope);
+  return users
+    .map((user) => ({
+      id: user.id,
+      name: user.name,
+      openId: user.openId,
+      departmentId: user.departmentId,
+      role: user.role,
+      activeTokenStatus: user.activeTokenStatus,
+      billingPeriod: user.billingPeriod,
+      monthlyQuota: user.billingMonthlyQuota ?? 0,
+      remainingQuota: user.billingRemainingQuota,
+      promptTokens: user.billingPromptTokens ?? 0,
+      completionTokens: user.billingCompletionTokens ?? 0,
+      totalTokens: user.billingTotalTokens ?? 0,
+      proxyLogCount: user.billingProxyLogCount ?? 0,
+      quotaUsageRate:
+        user.billingMonthlyQuota && user.billingMonthlyQuota > 0
+          ? (user.billingTotalTokens ?? 0) / user.billingMonthlyQuota
+          : 0,
+      latestProxyLogAt: user.latestProxyLogAt,
+    }))
+    .sort((a, b) => b.totalTokens - a.totalTokens);
+}
+
+export async function listAdminUsageRecords(input: {
+  scope: AdminScope;
+  userId?: string;
+  departmentId?: string;
+  limit?: number;
+}) {
+  const store = await readStore();
+  const usersById = new Map(store.users.map((user) => [user.id, user]));
+  const limit = Math.min(Math.max(input.limit ?? 100, 1), 500);
+  return store.proxyRequestLogs
+    .filter((log) => proxyLogInScope(log, input.scope, usersById))
+    .filter((log) => !input.userId || log.feishuUserId === input.userId)
+    .filter((log) => {
+      if (!input.departmentId) return true;
+      if (log.departmentId) return log.departmentId === input.departmentId;
+      const user = log.feishuUserId ? usersById.get(log.feishuUserId) : undefined;
+      return user?.departmentId === input.departmentId;
+    })
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .slice(0, limit)
+    .map((log) => {
+      const user = log.feishuUserId ? usersById.get(log.feishuUserId) : undefined;
+      return {
+        id: log.id,
+        feishuUserId: log.feishuUserId,
+        tokenAccountId: log.tokenAccountId,
+        userName: user?.name,
+        userOpenId: user?.openId,
+        departmentId: log.departmentId ?? user?.departmentId,
+        departmentName: log.departmentName,
+        requestPath: log.requestPath,
+        method: log.method,
+        statusCode: log.statusCode,
+        durationMs: log.durationMs,
+        promptTokens: log.promptTokens,
+        completionTokens: log.completionTokens,
+        totalTokens: log.totalTokens,
+        clientIp: log.clientIp,
+        userAgent: log.userAgent,
+        createdAt: log.createdAt,
+      };
+    });
+}
+
+export async function listUserUsageRecords(feishuUserId: string, limit = 100) {
+  const store = await readStore();
+  const user = store.users.find((item) => item.id === feishuUserId);
+  const boundedLimit = Math.min(Math.max(limit, 1), 500);
+  return store.proxyRequestLogs
+    .filter((log) => log.feishuUserId === feishuUserId)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .slice(0, boundedLimit)
+    .map((log) => ({
+      id: log.id,
+      departmentId: log.departmentId ?? user?.departmentId,
+      departmentName: log.departmentName,
+      requestPath: log.requestPath,
+      method: log.method,
+      statusCode: log.statusCode,
+      durationMs: log.durationMs,
+      promptTokens: log.promptTokens,
+      completionTokens: log.completionTokens,
+      totalTokens: log.totalTokens,
+      createdAt: log.createdAt,
+    }));
+}
+
+export async function listDepartmentStats(scope: AdminScope) {
+  if (scope.scopeType !== "global") return null;
+
+  const store = await readStore();
+  const currentPeriod = nowIso().slice(0, 7);
+  const usersById = new Map(store.users.map((user) => [user.id, user]));
+  const activeAccounts = store.tokenAccounts.filter((account) => account.status === "active");
+  const stats = new Map<
+    string,
+    {
+      departmentId: string;
+      departmentName?: string;
+      memberCount: number;
+      keyedUsers: Set<string>;
+      monthlyQuota: number;
+      remainingQuota: number;
+      promptTokens: number;
+      completionTokens: number;
+      totalTokens: number;
+      proxyLogCount: number;
+      latestProxyLogAt?: string;
+    }
+  >();
+
+  function ensure(departmentId?: string, departmentName?: string) {
+    const id = departmentId || "unknown";
+    let item = stats.get(id);
+    if (!item) {
+      item = {
+        departmentId: id,
+        departmentName,
+        memberCount: 0,
+        keyedUsers: new Set<string>(),
+        monthlyQuota: 0,
+        remainingQuota: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        proxyLogCount: 0,
+      };
+      stats.set(id, item);
+    }
+    if (!item.departmentName && departmentName) item.departmentName = departmentName;
+    return item;
+  }
+
+  for (const user of store.users) {
+    ensure(user.departmentId).memberCount += 1;
+  }
+
+  for (const account of activeAccounts) {
+    const user = usersById.get(account.feishuUserId);
+    ensure(user?.departmentId).keyedUsers.add(account.feishuUserId);
+  }
+
+  for (const period of store.userBillingPeriods.filter((item) => item.period === currentPeriod)) {
+    const user = usersById.get(period.feishuUserId);
+    const item = ensure(user?.departmentId);
+    item.monthlyQuota += period.monthlyQuota;
+    item.remainingQuota += Math.max(period.monthlyQuota - period.totalTokens, 0);
+  }
+
+  for (const log of store.proxyRequestLogs) {
+    const user = log.feishuUserId ? usersById.get(log.feishuUserId) : undefined;
+    const item = ensure(log.departmentId ?? user?.departmentId, log.departmentName);
+    item.promptTokens += log.promptTokens ?? 0;
+    item.completionTokens += log.completionTokens ?? 0;
+    item.totalTokens += log.totalTokens ?? 0;
+    item.proxyLogCount += 1;
+    if (!item.latestProxyLogAt || log.createdAt.localeCompare(item.latestProxyLogAt) > 0) {
+      item.latestProxyLogAt = log.createdAt;
+    }
+  }
+
+  const totalTokens = [...stats.values()].reduce((sum, item) => sum + item.totalTokens, 0);
+  return [...stats.values()]
+    .map((item) => ({
+      departmentId: item.departmentId,
+      departmentName: item.departmentName,
+      memberCount: item.memberCount,
+      keyedUsers: item.keyedUsers.size,
+      monthlyQuota: item.monthlyQuota,
+      remainingQuota: item.remainingQuota,
+      promptTokens: item.promptTokens,
+      completionTokens: item.completionTokens,
+      totalTokens: item.totalTokens,
+      proxyLogCount: item.proxyLogCount,
+      usageShare: totalTokens > 0 ? item.totalTokens / totalTokens : 0,
+      quotaUsageRate: item.monthlyQuota > 0 ? item.totalTokens / item.monthlyQuota : 0,
+      latestProxyLogAt: item.latestProxyLogAt,
+    }))
+    .sort((a, b) => b.totalTokens - a.totalTokens);
 }
 
 export async function getAdminOverview(scope: AdminScope) {

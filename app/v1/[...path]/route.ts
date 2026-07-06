@@ -130,6 +130,20 @@ async function proxy(request: Request, context: RouteContext) {
   if (!user) {
     return NextResponse.json({ error: "Bound Feishu user no longer exists" }, { status: 403 });
   }
+  if (user.status === "disabled" || user.status === "deleted") {
+    await addProxyLog({
+      feishuUserId: user.id,
+      tokenAccountId: tokenAccount.id,
+      departmentId: user.departmentId,
+      requestPath,
+      method: request.method,
+      statusCode: 403,
+      durationMs: Date.now() - startedAt,
+      userAgent: request.headers.get("user-agent") ?? undefined,
+      clientIp: request.headers.get("x-forwarded-for") ?? undefined,
+    });
+    return NextResponse.json({ error: "Bound Feishu user is not active" }, { status: 403 });
+  }
 
   const upstreamUrl = buildNewApiProxyUrl(path, requestUrl.search);
   const body =
@@ -148,6 +162,7 @@ async function proxy(request: Request, context: RouteContext) {
   await addProxyLog({
     feishuUserId: user.id,
     tokenAccountId: tokenAccount.id,
+    departmentId: user.departmentId,
     requestPath,
     method: request.method,
     statusCode: upstream.status,

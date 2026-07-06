@@ -24,6 +24,11 @@ export type FeishuUser = {
   name?: string;
   avatarUrl?: string;
   departmentId?: string;
+  status?: "active" | "disabled" | "deleted";
+  disabledAt?: string;
+  disabledReason?: string;
+  deletedAt?: string;
+  deletedReason?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -90,6 +95,8 @@ export type ProxyRequestLog = {
   id: string;
   feishuUserId?: string;
   tokenAccountId?: string;
+  departmentId?: string;
+  departmentName?: string;
   requestPath: string;
   method: string;
   statusCode: number;
