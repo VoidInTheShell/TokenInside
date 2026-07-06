@@ -119,9 +119,9 @@ export function getConfig(): RuntimeConfig {
 }
 
 export function requireSessionSecret() {
-  const secret = getConfig().sessionSecret;
-  if (!secret) {
+  const sessionKey = getConfig().sessionSecret;
+  if (!sessionKey) {
     throw new Error("TOKENINSIDE_SESSION_SECRET is required for Feishu session cookies");
   }
-  return secret;
+  return sessionKey;
 }

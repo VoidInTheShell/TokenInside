@@ -289,20 +289,20 @@ async function checkNewApiMutation() {
 
   const params = new URLSearchParams({ keyword: name, p: "0", size: "20" });
   const page = await newApiFetch(`/api/token/search?${params.toString()}`);
-  const token = page.items?.find((item) => item.name === name);
-  if (!token?.id) {
+  const matchedToken = page.items?.find((item) => item.name === name);
+  if (!matchedToken?.id) {
     throw new Error("Created NewAPI token could not be found by exact name");
   }
-  status("NewAPI token search", true, `id=${token.id}`);
+  status("NewAPI token search", true, `id=${matchedToken.id}`);
 
-  const keyBody = await newApiFetch(`/api/token/${token.id}/key`, { method: "POST" });
+  const keyBody = await newApiFetch(`/api/token/${matchedToken.id}/key`, { method: "POST" });
   status("NewAPI token full key", Boolean(keyBody.key), keyBody.key ? "available" : "empty");
 
   await newApiFetch("/api/token/?status_only=true", {
     method: "PUT",
-    body: JSON.stringify({ id: tokenId(token.id), status: 2 }),
+    body: JSON.stringify({ id: tokenId(matchedToken.id), status: 2 }),
   });
-  status("NewAPI token disable", true, `id=${token.id}`);
+  status("NewAPI token disable", true, `id=${matchedToken.id}`);
 }
 
 async function main() {
