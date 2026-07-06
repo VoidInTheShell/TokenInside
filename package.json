@@ -1,0 +1,39 @@
+{
+  "name": "tokeninside",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --hostname 127.0.0.1 --port 16878",
+    "build": "next build",
+    "start": "next start --hostname 0.0.0.0 --port 16878",
+    "typecheck": "tsc --noEmit",
+    "b:check": "node scripts/b-stage-check.mjs",
+    "db:migrate": "node scripts/db-migrate.mjs",
+    "db:import-json": "node scripts/db-import-json.mjs",
+    "db:verify-import": "node scripts/db-verify-import.mjs",
+    "production:preflight": "node scripts/production-preflight.mjs",
+    "production:pg-backup": "bash scripts/production-pg-backup.sh",
+    "production:pg-restore": "bash scripts/production-pg-restore.sh",
+    "production:docker-pull": "bash scripts/production-docker-pull-with-mihomo.sh"
+  },
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.468.0",
+    "next": "^16.0.0",
+    "pg": "^8.22.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tailwind-merge": "^2.6.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.20.0",
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2",
+    "typescript": "^5.7.2"
+  },
+  "overrides": {
+    "postcss": "^8.5.10"
+  }
+}
