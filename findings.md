@@ -276,6 +276,8 @@
 1. 本轮后台重做必须立即落地，不再停留在规划层。实现优先级调整为 E9：重组管理后台、补用户管理、部门统计/用户统计、用户侧和管理侧使用记录，并补禁用/删除重新申请链路。
 2. `fast_context_search` 已定位当前 TokenInside 管理后台核心仍在 `components/admin-client.tsx`、`app/api/admin/overview/route.ts` 和 `lib/store.ts`；当前旧导航仍包含“额度管理”“额度统计”“使用记录”“管理员”，需要合并到“用户管理”和新统计页。
 3. 当前 `getAdminOverview()` 已经能按 `global` / `department` 范围过滤 users、token requests、token accounts、proxy logs 和 user billing periods，适合作为 E9 scope helper 的基础，但后续列表 API 不应继续把完整大数组塞进 overview。
+4. E9 首轮落地后仍需保留 P2 深化项：proxy log 当前只新增 `departmentId` 快照，`departmentName` 仍未从调用时上下文稳定写入；使用记录首版覆盖用户/部门范围与状态码/tokens/路径，但模型维度、错误摘要、时间范围和多条件筛选还没有完全达到 Aether 的完整表格能力。
+5. 删除用户采用软删除/撤销资格更符合历史审计要求：历史 proxy logs、账期和 token request 不删除；用户重新申请时由 `first_apply` 流程清除 deleted 标记并重新审批，不复用旧 key。
 4. Aether 侧可迁移的参考实现已定位：`frontend/src/views/admin/Users.vue` 用于用户表格和操作布局，`frontend/src/features/users/components/UserFormDialog.vue` 用于表单弹窗，`frontend/src/views/admin/UserStats.vue` 用于用户统计排行，`frontend/src/features/usage/components/UsageRecordsTable.vue` 用于复用使用记录表格。
 5. 部门管理员的“用户统计”必须先在服务端计算本部门下属用户集合，再聚合统计；不能返回全站排行后前端过滤，也不能复用系统管理员的全站统计口径。
 6. 系统管理员可以查看“部门统计”；部门管理员不能查看该页面或 API。部门管理员的用户管理和使用记录同样只能覆盖本部门下属用户，跨部门 userId/departmentId/logId 请求必须返回 403。

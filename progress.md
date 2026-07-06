@@ -387,3 +387,10 @@
 377. 已更新 `task_plan.md`：新增 E9 管理后台重做立即落地阶段，明确将旧“额度管理”“管理员”“额度统计”合并为“用户管理”，新增系统管理员专用“部门统计”、部门管理员范围内“用户统计”、用户侧/管理侧“使用记录”和禁用/删除重新申请链路。
 378. 已更新 `.agent-docs/TokenInside-E阶段管理后台与用量统计计划.md`：新增边界 19-25 和 E9 专项计划，写清页面信息架构、用户管理字段、系统管理员/部门管理员权限规则、部门统计、用户统计、使用记录、API、数据模型和验收标准。
 379. 已更新 `findings.md`：记录 fast-context 定位结果、Aether 参考文件、部门管理员统计范围、删除用户软删除语义和部门快照字段需求。下一步开始落地后端 scope/list/stats/usage/revoke API 与管理后台 UI。
+380. E9 后端首轮已本地落地：新增 `FeishuUser.status`、禁用/删除字段和 proxy log 部门快照字段；新增用户管理、用户统计、部门统计、管理侧使用记录、用户侧使用记录、用户禁用和用户删除 API；部门统计仅系统管理员可用，部门管理员直接访问返回 403。
+381. E9 权限边界已服务端收口：用户管理、用户统计和管理侧使用记录均通过 admin scope 裁剪后返回；部门管理员只能看到本部门下属用户；删除为软删除/撤销资格，用户重新申请时清除删除标记并走新申请；`/v1/[...path]` 增加 disabled/deleted 用户状态兜底 403。
+382. E9 前端首轮已本地落地：`/admin` 旧“额度管理”“管理员”“额度统计”合并为“用户管理”；新增系统管理员可见的“部门统计”、系统/部门范围内的“用户统计”、管理侧“使用记录”；用户后台“使用记录”迁入 Aether 风格表格组件。
+383. 本地验证通过：`npm run typecheck` 成功；`npm run build` 成功；`git diff --check` 无空白错误，仅有 Windows LF/CRLF 提示；Docker 构建 `tokeninside:e9-admin-redesign-20260704` 成功，构建阶段 Next 生产构建通过。
+384. 已推送 `voidintheshell/tokeninside:e9-admin-redesign-20260704` 与 `voidintheshell/tokeninside:latest`，两者 digest 均为 `sha256:238326535896e792dab490bc6571a5d7d8b01e1e4420ba7887293945e5bb0b75`。
+385. 已更新 LA/RemoteUSDMITLA 部署：`/home/beihai/tokeninside/docker-compose.yml` 已备份为 `docker-compose.yml.before-e9-admin-redesign-20260704`，app image 已切到 `voidintheshell/tokeninside:e9-admin-redesign-20260704`；远端执行 `sudo -n docker compose pull tokeninside` 和 `up -d tokeninside`，PostgreSQL 未重建。
+386. LA 验收通过：`tokeninside-tokeninside-1` 运行 E9 镜像且 healthy；远端本机 `/api/health` 返回 200；公网 `https://ti.kumiko-love.com/api/health` 返回 200 且 `store.type=postgres`、`schema.ready=true`、`systemAdmins=1`；公网 `/admin` 返回 200；本机 `/api/admin/users` 未登录返回 401 JSON。
