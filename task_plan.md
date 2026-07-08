@@ -63,10 +63,12 @@
 | A5 | complete | 完成依赖安装、类型检查、生产构建、依赖审计和本地页面/API 冒烟验证 |
 | B | in_progress | P0：服务器优先真实链路当前聚焦审批闭环与状态同步；`ti.kumiko-love.com` 当前调试入口仍以可访问公网链路为准，必须完成真实飞书卡片点击、事件审计、App 状态回写、NewAPI 发放/失败补偿和 `/v1` 复测后才能把 B3/B5 视为闭环 |
 | C | in_progress | PostgreSQL foundation 已落地并在生产机切换启用：新增 schema 迁移脚本、JSON 导入脚本、可选 Postgres store、健康检查和 2C2G 默认容器/连接池参数；后续仍需补齐行级事务状态机和备份/恢复运维 |
-| D | pulled_forward | 部署运维工作前置并合入 B0；当前生产机使用统一 compose 管理 PG/app、Nginx Proxy Manager 内网反代 `tokeninside:16878`。2026-07-08 起发布路径升级为 GitHub Actions + 公司 GitLab CI 双 CI/CD 自动构建并推送 `ghcr.io/voidintheshell/tokeninside`；远端仍只执行 pull-only compose 更新，不做源码构建；Docker Hub/save-load 保留为历史回退路径 |
+| D | pulled_forward | 部署运维工作前置并合入 B0；当前生产机使用统一 compose 管理 PG/app、Nginx Proxy Manager 内网反代 `tokeninside:16878`。2026-07-08 起发布路径升级为 GitHub Actions + 公司 GitLab CI 双 CI/CD 自动构建并推送 `ghcr.io/voidintheshell/tokeninside`；公司 GitLab 与 GitHub 公开库主分支均为 `main`，每次更新先推 `company/main`，公开发布只推 `public-export/*` 到 `github-public/main`；远端仍只执行 pull-only compose 更新，不做源码构建；Docker Hub/save-load 保留为历史回退路径 |
 | E | in_progress | P1/P2：已按最新口径前置补齐申请界面/用户后台分流、用户后台模型列表、管理员入口权限展示、`/admin` 入口壳、管理范围数据结构和只读概览 API；已继续补齐默认额度配置、审批单额度覆盖、管理端审批、基础用量统计、用户后台 key 头尾省略展示与点击查看复制、key 重置、用户侧额度重置申请、部门主管自动同步、管理端主动调额、基础账期同步汇总和默认关闭的月度账期重置执行入口；已补入管理员取消用户权限/禁用 active key 的计划任务、被取消资格触发条件和跨部门调动额度继承规则。E8 近期优先修复包已本地落地并部署到 LA：系统管理员兜底审批、系统管理员配置/命名/指派能力、用户后台剩余额度、UI 文案布局收口、`.env` 中文变量说明，以及 token/额度按 K/M/B/T 紧凑单位展示；E8-8 前端细节修复包已本地落地并部署到 LA，覆盖对齐、管理范围卡片和指标卡片口径。E9 管理后台重做首轮已本地落地并部署到 LA，覆盖用户管理、系统管理员部门统计、部门管理员范围内用户统计、用户/管理两侧使用记录、禁用/删除重新申请链路和 `/v1` 用户状态保护 |
 
 ## 当前落地状态
+
+> 发布链路口径说明：本节按时间追加历史状态，2026-07-08 之前的 `本地构建`、`Docker Hub`、`voidintheshell/tokeninside:*` 记录仅代表当时部署事实。2026-07-08 起，后续发布以 GitHub Actions + 公司 GitLab CI 自动构建 `ghcr.io/voidintheshell/tokeninside` 为准；每次更新先推 `company/main`，公开发布只推 `public-export/*` 到 `github-public/main`；staging 自动部署需显式设置 `DEPLOY_STAGING=true`。
 
 1. 本地服务已启动在 `http://127.0.0.1:16878`。
 2. 首版使用 `.local-data/tokeninside.json` 作为 MVP 状态存储；后续生产化应替换为 PostgreSQL。
