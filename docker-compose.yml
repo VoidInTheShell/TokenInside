@@ -1,0 +1,111 @@
+# TokenInside standalone compose example.
+#
+# Usage:
+#   cp .env.example .env
+#   # edit `.env` and fill every replace-with-* value
+#   docker compose -f docker-compose.example.yml up -d
+#   docker compose -f docker-compose.example.yml exec tokeninside npm run db:migrate
+#
+# The app listens on host port 16878. Put your reverse proxy in front of it and
+# set TOKENINSIDE_PUBLIC_BASE_URL in `.env` to the public HTTPS URL.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tokeninside-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tokeninside}
+      POSTGRES_USER: ${POSTGRES_USER:-tokeninside}
+    command:
+      - postgres
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:?set POSTGRES_MAX_CONNECTIONS in .env}
+      - -c
+      - superuser_reserved_connections=${POSTGRES_SUPERUSER_RESERVED_CONNECTIONS:?set POSTGRES_SUPERUSER_RESERVED_CONNECTIONS in .env}
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:?set POSTGRES_SHARED_BUFFERS in .env}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:?set POSTGRES_EFFECTIVE_CACHE_SIZE in .env}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:?set POSTGRES_WORK_MEM in .env}
+      - -c
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:?set POSTGRES_MAINTENANCE_WORK_MEM in .env}
+      - -c
+      - checkpoint_timeout=${POSTGRES_CHECKPOINT_TIMEOUT:?set POSTGRES_CHECKPOINT_TIMEOUT in .env}
+      - -c
+      - checkpoint_completion_target=${POSTGRES_CHECKPOINT_COMPLETION_TARGET:?set POSTGRES_CHECKPOINT_COMPLETION_TARGET in .env}
+      - -c
+      - max_wal_size=${POSTGRES_MAX_WAL_SIZE:?set POSTGRES_MAX_WAL_SIZE in .env}
+      - -c
+      - min_wal_size=${POSTGRES_MIN_WAL_SIZE:?set POSTGRES_MIN_WAL_SIZE in .env}
+      - -c
+      - wal_buffers=${POSTGRES_WAL_BUFFERS:?set POSTGRES_WAL_BUFFERS in .env}
+      - -c
+      - wal_compression=${POSTGRES_WAL_COMPRESSION:?set POSTGRES_WAL_COMPRESSION in .env}
+      - -c
+      - autovacuum=${POSTGRES_AUTOVACUUM:?set POSTGRES_AUTOVACUUM in .env}
+      - -c
+      - autovacuum_max_workers=${POSTGRES_AUTOVACUUM_MAX_WORKERS:?set POSTGRES_AUTOVACUUM_MAX_WORKERS in .env}
+      - -c
+      - autovacuum_naptime=${POSTGRES_AUTOVACUUM_NAPTIME:?set POSTGRES_AUTOVACUUM_NAPTIME in .env}
+      - -c
+      - autovacuum_vacuum_scale_factor=${POSTGRES_AUTOVACUUM_VACUUM_SCALE_FACTOR:?set POSTGRES_AUTOVACUUM_VACUUM_SCALE_FACTOR in .env}
+      - -c
+      - autovacuum_analyze_scale_factor=${POSTGRES_AUTOVACUUM_ANALYZE_SCALE_FACTOR:?set POSTGRES_AUTOVACUUM_ANALYZE_SCALE_FACTOR in .env}
+      - -c
+      - autovacuum_vacuum_threshold=${POSTGRES_AUTOVACUUM_VACUUM_THRESHOLD:?set POSTGRES_AUTOVACUUM_VACUUM_THRESHOLD in .env}
+      - -c
+      - autovacuum_analyze_threshold=${POSTGRES_AUTOVACUUM_ANALYZE_THRESHOLD:?set POSTGRES_AUTOVACUUM_ANALYZE_THRESHOLD in .env}
+      - -c
+      - idle_in_transaction_session_timeout=${POSTGRES_IDLE_IN_TRANSACTION_SESSION_TIMEOUT:?set POSTGRES_IDLE_IN_TRANSACTION_SESSION_TIMEOUT in .env}
+      - -c
+      - statement_timeout=${POSTGRES_STATEMENT_TIMEOUT:?set POSTGRES_STATEMENT_TIMEOUT in .env}
+      - -c
+      - lock_timeout=${POSTGRES_LOCK_TIMEOUT:?set POSTGRES_LOCK_TIMEOUT in .env}
+      - -c
+      - log_min_duration_statement=${POSTGRES_LOG_MIN_DURATION_STATEMENT:?set POSTGRES_LOG_MIN_DURATION_STATEMENT in .env}
+    shm_size: "${TOKENINSIDE_POSTGRES_SHM_SIZE:?set TOKENINSIDE_POSTGRES_SHM_SIZE in .env}"
+    volumes:
+      - tokeninside_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tokeninside} -d ${POSTGRES_DB:-tokeninside}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  tokeninside:
+    image: ${TOKENINSIDE_IMAGE:-ghcr.io/voidintheshell/tokeninside:staging}
+    container_name: tokeninside
+    restart: unless-stopped
+    pull_policy: always
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "16878:16878"
+    volumes:
+      - tokeninside_app_data:/app/.local-data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:16878/api/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  tokeninside_app_data:
+    name: tokeninside_app_data
+  tokeninside_pg_data:
+    name: tokeninside_pg_data

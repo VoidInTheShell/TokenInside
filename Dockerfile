@@ -13,6 +13,9 @@ RUN npm run build
 FROM node:22-alpine AS runner
 WORKDIR /app
 
+ARG SOURCE_URL=https://github.com/VoidInTheShell/TokenInside
+LABEL org.opencontainers.image.source=$SOURCE_URL
+
 ENV HOSTNAME=0.0.0.0
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
