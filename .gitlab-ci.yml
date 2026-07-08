@@ -96,7 +96,7 @@ deploy:staging:
     url: $STAGING_APP_URL
   resource_group: tokeninside-staging
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "main" && $DEPLOY_STAGING == "true"'
   before_script:
     - apk add --no-cache openssh-client curl
     - mkdir -p ~/.ssh
