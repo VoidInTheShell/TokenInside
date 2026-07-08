@@ -210,16 +210,24 @@ export async function listModelsForNewApiToken(newapiTokenId: string) {
   return [];
 }
 
-export async function disableNewApiToken(newapiTokenId: string) {
+async function setNewApiTokenStatus(newapiTokenId: string, status: 1 | 2) {
   const { newapi } = getConfig();
   if (newapi.mock) return;
   await newApiFetch<unknown>("/api/token/?status_only=true", {
     method: "PUT",
     body: JSON.stringify({
       id: Number.isNaN(Number(newapiTokenId)) ? newapiTokenId : Number(newapiTokenId),
-      status: 2,
+      status,
     }),
   });
+}
+
+export async function enableNewApiToken(newapiTokenId: string) {
+  await setNewApiTokenStatus(newapiTokenId, 1);
+}
+
+export async function disableNewApiToken(newapiTokenId: string) {
+  await setNewApiTokenStatus(newapiTokenId, 2);
 }
 
 export async function updateNewApiTokenQuota(input: {

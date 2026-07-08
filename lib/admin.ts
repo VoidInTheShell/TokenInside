@@ -1,6 +1,15 @@
 import { NextResponse } from "next/server";
 import { getEffectiveAdminScopeForUser, hydrateUserDepartment } from "@/lib/admin-sync";
 import { getCurrentUser } from "@/lib/session";
+import type { AdminScope } from "@/lib/types";
+
+export function isRootAdminScope(scope?: AdminScope | null) {
+  return scope?.scopeType === "global" && scope.source === "environment" && scope.role === "root";
+}
+
+export function isSystemAdminScope(scope?: AdminScope | null) {
+  return scope?.scopeType === "global";
+}
 
 export async function requireAdminScope() {
   const user = await hydrateUserDepartment(await getCurrentUser());

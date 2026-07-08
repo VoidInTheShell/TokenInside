@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { requireAdminScope } from "@/lib/admin";
-import { updateManualAdminScope } from "@/lib/store";
+import { isRootAdminScope, isSystemAdminScope, requireAdminScope } from "@/lib/admin";
+import { getAdminScopeById, updateManualAdminScope } from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,11 +17,22 @@ export async function PATCH(
 ) {
   const auth = await requireAdminScope();
   if ("error" in auth) return auth.error;
-  if (auth.scope.scopeType !== "global") {
+  if (!isSystemAdminScope(auth.scope)) {
     return NextResponse.json({ error: "只有系统管理员可以管理管理员范围" }, { status: 403 });
   }
 
   const { id } = await context.params;
+  const current = await getAdminScopeById(id);
+  if (!current || current.source === "environment") {
+    return NextResponse.json(
+      { error: "管理员范围不存在，或该范围来自环境变量不能在页面中修改" },
+      { status: 404 },
+    );
+  }
+  if (current.scopeType === "global" && !isRootAdminScope(auth.scope)) {
+    return NextResponse.json({ error: "只有 root 管理员可以修改系统管理员" }, { status: 403 });
+  }
+
   const input = updateAdminSchema.parse(await request.json());
   const admin = await updateManualAdminScope({
     scopeId: id,
@@ -33,6 +44,39 @@ export async function PATCH(
       { error: "管理员范围不存在，或该范围来自环境变量不能在页面中修改" },
       { status: 404 },
     );
+  }
+
+  return NextResponse.json({ admin });
+}
+
+export async function DELETE(
+  _request: Request,
+  context: { params: Promise<{ id: string }> },
+) {
+  const auth = await requireAdminScope();
+  if ("error" in auth) return auth.error;
+  if (!isSystemAdminScope(auth.scope)) {
+    return NextResponse.json({ error: "只有系统管理员可以取消管理员" }, { status: 403 });
+  }
+
+  const { id } = await context.params;
+  const current = await getAdminScopeById(id);
+  if (!current || current.source === "environment") {
+    return NextResponse.json(
+      { error: "管理员范围不存在，或该范围来自环境变量不能在页面中取消" },
+      { status: 404 },
+    );
+  }
+  if (current.scopeType === "global" && !isRootAdminScope(auth.scope)) {
+    return NextResponse.json({ error: "只有 root 管理员可以取消系统管理员" }, { status: 403 });
+  }
+
+  const admin = await updateManualAdminScope({
+    scopeId: id,
+    status: "disabled",
+  });
+  if (!admin) {
+    return NextResponse.json({ error: "取消管理员失败" }, { status: 404 });
   }
 
   return NextResponse.json({ admin });

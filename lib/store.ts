@@ -94,12 +94,32 @@ function normalizeStore(store: StoreShape) {
   }
 
   for (const log of store.proxyRequestLogs) {
+    if (!log.status) {
+      if (log.statusCode === 0) {
+        log.status = "pending";
+      } else if (log.statusCode === 499) {
+        log.status = "cancelled";
+      } else if (log.statusCode >= 400) {
+        log.status = "failed";
+      } else {
+        log.status = "completed";
+      }
+      changed = true;
+    }
+    if (log.durationMs === undefined) {
+      log.durationMs = 0;
+      changed = true;
+    }
     if (
       log.totalTokens === undefined &&
       log.promptTokens !== undefined &&
       log.completionTokens !== undefined
     ) {
       log.totalTokens = log.promptTokens + log.completionTokens;
+      changed = true;
+    }
+    if (!log.updatedAt) {
+      log.updatedAt = log.createdAt;
       changed = true;
     }
   }
@@ -492,6 +512,16 @@ export async function getActiveTokenForUser(feishuUserId: string) {
   );
 }
 
+export async function getDisabledTokenForUser(feishuUserId: string) {
+  const store = await readStore();
+  return (
+    [...store.tokenAccounts]
+      .filter((account) => account.feishuUserId === feishuUserId && account.status === "disabled")
+      .sort((a, b) => (b.disabledAt ?? b.createdAt).localeCompare(a.disabledAt ?? a.createdAt))[0] ??
+    null
+  );
+}
+
 export async function listActiveTokenAccounts() {
   const store = await readStore();
   const usersById = new Map(store.users.map((user) => [user.id, user]));
@@ -667,13 +697,61 @@ export async function getFeishuEventByUuid(eventUuid: string) {
 
 export async function addProxyLog(log: Omit<ProxyRequestLog, "id" | "createdAt">) {
   return mutate((store) => {
+    const now = nowIso();
     const stored: ProxyRequestLog = {
       id: randomId("pl"),
-      createdAt: nowIso(),
+      createdAt: now,
+      updatedAt: now,
       ...log,
+      status:
+        log.status ??
+        (log.statusCode === 499
+          ? "cancelled"
+          : log.statusCode >= 400
+            ? "failed"
+            : "completed"),
     };
     store.proxyRequestLogs.push(stored);
     return stored;
+  });
+}
+
+export async function beginProxyLog(
+  log: Omit<ProxyRequestLog, "id" | "createdAt" | "statusCode" | "durationMs"> &
+    Partial<Pick<ProxyRequestLog, "statusCode" | "durationMs">>,
+) {
+  return mutate((store) => {
+    const now = nowIso();
+    const stored: ProxyRequestLog = {
+      id: randomId("pl"),
+      createdAt: now,
+      updatedAt: now,
+      statusCode: log.statusCode ?? 0,
+      durationMs: log.durationMs ?? 0,
+      ...log,
+      status: log.status ?? "pending",
+    };
+    store.proxyRequestLogs.push(stored);
+    return stored;
+  });
+}
+
+export async function updateProxyLog(
+  id: string,
+  patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">>,
+) {
+  return mutate((store) => {
+    const log = store.proxyRequestLogs.find((item) => item.id === id);
+    if (!log) return null;
+    Object.assign(log, patch, { updatedAt: nowIso() });
+    if (
+      log.totalTokens === undefined &&
+      log.promptTokens !== undefined &&
+      log.completionTokens !== undefined
+    ) {
+      log.totalTokens = log.promptTokens + log.completionTokens;
+    }
+    return log;
   });
 }
 
@@ -689,6 +767,7 @@ export async function getAdminScopeForUser(feishuUserId: string) {
       feishuUserId,
       scopeType: "global",
       source: "environment",
+      role: "root",
       status: "active",
       createdAt: now,
       updatedAt: now,
@@ -737,6 +816,7 @@ export async function listAdminScopes() {
       feishuUserId: user?.id ?? "",
       scopeType: "global" as const,
       source: "environment" as const,
+      role: "root" as const,
       status: "active" as const,
       createdAt: user?.createdAt ?? now,
       updatedAt: user?.updatedAt ?? now,
@@ -808,6 +888,11 @@ export async function updateManualAdminScope(input: {
     scope.updatedAt = nowIso();
     return scope;
   });
+}
+
+export async function getAdminScopeById(scopeId: string) {
+  const store = await readStore();
+  return store.adminScopes.find((item) => item.id === scopeId) ?? null;
 }
 
 export async function syncDepartmentSupervisorAdminScope(input: {
@@ -905,6 +990,7 @@ function activeAdminScopesForUser(user: FeishuUser, store: StoreShape) {
       feishuUserId: user.id,
       scopeType: "global",
       source: "environment",
+      role: "root",
       status: "active",
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
@@ -988,6 +1074,38 @@ export async function updateUserAccessStatus(input: {
   });
 }
 
+export async function enableUserAccess(input: {
+  feishuUserId: string;
+  reason?: string;
+}) {
+  return mutate((store) => {
+    const now = nowIso();
+    const user = store.users.find((item) => item.id === input.feishuUserId);
+    if (!user || user.status !== "disabled") return null;
+
+    const disabledAccount =
+      [...store.tokenAccounts]
+        .filter(
+          (account) =>
+            account.feishuUserId === input.feishuUserId && account.status === "disabled",
+        )
+        .sort((a, b) =>
+          (b.disabledAt ?? b.createdAt).localeCompare(a.disabledAt ?? a.createdAt),
+        )[0] ?? null;
+    if (!disabledAccount) return null;
+
+    disabledAccount.status = "active";
+    disabledAccount.disabledAt = undefined;
+
+    user.status = "active";
+    user.updatedAt = now;
+    user.disabledAt = undefined;
+    user.disabledReason = undefined;
+
+    return { user, tokenAccount: disabledAccount };
+  });
+}
+
 export async function listAdminUsers(scope: AdminScope) {
   const store = await readStore();
   const users = scopedUsersForStore(store, scope);
@@ -996,6 +1114,7 @@ export async function listAdminUsers(scope: AdminScope) {
       .filter((account) => account.status === "active")
       .map((account) => [account.feishuUserId, account]),
   );
+  const latestAccountsByUserId = latestByUser(store.tokenAccounts);
   const latestRequestsByUserId = latestByUser(store.tokenRequests);
   const latestLogsByUserId = latestByUser(
     store.proxyRequestLogs.filter((log): log is ProxyRequestLog & { feishuUserId: string } =>
@@ -1013,6 +1132,7 @@ export async function listAdminUsers(scope: AdminScope) {
   return users
     .map((user) => {
       const activeAccount = activeAccountsByUserId.get(user.id);
+      const latestAccount = activeAccount ?? latestAccountsByUserId.get(user.id);
       const billingPeriod = activeAccount?.billingPeriod ?? currentPeriod;
       const billing = billingByUserAndPeriod.get(billingKey(user.id, billingPeriod));
       const latestRequest = latestRequestsByUserId.get(user.id);
@@ -1024,8 +1144,8 @@ export async function listAdminUsers(scope: AdminScope) {
         departmentId: user.departmentId,
         status: user.status ?? "active",
         role: userRoleLabel(user, store),
-        activeTokenStatus: activeAccount?.status,
-        activeTokenCreatedAt: activeAccount?.createdAt,
+        activeTokenStatus: latestAccount?.status,
+        activeTokenCreatedAt: latestAccount?.createdAt,
         billingPeriod,
         billingMonthlyQuota: billing?.monthlyQuota,
         billingRemainingQuota:
@@ -1077,71 +1197,451 @@ export async function listAdminUserStats(scope: AdminScope) {
     .sort((a, b) => b.totalTokens - a.totalTokens);
 }
 
-export async function listAdminUsageRecords(input: {
-  scope: AdminScope;
+type UsageRecordFilters = {
   userId?: string;
   departmentId?: string;
+  model?: string;
+  provider?: string;
+  apiFormat?: string;
+  status?: string;
+  userAgent?: string;
+  clientFamily?: string;
+  search?: string;
+  preset?: string;
+  startDate?: string;
+  endDate?: string;
+  hideUnknownRecords?: boolean;
   limit?: number;
+  offset?: number;
+};
+
+function boundedLimit(value: number | undefined, fallback: number) {
+  return Math.min(Math.max(value ?? fallback, 1), 500);
+}
+
+function boundedOffset(value: number | undefined) {
+  return Math.max(value ?? 0, 0);
+}
+
+function normalizeFilter(value?: string) {
+  if (!value || value === "__all__") return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function isUnknownUsageValue(value?: string) {
+  const normalized = value?.trim().toLowerCase();
+  return !normalized || normalized === "unknown" || normalized === "-" || normalized === "null";
+}
+
+function logDisplayStatus(log: ProxyRequestLog) {
+  if (log.status === "pending" || log.status === "streaming") {
+    if (log.statusCode >= 400 || log.errorMessage) return "failed";
+    if (log.status === "streaming" && log.firstByteMs === undefined) return "pending";
+    return log.status;
+  }
+  if (log.status) return log.status;
+  if (log.statusCode === 499) return "cancelled";
+  if (log.statusCode >= 400) return "failed";
+  return "completed";
+}
+
+function logIsStream(log: ProxyRequestLog) {
+  return Boolean(log.isStream || log.upstreamIsStream || log.clientRequestedStream || log.clientIsStream);
+}
+
+function logDepartmentId(log: ProxyRequestLog, user?: FeishuUser) {
+  return log.departmentId ?? user?.departmentId;
+}
+
+function matchesStatusFilter(log: ProxyRequestLog, status?: string) {
+  if (!status) return true;
+  const displayStatus = logDisplayStatus(log);
+  switch (status) {
+    case "stream":
+      return logIsStream(log);
+    case "standard":
+      return !logIsStream(log);
+    case "active":
+      return displayStatus === "pending" || displayStatus === "streaming";
+    case "failed":
+      return displayStatus === "failed";
+    case "cancelled":
+      return displayStatus === "cancelled";
+    case "has_retry":
+    case "has_fallback":
+      return false;
+    default:
+      return displayStatus === status;
+  }
+}
+
+function dateBoundary(value: string | undefined, endOfDay: boolean) {
+  if (!value) return undefined;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return new Date(`${value}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}`).getTime();
+  }
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) ? time : undefined;
+}
+
+function presetDateRange(preset?: string) {
+  const now = new Date();
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setHours(23, 59, 59, 999);
+
+  switch (preset) {
+    case "yesterday":
+      start.setDate(start.getDate() - 1);
+      end.setDate(end.getDate() - 1);
+      return { start: start.getTime(), end: end.getTime() };
+    case "last7days":
+      start.setDate(start.getDate() - 6);
+      return { start: start.getTime(), end: now.getTime() };
+    case "last30days":
+      start.setDate(start.getDate() - 29);
+      return { start: start.getTime(), end: now.getTime() };
+    case "last90days":
+      start.setDate(start.getDate() - 89);
+      return { start: start.getTime(), end: now.getTime() };
+    case "today":
+      return { start: start.getTime(), end: now.getTime() };
+    default:
+      return {};
+  }
+}
+
+function matchesDateRange(log: ProxyRequestLog, filters: UsageRecordFilters) {
+  const preset = presetDateRange(filters.preset);
+  const start = dateBoundary(filters.startDate, false) ?? preset.start;
+  const end = dateBoundary(filters.endDate, true) ?? preset.end;
+  const createdAt = new Date(log.createdAt).getTime();
+  if (!Number.isFinite(createdAt)) return true;
+  if (start !== undefined && createdAt < start) return false;
+  if (end !== undefined && createdAt > end) return false;
+  return true;
+}
+
+function matchesSearch(log: ProxyRequestLog, user: FeishuUser | undefined, search?: string) {
+  const normalized = search?.trim().toLowerCase();
+  if (!normalized) return true;
+  return [
+    user?.name,
+    user?.openId,
+    log.tokenAccountId,
+    log.requestPath,
+    log.method,
+    log.model,
+    log.provider,
+    log.providerKeyName,
+    log.apiFormat,
+    log.clientFamily,
+    log.clientIp,
+    log.userAgent,
+    log.errorMessage,
+  ]
+    .filter(Boolean)
+    .some((value) => String(value).toLowerCase().includes(normalized));
+}
+
+function mapUsageRecord(log: ProxyRequestLog, usersById: Map<string, FeishuUser>) {
+  const user = log.feishuUserId ? usersById.get(log.feishuUserId) : undefined;
+  return {
+    id: log.id,
+    feishuUserId: log.feishuUserId,
+    tokenAccountId: log.tokenAccountId,
+    userName: user?.name,
+    userOpenId: user?.openId,
+    departmentId: logDepartmentId(log, user),
+    departmentName: log.departmentName,
+    requestPath: log.requestPath,
+    method: log.method,
+    status: logDisplayStatus(log),
+    rawStatus: log.status,
+    statusCode: log.statusCode,
+    durationMs: log.durationMs,
+    firstByteMs: log.firstByteMs,
+    responseTimeUpdatedAt: log.responseTimeUpdatedAt,
+    model: log.model,
+    provider: log.provider,
+    providerKeyName: log.providerKeyName,
+    apiFormat: log.apiFormat,
+    endpointApiFormat: log.endpointApiFormat,
+    requestType: log.requestType,
+    isStream: log.isStream,
+    upstreamIsStream: log.upstreamIsStream,
+    clientRequestedStream: log.clientRequestedStream,
+    clientIsStream: log.clientIsStream,
+    promptTokens: log.promptTokens,
+    completionTokens: log.completionTokens,
+    totalTokens: log.totalTokens,
+    cacheReadTokens: log.cacheReadTokens,
+    cacheCreationTokens: log.cacheCreationTokens,
+    cost: log.cost,
+    actualCost: log.actualCost,
+    errorMessage: log.errorMessage,
+    clientFamily: log.clientFamily,
+    clientIp: log.clientIp,
+    userAgent: log.userAgent,
+    createdAt: log.createdAt,
+    updatedAt: log.updatedAt,
+  };
+}
+
+function uniqueSorted(values: Array<string | undefined>) {
+  return [...new Set(values.filter((value): value is string => Boolean(value?.trim())))]
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function usageCacheHitRate(inputTokens: number, cacheReadTokens: number, cacheCreationTokens: number) {
+  const totalInputContext = inputTokens + cacheReadTokens + cacheCreationTokens;
+  return totalInputContext > 0 ? cacheReadTokens / totalInputContext : 0;
+}
+
+function aggregateUsage(
+  logs: ProxyRequestLog[],
+  usersById: Map<string, FeishuUser>,
+  getKey: (log: ProxyRequestLog, user: FeishuUser | undefined) => { key: string; label: string },
+) {
+  const rows = new Map<
+    string,
+    {
+      id: string;
+      label: string;
+      requestCount: number;
+      promptTokens: number;
+      completionTokens: number;
+      totalTokens: number;
+      cacheReadTokens: number;
+      cacheCreationTokens: number;
+      cost: number;
+      actualCost: number;
+      successCount: number;
+      durationTotalMs: number;
+      durationCount: number;
+    }
+  >();
+
+  for (const log of logs) {
+    const user = log.feishuUserId ? usersById.get(log.feishuUserId) : undefined;
+    const key = getKey(log, user);
+    let row = rows.get(key.key);
+    if (!row) {
+      row = {
+        id: key.key,
+        label: key.label,
+        requestCount: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        cost: 0,
+        actualCost: 0,
+        successCount: 0,
+        durationTotalMs: 0,
+        durationCount: 0,
+      };
+      rows.set(key.key, row);
+    }
+    row.requestCount += 1;
+    row.promptTokens += log.promptTokens ?? 0;
+    row.completionTokens += log.completionTokens ?? 0;
+    row.totalTokens += log.totalTokens ?? 0;
+    row.cacheReadTokens += log.cacheReadTokens ?? 0;
+    row.cacheCreationTokens += log.cacheCreationTokens ?? 0;
+    row.cost += log.cost ?? 0;
+    row.actualCost += log.actualCost ?? 0;
+    if (logDisplayStatus(log) === "completed") row.successCount += 1;
+    if (log.durationMs > 0) {
+      row.durationTotalMs += log.durationMs;
+      row.durationCount += 1;
+    }
+  }
+
+  return [...rows.values()]
+    .map((row) => ({
+      id: row.id,
+      label: row.label,
+      requestCount: row.requestCount,
+      promptTokens: row.promptTokens,
+      completionTokens: row.completionTokens,
+      totalTokens: row.totalTokens,
+      cacheReadTokens: row.cacheReadTokens,
+      cacheCreationTokens: row.cacheCreationTokens,
+      cost: row.cost,
+      actualCost: row.actualCost,
+      successRate: row.requestCount > 0 ? row.successCount / row.requestCount : 0,
+      avgDurationMs: row.durationCount > 0 ? row.durationTotalMs / row.durationCount : 0,
+      cacheHitRate: usageCacheHitRate(
+        row.promptTokens,
+        row.cacheReadTokens,
+        row.cacheCreationTokens,
+      ),
+      costPerMillionTokens: row.totalTokens > 0 ? (row.cost / row.totalTokens) * 1_000_000 : 0,
+    }))
+    .sort((a, b) => b.totalTokens - a.totalTokens || b.requestCount - a.requestCount);
+}
+
+function filterUsageLogs(
+  logs: ProxyRequestLog[],
+  usersById: Map<string, FeishuUser>,
+  filters: UsageRecordFilters,
+) {
+  const userId = normalizeFilter(filters.userId);
+  const departmentId = normalizeFilter(filters.departmentId);
+  const model = normalizeFilter(filters.model);
+  const provider = normalizeFilter(filters.provider);
+  const apiFormat = normalizeFilter(filters.apiFormat);
+  const status = normalizeFilter(filters.status);
+  const userAgent = normalizeFilter(filters.userAgent);
+  const clientFamily = normalizeFilter(filters.clientFamily);
+
+  return logs
+    .filter((log) => matchesDateRange(log, filters))
+    .filter((log) => {
+      const user = log.feishuUserId ? usersById.get(log.feishuUserId) : undefined;
+      if (userId && log.feishuUserId !== userId) return false;
+      if (departmentId && logDepartmentId(log, user) !== departmentId) return false;
+      if (model && log.model !== model) return false;
+      if (provider && log.provider !== provider) return false;
+      if (apiFormat && log.apiFormat !== apiFormat) return false;
+      if (userAgent && log.userAgent !== userAgent) return false;
+      if (!userAgent && clientFamily && log.clientFamily !== clientFamily) return false;
+      if (!matchesStatusFilter(log, status)) return false;
+      if (filters.hideUnknownRecords && (
+        isUnknownUsageValue(log.model) ||
+        isUnknownUsageValue(log.provider) ||
+        isUnknownUsageValue(log.apiFormat)
+      )) {
+        return false;
+      }
+      return matchesSearch(log, user, filters.search);
+    });
+}
+
+export async function listAdminUsageRecords(input: UsageRecordFilters & {
+  scope: AdminScope;
 }) {
   const store = await readStore();
   const usersById = new Map(store.users.map((user) => [user.id, user]));
-  const limit = Math.min(Math.max(input.limit ?? 100, 1), 500);
-  return store.proxyRequestLogs
-    .filter((log) => proxyLogInScope(log, input.scope, usersById))
-    .filter((log) => !input.userId || log.feishuUserId === input.userId)
-    .filter((log) => {
-      if (!input.departmentId) return true;
-      if (log.departmentId) return log.departmentId === input.departmentId;
-      const user = log.feishuUserId ? usersById.get(log.feishuUserId) : undefined;
-      return user?.departmentId === input.departmentId;
-    })
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-    .slice(0, limit)
-    .map((log) => {
-      const user = log.feishuUserId ? usersById.get(log.feishuUserId) : undefined;
+  const scopedLogs = store.proxyRequestLogs.filter((log) =>
+    proxyLogInScope(log, input.scope, usersById),
+  );
+  const dateScopedLogs = scopedLogs.filter((log) => matchesDateRange(log, input));
+  const filteredLogs = filterUsageLogs(scopedLogs, usersById, input).sort((a, b) =>
+    b.createdAt.localeCompare(a.createdAt),
+  );
+  const limit = boundedLimit(input.limit, 100);
+  const offset = boundedOffset(input.offset);
+  const pageLogs = filteredLogs.slice(offset, offset + limit);
+  const userIdsWithLogs = new Set(dateScopedLogs.map((log) => log.feishuUserId).filter(Boolean));
+
+  return {
+    records: pageLogs.map((log) => mapUsageRecord(log, usersById)),
+    total: filteredLogs.length,
+    limit,
+    offset,
+    filters: {
+      users: [...userIdsWithLogs]
+        .map((userId) => {
+          const user = userId ? usersById.get(userId) : undefined;
+          return user
+            ? {
+                id: user.id,
+                name: user.name,
+                openId: user.openId,
+                departmentId: user.departmentId,
+              }
+            : null;
+        })
+        .filter(Boolean)
+        .sort((a, b) => (a?.name ?? a?.openId ?? "").localeCompare(b?.name ?? b?.openId ?? "")),
+      departments: [...new Map(
+        dateScopedLogs.map((log) => {
+          const user = log.feishuUserId ? usersById.get(log.feishuUserId) : undefined;
+          const id = logDepartmentId(log, user) ?? "unknown";
+          return [
+            id,
+            {
+              id,
+              name: log.departmentName,
+            },
+          ] as const;
+        }),
+      ).values()].sort((a, b) => a.id.localeCompare(b.id)),
+      models: uniqueSorted(dateScopedLogs.map((log) => log.model)),
+      providers: uniqueSorted(dateScopedLogs.map((log) => log.provider)),
+      apiFormats: uniqueSorted(dateScopedLogs.map((log) => log.apiFormat)),
+      userAgents: uniqueSorted(dateScopedLogs.map((log) => log.userAgent)),
+      clientFamilies: uniqueSorted(dateScopedLogs.map((log) => log.clientFamily)),
+    },
+    modelStats: aggregateUsage(filteredLogs, usersById, (log) => ({
+      key: log.model ?? "unknown",
+      label: log.model ?? "unknown",
+    })),
+    departmentStats: aggregateUsage(filteredLogs, usersById, (log, user) => {
+      const id = logDepartmentId(log, user) ?? "unknown";
       return {
-        id: log.id,
-        feishuUserId: log.feishuUserId,
-        tokenAccountId: log.tokenAccountId,
-        userName: user?.name,
-        userOpenId: user?.openId,
-        departmentId: log.departmentId ?? user?.departmentId,
-        departmentName: log.departmentName,
-        requestPath: log.requestPath,
-        method: log.method,
-        statusCode: log.statusCode,
-        durationMs: log.durationMs,
-        promptTokens: log.promptTokens,
-        completionTokens: log.completionTokens,
-        totalTokens: log.totalTokens,
-        clientIp: log.clientIp,
-        userAgent: log.userAgent,
-        createdAt: log.createdAt,
+        key: id,
+        label: log.departmentName ?? id,
       };
-    });
+    }),
+    apiFormatStats: aggregateUsage(filteredLogs, usersById, (log) => ({
+      key: log.apiFormat ?? "unknown",
+      label: log.apiFormat ?? "unknown",
+    })),
+  };
 }
 
 export async function listUserUsageRecords(feishuUserId: string, limit = 100) {
   const store = await readStore();
-  const user = store.users.find((item) => item.id === feishuUserId);
-  const boundedLimit = Math.min(Math.max(limit, 1), 500);
+  const usersById = new Map(store.users.map((user) => [user.id, user]));
+  const bounded = boundedLimit(limit, 100);
   return store.proxyRequestLogs
     .filter((log) => log.feishuUserId === feishuUserId)
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-    .slice(0, boundedLimit)
-    .map((log) => ({
-      id: log.id,
-      departmentId: log.departmentId ?? user?.departmentId,
-      departmentName: log.departmentName,
-      requestPath: log.requestPath,
-      method: log.method,
-      statusCode: log.statusCode,
-      durationMs: log.durationMs,
-      promptTokens: log.promptTokens,
-      completionTokens: log.completionTokens,
-      totalTokens: log.totalTokens,
-      createdAt: log.createdAt,
-    }));
+    .slice(0, bounded)
+    .map((log) => mapUsageRecord(log, usersById));
+}
+
+export async function listUserUsageReport(input: UsageRecordFilters & {
+  feishuUserId: string;
+}) {
+  const store = await readStore();
+  const usersById = new Map(store.users.map((user) => [user.id, user]));
+  const scopedLogs = store.proxyRequestLogs.filter((log) => log.feishuUserId === input.feishuUserId);
+  const dateScopedLogs = scopedLogs.filter((log) => matchesDateRange(log, input));
+  const filteredLogs = filterUsageLogs(scopedLogs, usersById, input).sort((a, b) =>
+    b.createdAt.localeCompare(a.createdAt),
+  );
+  const limit = boundedLimit(input.limit, 100);
+  const offset = boundedOffset(input.offset);
+  const pageLogs = filteredLogs.slice(offset, offset + limit);
+
+  return {
+    records: pageLogs.map((log) => mapUsageRecord(log, usersById)),
+    total: filteredLogs.length,
+    limit,
+    offset,
+    filters: {
+      models: uniqueSorted(dateScopedLogs.map((log) => log.model)),
+      providers: uniqueSorted(dateScopedLogs.map((log) => log.provider)),
+      apiFormats: uniqueSorted(dateScopedLogs.map((log) => log.apiFormat)),
+      userAgents: uniqueSorted(dateScopedLogs.map((log) => log.userAgent)),
+      clientFamilies: uniqueSorted(dateScopedLogs.map((log) => log.clientFamily)),
+    },
+    modelStats: aggregateUsage(filteredLogs, usersById, (log) => ({
+      key: log.model ?? "unknown",
+      label: log.model ?? "unknown",
+    })),
+    apiFormatStats: aggregateUsage(filteredLogs, usersById, (log) => ({
+      key: log.apiFormat ?? "unknown",
+      label: log.apiFormat ?? "unknown",
+    })),
+  };
 }
 
 export async function listDepartmentStats(scope: AdminScope) {
@@ -1327,6 +1827,7 @@ export async function getAdminOverview(scope: AdminScope) {
       type: scope.scopeType,
       departmentId: scope.departmentId,
       source: scope.source,
+      role: scope.role,
     },
     totals: {
       users: scopedUsers.length,

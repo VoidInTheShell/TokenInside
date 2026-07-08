@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { requireAdminScope } from "@/lib/admin";
+import { isRootAdminScope, isSystemAdminScope, requireAdminScope } from "@/lib/admin";
 import { listAdminScopes, upsertManualAdminScope } from "@/lib/store";
 
 export const runtime = "nodejs";
@@ -37,6 +37,12 @@ export async function POST(request: Request) {
   if (systemAdminError) return systemAdminError;
 
   const input = assignAdminSchema.parse(await request.json());
+  if (!isSystemAdminScope(auth.scope)) {
+    return NextResponse.json({ error: "只有系统管理员可以管理管理员范围" }, { status: 403 });
+  }
+  if (input.scopeType === "global" && !isRootAdminScope(auth.scope)) {
+    return NextResponse.json({ error: "只有 root 管理员可以指派系统管理员" }, { status: 403 });
+  }
   if (input.scopeType === "department" && !input.departmentId) {
     return NextResponse.json({ error: "指派部门管理员需要 departmentId" }, { status: 400 });
   }

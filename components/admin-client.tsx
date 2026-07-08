@@ -33,14 +33,41 @@ import { Input } from "@/components/ui/input";
 import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
 import {
   UsageRecordsTable,
+  type UsageOption,
   type UsageRecordRow,
+  type UsageRecordFiltersState,
 } from "@/components/usage-records-table";
+import {
+  UsageAnalysisTable,
+  type UsageAggregateRow,
+} from "@/components/usage-analysis-tables";
 import { formatDateTime, formatTokenAmount, maskSecret } from "@/lib/utils";
 
 type AdminScopeSummary = {
   type: "global" | "department";
   departmentId?: string;
   source: "manual" | "department_supervisor" | "environment";
+  role?: "root";
+};
+
+type AdminScopeRecord = {
+  id: string;
+  feishuUserId: string;
+  scopeType: "global" | "department";
+  departmentId?: string;
+  source: "manual" | "department_supervisor" | "environment";
+  role?: "root";
+  status: "active" | "disabled";
+  configuredOpenId?: string;
+  readonly?: boolean;
+  user?: {
+    id: string;
+    name?: string;
+    openId?: string;
+    departmentId?: string;
+  } | null;
+  createdAt: string;
+  updatedAt: string;
 };
 
 type AdminOverviewResponse = {
@@ -143,6 +170,11 @@ type AdminUsersResponse = {
   error?: string;
 };
 
+type AdminScopesResponse = {
+  admins: AdminScopeRecord[];
+  error?: string;
+};
+
 type UserStatsRow = {
   id: string;
   name?: string;
@@ -189,6 +221,21 @@ type DepartmentStatsResponse = {
 
 type UsageRecordsResponse = {
   records: UsageRecordRow[];
+  total?: number;
+  limit?: number;
+  offset?: number;
+  filters?: {
+    users?: Array<{ id: string; name?: string; openId?: string; departmentId?: string }>;
+    departments?: Array<{ id: string; name?: string }>;
+    models?: string[];
+    providers?: string[];
+    apiFormats?: string[];
+    clientFamilies?: string[];
+    userAgents?: string[];
+  };
+  modelStats?: UsageAggregateRow[];
+  departmentStats?: UsageAggregateRow[];
+  apiFormatStats?: UsageAggregateRow[];
   error?: string;
 };
 
@@ -237,9 +284,22 @@ function badgeVariant(status?: string) {
 
 function scopeLabel(scope?: AdminScopeSummary) {
   if (!scope) return "无管理范围";
+  if (scope.role === "root") return "root 管理员";
   if (scope.type === "global") return "系统管理员";
   return "部门管理";
 }
+
+function adminScopeLabel(scope: AdminScopeRecord) {
+  if (scope.role === "root") return "root 管理员";
+  if (scope.scopeType === "global") return "系统管理员";
+  return "部门管理员";
+}
+
+const adminScopeSourceLabel: Record<AdminScopeRecord["source"], string> = {
+  manual: "手动指派",
+  department_supervisor: "部门主管同步",
+  environment: "环境变量 root",
+};
 
 function displayName(user?: AdminOverviewResponse["user"]) {
   return user?.name || maskSecret(user?.openId) || "-";
@@ -269,12 +329,60 @@ function formatRate(value?: number) {
   return `${Math.round((value ?? 0) * 1000) / 10}%`;
 }
 
+async function readJsonResponse<T>(res: Response): Promise<T & { error?: string }> {
+  const text = await res.text();
+  if (!text.trim()) return {} as T & { error?: string };
+  try {
+    return JSON.parse(text) as T & { error?: string };
+  } catch {
+    return { error: text } as T & { error?: string };
+  }
+}
+
+function appendUsageParam(params: URLSearchParams, key: string, value?: string) {
+  if (!value || value === "__all__") return;
+  params.set(key, value);
+}
+
 export function AdminClient() {
   const [data, setData] = useState<AdminOverviewResponse | null>(null);
   const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
+  const [adminScopes, setAdminScopes] = useState<AdminScopeRecord[]>([]);
   const [userStats, setUserStats] = useState<UserStatsRow[]>([]);
   const [departmentStats, setDepartmentStats] = useState<DepartmentStatsRow[]>([]);
   const [usageRecords, setUsageRecords] = useState<UsageRecordRow[]>([]);
+  const [usageModelStats, setUsageModelStats] = useState<UsageAggregateRow[]>([]);
+  const [usageDepartmentStats, setUsageDepartmentStats] = useState<UsageAggregateRow[]>([]);
+  const [usageApiFormatStats, setUsageApiFormatStats] = useState<UsageAggregateRow[]>([]);
+  const [usageTotalRecords, setUsageTotalRecords] = useState(0);
+  const [usagePage, setUsagePage] = useState(1);
+  const [usagePageSize, setUsagePageSize] = useState(20);
+  const [usageStatsExpanded, setUsageStatsExpanded] = useState(true);
+  const [usageAutoRefresh, setUsageAutoRefresh] = useState(true);
+  const [usageHideUnknownRecords, setUsageHideUnknownRecords] = useState(false);
+  const [usageFilters, setUsageFilters] = useState<UsageRecordFiltersState>({
+    preset: "today",
+    search: "",
+    userId: "__all__",
+    departmentId: "__all__",
+    model: "__all__",
+    apiFormat: "__all__",
+    status: "__all__",
+    userAgent: "__all__",
+  });
+  const [usageFilterOptions, setUsageFilterOptions] = useState<{
+    users: UsageOption[];
+    departments: UsageOption[];
+    models: string[];
+    apiFormats: string[];
+    userAgents: string[];
+  }>({
+    users: [],
+    departments: [],
+    models: [],
+    apiFormats: [],
+    userAgents: [],
+  });
   const [loading, setLoading] = useState(true);
   const [panelLoading, setPanelLoading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -294,7 +402,7 @@ export function AdminClient() {
     setError(null);
     try {
       const res = await fetch("/api/admin/overview?mode=soft", { cache: "no-store" });
-      const body = (await res.json()) as AdminOverviewResponse;
+      const body = await readJsonResponse<AdminOverviewResponse>(res);
       setData(body);
       if (body.settings) {
         setDefaultQuotaDraft(String(body.settings.defaultMonthlyQuota));
@@ -325,7 +433,7 @@ export function AdminClient() {
     setError(null);
     try {
       const res = await fetch("/api/admin/users", { cache: "no-store" });
-      const body = (await res.json()) as AdminUsersResponse;
+      const body = await readJsonResponse<AdminUsersResponse>(res);
       if (!res.ok) throw new Error(body.error ?? "读取用户管理失败");
       setAdminUsers(body.users);
     } catch (err) {
@@ -335,12 +443,24 @@ export function AdminClient() {
     }
   }, []);
 
+  const loadAdminScopes = useCallback(async () => {
+    setError(null);
+    try {
+      const res = await fetch("/api/admin/admins", { cache: "no-store" });
+      const body = await readJsonResponse<AdminScopesResponse>(res);
+      if (!res.ok) throw new Error(body.error ?? "读取管理员范围失败");
+      setAdminScopes(body.admins);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取管理员范围失败");
+    }
+  }, []);
+
   const loadUserStats = useCallback(async () => {
     setPanelLoading(true);
     setError(null);
     try {
       const res = await fetch("/api/admin/user-stats", { cache: "no-store" });
-      const body = (await res.json()) as UserStatsResponse;
+      const body = await readJsonResponse<UserStatsResponse>(res);
       if (!res.ok) throw new Error(body.error ?? "读取用户统计失败");
       setUserStats(body.stats);
     } catch (err) {
@@ -355,7 +475,7 @@ export function AdminClient() {
     setError(null);
     try {
       const res = await fetch("/api/admin/department-stats", { cache: "no-store" });
-      const body = (await res.json()) as DepartmentStatsResponse;
+      const body = await readJsonResponse<DepartmentStatsResponse>(res);
       if (!res.ok) throw new Error(body.error ?? "读取部门统计失败");
       setDepartmentStats(body.departments);
     } catch (err) {
@@ -365,20 +485,51 @@ export function AdminClient() {
     }
   }, []);
 
-  const loadUsageRecords = useCallback(async () => {
-    setPanelLoading(true);
+  const loadUsageRecords = useCallback(async (options: { quiet?: boolean } = {}) => {
+    if (!options.quiet) setPanelLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/admin/usage-records?limit=200", { cache: "no-store" });
-      const body = (await res.json()) as UsageRecordsResponse;
+      const params = new URLSearchParams();
+      params.set("limit", String(usagePageSize));
+      params.set("offset", String((usagePage - 1) * usagePageSize));
+      params.set("hideUnknownRecords", String(usageHideUnknownRecords));
+      appendUsageParam(params, "preset", usageFilters.preset);
+      appendUsageParam(params, "search", usageFilters.search);
+      appendUsageParam(params, "userId", usageFilters.userId);
+      appendUsageParam(params, "departmentId", usageFilters.departmentId);
+      appendUsageParam(params, "model", usageFilters.model);
+      appendUsageParam(params, "apiFormat", usageFilters.apiFormat);
+      appendUsageParam(params, "status", usageFilters.status);
+      appendUsageParam(params, "userAgent", usageFilters.userAgent);
+      const res = await fetch(`/api/admin/usage-records?${params.toString()}`, { cache: "no-store" });
+      const body = await readJsonResponse<UsageRecordsResponse>(res);
       if (!res.ok) throw new Error(body.error ?? "读取使用记录失败");
       setUsageRecords(body.records);
+      setUsageTotalRecords(body.total ?? body.records.length);
+      setUsageModelStats(body.modelStats ?? []);
+      setUsageDepartmentStats(body.departmentStats ?? []);
+      setUsageApiFormatStats(body.apiFormatStats ?? []);
+      if (body.filters) {
+        setUsageFilterOptions({
+          users: (body.filters.users ?? []).map((user) => ({
+            id: user.id,
+            label: user.name ?? maskSecret(user.openId) ?? user.id,
+          })),
+          departments: (body.filters.departments ?? []).map((department) => ({
+            id: department.id,
+            label: department.name ?? maskSecret(department.id) ?? department.id,
+          })),
+          models: body.filters.models ?? [],
+          apiFormats: body.filters.apiFormats ?? [],
+          userAgents: body.filters.userAgents ?? [],
+        });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "读取使用记录失败");
     } finally {
-      setPanelLoading(false);
+      if (!options.quiet) setPanelLoading(false);
     }
-  }, []);
+  }, [usageFilters, usageHideUnknownRecords, usagePage, usagePageSize]);
 
   useEffect(() => {
     void refresh();
@@ -387,22 +538,39 @@ export function AdminClient() {
   const overview = data?.overview;
   const totals = overview?.totals;
   const isSystemAdmin = overview?.scope.type === "global";
+  const isRootAdmin = overview?.scope.role === "root";
 
   useEffect(() => {
     if (!data?.authorized) return;
-    if (panel === "users") void loadAdminUsers();
+    if (panel === "users") {
+      void loadAdminUsers();
+      if (isSystemAdmin) void loadAdminScopes();
+    }
     if (panel === "userStats") void loadUserStats();
     if (panel === "departmentStats" && isSystemAdmin) void loadDepartmentStats();
     if (panel === "usageRecords") void loadUsageRecords();
   }, [
     data?.authorized,
     isSystemAdmin,
+    loadAdminScopes,
     loadAdminUsers,
     loadDepartmentStats,
     loadUsageRecords,
     loadUserStats,
     panel,
   ]);
+
+  useEffect(() => {
+    setUsagePage(1);
+  }, [usageFilters, usageHideUnknownRecords, usagePageSize]);
+
+  useEffect(() => {
+    if (!data?.authorized || panel !== "usageRecords" || !usageAutoRefresh) return;
+    const timer = window.setInterval(() => {
+      void loadUsageRecords({ quiet: true });
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [data?.authorized, loadUsageRecords, panel, usageAutoRefresh]);
 
   const connectFeishu = useCallback(async () => {
     setError(null);
@@ -546,6 +714,10 @@ export function AdminClient() {
   }
 
   async function assignAdmin(scopeType: "global" | "department") {
+    if (scopeType === "global" && !isRootAdmin) {
+      setError("只有 root 管理员可以指派系统管理员");
+      return;
+    }
     if (!adminTargetOpenId.trim()) {
       setError("需要填写目标用户 open_id");
       return;
@@ -573,9 +745,30 @@ export function AdminClient() {
       setMessage("管理员已指派。");
       setAdminTargetOpenId("");
       setAdminDepartmentId("");
-      await loadAdminUsers();
+      await Promise.all([loadAdminUsers(), loadAdminScopes(), refresh()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "指派管理员失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelAdmin(scope: AdminScopeRecord) {
+    const target = scope.user?.name ?? maskSecret(scope.user?.openId ?? scope.configuredOpenId) ?? scope.id;
+    if (!window.confirm(`确认取消 ${target} 的${adminScopeLabel(scope)}权限？`)) return;
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(`/api/admin/admins/${encodeURIComponent(scope.id)}`, {
+        method: "DELETE",
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "取消管理员失败");
+      setMessage("管理员权限已取消。");
+      await Promise.all([loadAdminScopes(), loadAdminUsers(), refresh()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "取消管理员失败");
     } finally {
       setBusy(false);
     }
@@ -598,6 +791,28 @@ export function AdminClient() {
       await Promise.all([refresh(), loadAdminUsers(), loadUserStats()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "禁用用户失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function enableUser(user: AdminUser) {
+    if (!window.confirm(`确认启用 ${user.name ?? maskSecret(user.openId)} 的 key？`)) return;
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(`/api/admin/users/${encodeURIComponent(user.id)}/enable`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reason: "管理后台启用用户 key" }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "启用用户失败");
+      setMessage("用户 key 已启用。");
+      await Promise.all([refresh(), loadAdminUsers(), loadUserStats()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "启用用户失败");
     } finally {
       setBusy(false);
     }
@@ -886,16 +1101,95 @@ export function AdminClient() {
                         />
                       </div>
                       <div className="toolbar toolbar-left">
-                        <Button variant="outline" disabled={busy} onClick={() => void assignAdmin("global")}>
-                          <ShieldCheckIcon data-icon="inline-start" />
-                          指派系统管理员
-                        </Button>
+                        {isRootAdmin && (
+                          <Button variant="outline" disabled={busy} onClick={() => void assignAdmin("global")}>
+                            <ShieldCheckIcon data-icon="inline-start" />
+                            指派系统管理员
+                          </Button>
+                        )}
                         <Button variant="outline" disabled={busy} onClick={() => void assignAdmin("department")}>
                           <UserCogIcon data-icon="inline-start" />
                           指派部门管理员
                         </Button>
                       </div>
                     </div>
+                  </CardContent>
+                </Card>
+              )}
+
+              {isSystemAdmin && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle>管理员范围</CardTitle>
+                    <CardDescription>
+                      root 来自环境变量，系统管理员权限只能由 root 指派或取消。
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="toolbar toolbar-left">
+                      <Button variant="outline" disabled={busy} onClick={() => void loadAdminScopes()}>
+                        <RefreshCwIcon data-icon="inline-start" />
+                        刷新管理员
+                      </Button>
+                      <Badge>{adminScopes.length} 条范围</Badge>
+                    </div>
+                    {!adminScopes.length ? (
+                      <div className="empty">暂无管理员范围</div>
+                    ) : (
+                      <div className="table-wrap">
+                        <table className="table">
+                          <thead>
+                            <tr>
+                              <th>管理员</th>
+                              <th>角色</th>
+                              <th>来源</th>
+                              <th>部门</th>
+                              <th>状态</th>
+                              <th>更新时间</th>
+                              <th>操作</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {adminScopes.map((scope) => {
+                              const canCancel =
+                                !scope.readonly &&
+                                scope.status === "active" &&
+                                (scope.scopeType !== "global" || isRootAdmin);
+                              return (
+                                <tr key={scope.id}>
+                                  <td>
+                                    <div className="meta-stack">
+                                      <strong>{scope.user?.name ?? maskSecret(scope.configuredOpenId) ?? "-"}</strong>
+                                      <span>{maskSecret(scope.user?.openId ?? scope.configuredOpenId) ?? "-"}</span>
+                                    </div>
+                                  </td>
+                                  <td>{adminScopeLabel(scope)}</td>
+                                  <td>{adminScopeSourceLabel[scope.source]}</td>
+                                  <td>{maskSecret(scope.departmentId) ?? "-"}</td>
+                                  <td>
+                                    <Badge variant={badgeVariant(scope.status)}>
+                                      {scope.status === "active" ? "启用" : "已取消"}
+                                    </Badge>
+                                  </td>
+                                  <td>{formatDateTime(scope.updatedAt)}</td>
+                                  <td>
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      disabled={busy || !canCancel}
+                                      onClick={() => void cancelAdmin(scope)}
+                                    >
+                                      <XCircleIcon data-icon="inline-start" />
+                                      取消管理员
+                                    </Button>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
                   </CardContent>
                 </Card>
               )}
@@ -995,14 +1289,25 @@ export function AdminClient() {
                                       指派
                                     </Button>
                                   )}
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    disabled={busy || user.activeTokenStatus !== "active"}
-                                    onClick={() => void disableUser(user)}
-                                  >
-                                    禁用
-                                  </Button>
+                                  {user.status === "disabled" ? (
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      disabled={busy || user.activeTokenStatus !== "disabled"}
+                                      onClick={() => void enableUser(user)}
+                                    >
+                                      启用
+                                    </Button>
+                                  ) : (
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      disabled={busy || user.status !== "active" || user.activeTokenStatus !== "active"}
+                                      onClick={() => void disableUser(user)}
+                                    >
+                                      禁用
+                                    </Button>
+                                  )}
                                   <Button variant="outline" size="sm" disabled={busy} onClick={() => void deleteUser(user)}>
                                     <Trash2Icon data-icon="inline-start" />
                                     删除
@@ -1125,17 +1430,85 @@ export function AdminClient() {
           )}
 
           {panel === "usageRecords" && (
-            <Card>
-              <CardHeader>
-                <CardTitle>使用记录</CardTitle>
-                <CardDescription>
-                  {isSystemAdmin ? "系统管理员查看全站调用记录。" : "部门管理员只查看本部门下属用户调用记录。"}
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <UsageRecordsTable records={usageRecords} />
-              </CardContent>
-            </Card>
+            <section className="stack">
+              <Card>
+                <CardHeader>
+                  <div className="usage-section-header">
+                    <div>
+                      <CardTitle>用量分析</CardTitle>
+                      <CardDescription>
+                        {isSystemAdmin ? "系统管理员查看全站调用记录。" : "部门管理员只查看本部门下属用户调用记录。"}
+                      </CardDescription>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setUsageStatsExpanded((current) => !current)}
+                    >
+                      <BarChart3Icon data-icon="inline-start" />
+                      {usageStatsExpanded ? "收起" : "展开"}
+                    </Button>
+                  </div>
+                </CardHeader>
+                {usageStatsExpanded && (
+                  <CardContent>
+                    <div className="usage-analysis-grid">
+                      <UsageAnalysisTable
+                        title="按模型分析"
+                        emptyText="暂无模型统计数据"
+                        rows={usageModelStats}
+                        terminalColumn="efficiency"
+                      />
+                      <UsageAnalysisTable
+                        title="按部门分析"
+                        emptyText="暂无部门统计数据"
+                        rows={usageDepartmentStats}
+                        terminalColumn="successRate"
+                      />
+                      <UsageAnalysisTable
+                        title="按API格式分析"
+                        emptyText="暂无API格式统计数据"
+                        rows={usageApiFormatStats}
+                        terminalColumn="avgDuration"
+                      />
+                    </div>
+                  </CardContent>
+                )}
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>使用记录</CardTitle>
+                  <CardDescription>按 Aether 维度展示请求、tokens、费用和首字/总耗时。</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <UsageRecordsTable
+                    records={usageRecords}
+                    loading={panelLoading}
+                    showUser
+                    showDepartment
+                    showControls
+                    filters={usageFilters}
+                    onFiltersChange={setUsageFilters}
+                    availableUsers={usageFilterOptions.users}
+                    availableDepartments={usageFilterOptions.departments}
+                    availableModels={usageFilterOptions.models}
+                    availableApiFormats={usageFilterOptions.apiFormats}
+                    availableUserAgents={usageFilterOptions.userAgents}
+                    totalRecords={usageTotalRecords}
+                    currentPage={usagePage}
+                    pageSize={usagePageSize}
+                    onPageChange={setUsagePage}
+                    onPageSizeChange={setUsagePageSize}
+                    autoRefresh={usageAutoRefresh}
+                    onAutoRefreshChange={setUsageAutoRefresh}
+                    hideUnknownRecords={usageHideUnknownRecords}
+                    onHideUnknownRecordsChange={setUsageHideUnknownRecords}
+                    onRefresh={() => void loadUsageRecords()}
+                  />
+                </CardContent>
+              </Card>
+            </section>
           )}
 
           {panel === "approvals" && (

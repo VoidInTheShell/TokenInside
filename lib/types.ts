@@ -15,6 +15,13 @@ export type RequestStatus =
 
 export type TokenStatus = "active" | "disabled" | "revoked" | "replaced";
 
+export type ProxyRequestStatus =
+  | "pending"
+  | "streaming"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
 export type FeishuUser = {
   id: string;
   tenantKey: string;
@@ -99,14 +106,34 @@ export type ProxyRequestLog = {
   departmentName?: string;
   requestPath: string;
   method: string;
+  status?: ProxyRequestStatus;
   statusCode: number;
   durationMs: number;
+  firstByteMs?: number;
+  responseTimeUpdatedAt?: string;
+  model?: string;
+  provider?: string;
+  providerKeyName?: string;
+  apiFormat?: string;
+  endpointApiFormat?: string;
+  requestType?: "standard" | "stream";
+  isStream?: boolean;
+  upstreamIsStream?: boolean;
+  clientRequestedStream?: boolean;
+  clientIsStream?: boolean;
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+  cost?: number;
+  actualCost?: number;
+  errorMessage?: string;
+  clientFamily?: string;
   clientIp?: string;
   userAgent?: string;
   createdAt: string;
+  updatedAt?: string;
 };
 
 export type UserBillingPeriod = {
@@ -129,6 +156,7 @@ export type AdminScope = {
   scopeType: "global" | "department";
   departmentId?: string;
   source: "manual" | "department_supervisor" | "environment";
+  role?: "root";
   status: "active" | "disabled";
   createdAt: string;
   updatedAt: string;

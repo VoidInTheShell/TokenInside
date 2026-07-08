@@ -150,6 +150,7 @@ export async function GET() {
           type: adminScope.scopeType,
           departmentId: adminScope.departmentId,
           source: adminScope.source,
+          role: adminScope.role,
         }
       : null,
     requests,

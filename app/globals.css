@@ -754,6 +754,322 @@ a {
   font-size: 12px;
 }
 
+.spin {
+  animation: ti-spin 0.9s linear infinite;
+}
+
+.usage-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.usage-analysis-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.usage-analysis-grid-user {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.usage-analysis-card .card-header,
+.usage-analysis-card .card-content {
+  padding: 12px;
+}
+
+.usage-analysis-card .card-header {
+  min-height: 42px;
+}
+
+.usage-analysis-table-wrap {
+  max-height: 320px;
+}
+
+.usage-analysis-table {
+  font-size: 12px;
+}
+
+.usage-analysis-table th,
+.usage-analysis-table td {
+  padding: 8px 7px;
+}
+
+.usage-th-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1.15;
+}
+
+.usage-th-stack span:last-child {
+  color: var(--muted-foreground);
+  font-weight: 400;
+}
+
+.usage-records {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.usage-records-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.usage-records-control-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.usage-records-actions {
+  justify-content: flex-end;
+}
+
+.usage-filter {
+  min-width: 132px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.usage-search-filter {
+  width: 132px;
+  min-width: 132px;
+  flex: 0 0 132px;
+}
+
+.usage-select {
+  height: 34px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.usage-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+}
+
+.usage-search svg {
+  position: absolute;
+  left: 10px;
+  color: var(--muted-foreground);
+  z-index: 1;
+}
+
+.usage-search .input {
+  height: 34px;
+  padding-left: 32px;
+  font-size: 12px;
+}
+
+.usage-columns {
+  position: relative;
+  min-width: 116px;
+  font-size: 12px;
+}
+
+.usage-columns summary {
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  background: var(--card);
+}
+
+.usage-columns div {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  width: 180px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.12);
+  padding: 8px;
+  z-index: 20;
+}
+
+.usage-columns label {
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--foreground);
+}
+
+.usage-toggle-active {
+  color: var(--primary);
+}
+
+.usage-table {
+  min-width: 1120px;
+  table-layout: fixed;
+}
+
+.usage-table th,
+.usage-table td {
+  height: 72px;
+  vertical-align: top;
+}
+
+.usage-table th {
+  height: 48px;
+}
+
+.usage-time,
+.usage-cost,
+.usage-performance,
+.usage-status-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.usage-time span:first-child {
+  color: var(--foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-time span:last-child,
+.usage-cost span:last-child,
+.usage-performance span:last-child,
+.usage-status-cell span {
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+
+.usage-cost {
+  align-items: flex-end;
+  color: var(--primary);
+  font-weight: 600;
+}
+
+.usage-tokens {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+}
+
+.usage-tokens div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 4px;
+  align-items: center;
+}
+
+.usage-tokens div span:first-child {
+  text-align: right;
+}
+
+.usage-tokens div span:last-child {
+  text-align: left;
+}
+
+.usage-tokens div:nth-child(2) {
+  color: var(--muted-foreground);
+}
+
+.usage-tokens-compact {
+  min-width: 88px;
+}
+
+.usage-muted {
+  color: var(--muted-foreground);
+}
+
+.usage-status-live {
+  animation: ti-pulse 1.4s ease-in-out infinite;
+}
+
+.usage-empty-cell {
+  height: 120px;
+  text-align: center;
+  color: var(--muted-foreground);
+}
+
+.usage-records-mobile {
+  display: none;
+}
+
+.usage-record-card {
+  border-bottom: 1px solid var(--border);
+  padding: 12px 0;
+}
+
+.usage-record-card-main,
+.usage-record-card-metrics {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.usage-record-card-main > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.usage-record-card-main strong {
+  overflow-wrap: anywhere;
+}
+
+.usage-record-card-main span,
+.usage-record-card-line {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.usage-record-card-line {
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+}
+
+.usage-record-card-metrics {
+  margin-top: 8px;
+}
+
+.usage-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+@keyframes ti-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
 @media (max-width: 1100px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -767,6 +1083,11 @@ a {
   .grid-4,
   .grid-2 {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .usage-analysis-grid,
+  .usage-analysis-grid-user {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -825,6 +1146,42 @@ a {
 
   .metric-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .usage-section-header,
+  .usage-pagination {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .usage-records-control-row {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .usage-records-actions {
+    justify-content: flex-start;
+  }
+
+  .usage-filter,
+  .usage-search-filter {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .usage-records-desktop {
+    display: none;
+  }
+
+  .usage-records-mobile {
+    display: block;
+  }
+
+  .usage-record-card-metrics {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .quick-approval {

@@ -33,7 +33,12 @@ import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
 import {
   UsageRecordsTable,
   type UsageRecordRow,
+  type UsageRecordFiltersState,
 } from "@/components/usage-records-table";
+import {
+  UsageAnalysisTable,
+  type UsageAggregateRow,
+} from "@/components/usage-analysis-tables";
 import { formatDateTime, formatTokenAmount, maskSecret } from "@/lib/utils";
 
 type SessionResponse = {
@@ -96,6 +101,18 @@ type ModelsResponse = {
 
 type UsageRecordsResponse = {
   records: UsageRecordRow[];
+  total?: number;
+  limit?: number;
+  offset?: number;
+  filters?: {
+    models?: string[];
+    providers?: string[];
+    apiFormats?: string[];
+    clientFamilies?: string[];
+    userAgents?: string[];
+  };
+  modelStats?: UsageAggregateRow[];
+  apiFormatStats?: UsageAggregateRow[];
   error?: string;
 };
 
@@ -185,10 +202,42 @@ function canDecideRequest(status: string) {
   ].includes(status);
 }
 
+function appendUsageParam(params: URLSearchParams, key: string, value?: string) {
+  if (!value || value === "__all__") return;
+  params.set(key, value);
+}
+
 export function ExperienceClient() {
   const [session, setSession] = useState<SessionResponse | null>(null);
   const [models, setModels] = useState<ModelsResponse["models"]>([]);
   const [usageRecords, setUsageRecords] = useState<UsageRecordRow[]>([]);
+  const [usageModelStats, setUsageModelStats] = useState<UsageAggregateRow[]>([]);
+  const [usageApiFormatStats, setUsageApiFormatStats] = useState<UsageAggregateRow[]>([]);
+  const [usageTotalRecords, setUsageTotalRecords] = useState(0);
+  const [usagePage, setUsagePage] = useState(1);
+  const [usagePageSize, setUsagePageSize] = useState(20);
+  const [usageStatsExpanded, setUsageStatsExpanded] = useState(true);
+  const [usageAutoRefresh, setUsageAutoRefresh] = useState(true);
+  const [usageHideUnknownRecords, setUsageHideUnknownRecords] = useState(false);
+  const [usageFilters, setUsageFilters] = useState<UsageRecordFiltersState>({
+    preset: "today",
+    search: "",
+    userId: "__all__",
+    departmentId: "__all__",
+    model: "__all__",
+    apiFormat: "__all__",
+    status: "__all__",
+    userAgent: "__all__",
+  });
+  const [usageFilterOptions, setUsageFilterOptions] = useState<{
+    models: string[];
+    apiFormats: string[];
+    userAgents: string[];
+  }>({
+    models: [],
+    apiFormats: [],
+    userAgents: [],
+  });
   const [quickApproval, setQuickApproval] = useState<QuickApprovalRequest | null>(null);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -245,21 +294,47 @@ export function ExperienceClient() {
     }
   }, [session?.activeToken]);
 
-  const loadUsageRecords = useCallback(async () => {
+  const loadUsageRecords = useCallback(async (options: { quiet?: boolean } = {}) => {
     if (!session?.activeToken) return;
-    setUsageLoading(true);
+    if (!options.quiet) setUsageLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/usage-records?limit=100", { cache: "no-store" });
+      const params = new URLSearchParams();
+      params.set("limit", String(usagePageSize));
+      params.set("offset", String((usagePage - 1) * usagePageSize));
+      params.set("hideUnknownRecords", String(usageHideUnknownRecords));
+      appendUsageParam(params, "preset", usageFilters.preset);
+      appendUsageParam(params, "search", usageFilters.search);
+      appendUsageParam(params, "model", usageFilters.model);
+      appendUsageParam(params, "apiFormat", usageFilters.apiFormat);
+      appendUsageParam(params, "status", usageFilters.status);
+      appendUsageParam(params, "userAgent", usageFilters.userAgent);
+      const res = await fetch(`/api/usage-records?${params.toString()}`, { cache: "no-store" });
       const data = (await res.json()) as UsageRecordsResponse;
       if (!res.ok) throw new Error(data.error ?? "读取使用记录失败");
       setUsageRecords(data.records);
+      setUsageTotalRecords(data.total ?? data.records.length);
+      setUsageModelStats(data.modelStats ?? []);
+      setUsageApiFormatStats(data.apiFormatStats ?? []);
+      if (data.filters) {
+        setUsageFilterOptions({
+          models: data.filters.models ?? [],
+          apiFormats: data.filters.apiFormats ?? [],
+          userAgents: data.filters.userAgents ?? [],
+        });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "读取使用记录失败");
     } finally {
-      setUsageLoading(false);
+      if (!options.quiet) setUsageLoading(false);
     }
-  }, [session?.activeToken]);
+  }, [
+    session?.activeToken,
+    usageFilters,
+    usageHideUnknownRecords,
+    usagePage,
+    usagePageSize,
+  ]);
 
   const loadQuickApproval = useCallback(async () => {
     if (!session?.adminScope) {
@@ -313,6 +388,18 @@ export function ExperienceClient() {
       void loadUsageRecords();
     }
   }, [loadUsageRecords, panel, session?.activeToken]);
+
+  useEffect(() => {
+    setUsagePage(1);
+  }, [usageFilters, usageHideUnknownRecords, usagePageSize]);
+
+  useEffect(() => {
+    if (panel !== "usage" || !session?.activeToken || !usageAutoRefresh) return;
+    const timer = window.setInterval(() => {
+      void loadUsageRecords({ quiet: true });
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [loadUsageRecords, panel, session?.activeToken, usageAutoRefresh]);
 
   const requests = useMemo(() => session?.requests ?? [], [session]);
   const latestRequest = requests[0];
@@ -944,27 +1031,68 @@ export function ExperienceClient() {
 
                   <Card>
                     <CardHeader>
+                      <div className="usage-section-header">
+                        <div>
+                          <CardTitle>用量分析</CardTitle>
+                          <CardDescription>当前飞书用户通过 TokenInside 产生的调用聚合。</CardDescription>
+                        </div>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setUsageStatsExpanded((current) => !current)}
+                        >
+                          <BarChart3Icon data-icon="inline-start" />
+                          {usageStatsExpanded ? "收起" : "展开"}
+                        </Button>
+                      </div>
+                    </CardHeader>
+                    {usageStatsExpanded && (
+                      <CardContent>
+                        <div className="usage-analysis-grid usage-analysis-grid-user">
+                          <UsageAnalysisTable
+                            title="按模型分析"
+                            emptyText="暂无模型统计数据"
+                            rows={usageModelStats}
+                            terminalColumn="efficiency"
+                          />
+                          <UsageAnalysisTable
+                            title="按API格式分析"
+                            emptyText="暂无API格式统计数据"
+                            rows={usageApiFormatStats}
+                            terminalColumn="avgDuration"
+                          />
+                        </div>
+                      </CardContent>
+                    )}
+                  </Card>
+
+                  <Card>
+                    <CardHeader>
                       <CardTitle>使用记录</CardTitle>
-                      <CardDescription>当前飞书用户通过 TokenInside 产生的最近调用。</CardDescription>
+                      <CardDescription>按 Aether 维度展示请求、tokens、费用和首字/总耗时。</CardDescription>
                     </CardHeader>
                     <CardContent>
-                      <div className="toolbar toolbar-left">
-                        <Button
-                          variant="outline"
-                          disabled={usageLoading}
-                          onClick={() => void loadUsageRecords()}
-                        >
-                          <RefreshCwIcon data-icon="inline-start" />
-                          刷新记录
-                        </Button>
-                        <Badge variant={usageLoading ? "warning" : "default"}>
-                          {usageLoading ? "读取中" : `${usageRecords.length} 条`}
-                        </Badge>
-                      </div>
                       <UsageRecordsTable
                         records={usageRecords}
+                        loading={usageLoading}
                         showUser={false}
                         showDepartment={false}
+                        showControls
+                        filters={usageFilters}
+                        onFiltersChange={setUsageFilters}
+                        availableModels={usageFilterOptions.models}
+                        availableApiFormats={usageFilterOptions.apiFormats}
+                        availableUserAgents={usageFilterOptions.userAgents}
+                        totalRecords={usageTotalRecords}
+                        currentPage={usagePage}
+                        pageSize={usagePageSize}
+                        onPageChange={setUsagePage}
+                        onPageSizeChange={setUsagePageSize}
+                        autoRefresh={usageAutoRefresh}
+                        onAutoRefreshChange={setUsageAutoRefresh}
+                        hideUnknownRecords={usageHideUnknownRecords}
+                        onHideUnknownRecordsChange={setUsageHideUnknownRecords}
+                        onRefresh={() => void loadUsageRecords()}
                         emptyText="暂无个人使用记录"
                       />
                     </CardContent>

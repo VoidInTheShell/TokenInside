@@ -1,7 +1,13 @@
 import { NextResponse } from "next/server";
 import { buildNewApiProxyUrl } from "@/lib/newapi";
 import { sha256Hex } from "@/lib/crypto";
-import { addProxyLog, findActiveTokenByHash, getUserById } from "@/lib/store";
+import {
+  addProxyLog,
+  beginProxyLog,
+  findActiveTokenByHash,
+  getUserById,
+  updateProxyLog,
+} from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -52,38 +58,222 @@ function numberFromUsage(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-async function extractUsage(upstream: Response) {
-  const contentType = upstream.headers.get("content-type") ?? "";
-  if (!contentType.includes("application/json")) return {};
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function parseJsonText(text: string) {
+  if (!text.trim()) return undefined;
   try {
-    const body = (await upstream.clone().json()) as {
-      usage?: {
-        prompt_tokens?: unknown;
-        completion_tokens?: unknown;
-        total_tokens?: unknown;
-        input_tokens?: unknown;
-        output_tokens?: unknown;
-      };
-    };
-    const usage = body.usage;
-    if (!usage) return {};
-    const promptTokens = numberFromUsage(usage.prompt_tokens ?? usage.input_tokens);
-    const completionTokens = numberFromUsage(
-      usage.completion_tokens ?? usage.output_tokens,
-    );
-    const explicitTotalTokens = numberFromUsage(usage.total_tokens);
-    return {
-      promptTokens,
-      completionTokens,
-      totalTokens:
-        explicitTotalTokens ??
-        (promptTokens !== undefined && completionTokens !== undefined
-          ? promptTokens + completionTokens
-          : undefined),
-    };
+    return JSON.parse(text) as unknown;
   } catch {
-    return {};
+    return undefined;
   }
+}
+
+function parseJsonBody(buffer: ArrayBuffer | undefined, contentType: string | null) {
+  if (!buffer || !contentType?.includes("application/json")) return undefined;
+  return parseJsonText(new TextDecoder().decode(buffer));
+}
+
+function sumDefinedNumbers(...values: Array<number | undefined>) {
+  const defined = values.filter((value): value is number => value !== undefined);
+  if (!defined.length) return undefined;
+  return defined.reduce((sum, value) => sum + value, 0);
+}
+
+function extractUsageFromJson(body: unknown) {
+  const root = objectValue(body);
+  const usage = objectValue(root?.usage);
+  if (!usage) return {};
+
+  const promptTokens = numberFromUsage(usage.prompt_tokens ?? usage.input_tokens);
+  const completionTokens = numberFromUsage(
+    usage.completion_tokens ?? usage.output_tokens,
+  );
+  const cacheReadTokens = numberFromUsage(
+    usage.cache_read_tokens ??
+      usage.cache_read_input_tokens ??
+      usage.prompt_cache_hit_tokens,
+  );
+  const directCacheCreationTokens = numberFromUsage(
+    usage.cache_creation_tokens ?? usage.cache_creation_input_tokens,
+  );
+  const splitCacheCreationTokens = sumDefinedNumbers(
+    numberFromUsage(usage.cache_creation_ephemeral_5m_input_tokens),
+    numberFromUsage(usage.cache_creation_ephemeral_1h_input_tokens),
+  );
+  const cacheCreationTokens = directCacheCreationTokens ?? splitCacheCreationTokens;
+  const explicitTotalTokens = numberFromUsage(usage.total_tokens);
+
+  return {
+    promptTokens,
+    completionTokens,
+    cacheReadTokens,
+    cacheCreationTokens,
+    totalTokens:
+      explicitTotalTokens ??
+      sumDefinedNumbers(promptTokens, completionTokens, cacheReadTokens, cacheCreationTokens),
+    cost: numberFromUsage(root?.cost ?? root?.total_cost ?? usage.cost ?? usage.total_cost),
+    actualCost: numberFromUsage(root?.actual_cost ?? usage.actual_cost),
+  };
+}
+
+function extractErrorMessage(body: unknown) {
+  const root = objectValue(body);
+  const error = objectValue(root?.error);
+  const message = error?.message ?? root?.message ?? root?.error;
+  return typeof message === "string" && message.trim() ? message.slice(0, 500) : undefined;
+}
+
+function detectApiFormat(path: string[]) {
+  const joined = path.join("/");
+  if (joined === "models") return "openai:models";
+  if (joined === "chat/completions") return "openai:chat";
+  if (joined === "responses") return "openai:responses";
+  if (joined === "messages") return "claude:messages";
+  return "unknown";
+}
+
+function detectClientFamily(userAgent?: string | null) {
+  const value = userAgent?.toLowerCase() ?? "";
+  if (!value) return undefined;
+  if (value.includes("curl")) return "curl";
+  if (value.includes("python")) return "python";
+  if (value.includes("node")) return "node";
+  if (value.includes("openai")) return "openai-sdk";
+  if (value.includes("claude")) return "claude";
+  if (value.includes("mozilla")) return "browser";
+  return "other";
+}
+
+function requestMetadata(path: string[], requestBody: unknown) {
+  const body = objectValue(requestBody);
+  const model =
+    typeof body?.model === "string" && body.model.trim()
+      ? body.model
+      : path.join("/") === "models"
+        ? "models"
+        : "unknown";
+  const clientRequestedStream = body?.stream === true;
+  return {
+    model,
+    clientRequestedStream,
+    requestType: clientRequestedStream ? ("stream" as const) : ("standard" as const),
+  };
+}
+
+function terminalStatus(statusCode: number) {
+  if (statusCode === 499) return "cancelled" as const;
+  if (statusCode >= 400) return "failed" as const;
+  return "completed" as const;
+}
+
+function sanitizedErrorMessage(err: unknown) {
+  if (err instanceof Error && err.message.trim()) return err.message.slice(0, 500);
+  return "Upstream request failed";
+}
+
+function streamWithProxyLog(input: {
+  body: ReadableStream<Uint8Array>;
+  logId: string;
+  startedAt: number;
+  statusCode: number;
+}) {
+  const reader = input.body.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const result = await reader.read();
+        if (result.done) {
+          await updateProxyLog(input.logId, {
+            status: terminalStatus(input.statusCode),
+            durationMs: Date.now() - input.startedAt,
+            responseTimeUpdatedAt: new Date().toISOString(),
+          });
+          controller.close();
+          return;
+        }
+        controller.enqueue(result.value);
+      } catch (err) {
+        await updateProxyLog(input.logId, {
+          status: "failed",
+          statusCode: input.statusCode >= 400 ? input.statusCode : 502,
+          durationMs: Date.now() - input.startedAt,
+          errorMessage: sanitizedErrorMessage(err),
+          responseTimeUpdatedAt: new Date().toISOString(),
+        });
+        controller.error(err);
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason);
+      } finally {
+        await updateProxyLog(input.logId, {
+          status: "cancelled",
+          statusCode: 499,
+          durationMs: Date.now() - input.startedAt,
+          errorMessage: "Client cancelled the request",
+          responseTimeUpdatedAt: new Date().toISOString(),
+        });
+      }
+    },
+  });
+}
+
+async function readResponseBody(upstream: Response) {
+  const buffer = await upstream.arrayBuffer();
+  const contentType = upstream.headers.get("content-type");
+  const json = parseJsonBody(buffer, contentType);
+  return {
+    buffer,
+    json,
+  };
+}
+
+async function recordFinishedProxyLog(input: {
+  logId: string;
+  startedAt: number;
+  firstByteMs: number;
+  upstream: Response;
+  responseJson: unknown;
+}) {
+  const usage = extractUsageFromJson(input.responseJson);
+  await updateProxyLog(input.logId, {
+    status: terminalStatus(input.upstream.status),
+    statusCode: input.upstream.status,
+    durationMs: Date.now() - input.startedAt,
+    firstByteMs: input.firstByteMs,
+    responseTimeUpdatedAt: new Date().toISOString(),
+    ...usage,
+    errorMessage:
+      input.upstream.status >= 400 ? extractErrorMessage(input.responseJson) : undefined,
+  });
+}
+
+async function recordFailedProxyLog(input: {
+  logId: string;
+  startedAt: number;
+  err: unknown;
+  aborted: boolean;
+}) {
+  await updateProxyLog(input.logId, {
+    status: input.aborted ? "cancelled" : "failed",
+    statusCode: input.aborted ? 499 : 502,
+    durationMs: Date.now() - input.startedAt,
+    errorMessage: input.aborted ? "Client cancelled the request" : sanitizedErrorMessage(input.err),
+    responseTimeUpdatedAt: new Date().toISOString(),
+  });
+}
+
+function responseHeadersFrom(upstream: Response) {
+  const responseHeaders = new Headers(upstream.headers);
+  responseHeaders.delete("content-encoding");
+  responseHeaders.delete("content-length");
+  return responseHeaders;
 }
 
 async function proxy(request: Request, context: RouteContext) {
@@ -145,42 +335,104 @@ async function proxy(request: Request, context: RouteContext) {
     return NextResponse.json({ error: "Bound Feishu user is not active" }, { status: 403 });
   }
 
-  const upstreamUrl = buildNewApiProxyUrl(path, requestUrl.search);
   const body =
     request.method === "GET" || request.method === "HEAD"
       ? undefined
       : await request.arrayBuffer();
-
-  const upstream = await fetch(upstreamUrl, {
-    method: request.method,
-    headers: filteredProxyHeaders(request, key),
-    body,
-    cache: "no-store",
-  });
-  const usage = await extractUsage(upstream);
-
-  await addProxyLog({
+  const requestBody = parseJsonBody(body, request.headers.get("content-type"));
+  const apiFormat = detectApiFormat(path);
+  const metadata = requestMetadata(path, requestBody);
+  const userAgent = request.headers.get("user-agent");
+  const clientIp = request.headers.get("x-forwarded-for") ?? undefined;
+  const proxyLog = await beginProxyLog({
     feishuUserId: user.id,
     tokenAccountId: tokenAccount.id,
     departmentId: user.departmentId,
+    departmentName: undefined,
     requestPath,
     method: request.method,
-    statusCode: upstream.status,
-    durationMs: Date.now() - startedAt,
-    ...usage,
-    userAgent: request.headers.get("user-agent") ?? undefined,
-    clientIp: request.headers.get("x-forwarded-for") ?? undefined,
+    model: metadata.model,
+    provider: "NewAPI",
+    providerKeyName: tokenAccount.newapiTokenId,
+    apiFormat,
+    endpointApiFormat: apiFormat,
+    requestType: metadata.requestType,
+    isStream: metadata.clientRequestedStream,
+    clientRequestedStream: metadata.clientRequestedStream,
+    clientIsStream: metadata.clientRequestedStream,
+    userAgent: userAgent ?? undefined,
+    clientIp,
+    clientFamily: detectClientFamily(userAgent),
   });
 
-  const responseHeaders = new Headers(upstream.headers);
-  responseHeaders.delete("content-encoding");
-  responseHeaders.delete("content-length");
+  const upstreamUrl = buildNewApiProxyUrl(path, requestUrl.search);
+  try {
+    const upstream = await fetch(upstreamUrl, {
+      method: request.method,
+      headers: filteredProxyHeaders(request, key),
+      body,
+      cache: "no-store",
+      signal: request.signal,
+    });
+    const firstByteMs = Date.now() - startedAt;
+    const contentType = upstream.headers.get("content-type") ?? "";
+    const upstreamIsStream = contentType.includes("text/event-stream");
+    const responseHeaders = responseHeadersFrom(upstream);
 
-  return new Response(upstream.body, {
-    status: upstream.status,
-    statusText: upstream.statusText,
-    headers: responseHeaders,
-  });
+    if (upstreamIsStream && upstream.body) {
+      await updateProxyLog(proxyLog.id, {
+        status: upstream.status >= 400 ? "failed" : "streaming",
+        statusCode: upstream.status,
+        durationMs: firstByteMs,
+        firstByteMs,
+        isStream: true,
+        upstreamIsStream: true,
+        responseTimeUpdatedAt: new Date().toISOString(),
+      });
+      return new Response(
+        streamWithProxyLog({
+          body: upstream.body,
+          logId: proxyLog.id,
+          startedAt,
+          statusCode: upstream.status,
+        }),
+        {
+          status: upstream.status,
+          statusText: upstream.statusText,
+          headers: responseHeaders,
+        },
+      );
+    }
+
+    const responseBody = await readResponseBody(upstream);
+    await recordFinishedProxyLog({
+      logId: proxyLog.id,
+      startedAt,
+      firstByteMs,
+      upstream,
+      responseJson: responseBody.json,
+    });
+
+    return new Response(responseBody.buffer, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: responseHeaders,
+    });
+  } catch (err) {
+    const aborted =
+      request.signal.aborted ||
+      (err instanceof DOMException && err.name === "AbortError");
+    await recordFailedProxyLog({
+      logId: proxyLog.id,
+      startedAt,
+      err,
+      aborted,
+    });
+    return NextResponse.json(
+      { error: aborted ? "Client cancelled the request" : "Upstream request failed" },
+      { status: aborted ? 499 : 502 },
+    );
+  }
 }
 
 export function GET(request: Request, context: RouteContext) {
