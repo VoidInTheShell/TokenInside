@@ -1,0 +1,193 @@
+stages:
+  - validate
+  - image
+  - deploy
+
+variables:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: voidintheshell/tokeninside
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+
+validate:
+  stage: validate
+  image: node:22
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - .npm/
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - npm run typecheck
+    - npm run build
+
+compose:validate:
+  stage: validate
+  image: docker:27-cli
+  script:
+    - |
+      cat > .env.ci <<'EOF'
+      TOKENINSIDE_ENV_FILE=.env.ci
+      TOKENINSIDE_IMAGE=ghcr.io/voidintheshell/tokeninside:ci
+      TOKENINSIDE_POSTGRES_SHM_SIZE=128m
+      TOKENINSIDE_POSTGRES_CPUS=1.0
+      TOKENINSIDE_POSTGRES_MEM_LIMIT=768m
+      TOKENINSIDE_POSTGRES_MEM_RESERVATION=512m
+      TOKENINSIDE_APP_CPUS=0.75
+      TOKENINSIDE_APP_MEM_LIMIT=768m
+      TOKENINSIDE_APP_MEM_RESERVATION=512m
+      EOF
+    - docker compose --env-file .env.ci -f docker-compose.production.example.yml config --quiet
+
+build:image:
+  stage: image
+  image: docker:27-cli
+  services:
+    - name: docker:27-dind
+      command: ["--tls=false"]
+  needs:
+    - validate
+    - compose:validate
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+  before_script:
+    - docker info
+    - echo "$GHCR_TOKEN" | docker login "$REGISTRY" -u "$GHCR_USERNAME" --password-stdin
+  script:
+    - export SHORT_SHA="$(printf '%s' "$CI_COMMIT_SHA" | cut -c1-7)"
+    - export COMMIT_IMAGE="$REGISTRY/$IMAGE_NAME:sha-$SHORT_SHA"
+    - docker build --pull --build-arg SOURCE_URL="https://github.com/VoidInTheShell/TokenInside" -t "$COMMIT_IMAGE" .
+    - docker push "$COMMIT_IMAGE"
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker tag "$COMMIT_IMAGE" "$REGISTRY/$IMAGE_NAME:staging"
+        docker push "$REGISTRY/$IMAGE_NAME:staging"
+      fi
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker tag "$COMMIT_IMAGE" "$REGISTRY/$IMAGE_NAME:$CI_COMMIT_TAG"
+        docker tag "$COMMIT_IMAGE" "$REGISTRY/$IMAGE_NAME:production"
+        docker push "$REGISTRY/$IMAGE_NAME:$CI_COMMIT_TAG"
+        docker push "$REGISTRY/$IMAGE_NAME:production"
+      fi
+    - printf 'TOKENINSIDE_IMAGE=%s\n' "$COMMIT_IMAGE" > image.env
+  artifacts:
+    reports:
+      dotenv: image.env
+
+deploy:staging:
+  stage: deploy
+  image: alpine:3.20
+  needs:
+    - build:image
+  environment:
+    name: staging
+    url: $STAGING_APP_URL
+  resource_group: tokeninside-staging
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  before_script:
+    - apk add --no-cache openssh-client curl
+    - mkdir -p ~/.ssh
+    - printf '%s\n' "$STAGING_SSH_PRIVATE_KEY" > ~/.ssh/tokeninside_deploy
+    - chmod 600 ~/.ssh/tokeninside_deploy
+    - ssh-keyscan -p "$STAGING_SSH_PORT" "$STAGING_SSH_HOST" >> ~/.ssh/known_hosts
+  script:
+    - |
+      ssh -i ~/.ssh/tokeninside_deploy -p "$STAGING_SSH_PORT" "$STAGING_SSH_USER@$STAGING_SSH_HOST" \
+        "TOKENINSIDE_IMAGE='$TOKENINSIDE_IMAGE' DEPLOY_DIR='$STAGING_DEPLOY_DIR' bash -s" <<'REMOTE'
+      set -eu
+      cd "$DEPLOY_DIR"
+      mkdir -p .deploy
+      previous="$(cat .deploy/current-image 2>/dev/null || true)"
+      printf '%s\n' "$previous" > .deploy/previous-image
+      rollback() {
+        if [ -n "$previous" ]; then
+          export TOKENINSIDE_IMAGE="$previous"
+          docker compose --env-file .env -f docker-compose.yml pull tokeninside
+          docker compose --env-file .env -f docker-compose.yml up -d --no-deps tokeninside
+        fi
+      }
+      trap rollback ERR
+      export TOKENINSIDE_IMAGE
+      docker compose --env-file .env -f docker-compose.yml pull tokeninside
+      docker compose --env-file .env -f docker-compose.yml up -d --no-deps tokeninside
+      curl -fsS http://127.0.0.1:16878/api/health
+      printf '%s\n' "$TOKENINSIDE_IMAGE" > .deploy/current-image
+      printf '%s\n' "$TOKENINSIDE_IMAGE" > .deploy/last-successful-image
+      printf '%s %s\n' "$(date -Is)" "$TOKENINSIDE_IMAGE" >> .deploy/releases.log
+      trap - ERR
+      REMOTE
+    - |
+      if [ -n "$STAGING_APP_URL" ]; then
+        curl -fsS "$STAGING_APP_URL/api/health"
+      fi
+
+deploy:production:
+  stage: deploy
+  image: alpine:3.20
+  needs:
+    - build:image
+  environment:
+    name: production
+    url: $PRODUCTION_APP_URL
+  resource_group: tokeninside-production
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+      when: manual
+    - if: '$CI_PIPELINE_SOURCE == "web" && $DEPLOY_PRODUCTION == "true"'
+      when: manual
+  before_script:
+    - apk add --no-cache openssh-client curl
+    - mkdir -p ~/.ssh
+    - printf '%s\n' "$PRODUCTION_SSH_PRIVATE_KEY" > ~/.ssh/tokeninside_deploy
+    - chmod 600 ~/.ssh/tokeninside_deploy
+    - ssh-keyscan -p "$PRODUCTION_SSH_PORT" "$PRODUCTION_SSH_HOST" >> ~/.ssh/known_hosts
+  script:
+    - |
+      if [ -n "$PRODUCTION_IMAGE_TAG" ]; then
+        TOKENINSIDE_IMAGE="$REGISTRY/$IMAGE_NAME:$PRODUCTION_IMAGE_TAG"
+      elif [ -n "$CI_COMMIT_TAG" ]; then
+        TOKENINSIDE_IMAGE="$REGISTRY/$IMAGE_NAME:$CI_COMMIT_TAG"
+      fi
+      export TOKENINSIDE_IMAGE
+    - |
+      ssh -i ~/.ssh/tokeninside_deploy -p "$PRODUCTION_SSH_PORT" "$PRODUCTION_SSH_USER@$PRODUCTION_SSH_HOST" \
+        "TOKENINSIDE_IMAGE='$TOKENINSIDE_IMAGE' DEPLOY_DIR='$PRODUCTION_DEPLOY_DIR' bash -s" <<'REMOTE'
+      set -eu
+      cd "$DEPLOY_DIR"
+      mkdir -p .deploy
+      previous="$(cat .deploy/current-image 2>/dev/null || true)"
+      printf '%s\n' "$previous" > .deploy/previous-image
+      rollback() {
+        if [ -n "$previous" ]; then
+          export TOKENINSIDE_IMAGE="$previous"
+          docker compose --env-file .env -f docker-compose.yml pull tokeninside
+          docker compose --env-file .env -f docker-compose.yml up -d --no-deps tokeninside
+        fi
+      }
+      trap rollback ERR
+      export TOKENINSIDE_IMAGE
+      docker compose --env-file .env -f docker-compose.yml pull tokeninside
+      docker compose --env-file .env -f docker-compose.yml up -d --no-deps tokeninside
+      curl -fsS http://127.0.0.1:16878/api/health
+      printf '%s\n' "$TOKENINSIDE_IMAGE" > .deploy/current-image
+      printf '%s\n' "$TOKENINSIDE_IMAGE" > .deploy/last-successful-image
+      printf '%s %s\n' "$(date -Is)" "$TOKENINSIDE_IMAGE" >> .deploy/releases.log
+      trap - ERR
+      REMOTE
+    - |
+      if [ -n "$PRODUCTION_APP_URL" ]; then
+        curl -fsS "$PRODUCTION_APP_URL/api/health"
+      fi
