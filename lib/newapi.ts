@@ -28,11 +28,61 @@ type NewApiKeyResponse = {
   token?: string;
 };
 
+type NewApiLogRecord = {
+  id?: string | number;
+  created_at?: string | number;
+  token_id?: string | number;
+  token_name?: string;
+  request_id?: string;
+  model_name?: string;
+  prompt_tokens?: string | number;
+  completion_tokens?: string | number;
+  quota?: string | number;
+  is_stream?: boolean | string | number;
+  type?: string | number;
+  use_time?: string | number;
+  channel_name?: string;
+  user_id?: string | number;
+  username?: string;
+};
+
+type NewApiLogPage = {
+  items?: NewApiLogRecord[];
+  total?: number;
+};
+
 export type NewApiModel = {
   id: string;
   object?: string;
   owned_by?: string;
   permission?: unknown[];
+};
+
+export type NormalizedNewApiUsageLog = {
+  newapiLogId?: string;
+  newapiRequestId?: string;
+  newapiTokenId?: string;
+  tokenName?: string;
+  createdAt?: string;
+  model?: string;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  quota?: number;
+  cost?: number;
+  isStream?: boolean;
+  type?: string;
+  newapiUseTimeSeconds?: number;
+  providerChannelName?: string;
+  newapiUserId?: string;
+  newapiUsername?: string;
+};
+
+export type NewApiUsageLogPage = {
+  items: NormalizedNewApiUsageLog[];
+  total: number;
+  page: number;
+  size: number;
 };
 
 type NewApiModelsResponse = {
@@ -97,6 +147,45 @@ async function newApiFetch<T>(path: string, init: RequestInit = {}) {
     throw new Error(body.message ?? body.error ?? `NewAPI request failed: ${res.status}`);
   }
   return (body.data ?? body) as T;
+}
+
+function numberFromNewApi(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function stringFromNewApi(value: unknown) {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+function booleanFromNewApi(value: unknown) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value === 1;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true" || normalized === "1") return true;
+    if (normalized === "false" || normalized === "0") return false;
+  }
+  return undefined;
+}
+
+function isoFromNewApiTime(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const millis = value > 1_000_000_000_000 ? value : value * 1000;
+    return new Date(millis).toISOString();
+  }
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    const millis = numeric > 1_000_000_000_000 ? numeric : numeric * 1000;
+    return new Date(millis).toISOString();
+  }
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : undefined;
 }
 
 function getTokenId(record?: NewApiTokenRecord | null) {
@@ -208,6 +297,65 @@ export async function listModelsForNewApiToken(newapiTokenId: string) {
   }
   if ("data" in body && Array.isArray(body.data)) return body.data;
   return [];
+}
+
+function normalizeNewApiUsageLog(record: NewApiLogRecord): NormalizedNewApiUsageLog {
+  const promptTokens = numberFromNewApi(record.prompt_tokens);
+  const completionTokens = numberFromNewApi(record.completion_tokens);
+  const quota = numberFromNewApi(record.quota);
+
+  return {
+    newapiLogId: stringFromNewApi(record.id),
+    newapiRequestId: stringFromNewApi(record.request_id),
+    newapiTokenId: stringFromNewApi(record.token_id),
+    tokenName: stringFromNewApi(record.token_name),
+    createdAt: isoFromNewApiTime(record.created_at),
+    model: stringFromNewApi(record.model_name),
+    promptTokens,
+    completionTokens,
+    totalTokens:
+      promptTokens !== undefined || completionTokens !== undefined
+        ? (promptTokens ?? 0) + (completionTokens ?? 0)
+        : undefined,
+    quota,
+    cost: quota === undefined ? undefined : fromNewApiQuota(quota),
+    isStream: booleanFromNewApi(record.is_stream),
+    type: stringFromNewApi(record.type),
+    newapiUseTimeSeconds: numberFromNewApi(record.use_time),
+    providerChannelName: stringFromNewApi(record.channel_name),
+    newapiUserId: stringFromNewApi(record.user_id),
+    newapiUsername: stringFromNewApi(record.username),
+  };
+}
+
+export async function listNewApiUsageLogs(input: {
+  page?: number;
+  size?: number;
+} = {}): Promise<NewApiUsageLogPage> {
+  const { newapi } = getConfig();
+  const page = Math.max(input.page ?? 0, 0);
+  const size = Math.min(Math.max(input.size ?? 100, 1), 500);
+  if (newapi.mock) {
+    return {
+      items: [],
+      total: 0,
+      page,
+      size,
+    };
+  }
+
+  const params = new URLSearchParams({
+    p: String(page),
+    size: String(size),
+  });
+  const data = await newApiFetch<NewApiLogPage>(`/api/log/self?${params.toString()}`);
+  const items = (data.items ?? []).map(normalizeNewApiUsageLog);
+  return {
+    items,
+    total: typeof data.total === "number" ? data.total : items.length,
+    page,
+    size,
+  };
 }
 
 async function setNewApiTokenStatus(newapiTokenId: string, status: 1 | 2) {

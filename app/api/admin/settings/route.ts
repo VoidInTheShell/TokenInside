@@ -13,12 +13,24 @@ const settingsSchema = z.object({
 export async function GET() {
   const auth = await requireAdminScope();
   if (auth.error) return auth.error;
+  if (auth.scope.scopeType !== "global") {
+    return NextResponse.json(
+      { error: "系统设置只能由全局管理员访问" },
+      { status: 403 },
+    );
+  }
   return NextResponse.json({ settings: await getAppSettings() });
 }
 
 export async function PATCH(request: Request) {
   const auth = await requireAdminScope();
   if (auth.error) return auth.error;
+  if (auth.scope.scopeType !== "global") {
+    return NextResponse.json(
+      { error: "系统设置只能由全局管理员访问" },
+      { status: 403 },
+    );
+  }
   const parsed = settingsSchema.safeParse(await request.json());
   if (!parsed.success) {
     return NextResponse.json({ error: "默认额度必须是正整数" }, { status: 400 });

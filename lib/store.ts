@@ -2,9 +2,13 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
+import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
 import { readPostgresStore, writePostgresStore } from "@/lib/postgres-store";
 import type {
   AdminScope,
+  BillingOperationKind,
+  BillingOperationRecord,
+  BillingOperationStatus,
   FeishuEvent,
   FeishuUser,
   ProxyRequestLog,
@@ -20,6 +24,7 @@ const initialStore: StoreShape = {
   version: 1,
   settings: {
     defaultMonthlyQuota: 200,
+    billingOperations: [],
   },
   users: [],
   tokenRequests: [],
@@ -29,6 +34,8 @@ const initialStore: StoreShape = {
   proxyRequestLogs: [],
   adminScopes: [],
 };
+
+const maxBillingOperationRecords = 50;
 
 const invalidatableFirstApplyStatuses = new Set<RequestStatus>([
   "pending_card_send",
@@ -76,6 +83,21 @@ async function readStore(): Promise<StoreShape> {
 
 function normalizeStore(store: StoreShape) {
   let changed = false;
+  if (!store.settings) {
+    store.settings = structuredClone(initialStore.settings);
+    changed = true;
+  }
+  if (!Array.isArray(store.settings.billingOperations)) {
+    store.settings.billingOperations = [];
+    changed = true;
+  }
+  if (store.settings.billingOperations.length > maxBillingOperationRecords) {
+    store.settings.billingOperations = store.settings.billingOperations.slice(
+      0,
+      maxBillingOperationRecords,
+    );
+    changed = true;
+  }
   const accountsByRequestId = new Map(
     store.tokenAccounts.map((account) => [account.tokenRequestId, account]),
   );
@@ -317,18 +339,79 @@ export async function getAppSettings() {
   return store.settings;
 }
 
+function prependBillingOperation(
+  store: StoreShape,
+  input: {
+    kind: BillingOperationKind;
+    status: BillingOperationStatus;
+    dryRun: boolean;
+    operatedByFeishuUserId: string;
+    period?: string;
+    input?: Record<string, unknown>;
+    summary: BillingOperationRecord["summary"];
+    errorMessage?: string;
+  },
+) {
+  const now = nowIso();
+  const record: BillingOperationRecord = {
+    id: randomId("bo"),
+    createdAt: now,
+    updatedAt: now,
+    ...input,
+  };
+  const records = store.settings.billingOperations ?? [];
+  store.settings.billingOperations = [record, ...records].slice(0, maxBillingOperationRecords);
+  return record;
+}
+
 export async function updateAppSettings(input: {
   defaultMonthlyQuota: number;
   updatedByFeishuUserId: string;
 }) {
   return mutate((store) => {
+    const previousDefaultMonthlyQuota = store.settings.defaultMonthlyQuota;
     store.settings = {
+      ...store.settings,
       defaultMonthlyQuota: input.defaultMonthlyQuota,
       updatedAt: nowIso(),
       updatedByFeishuUserId: input.updatedByFeishuUserId,
     };
+    prependBillingOperation(store, {
+      kind: "settings_update",
+      status: "applied",
+      dryRun: false,
+      operatedByFeishuUserId: input.updatedByFeishuUserId,
+      input: {
+        previousDefaultMonthlyQuota,
+        defaultMonthlyQuota: input.defaultMonthlyQuota,
+      },
+      summary: {
+        previousDefaultMonthlyQuota,
+        defaultMonthlyQuota: input.defaultMonthlyQuota,
+      },
+    });
     return store.settings;
   });
+}
+
+export async function recordBillingOperation(input: {
+  kind: BillingOperationKind;
+  status: BillingOperationStatus;
+  dryRun: boolean;
+  operatedByFeishuUserId: string;
+  period?: string;
+  input?: Record<string, unknown>;
+  summary: BillingOperationRecord["summary"];
+  errorMessage?: string;
+}) {
+  return mutate((store) => {
+    return prependBillingOperation(store, input);
+  });
+}
+
+export async function listBillingOperations(limit = 20) {
+  const store = await readStore();
+  return (store.settings.billingOperations ?? []).slice(0, Math.max(limit, 0));
 }
 
 export async function upsertFeishuUser(input: {
@@ -581,6 +664,7 @@ export async function recordMonthlyResetApplied(input: {
   period: string;
   monthlyQuota: number;
   operatedByFeishuUserId: string;
+  approvalOperatorOpenId: string;
 }) {
   return mutate((store) => {
     const account = store.tokenAccounts.find(
@@ -617,7 +701,7 @@ export async function recordMonthlyResetApplied(input: {
       approvedMonthlyQuota: input.monthlyQuota,
       approvalUuid: randomId("approval"),
       approvalMode: "manual",
-      approvalOperatorOpenId: input.operatedByFeishuUserId,
+      approvalOperatorOpenId: input.approvalOperatorOpenId,
       approvalOperatedAt: now,
       tokenAccountId: account.id,
       createdAt: now,
@@ -751,7 +835,245 @@ export async function updateProxyLog(
     ) {
       log.totalTokens = log.promptTokens + log.completionTokens;
     }
+    syncBillingPeriods(store);
     return log;
+  });
+}
+
+export type NewApiUsageBackfillItem = {
+  action: "updated" | "matched_no_change" | "skipped_unknown_token" | "skipped_no_match";
+  newapiLogId?: string;
+  newapiRequestId?: string;
+  newapiTokenId?: string;
+  proxyLogId?: string;
+  feishuUserId?: string;
+  tokenAccountId?: string;
+  reason?: string;
+};
+
+export type NewApiUsageBackfillResult = {
+  dryRun: boolean;
+  seen: number;
+  matched: number;
+  updated: number;
+  skippedUnknownToken: number;
+  skippedNoMatch: number;
+  items: NewApiUsageBackfillItem[];
+};
+
+function isUnknownModel(value?: string) {
+  const normalized = value?.trim().toLowerCase();
+  return !normalized || normalized === "unknown" || normalized === "-" || normalized === "null";
+}
+
+function proxyLogIsStream(log: ProxyRequestLog) {
+  return Boolean(log.isStream || log.upstreamIsStream || log.clientRequestedStream || log.clientIsStream);
+}
+
+function usageLogTime(log: NormalizedNewApiUsageLog) {
+  if (!log.createdAt) return undefined;
+  const time = new Date(log.createdAt).getTime();
+  return Number.isFinite(time) ? time : undefined;
+}
+
+function proxyLogTime(log: ProxyRequestLog) {
+  const time = new Date(log.createdAt).getTime();
+  return Number.isFinite(time) ? time : undefined;
+}
+
+function buildUsagePatch(
+  usageLog: NormalizedNewApiUsageLog,
+  currentLog: ProxyRequestLog,
+) {
+  const patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">> = {
+    usageSource: "newapi_log",
+  };
+
+  if (usageLog.newapiLogId) patch.newapiLogId = usageLog.newapiLogId;
+  if (usageLog.newapiRequestId) patch.newapiRequestId = usageLog.newapiRequestId;
+  if (usageLog.providerChannelName) patch.providerChannelName = usageLog.providerChannelName;
+  if (usageLog.newapiUseTimeSeconds !== undefined) {
+    patch.newapiUseTimeSeconds = usageLog.newapiUseTimeSeconds;
+  }
+  if (usageLog.quota !== undefined) patch.quota = usageLog.quota;
+  if (usageLog.cost !== undefined) patch.cost = usageLog.cost;
+  if (usageLog.promptTokens !== undefined) patch.promptTokens = usageLog.promptTokens;
+  if (usageLog.completionTokens !== undefined) patch.completionTokens = usageLog.completionTokens;
+  if (usageLog.totalTokens !== undefined) patch.totalTokens = usageLog.totalTokens;
+  if (usageLog.isStream !== undefined) {
+    patch.isStream = usageLog.isStream;
+    patch.upstreamIsStream = usageLog.isStream;
+  }
+  if (usageLog.model && isUnknownModel(currentLog.model)) {
+    patch.model = usageLog.model;
+  }
+  if (
+    (currentLog.status === "pending" || currentLog.status === "streaming") &&
+    currentLog.statusCode < 400
+  ) {
+    patch.status = "completed";
+  }
+
+  return patch;
+}
+
+function patchChangesLog(
+  log: ProxyRequestLog,
+  patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">>,
+) {
+  return Object.entries(patch).some(([key, value]) => {
+    if (value === undefined) return false;
+    return log[key as keyof ProxyRequestLog] !== value;
+  });
+}
+
+function findProxyLogForNewApiUsage(input: {
+  store: StoreShape;
+  usageLog: NormalizedNewApiUsageLog;
+  account: TokenAccount;
+  matchWindowMs: number;
+}) {
+  const { store, usageLog, account, matchWindowMs } = input;
+  const existingByLogId =
+    usageLog.newapiLogId &&
+    store.proxyRequestLogs.find((log) => log.newapiLogId === usageLog.newapiLogId);
+  if (existingByLogId) return existingByLogId;
+
+  const existingByRequestId =
+    usageLog.newapiRequestId &&
+    store.proxyRequestLogs.find((log) => log.newapiRequestId === usageLog.newapiRequestId);
+  if (existingByRequestId) return existingByRequestId;
+
+  const targetTime = usageLogTime(usageLog);
+  const candidates = store.proxyRequestLogs
+    .map((log) => {
+      const logTime = proxyLogTime(log);
+      const timeDelta =
+        targetTime !== undefined && logTime !== undefined
+          ? Math.abs(targetTime - logTime)
+          : Number.POSITIVE_INFINITY;
+      return { log, timeDelta };
+    })
+    .filter(({ log, timeDelta }) => {
+      if (usageLog.newapiLogId && log.newapiLogId && log.newapiLogId !== usageLog.newapiLogId) {
+        return false;
+      }
+      if (usageLog.newapiRequestId && log.newapiRequestId && log.newapiRequestId !== usageLog.newapiRequestId) {
+        return false;
+      }
+      if (log.feishuUserId && log.feishuUserId !== account.feishuUserId) return false;
+      const tokenMatches =
+        log.tokenAccountId === account.id ||
+        (usageLog.newapiTokenId !== undefined && log.providerKeyName === usageLog.newapiTokenId);
+      if (!tokenMatches) return false;
+      if (usageLog.model && !isUnknownModel(log.model) && log.model !== usageLog.model) return false;
+      if (usageLog.isStream !== undefined && proxyLogIsStream(log) !== usageLog.isStream) return false;
+      if (targetTime !== undefined && !Number.isFinite(timeDelta)) return false;
+      if (targetTime !== undefined && timeDelta > matchWindowMs) return false;
+      return true;
+    })
+    .sort((left, right) => {
+      const leftHasUsage = left.log.totalTokens !== undefined || left.log.usageSource === "newapi_log";
+      const rightHasUsage = right.log.totalTokens !== undefined || right.log.usageSource === "newapi_log";
+      if (leftHasUsage !== rightHasUsage) return leftHasUsage ? 1 : -1;
+      if (left.log.newapiLogId !== right.log.newapiLogId) return left.log.newapiLogId ? 1 : -1;
+      return left.timeDelta - right.timeDelta;
+    });
+
+  return candidates[0]?.log;
+}
+
+export async function backfillProxyLogsFromNewApiUsage(
+  usageLogs: NormalizedNewApiUsageLog[],
+  input: {
+    dryRun?: boolean;
+    matchWindowMs?: number;
+  } = {},
+): Promise<NewApiUsageBackfillResult> {
+  const dryRun = input.dryRun ?? true;
+  const matchWindowMs = input.matchWindowMs ?? 30 * 60 * 1000;
+
+  return mutate((store) => {
+    const syncedAt = nowIso();
+    const accountByNewApiTokenId = new Map(
+      store.tokenAccounts
+        .filter((account) => account.newapiTokenId)
+        .map((account) => [account.newapiTokenId as string, account] as const),
+    );
+    const result: NewApiUsageBackfillResult = {
+      dryRun,
+      seen: usageLogs.length,
+      matched: 0,
+      updated: 0,
+      skippedUnknownToken: 0,
+      skippedNoMatch: 0,
+      items: [],
+    };
+
+    for (const usageLog of usageLogs) {
+      const account =
+        usageLog.newapiTokenId === undefined
+          ? undefined
+          : accountByNewApiTokenId.get(usageLog.newapiTokenId);
+      if (!account) {
+        result.skippedUnknownToken += 1;
+        result.items.push({
+          action: "skipped_unknown_token",
+          newapiLogId: usageLog.newapiLogId,
+          newapiRequestId: usageLog.newapiRequestId,
+          newapiTokenId: usageLog.newapiTokenId,
+          reason: "NewAPI token_id is not bound to a TokenInside token account",
+        });
+        continue;
+      }
+
+      const proxyLog = findProxyLogForNewApiUsage({
+        store,
+        usageLog,
+        account,
+        matchWindowMs,
+      });
+      if (!proxyLog) {
+        result.skippedNoMatch += 1;
+        result.items.push({
+          action: "skipped_no_match",
+          newapiLogId: usageLog.newapiLogId,
+          newapiRequestId: usageLog.newapiRequestId,
+          newapiTokenId: usageLog.newapiTokenId,
+          feishuUserId: account.feishuUserId,
+          tokenAccountId: account.id,
+          reason: "No proxy request log matched token, model, stream flag and time window",
+        });
+        continue;
+      }
+
+      result.matched += 1;
+      const patch = buildUsagePatch(usageLog, proxyLog);
+      const changed = patchChangesLog(proxyLog, patch);
+      if (changed) {
+        result.updated += 1;
+        if (!dryRun) {
+          Object.assign(proxyLog, patch, {
+            usageSyncedAt: syncedAt,
+            updatedAt: syncedAt,
+          });
+        }
+      }
+      result.items.push({
+        action: changed ? "updated" : "matched_no_change",
+        newapiLogId: usageLog.newapiLogId,
+        newapiRequestId: usageLog.newapiRequestId,
+        newapiTokenId: usageLog.newapiTokenId,
+        proxyLogId: proxyLog.id,
+        feishuUserId: proxyLog.feishuUserId ?? account.feishuUserId,
+        tokenAccountId: proxyLog.tokenAccountId ?? account.id,
+      });
+    }
+
+    if (!dryRun && result.updated > 0) {
+      syncBillingPeriods(store);
+    }
+    return result;
   });
 }
 
@@ -1379,8 +1701,15 @@ function mapUsageRecord(log: ProxyRequestLog, usersById: Map<string, FeishuUser>
     totalTokens: log.totalTokens,
     cacheReadTokens: log.cacheReadTokens,
     cacheCreationTokens: log.cacheCreationTokens,
+    quota: log.quota,
     cost: log.cost,
     actualCost: log.actualCost,
+    usageSource: log.usageSource,
+    usageSyncedAt: log.usageSyncedAt,
+    newapiLogId: log.newapiLogId,
+    newapiRequestId: log.newapiRequestId,
+    providerChannelName: log.providerChannelName,
+    newapiUseTimeSeconds: log.newapiUseTimeSeconds,
     errorMessage: log.errorMessage,
     clientFamily: log.clientFamily,
     clientIp: log.clientIp,

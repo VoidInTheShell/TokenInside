@@ -45,8 +45,15 @@ export type UsageRecordRow = {
   totalTokens?: number;
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
+  quota?: number;
   cost?: number;
   actualCost?: number;
+  usageSource?: "proxy_json" | "proxy_stream" | "newapi_log" | "missing";
+  usageSyncedAt?: string;
+  newapiLogId?: string;
+  newapiRequestId?: string;
+  providerChannelName?: string;
+  newapiUseTimeSeconds?: number;
   errorMessage?: string;
   clientFamily?: string;
   clientIp?: string;
@@ -103,7 +110,6 @@ type UsageColumnId =
   | "user"
   | "department"
   | "model"
-  | "provider"
   | "apiFormat"
   | "status"
   | "tokens"
@@ -115,7 +121,6 @@ const DEFAULT_COLUMNS: UsageColumnId[] = [
   "time",
   "user",
   "model",
-  "provider",
   "apiFormat",
   "status",
   "tokens",
@@ -128,7 +133,6 @@ const COLUMN_LABELS: Record<UsageColumnId, string> = {
   user: "用户",
   department: "部门",
   model: "模型",
-  provider: "提供商",
   apiFormat: "API格式",
   status: "类型",
   tokens: "Tokens",
@@ -213,6 +217,14 @@ function formatApiFormat(value?: string) {
   return labels[value] ?? value;
 }
 
+function usageSourceLabel(value?: UsageRecordRow["usageSource"]) {
+  if (value === "newapi_log") return "NewAPI";
+  if (value === "proxy_json") return "代理JSON";
+  if (value === "proxy_stream") return "代理流式";
+  if (value === "missing") return "缺用量";
+  return "未记录";
+}
+
 function formatUserAgent(value?: string) {
   if (!value) return "-";
   return value.length > 44 ? `${value.slice(0, 41)}...` : value;
@@ -251,7 +263,6 @@ function elapsedMs(record: UsageRecordRow) {
 function visibleColumnDefaults(showUser: boolean, showDepartment: boolean) {
   return DEFAULT_COLUMNS.filter((column) => {
     if (column === "user" && !showUser) return false;
-    if (column === "provider" && !showUser) return false;
     if (column === "department" && !showDepartment) return false;
     return true;
   });
@@ -386,7 +397,7 @@ export function UsageRecordsTable({
     <div className="usage-records">
       {showControls && filters && (
         <div className="usage-records-controls">
-          <div className="usage-records-control-row">
+          <div className="usage-records-control-row usage-records-primary-row">
             {usageSelect("时间", filters.preset, PRESET_OPTIONS, (value) => updateFilter("preset", value))}
             <label className="usage-filter usage-search-filter">
               <span>搜索</span>
@@ -420,7 +431,7 @@ export function UsageRecordsTable({
                 (value) => updateFilter("departmentId", value),
               )}
           </div>
-          <div className="usage-records-control-row">
+          <div className="usage-records-control-row usage-records-secondary-row">
             {usageSelect(
               "模型",
               filters.model,
@@ -449,15 +460,13 @@ export function UsageRecordsTable({
               }))],
               (value) => updateFilter("userAgent", value),
             )}
-          </div>
-          <div className="usage-records-control-row usage-records-actions">
+            <div className="usage-records-actions">
             <details className="usage-columns">
               <summary>显示列</summary>
               <div>
                 {Object.entries(COLUMN_LABELS)
                   .filter(([column]) => {
                     if (column === "user" && !showUser) return false;
-                    if (column === "provider" && !showUser) return false;
                     if (column === "department" && !showDepartment) return false;
                     return true;
                   })
@@ -507,6 +516,7 @@ export function UsageRecordsTable({
             <Badge variant={loading ? "warning" : "default"}>
               {loading ? "读取中" : `${totalRecords ?? records.length} 条`}
             </Badge>
+            </div>
           </div>
         </div>
       )}
@@ -531,7 +541,7 @@ export function UsageRecordsTable({
                 </div>
                 {showUser && (
                   <div className="usage-record-card-line">
-                    {record.userName ?? maskSecret(record.userOpenId) ?? "-"} · {record.provider ?? "-"}
+                    {record.userName ?? maskSecret(record.userOpenId) ?? "-"}
                   </div>
                 )}
                 <div className="usage-record-card-line">
@@ -547,7 +557,7 @@ export function UsageRecordsTable({
         )}
       </div>
 
-      <div className="table-wrap usage-records-desktop">
+      <div className="table-wrap table-scroll table-scroll-usage usage-records-desktop">
         <table className="table usage-table">
           <thead>
             <tr>
@@ -555,11 +565,10 @@ export function UsageRecordsTable({
               {showUser && visibleSet.has("user") && <th>用户</th>}
               {showDepartment && visibleSet.has("department") && <th>部门</th>}
               {visibleSet.has("model") && <th>模型</th>}
-              {visibleSet.has("provider") && <th>提供商</th>}
               {visibleSet.has("apiFormat") && <th>API格式</th>}
               {visibleSet.has("status") && <th>类型</th>}
-              {visibleSet.has("tokens") && <th>Tokens</th>}
-              {visibleSet.has("cost") && <th>费用</th>}
+              {visibleSet.has("tokens") && <th className="usage-number-heading">Tokens</th>}
+              {visibleSet.has("cost") && <th className="usage-number-heading">费用</th>}
               {visibleSet.has("performance") && (
                 <th>
                   <div className="usage-th-stack">
@@ -610,14 +619,6 @@ export function UsageRecordsTable({
                         </div>
                       </td>
                     )}
-                    {visibleSet.has("provider") && (
-                      <td>
-                        <div className="meta-stack">
-                          <strong>{record.provider ?? "unknown"}</strong>
-                          <span>{record.providerKeyName ?? "-"}</span>
-                        </div>
-                      </td>
-                    )}
                     {visibleSet.has("apiFormat") && <td>{formatApiFormat(record.apiFormat)}</td>}
                     {visibleSet.has("status") && (
                       <td>
@@ -625,15 +626,25 @@ export function UsageRecordsTable({
                       </td>
                     )}
                     {visibleSet.has("tokens") && (
-                      <td>
+                      <td className="usage-number-cell">
                         <TokensCell record={record} />
                       </td>
                     )}
                     {visibleSet.has("cost") && (
-                      <td>
-                        <div className="usage-cost">
+                      <td className="usage-number-cell">
+                        <div
+                          className="usage-cost"
+                          title={[
+                            record.usageSyncedAt ? `同步时间：${formatDateTime(record.usageSyncedAt)}` : undefined,
+                            record.newapiLogId ? `NewAPI log：${record.newapiLogId}` : undefined,
+                            record.newapiRequestId ? `NewAPI request：${record.newapiRequestId}` : undefined,
+                            record.providerChannelName ? `渠道：${record.providerChannelName}` : undefined,
+                          ].filter(Boolean).join("\n") || undefined}
+                        >
                           <span>{formatCurrency(record.cost)}</span>
                           {record.actualCost !== undefined && <span>{formatCurrency(record.actualCost)}</span>}
+                          {record.quota !== undefined && <span>{formatTokenAmount(record.quota, "0")} quota</span>}
+                          <span>{usageSourceLabel(record.usageSource)}</span>
                         </div>
                       </td>
                     )}

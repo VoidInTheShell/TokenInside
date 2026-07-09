@@ -126,8 +126,15 @@ export type ProxyRequestLog = {
   totalTokens?: number;
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
+  quota?: number;
   cost?: number;
   actualCost?: number;
+  usageSource?: "proxy_json" | "proxy_stream" | "newapi_log" | "missing";
+  usageSyncedAt?: string;
+  newapiLogId?: string;
+  newapiRequestId?: string;
+  providerChannelName?: string;
+  newapiUseTimeSeconds?: number;
   errorMessage?: string;
   clientFamily?: string;
   clientIp?: string;
@@ -162,8 +169,27 @@ export type AdminScope = {
   updatedAt: string;
 };
 
+export type BillingOperationKind = "usage_sync" | "monthly_reset" | "settings_update";
+
+export type BillingOperationStatus = "dry_run" | "applied" | "partial_failed" | "failed";
+
+export type BillingOperationRecord = {
+  id: string;
+  kind: BillingOperationKind;
+  status: BillingOperationStatus;
+  dryRun: boolean;
+  operatedByFeishuUserId: string;
+  period?: string;
+  input?: Record<string, unknown>;
+  summary: Record<string, string | number | boolean | undefined>;
+  errorMessage?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type AppSettings = {
   defaultMonthlyQuota: number;
+  billingOperations?: BillingOperationRecord[];
   updatedAt?: string;
   updatedByFeishuUserId?: string;
 };

@@ -536,6 +536,21 @@ a {
   overflow-x: auto;
 }
 
+.table-scroll {
+  max-height: 480px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.table-scroll-users {
+  max-height: 520px;
+}
+
+.table-scroll-usage {
+  max-height: 560px;
+}
+
 .table {
   width: 100%;
   border-collapse: collapse;
@@ -554,6 +569,13 @@ a {
 .table th {
   color: var(--muted-foreground);
   font-weight: 600;
+}
+
+.table-scroll .table th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--card);
 }
 
 .empty {
@@ -600,6 +622,44 @@ a {
 
 .quota-control .input {
   min-width: 96px;
+}
+
+.settings-section {
+  display: grid;
+  gap: 12px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-section:first-child {
+  padding-top: 0;
+}
+
+.settings-section:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.settings-section h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.settings-section p {
+  margin: 4px 0 0;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.billing-control-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  gap: 12px;
+}
+
+.billing-operation-table {
+  max-height: 360px;
 }
 
 .quick-approval {
@@ -822,18 +882,30 @@ a {
 }
 
 .usage-records-control-row {
-  display: flex;
-  align-items: flex-end;
+  display: grid;
+  align-items: end;
   gap: 10px;
-  flex-wrap: wrap;
+}
+
+.usage-records-primary-row {
+  grid-template-columns: minmax(120px, 0.7fr) minmax(180px, 1.3fr) repeat(2, minmax(132px, 1fr));
+}
+
+.usage-records-secondary-row {
+  grid-template-columns: repeat(4, minmax(120px, 1fr)) minmax(430px, auto);
 }
 
 .usage-records-actions {
+  min-width: 0;
+  display: flex;
+  align-items: flex-end;
   justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .usage-filter {
-  min-width: 132px;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -842,9 +914,8 @@ a {
 }
 
 .usage-search-filter {
-  width: 132px;
-  min-width: 132px;
-  flex: 0 0 132px;
+  width: auto;
+  min-width: 0;
 }
 
 .usage-select {
@@ -917,7 +988,7 @@ a {
 }
 
 .usage-table {
-  min-width: 1120px;
+  min-width: 1040px;
   table-layout: fixed;
 }
 
@@ -929,6 +1000,24 @@ a {
 
 .usage-table th {
   height: 48px;
+}
+
+.usage-table th.usage-number-heading,
+.usage-table td.usage-number-cell {
+  text-align: right;
+}
+
+.usage-number-cell .usage-tokens,
+.usage-number-cell .usage-cost {
+  margin-left: auto;
+}
+
+.usage-number-cell .usage-tokens {
+  width: 96px;
+}
+
+.usage-number-cell .usage-cost {
+  min-width: 72px;
 }
 
 .usage-time,
@@ -948,7 +1037,7 @@ a {
 }
 
 .usage-time span:last-child,
-.usage-cost span:last-child,
+.usage-cost span:not(:first-child),
 .usage-performance span:last-child,
 .usage-status-cell span {
   color: var(--muted-foreground);
@@ -1085,6 +1174,10 @@ a {
     grid-template-columns: 1fr 1fr;
   }
 
+  .billing-control-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .usage-analysis-grid,
   .usage-analysis-grid-user {
     grid-template-columns: 1fr;
@@ -1141,6 +1234,10 @@ a {
 
   .grid-4,
   .grid-2 {
+    grid-template-columns: 1fr;
+  }
+
+  .billing-control-grid {
     grid-template-columns: 1fr;
   }
 

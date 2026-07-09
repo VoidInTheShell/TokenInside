@@ -70,6 +70,20 @@ type AdminScopeRecord = {
   updatedAt: string;
 };
 
+type BillingOperationRecord = {
+  id: string;
+  kind: "usage_sync" | "monthly_reset" | "settings_update";
+  status: "dry_run" | "applied" | "partial_failed" | "failed";
+  dryRun: boolean;
+  operatedByFeishuUserId: string;
+  period?: string;
+  input?: Record<string, unknown>;
+  summary: Record<string, string | number | boolean | undefined>;
+  errorMessage?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type AdminOverviewResponse = {
   authenticated: boolean;
   authorized: boolean;
@@ -128,6 +142,7 @@ type AdminOverviewResponse = {
   };
   settings?: {
     defaultMonthlyQuota: number;
+    billingOperations?: BillingOperationRecord[];
     updatedAt?: string;
   };
 };
@@ -239,6 +254,46 @@ type UsageRecordsResponse = {
   error?: string;
 };
 
+type UsageSyncDraft = {
+  page: string;
+  size: string;
+  maxPages: string;
+  matchWindowMinutes: string;
+};
+
+type MonthlyResetDraft = {
+  period: string;
+  limit: string;
+};
+
+type UsageSyncResult = {
+  dryRun: boolean;
+  pageStart: number;
+  size: number;
+  maxPages: number;
+  totals: {
+    fetched: number;
+    seen: number;
+    matched: number;
+    updated: number;
+    skippedUnknownToken: number;
+    skippedNoMatch: number;
+  };
+};
+
+type MonthlyResetResult = {
+  period: string;
+  dryRun: boolean;
+  monthlyQuota: number;
+  totals: {
+    activeTokens: number;
+    skippedCurrentPeriod: number;
+    planned: number;
+    applied: number;
+    failed: number;
+  };
+};
+
 const statusLabel: Record<string, string> = {
   pending_card_send: "发送审批卡片中",
   pending_card_approval: "卡片审批中",
@@ -329,6 +384,68 @@ function formatRate(value?: number) {
   return `${Math.round((value ?? 0) * 1000) / 10}%`;
 }
 
+function currentBillingPeriod() {
+  return new Date().toISOString().slice(0, 7);
+}
+
+function parseIntegerDraft(value: string, label: string, input: { min: number; max?: number }) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < input.min || (input.max !== undefined && parsed > input.max)) {
+    throw new Error(
+      input.max === undefined
+        ? `${label}必须是不小于 ${input.min} 的整数`
+        : `${label}必须是 ${input.min}-${input.max} 的整数`,
+    );
+  }
+  return parsed;
+}
+
+function billingKindLabel(kind: BillingOperationRecord["kind"]) {
+  if (kind === "usage_sync") return "用量同步";
+  if (kind === "monthly_reset") return "月度重置";
+  return "设置变更";
+}
+
+function billingStatusLabel(status: BillingOperationRecord["status"]) {
+  if (status === "dry_run") return "试算";
+  if (status === "partial_failed") return "部分失败";
+  if (status === "failed") return "失败";
+  return "已执行";
+}
+
+function billingStatusVariant(status: BillingOperationRecord["status"]) {
+  if (status === "applied") return "success";
+  if (status === "failed" || status === "partial_failed") return "danger";
+  return "warning";
+}
+
+function billingSummaryText(operation: BillingOperationRecord) {
+  const summary = operation.summary ?? {};
+  if (operation.kind === "usage_sync") {
+    return `取回 ${summary.fetched ?? 0}，匹配 ${summary.matched ?? 0}，更新 ${summary.updated ?? 0}`;
+  }
+  if (operation.kind === "settings_update") {
+    return `默认额度 ${summary.previousDefaultMonthlyQuota ?? "-"} -> ${summary.defaultMonthlyQuota ?? "-"}`;
+  }
+  return `计划 ${summary.planned ?? 0}，应用 ${summary.applied ?? 0}，失败 ${summary.failed ?? 0}`;
+}
+
+function usageSyncDraftSignature(draft: UsageSyncDraft) {
+  return JSON.stringify({
+    page: draft.page.trim(),
+    size: draft.size.trim(),
+    maxPages: draft.maxPages.trim(),
+    matchWindowMinutes: draft.matchWindowMinutes.trim(),
+  });
+}
+
+function monthlyResetDraftSignature(draft: MonthlyResetDraft) {
+  return JSON.stringify({
+    period: draft.period.trim(),
+    limit: draft.limit.trim(),
+  });
+}
+
 async function readJsonResponse<T>(res: Response): Promise<T & { error?: string }> {
   const text = await res.text();
   if (!text.trim()) return {} as T & { error?: string };
@@ -391,7 +508,24 @@ export function AdminClient() {
   const [panel, setPanel] = useState<AdminPanel>("overview");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [defaultQuotaDraft, setDefaultQuotaDraft] = useState("200");
+  const [usageSyncDraft, setUsageSyncDraft] = useState({
+    page: "0",
+    size: "100",
+    maxPages: "1",
+    matchWindowMinutes: "30",
+  } satisfies UsageSyncDraft);
+  const [monthlyResetDraft, setMonthlyResetDraft] = useState({
+    period: currentBillingPeriod(),
+    limit: "",
+  } satisfies MonthlyResetDraft);
+  const [billingResult, setBillingResult] = useState<string | null>(null);
+  const [lastUsageSyncDryRunSignature, setLastUsageSyncDryRunSignature] = useState<string | null>(null);
+  const [lastUsageSyncDryRunSummary, setLastUsageSyncDryRunSummary] = useState<string | null>(null);
+  const [lastMonthlyResetDryRunSignature, setLastMonthlyResetDryRunSignature] = useState<string | null>(null);
+  const [lastMonthlyResetDryRunSummary, setLastMonthlyResetDryRunSummary] = useState<string | null>(null);
   const [quotaDrafts, setQuotaDrafts] = useState<Record<string, string>>({});
+  const [adminUsersPage, setAdminUsersPage] = useState(1);
+  const [adminUsersPageSize, setAdminUsersPageSize] = useState(10);
   const [adminTargetOpenId, setAdminTargetOpenId] = useState("");
   const [adminDepartmentId, setAdminDepartmentId] = useState("");
   const [feishuSdkReady, setFeishuSdkReady] = useState(false);
@@ -436,6 +570,7 @@ export function AdminClient() {
       const body = await readJsonResponse<AdminUsersResponse>(res);
       if (!res.ok) throw new Error(body.error ?? "读取用户管理失败");
       setAdminUsers(body.users);
+      setAdminUsersPage(1);
     } catch (err) {
       setError(err instanceof Error ? err.message : "读取用户管理失败");
     } finally {
@@ -621,6 +756,118 @@ export function AdminClient() {
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存默认额度失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runUsageSync(dryRun: boolean) {
+    try {
+      const signature = usageSyncDraftSignature(usageSyncDraft);
+      const page = parseIntegerDraft(usageSyncDraft.page, "起始页", { min: 0 });
+      const size = parseIntegerDraft(usageSyncDraft.size, "每页数量", { min: 1, max: 500 });
+      const maxPages = parseIntegerDraft(usageSyncDraft.maxPages, "最大页数", { min: 1, max: 20 });
+      const matchWindowMinutes = parseIntegerDraft(usageSyncDraft.matchWindowMinutes, "匹配窗口", {
+        min: 1,
+        max: 24 * 60,
+      });
+      if (!dryRun && lastUsageSyncDryRunSignature !== signature) {
+        throw new Error("执行同步前必须先用相同参数完成一次试算同步");
+      }
+      if (
+        !dryRun &&
+        !window.confirm(
+          `确认把 NewAPI 日志回填到 TokenInside 使用记录？\n${lastUsageSyncDryRunSummary ?? ""}`,
+        )
+      ) {
+        return;
+      }
+
+      setBusy(true);
+      setError(null);
+      setMessage(null);
+      setBillingResult(null);
+      const res = await fetch("/api/admin/usage-sync", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          dryRun,
+          page,
+          size,
+          maxPages,
+          matchWindowMinutes,
+        }),
+      });
+      const body = await readJsonResponse<UsageSyncResult>(res);
+      if (!res.ok) throw new Error(body.error ?? "同步 NewAPI 用量失败");
+      const summary = `取回 ${body.totals.fetched}，匹配 ${body.totals.matched}，更新 ${body.totals.updated}，未绑定 ${body.totals.skippedUnknownToken}，未匹配 ${body.totals.skippedNoMatch}`;
+      setBillingResult(`NewAPI 用量${dryRun ? "试算" : "同步"}完成：${summary}`);
+      setMessage(`NewAPI 用量${dryRun ? "试算" : "同步"}完成。`);
+      if (dryRun) {
+        setLastUsageSyncDryRunSignature(signature);
+        setLastUsageSyncDryRunSummary(summary);
+      } else {
+        setLastUsageSyncDryRunSignature(null);
+        setLastUsageSyncDryRunSummary(null);
+      }
+      await Promise.all([refresh(), loadUsageRecords({ quiet: true })]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "同步 NewAPI 用量失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runMonthlyReset(dryRun: boolean) {
+    try {
+      const signature = monthlyResetDraftSignature(monthlyResetDraft);
+      const period = monthlyResetDraft.period.trim();
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(period)) {
+        throw new Error("账期必须是 YYYY-MM");
+      }
+      const limit = monthlyResetDraft.limit.trim()
+        ? parseIntegerDraft(monthlyResetDraft.limit, "处理上限", { min: 1, max: 500 })
+        : undefined;
+      if (!dryRun && lastMonthlyResetDryRunSignature !== signature) {
+        throw new Error("执行月度重置前必须先用相同参数完成一次试算重置");
+      }
+      if (
+        !dryRun &&
+        !window.confirm(
+          `确认执行 ${period} 月度账期重置？\n${lastMonthlyResetDryRunSummary ?? ""}`,
+        )
+      ) {
+        return;
+      }
+
+      setBusy(true);
+      setError(null);
+      setMessage(null);
+      setBillingResult(null);
+      const res = await fetch("/api/admin/billing/monthly-reset", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          dryRun,
+          period,
+          limit,
+        }),
+      });
+      const body = await readJsonResponse<MonthlyResetResult>(res);
+      if (!res.ok) throw new Error(body.error ?? "月度账期重置失败");
+      const summary = `活跃 ${body.totals.activeTokens}，跳过 ${body.totals.skippedCurrentPeriod}，计划 ${body.totals.planned}，应用 ${body.totals.applied}，失败 ${body.totals.failed}`;
+      setBillingResult(`${body.period} 月度重置${dryRun ? "试算" : "执行"}完成：${summary}`);
+      setMessage(`月度账期重置${dryRun ? "试算" : "执行"}完成。`);
+      if (dryRun) {
+        setLastMonthlyResetDryRunSignature(signature);
+        setLastMonthlyResetDryRunSummary(summary);
+      } else {
+        setLastMonthlyResetDryRunSignature(null);
+        setLastMonthlyResetDryRunSummary(null);
+      }
+      await Promise.all([refresh(), loadAdminUsers(), loadUserStats()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "月度账期重置失败");
     } finally {
       setBusy(false);
     }
@@ -846,6 +1093,17 @@ export function AdminClient() {
     setPanel(nextPanel);
     setMobileNavOpen(false);
   }
+
+  const adminUsersPageCount = Math.max(Math.ceil(adminUsers.length / adminUsersPageSize), 1);
+  const currentAdminUsersPage = Math.min(adminUsersPage, adminUsersPageCount);
+  const pagedAdminUsers = adminUsers.slice(
+    (currentAdminUsersPage - 1) * adminUsersPageSize,
+    currentAdminUsersPage * adminUsersPageSize,
+  );
+  const usageSyncReadyToExecute =
+    lastUsageSyncDryRunSignature === usageSyncDraftSignature(usageSyncDraft);
+  const monthlyResetReadyToExecute =
+    lastMonthlyResetDryRunSignature === monthlyResetDraftSignature(monthlyResetDraft);
 
   return (
     <>
@@ -1117,6 +1375,179 @@ export function AdminClient() {
                 </Card>
               )}
 
+              <Card>
+                <CardHeader>
+                  <CardTitle>用户管理</CardTitle>
+                  <CardDescription>
+                    调整额度、指派管理员、禁用和删除都在这里处理。部门管理员只能看到本部门下属用户。
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="toolbar toolbar-left">
+                    <Button variant="outline" disabled={panelLoading} onClick={() => void loadAdminUsers()}>
+                      <RefreshCwIcon data-icon="inline-start" />
+                      刷新用户
+                    </Button>
+                    <Badge>{adminUsers.length} 个用户</Badge>
+                    {adminUsers.length > 0 && (
+                      <Badge>
+                        第 {currentAdminUsersPage} / {adminUsersPageCount} 页
+                      </Badge>
+                    )}
+                  </div>
+                  {!adminUsers.length ? (
+                    <div className="empty">{panelLoading ? "读取用户中" : "暂无用户"}</div>
+                  ) : (
+                    <>
+                      <div className="table-wrap table-scroll table-scroll-users">
+                        <table className="table">
+                          <thead>
+                            <tr>
+                              <th>用户</th>
+                              <th>部门</th>
+                              <th>状态</th>
+                              <th>角色</th>
+                              <th>active key</th>
+                              <th>账期</th>
+                              <th>发放额度</th>
+                              <th>剩余额度</th>
+                              <th>已用</th>
+                              <th>最近调用</th>
+                              <th>操作</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {pagedAdminUsers.map((user) => (
+                              <tr key={user.id}>
+                                <td>
+                                  <div className="meta-stack">
+                                    <strong>{user.name ?? maskSecret(user.openId)}</strong>
+                                    <span>{maskSecret(user.openId)}</span>
+                                  </div>
+                                </td>
+                                <td>{maskSecret(user.departmentId) ?? "-"}</td>
+                                <td>
+                                  <Badge variant={badgeVariant(user.status)}>{userStatusLabel[user.status]}</Badge>
+                                </td>
+                                <td>{user.role}</td>
+                                <td>{user.activeTokenStatus ?? "-"}</td>
+                                <td>{user.billingPeriod ?? "-"}</td>
+                                <td>{formatTokenAmount(user.billingMonthlyQuota)}</td>
+                                <td>{formatTokenAmount(user.billingRemainingQuota)}</td>
+                                <td>{formatTokenAmount(user.billingTotalTokens, "0")}</td>
+                                <td>{user.latestProxyLogAt ? formatDateTime(user.latestProxyLogAt) : "-"}</td>
+                                <td>
+                                  <div className="toolbar toolbar-left">
+                                    <div className="quota-control">
+                                      <Input
+                                        min={1}
+                                        step={1}
+                                        type="number"
+                                        value={quotaDrafts[user.id] ?? ""}
+                                        placeholder="额度"
+                                        onChange={(event) =>
+                                          setQuotaDrafts((current) => ({
+                                            ...current,
+                                            [user.id]: event.target.value,
+                                          }))
+                                        }
+                                        disabled={busy || user.activeTokenStatus !== "active"}
+                                      />
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={busy || user.activeTokenStatus !== "active"}
+                                        onClick={() => void adjustUserQuota(user.id)}
+                                      >
+                                        调额
+                                      </Button>
+                                    </div>
+                                    {isSystemAdmin && (
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={busy}
+                                        onClick={() => {
+                                          setAdminTargetOpenId(user.openId);
+                                          setAdminDepartmentId(user.departmentId ?? "");
+                                        }}
+                                      >
+                                        <UserCogIcon data-icon="inline-start" />
+                                        指派
+                                      </Button>
+                                    )}
+                                    {user.status === "disabled" ? (
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={busy || user.activeTokenStatus !== "disabled"}
+                                        onClick={() => void enableUser(user)}
+                                      >
+                                        启用
+                                      </Button>
+                                    ) : (
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={busy || user.status !== "active" || user.activeTokenStatus !== "active"}
+                                        onClick={() => void disableUser(user)}
+                                      >
+                                        禁用
+                                      </Button>
+                                    )}
+                                    <Button variant="outline" size="sm" disabled={busy} onClick={() => void deleteUser(user)}>
+                                      <Trash2Icon data-icon="inline-start" />
+                                      删除
+                                    </Button>
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      <div className="usage-pagination">
+                        <span>
+                          第 {currentAdminUsersPage} / {adminUsersPageCount} 页，共 {adminUsers.length} 个用户
+                        </span>
+                        <div className="toolbar toolbar-left">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={currentAdminUsersPage <= 1 || panelLoading}
+                            onClick={() => setAdminUsersPage(currentAdminUsersPage - 1)}
+                          >
+                            上一页
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={currentAdminUsersPage >= adminUsersPageCount || panelLoading}
+                            onClick={() => setAdminUsersPage(currentAdminUsersPage + 1)}
+                          >
+                            下一页
+                          </Button>
+                          <select
+                            className="input usage-select"
+                            value={adminUsersPageSize}
+                            onChange={(event) => {
+                              setAdminUsersPageSize(Number(event.target.value));
+                              setAdminUsersPage(1);
+                            }}
+                          >
+                            {[10, 20, 50, 100].map((option) => (
+                              <option key={option} value={option}>
+                                {option} / 页
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </CardContent>
+              </Card>
+
               {isSystemAdmin && (
                 <Card>
                   <CardHeader>
@@ -1194,134 +1625,6 @@ export function AdminClient() {
                 </Card>
               )}
 
-              <Card>
-                <CardHeader>
-                  <CardTitle>用户管理</CardTitle>
-                  <CardDescription>
-                    调整额度、指派管理员、禁用和删除都在这里处理。部门管理员只能看到本部门下属用户。
-                  </CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <div className="toolbar toolbar-left">
-                    <Button variant="outline" disabled={panelLoading} onClick={() => void loadAdminUsers()}>
-                      <RefreshCwIcon data-icon="inline-start" />
-                      刷新用户
-                    </Button>
-                    <Badge>{adminUsers.length} 个用户</Badge>
-                  </div>
-                  {!adminUsers.length ? (
-                    <div className="empty">{panelLoading ? "读取用户中" : "暂无用户"}</div>
-                  ) : (
-                    <div className="table-wrap">
-                      <table className="table">
-                        <thead>
-                          <tr>
-                            <th>用户</th>
-                            <th>部门</th>
-                            <th>状态</th>
-                            <th>角色</th>
-                            <th>active key</th>
-                            <th>账期</th>
-                            <th>发放额度</th>
-                            <th>剩余额度</th>
-                            <th>已用</th>
-                            <th>最近调用</th>
-                            <th>操作</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {adminUsers.map((user) => (
-                            <tr key={user.id}>
-                              <td>
-                                <div className="meta-stack">
-                                  <strong>{user.name ?? maskSecret(user.openId)}</strong>
-                                  <span>{maskSecret(user.openId)}</span>
-                                </div>
-                              </td>
-                              <td>{maskSecret(user.departmentId) ?? "-"}</td>
-                              <td>
-                                <Badge variant={badgeVariant(user.status)}>{userStatusLabel[user.status]}</Badge>
-                              </td>
-                              <td>{user.role}</td>
-                              <td>{user.activeTokenStatus ?? "-"}</td>
-                              <td>{user.billingPeriod ?? "-"}</td>
-                              <td>{formatTokenAmount(user.billingMonthlyQuota)}</td>
-                              <td>{formatTokenAmount(user.billingRemainingQuota)}</td>
-                              <td>{formatTokenAmount(user.billingTotalTokens, "0")}</td>
-                              <td>{user.latestProxyLogAt ? formatDateTime(user.latestProxyLogAt) : "-"}</td>
-                              <td>
-                                <div className="toolbar toolbar-left">
-                                  <div className="quota-control">
-                                    <Input
-                                      min={1}
-                                      step={1}
-                                      type="number"
-                                      value={quotaDrafts[user.id] ?? ""}
-                                      placeholder="额度"
-                                      onChange={(event) =>
-                                        setQuotaDrafts((current) => ({
-                                          ...current,
-                                          [user.id]: event.target.value,
-                                        }))
-                                      }
-                                      disabled={busy || user.activeTokenStatus !== "active"}
-                                    />
-                                    <Button
-                                      variant="outline"
-                                      size="sm"
-                                      disabled={busy || user.activeTokenStatus !== "active"}
-                                      onClick={() => void adjustUserQuota(user.id)}
-                                    >
-                                      调额
-                                    </Button>
-                                  </div>
-                                  {isSystemAdmin && (
-                                    <Button
-                                      variant="outline"
-                                      size="sm"
-                                      disabled={busy}
-                                      onClick={() => {
-                                        setAdminTargetOpenId(user.openId);
-                                        setAdminDepartmentId(user.departmentId ?? "");
-                                      }}
-                                    >
-                                      <UserCogIcon data-icon="inline-start" />
-                                      指派
-                                    </Button>
-                                  )}
-                                  {user.status === "disabled" ? (
-                                    <Button
-                                      variant="outline"
-                                      size="sm"
-                                      disabled={busy || user.activeTokenStatus !== "disabled"}
-                                      onClick={() => void enableUser(user)}
-                                    >
-                                      启用
-                                    </Button>
-                                  ) : (
-                                    <Button
-                                      variant="outline"
-                                      size="sm"
-                                      disabled={busy || user.status !== "active" || user.activeTokenStatus !== "active"}
-                                      onClick={() => void disableUser(user)}
-                                    >
-                                      禁用
-                                    </Button>
-                                  )}
-                                  <Button variant="outline" size="sm" disabled={busy} onClick={() => void deleteUser(user)}>
-                                    <Trash2Icon data-icon="inline-start" />
-                                    删除
-                                  </Button>
-                                </div>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
             </section>
           )}
 
@@ -1613,7 +1916,12 @@ export function AdminClient() {
                 <CardDescription>默认额度和全局设置只允许系统管理员修改。</CardDescription>
               </CardHeader>
               <CardContent>
-                <div className="field-group">
+                {billingResult && <div className="alert">{billingResult}</div>}
+                <section className="settings-section">
+                  <div>
+                    <h3>默认额度</h3>
+                    <p>新申请、调额基准和月度重置会使用该值。</p>
+                  </div>
                   <div className="field">
                     <label htmlFor="defaultMonthlyQuota">默认申请额度</label>
                     <div className="quota-control">
@@ -1635,7 +1943,191 @@ export function AdminClient() {
                       当前值：{formatTokenAmount(data?.settings?.defaultMonthlyQuota ?? 200)}
                     </span>
                   </div>
-                </div>
+                </section>
+
+                <section className="settings-section">
+                  <div>
+                    <h3>NewAPI 用量同步</h3>
+                    <p>从 NewAPI 日志回填 token、费用和渠道字段。</p>
+                  </div>
+                  <div className="billing-control-grid">
+                    <div className="field">
+                      <label htmlFor="usageSyncPage">起始页</label>
+                      <Input
+                        id="usageSyncPage"
+                        min={0}
+                        step={1}
+                        type="number"
+                        value={usageSyncDraft.page}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setUsageSyncDraft((current) => ({ ...current, page: event.target.value }))
+                        }
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="usageSyncSize">每页数量</label>
+                      <Input
+                        id="usageSyncSize"
+                        min={1}
+                        max={500}
+                        step={1}
+                        type="number"
+                        value={usageSyncDraft.size}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setUsageSyncDraft((current) => ({ ...current, size: event.target.value }))
+                        }
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="usageSyncMaxPages">最大页数</label>
+                      <Input
+                        id="usageSyncMaxPages"
+                        min={1}
+                        max={20}
+                        step={1}
+                        type="number"
+                        value={usageSyncDraft.maxPages}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setUsageSyncDraft((current) => ({ ...current, maxPages: event.target.value }))
+                        }
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="usageSyncWindow">匹配窗口(分钟)</label>
+                      <Input
+                        id="usageSyncWindow"
+                        min={1}
+                        max={1440}
+                        step={1}
+                        type="number"
+                        value={usageSyncDraft.matchWindowMinutes}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setUsageSyncDraft((current) => ({
+                            ...current,
+                            matchWindowMinutes: event.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                  </div>
+                  <div className="toolbar toolbar-left">
+                    <Button variant="outline" size="sm" disabled={!data?.authorized || busy} onClick={() => void runUsageSync(true)}>
+                      <RefreshCwIcon data-icon="inline-start" />
+                      试算同步
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={!data?.authorized || busy || !usageSyncReadyToExecute}
+                      title={usageSyncReadyToExecute ? "执行同步" : "请先用相同参数试算同步"}
+                      onClick={() => void runUsageSync(false)}
+                    >
+                      <ShieldCheckIcon data-icon="inline-start" />
+                      执行同步
+                    </Button>
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <div>
+                    <h3>月度账期重置</h3>
+                    <p>按当前默认额度重置活跃 key 的 NewAPI 剩余额度和本地账期。</p>
+                  </div>
+                  <div className="billing-control-grid">
+                    <div className="field">
+                      <label htmlFor="monthlyResetPeriod">目标账期</label>
+                      <Input
+                        id="monthlyResetPeriod"
+                        value={monthlyResetDraft.period}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setMonthlyResetDraft((current) => ({ ...current, period: event.target.value }))
+                        }
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="monthlyResetLimit">处理上限</label>
+                      <Input
+                        id="monthlyResetLimit"
+                        min={1}
+                        max={500}
+                        step={1}
+                        type="number"
+                        placeholder="全部"
+                        value={monthlyResetDraft.limit}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setMonthlyResetDraft((current) => ({ ...current, limit: event.target.value }))
+                        }
+                      />
+                    </div>
+                  </div>
+                  <div className="toolbar toolbar-left">
+                    <Button variant="outline" size="sm" disabled={!data?.authorized || busy} onClick={() => void runMonthlyReset(true)}>
+                      <RefreshCwIcon data-icon="inline-start" />
+                      试算重置
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={!data?.authorized || busy || !monthlyResetReadyToExecute}
+                      title={monthlyResetReadyToExecute ? "执行重置" : "请先用相同参数试算重置"}
+                      onClick={() => void runMonthlyReset(false)}
+                    >
+                      <ShieldCheckIcon data-icon="inline-start" />
+                      执行重置
+                    </Button>
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <div>
+                    <h3>计费操作</h3>
+                    <p>最近 50 次计费同步和重置操作会持久化到设置审计中。</p>
+                  </div>
+                  <div className="table-wrap table-scroll billing-operation-table">
+                    <table className="table">
+                      <thead>
+                        <tr>
+                          <th>时间</th>
+                          <th>类型</th>
+                          <th>状态</th>
+                          <th>账期</th>
+                          <th>摘要</th>
+                          <th>操作者</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {!(data?.settings?.billingOperations ?? []).length ? (
+                          <tr>
+                            <td colSpan={6} className="usage-empty-cell">
+                              暂无计费操作
+                            </td>
+                          </tr>
+                        ) : (
+                          (data?.settings?.billingOperations ?? []).slice(0, 50).map((operation) => (
+                            <tr key={operation.id} title={operation.errorMessage ?? undefined}>
+                              <td>{formatDateTime(operation.createdAt)}</td>
+                              <td>{billingKindLabel(operation.kind)}</td>
+                              <td>
+                                <Badge variant={billingStatusVariant(operation.status)}>
+                                  {billingStatusLabel(operation.status)}
+                                </Badge>
+                              </td>
+                              <td>{operation.period ?? "-"}</td>
+                              <td>{billingSummaryText(operation)}</td>
+                              <td>{maskSecret(operation.operatedByFeishuUserId) ?? "-"}</td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
               </CardContent>
             </Card>
           )}

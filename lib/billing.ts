@@ -1,6 +1,13 @@
 import { toNewApiQuota, updateNewApiTokenQuota } from "@/lib/newapi";
-import { getAppSettings, listActiveTokenAccounts, recordMonthlyResetApplied } from "@/lib/store";
+import {
+  getAppSettings,
+  listActiveTokenAccounts,
+  recordBillingOperation,
+  recordMonthlyResetApplied,
+} from "@/lib/store";
 import type { FeishuUser, TokenAccount } from "@/lib/types";
+
+const monthlyResetLocks = new Set<string>();
 
 export type MonthlyResetItem = {
   feishuUserId: string;
@@ -40,86 +47,178 @@ function toItem(input: {
   };
 }
 
+function billingOperationStatus(input: {
+  dryRun: boolean;
+  applied: number;
+  failed: number;
+}) {
+  if (input.dryRun) return "dry_run";
+  if (input.failed > 0 && input.applied > 0) return "partial_failed";
+  if (input.failed > 0) return "failed";
+  return "applied";
+}
+
+function errorMessage(err: unknown) {
+  return err instanceof Error ? err.message : "monthly billing reset failed";
+}
+
 export async function runMonthlyBillingReset(input: {
   period?: string;
   dryRun: boolean;
   operatedByFeishuUserId: string;
+  operatedByOpenId: string;
   limit?: number;
 }) {
   const targetPeriod = input.period ?? currentPeriod();
-  const settings = await getAppSettings();
-  const monthlyQuota = settings.defaultMonthlyQuota;
-  const activeAccounts = await listActiveTokenAccounts();
-  const candidates = activeAccounts
-    .map(({ account, user }) => toItem({ account, user, targetPeriod, monthlyQuota }))
-    .filter((item) => item.previousPeriod !== targetPeriod);
-  const limitedCandidates = input.limit ? candidates.slice(0, input.limit) : candidates;
-  const skippedCurrentPeriod = activeAccounts.length - candidates.length;
+  const lockKey = `monthly_reset:${targetPeriod}`;
+  let lockAcquired = false;
+  try {
+    if (!input.dryRun) {
+      if (monthlyResetLocks.has(lockKey)) {
+        throw new Error(`monthly reset for ${targetPeriod} is already running`);
+      }
+      monthlyResetLocks.add(lockKey);
+      lockAcquired = true;
+    }
 
-  if (input.dryRun) {
-    return {
+    const settings = await getAppSettings();
+    const monthlyQuota = settings.defaultMonthlyQuota;
+    const activeAccounts = await listActiveTokenAccounts();
+    const candidates = activeAccounts
+      .map(({ account, user }) => toItem({ account, user, targetPeriod, monthlyQuota }))
+      .filter((item) => item.previousPeriod !== targetPeriod);
+    const limitedCandidates = input.limit ? candidates.slice(0, input.limit) : candidates;
+    const skippedCurrentPeriod = activeAccounts.length - candidates.length;
+
+    if (input.dryRun) {
+      const result = {
+        period: targetPeriod,
+        dryRun: true,
+        monthlyQuota,
+        totals: {
+          activeTokens: activeAccounts.length,
+          skippedCurrentPeriod,
+          planned: limitedCandidates.length,
+          applied: 0,
+          failed: 0,
+        },
+        items: limitedCandidates,
+      };
+      await recordBillingOperation({
+        kind: "monthly_reset",
+        status: "dry_run",
+        dryRun: true,
+        operatedByFeishuUserId: input.operatedByFeishuUserId,
+        period: targetPeriod,
+        input: {
+          period: targetPeriod,
+          limit: input.limit,
+          monthlyQuota,
+        },
+        summary: {
+          activeTokens: result.totals.activeTokens,
+          skippedCurrentPeriod: result.totals.skippedCurrentPeriod,
+          planned: result.totals.planned,
+          applied: result.totals.applied,
+          failed: result.totals.failed,
+          monthlyQuota,
+        },
+      });
+      return result;
+    }
+
+    const items: MonthlyResetItem[] = [];
+    for (const candidate of limitedCandidates) {
+      if (!candidate.newapiTokenId) {
+        items.push({
+          ...candidate,
+          status: "failed",
+          reason: "active token has no NewAPI token id",
+        });
+        continue;
+      }
+
+      try {
+        await updateNewApiTokenQuota({
+          newapiTokenId: candidate.newapiTokenId,
+          remainQuota: toNewApiQuota(monthlyQuota),
+        });
+        const recorded = await recordMonthlyResetApplied({
+          tokenAccountId: candidate.tokenAccountId,
+          feishuUserId: candidate.feishuUserId,
+          period: targetPeriod,
+          monthlyQuota,
+          operatedByFeishuUserId: input.operatedByFeishuUserId,
+          approvalOperatorOpenId: input.operatedByOpenId,
+        });
+        items.push({
+          ...candidate,
+          status: recorded.applied ? "applied" : "skipped",
+          reason: recorded.reason,
+        });
+      } catch (err) {
+        items.push({
+          ...candidate,
+          status: "failed",
+          reason: errorMessage(err),
+        });
+      }
+    }
+
+    const result = {
       period: targetPeriod,
-      dryRun: true,
+      dryRun: false,
       monthlyQuota,
       totals: {
         activeTokens: activeAccounts.length,
         skippedCurrentPeriod,
         planned: limitedCandidates.length,
-        applied: 0,
-        failed: 0,
+        applied: items.filter((item) => item.status === "applied").length,
+        failed: items.filter((item) => item.status === "failed").length,
       },
-      items: limitedCandidates,
+      items,
     };
-  }
-
-  const items: MonthlyResetItem[] = [];
-  for (const candidate of limitedCandidates) {
-    if (!candidate.newapiTokenId) {
-      items.push({
-        ...candidate,
-        status: "failed",
-        reason: "active token has no NewAPI token id",
-      });
-      continue;
-    }
-
-    try {
-      await updateNewApiTokenQuota({
-        newapiTokenId: candidate.newapiTokenId,
-        remainQuota: toNewApiQuota(monthlyQuota),
-      });
-      const recorded = await recordMonthlyResetApplied({
-        tokenAccountId: candidate.tokenAccountId,
-        feishuUserId: candidate.feishuUserId,
+    await recordBillingOperation({
+      kind: "monthly_reset",
+      status: billingOperationStatus({ dryRun: false, ...result.totals }),
+      dryRun: false,
+      operatedByFeishuUserId: input.operatedByFeishuUserId,
+      period: targetPeriod,
+      input: {
         period: targetPeriod,
+        limit: input.limit,
         monthlyQuota,
-        operatedByFeishuUserId: input.operatedByFeishuUserId,
-      });
-      items.push({
-        ...candidate,
-        status: recorded.applied ? "applied" : "skipped",
-        reason: recorded.reason,
-      });
-    } catch (err) {
-      items.push({
-        ...candidate,
-        status: "failed",
-        reason: err instanceof Error ? err.message : "monthly reset failed",
-      });
+      },
+      summary: {
+        activeTokens: result.totals.activeTokens,
+        skippedCurrentPeriod: result.totals.skippedCurrentPeriod,
+        planned: result.totals.planned,
+        applied: result.totals.applied,
+        failed: result.totals.failed,
+        monthlyQuota,
+      },
+    });
+    return result;
+  } catch (err) {
+    await recordBillingOperation({
+      kind: "monthly_reset",
+      status: "failed",
+      dryRun: input.dryRun,
+      operatedByFeishuUserId: input.operatedByFeishuUserId,
+      period: targetPeriod,
+      input: {
+        period: targetPeriod,
+        limit: input.limit,
+      },
+      summary: {
+        failed: 1,
+      },
+      errorMessage: errorMessage(err),
+    });
+    throw err;
+  } finally {
+    if (lockAcquired) {
+      monthlyResetLocks.delete(lockKey);
     }
   }
-
-  return {
-    period: targetPeriod,
-    dryRun: false,
-    monthlyQuota,
-    totals: {
-      activeTokens: activeAccounts.length,
-      skippedCurrentPeriod,
-      planned: limitedCandidates.length,
-      applied: items.filter((item) => item.status === "applied").length,
-      failed: items.filter((item) => item.status === "failed").length,
-    },
-    items,
-  };
 }

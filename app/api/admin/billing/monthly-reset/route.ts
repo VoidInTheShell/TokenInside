@@ -8,7 +8,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const monthlyResetSchema = z.object({
-  period: z.string().regex(/^\d{4}-\d{2}$/).optional(),
+  period: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/).optional(),
   dryRun: z.boolean().default(true),
   limit: z.number().int().positive().max(500).optional(),
 });
@@ -26,7 +26,7 @@ export async function POST(request: Request) {
   const parsed = monthlyResetSchema.safeParse(await request.json().catch(() => ({})));
   if (!parsed.success) {
     return NextResponse.json(
-      { error: "period 必须是 YYYY-MM，dryRun 必须是布尔值" },
+      { error: "period 必须是有效 YYYY-MM，dryRun 必须是布尔值" },
       { status: 400 },
     );
   }
@@ -47,6 +47,7 @@ export async function POST(request: Request) {
     dryRun: parsed.data.dryRun,
     limit: parsed.data.limit,
     operatedByFeishuUserId: auth.user.id,
+    operatedByOpenId: auth.user.openId,
   });
   return NextResponse.json(result);
 }

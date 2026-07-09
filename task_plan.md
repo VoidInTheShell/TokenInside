@@ -14,8 +14,11 @@
 | P0 | in_progress | 飞书与 App 状态一致性：飞书卡片点击必须返回 HTTP 200 toast；通过后若 NewAPI 发放成功，App 必须变为 `provisioned` 并生成 active key；若发放失败，App 必须保留 `approved_provision_failed` 和错误原因，不能让飞书端只看到 `200671`；拒绝后 App 必须变为 `rejected` 且不得发放 key |
 | P0 | complete_local | 系统管理员兜底审批：全局管理角色统一命名为“系统管理员”；初始化环境变量已支持 `TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS` 手动配置并兼容旧 `TOKENINSIDE_ADMIN_OPEN_IDS`；当用户不属于任何组织、部门负责人缺失、负责人等于申请人或通讯录无法安全解析主管时，不再静默不发送请求，而是把申请发送给系统管理员，并在用户界面提示“您当前不属于任何组织，请求将发送给系统管理员，请联系系统管理员审批” |
 | P1 | pending | 用真实卡片审批发放出来的 key 复测 `/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`，确认数据面不再只依赖管理端人工兜底发放证据 |
-| P1 | in_progress | 管理员治理与用户后台收口：系统管理员可查看全部管理员、指派管理员；用户后台补当前账期剩余额度，调整 active key 提示、刷新按钮、自动识别动画、管理入口、最新审批请求显示位置、品牌副标题和模型列表说明文案；E8-8 前端细节修复包已本地落地并部署到 LA，公开 `/admin` 与 `/api/health` 已返回 200 |
-| P1 | complete_first_pass_deployed | E9 管理后台重做首轮已落地并部署到 LA：将“额度管理”“管理员”“额度统计”合并为“用户管理”；新增系统管理员专用“部门统计”；部门管理员只可查看本部门下属用户的“用户统计”；将 Aether 风格“使用记录”迁入用户后台和管理后台，并补齐禁用/删除后重新申请链路。后续高级筛选、模型维度和精确历史部门归属留到 P2 深化 |
+| P1 | in_progress | 管理员治理与用户后台收口：系统管理员可查看全部管理员、指派管理员；root 管理员由 `TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS` 决定，继承系统管理员全部权限，且有且仅有 root 能指派/取消系统管理员；普通系统管理员只能指派/取消部门管理员；用户后台补当前账期剩余额度，调整 active key 提示、刷新按钮、自动识别动画、管理入口、最新审批请求显示位置、品牌副标题和模型列表说明文案；E8-8 前端细节修复包已本地落地并部署到 LA，公开 `/admin` 与 `/api/health` 已返回 200 |
+| P1 | complete_e9_8_deployed | E9 管理后台重做首轮已落地并部署到 LA：将“额度管理”“管理员”“额度统计”合并为“用户管理”；新增系统管理员专用“部门统计”；部门管理员只可查看本部门下属用户的“用户统计”；已迁入首版使用记录并补齐禁用/删除后重新申请链路。E9-8 已落地并部署到 LA：用户后台和管理后台使用记录均按 Aether 结构与细节重做；管理后台删除“总体活跃天数”“请求间隔时间线”，并把“按提供商分析”改为“按部门分析”；代理请求记录生命周期、动态刷新、筛选、分页和 Aether 维度字段已补齐。 |
+| P1 | complete_e9_9_deployed | E9-9 token 统计与计费修复已本地落地并部署到 LA：新增 NewAPI `/api/log/self` 同步、`/api/admin/usage-sync` 全局管理员 dry-run/执行入口、`token_id -> token_accounts.newapiTokenId -> feishuUserId` 回填、`quota -> fromNewApiQuota()` 换算、`/v1` 流式 SSE usage parser，并为 OpenAI chat stream 自动补 `stream_options.include_usage=true`。LA 已回填 4 条 NewAPI 记录；2026-07-08 两条 stream 调用已从 0 更新为 265 tokens 与 22549 tokens，账期汇总已同步。2026-07-09 已追加部署 `voidintheshell/tokeninside:e9-9-usage-ui-20260709-1`，完成使用记录 provider 列移除、Tokens/费用对齐、两排筛选布局、用户管理上移、用户表分页和长表内部滚动。 |
+| P1 | complete_e9_11_local | E9-11 完整计费模块本地落地并经子 agent 设计复核：计费操作审计持久化到 `app_settings.billingOperations`，默认保留最近 50 条；NewAPI 用量同步、月度账期重置和默认额度变更均写入审计；计费写 API 收紧为全局管理员；月度重置补同进程账期锁、有效月份校验和 open_id 操作人字段；usage-sync 部分失败记录 `partial_failed` 与已完成 totals；后台系统设置页新增用量同步、月度重置和计费操作历史；使用记录费用列补 NewAPI/代理来源、quota 和同步追踪信息。 |
+| P1 | pending_e9_10_after_log_sync | E9-10 部门名称展示修复：必须排在 E9-9 NewAPI logs 同步、usage-sync 回填和使用记录 UI 收口之后。修复目标是保留 `departmentId` 作为权限/过滤主键，同时通过飞书部门详情接口补齐 `departmentName`，让前端用户卡片、管理端用户列表、部门统计、用量筛选和 usage records 优先显示部门名称而不是 `od-...` ID。 |
 | P2 | pending | 审批闭环完成后再继续管理员取消用户权限、部门归属历史快照、真实月度重置和更完整报表；这些任务保留在 E 阶段，但暂不抢占 P0 |
 
 ## 阶段
@@ -64,7 +67,7 @@
 | B | in_progress | P0：服务器优先真实链路当前聚焦审批闭环与状态同步；`ti.kumiko-love.com` 当前调试入口仍以可访问公网链路为准，必须完成真实飞书卡片点击、事件审计、App 状态回写、NewAPI 发放/失败补偿和 `/v1` 复测后才能把 B3/B5 视为闭环 |
 | C | in_progress | PostgreSQL foundation 已落地并在生产机切换启用：新增 schema 迁移脚本、JSON 导入脚本、可选 Postgres store、健康检查和 2C2G 默认容器/连接池参数；后续仍需补齐行级事务状态机和备份/恢复运维 |
 | D | pulled_forward | 部署运维工作前置并合入 B0；当前生产机使用统一 compose 管理 PG/app、Nginx Proxy Manager 内网反代 `tokeninside:16878`。2026-07-08 起发布路径升级为 GitHub Actions + 公司 GitLab CI 双 CI/CD 自动构建并推送 `ghcr.io/voidintheshell/tokeninside`；公司 GitLab 与 GitHub 公开库主分支均为 `main`，每次更新先推 `company/main`，公开发布只推 `public-export/*` 到 `github-public/main`；远端仍只执行 pull-only compose 更新，不做源码构建；Docker Hub/save-load 保留为历史回退路径 |
-| E | in_progress | P1/P2：已按最新口径前置补齐申请界面/用户后台分流、用户后台模型列表、管理员入口权限展示、`/admin` 入口壳、管理范围数据结构和只读概览 API；已继续补齐默认额度配置、审批单额度覆盖、管理端审批、基础用量统计、用户后台 key 头尾省略展示与点击查看复制、key 重置、用户侧额度重置申请、部门主管自动同步、管理端主动调额、基础账期同步汇总和默认关闭的月度账期重置执行入口；已补入管理员取消用户权限/禁用 active key 的计划任务、被取消资格触发条件和跨部门调动额度继承规则。E8 近期优先修复包已本地落地并部署到 LA：系统管理员兜底审批、系统管理员配置/命名/指派能力、用户后台剩余额度、UI 文案布局收口、`.env` 中文变量说明，以及 token/额度按 K/M/B/T 紧凑单位展示；E8-8 前端细节修复包已本地落地并部署到 LA，覆盖对齐、管理范围卡片和指标卡片口径。E9 管理后台重做首轮已本地落地并部署到 LA，覆盖用户管理、系统管理员部门统计、部门管理员范围内用户统计、用户/管理两侧使用记录、禁用/删除重新申请链路和 `/v1` 用户状态保护 |
+| E | in_progress | P1/P2：已按最新口径前置补齐申请界面/用户后台分流、用户后台模型列表、管理员入口权限展示、`/admin` 入口壳、管理范围数据结构和只读概览 API；已继续补齐默认额度配置、审批单额度覆盖、管理端审批、基础用量统计、用户后台 key 头尾省略展示与点击查看复制、key 重置、用户侧额度重置申请、部门主管自动同步、管理端主动调额、基础账期同步汇总和默认关闭的月度账期重置执行入口；已补入管理员取消用户权限/禁用 active key 的计划任务、被取消资格触发条件和跨部门调动额度继承规则。E8 近期优先修复包已本地落地并部署到 LA：系统管理员兜底审批、系统管理员配置/命名/指派能力、用户后台剩余额度、UI 文案布局收口、`.env` 中文变量说明，以及 token/额度按 K/M/B/T 紧凑单位展示；E8-8 前端细节修复包已本地落地并部署到 LA，覆盖对齐、管理范围卡片和指标卡片口径。E9 管理后台重做首轮已本地落地并部署到 LA，覆盖用户管理、系统管理员部门统计、部门管理员范围内用户统计、用户/管理两侧使用记录、禁用/删除重新申请链路和 `/v1` 用户状态保护。E9-8 已本地落地并部署到 LA：用户后台和管理后台使用记录完整按 Aether 页面结构和表格维度实现，管理后台删除“总体活跃天数”“请求间隔时间线”，将“按提供商分析”改为“按部门分析”，并补代理请求生命周期、动态刷新、筛选、分页和聚合。 |
 
 ## 当前落地状态
 
@@ -112,7 +115,7 @@
 40. 用户真实测试发现三项问题：用户已加入部门但用户卡片部门仍显示占位符；点击申请时报 `Bot ability is not activated.`；申请理由需要用户填写，默认申请金额需要展示但不可修改。已本地修复部门懒同步、申请表单和机器人能力错误提示。
 41. B2/B3 修复已部署到 USLA：镜像 `voidintheshell/tokeninside:b2-card-fix-20260702-2310` 与 `latest` 已推送并部署，digest 为 `sha256:52ab21f02022e0b0f7ed68e5cbce282a2bcbf5acf1e74629f34a3df5923e4ffa`；远端容器 running/healthy，公网 `/api/health`、`/`、`/v1/models` 无 key、`/v1/embeddings` allowlist 404 和签名加密事件 challenge 均复测通过。
 42. 最新额度配置需求已补入计划：管理后台需要提供默认申请额度配置，初始化值为 `200`；普通用户申请页只展示该值且不可修改；审批每条申请时可手动确认或覆盖最终额度，审批通过后以最终额度发放和进入账期统计。
-43. 用户卡片展示收尾已本地完成：首页用户卡移除“租户”，部门展示改为服务端从飞书部门详情解析出的 `departmentName`，管理后台当前用户与管理范围同样优先展示部门名称。
+43. 用户卡片展示收尾曾做过一次本地修复：首页用户卡移除“租户”，并尝试让部门展示优先使用服务端派生的 `departmentName`。当前用户反馈仍会显示部门 ID，说明该修复未覆盖完整链路或线上数据仍缺少名称；统一纳入 E9-10，在 E9-9 log 同步和使用记录收口之后重新修复。
 44. 用户卡片展示收尾已部署到 USLA：当前运行镜像为 `voidintheshell/tokeninside:b2-user-card-dept-20260702`，digest `sha256:a2593de49c3564e23fdc36dd19703e59329ae42c370b1b0831f322ea2332d98e`，公网健康、未登录 session、无 key `/v1/models` 和飞书事件签名 challenge 均已复测。
 45. E 阶段额度配置已进入代码落地：默认申请额度改为 JSON store settings，由管理后台配置；普通申请接口只接受申请理由，额度从服务端默认值生成快照；管理后台可对待审批申请写入最终额度，发放时优先使用最终额度。
 46. E 阶段额度配置已部署到 USLA：当前运行镜像为 `voidintheshell/tokeninside:e-quota-config-20260702` 的后续收尾镜像已被 `voidintheshell/tokeninside:hide-department-20260703` 替换；公网健康、未登录 session settings、管理设置 401 和飞书事件签名 challenge 均已复测。
@@ -162,7 +165,7 @@
 4. P0-4：执行反向和幂等检查：非审批目标点击不能改变申请状态；重复点击或飞书重试不能重复发放 NewAPI key；旧版/重复订阅若产生多路回调，必须以本地幂等状态为准。
 5. P1：用真实卡片审批通过后发放的 key 复测 `GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`，并确认代理日志、账期 usage 和管理概览均归属到同一飞书用户。
 6. E8-1：系统管理员兜底审批已本地落地。`TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS` 作为新的初始化配置，兼容旧 `TOKENINSIDE_ADMIN_OPEN_IDS`；服务端审批目标解析失败时会发送给系统管理员，不再让申请停在不发送状态。
-7. E8-2：系统管理员治理页/API 已本地落地。系统管理员可查看全部管理员范围记录，并可指派系统管理员或部门管理员；普通部门主管不能越权指派系统管理员。
+7. E8-2/E9-7：系统管理员治理页/API 已本地落地并继续收紧。系统管理员可查看全部管理员范围记录；root 管理员由 `TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS` 决定，继承系统管理员全部权限，且有且仅有 root 能指派/取消系统管理员；普通系统管理员只能指派/取消部门管理员；部门主管不能越权指派管理员。
 8. E8-3：用户后台 UI 收口已本地落地：管理后台入口只保留在用户卡片处；最新审批请求只在管理员用户后台首屏、用户卡片下方展示，切换到账户/额度/模型/申请记录子菜单后不常驻；底部小字移除；左上副标题改为“共绩科技”；模型列表说明改为“当前可用的模型ID”。
 9. E8-4：额度展示已本地落地：用户后台当前账期卡片既显示账期额度，也显示当前账期剩余额度；剩余额度优先读取 NewAPI 当前 active token 的 `remain_quota` 并按 `NEWAPI_QUOTA_PER_UNIT` 换算，避免直接用 token usage 相减。
 10. E8-5：用户卡片交互细节已本地落地：已有 key 用户的“当前用户已有 active key”提示移动到用户卡片刷新按钮旁绿色小勾左侧；刷新按钮固定在用户卡片右下方；“自动识别中”文字改为不越界的旋转动画状态，组件尺寸保持稳定。
@@ -172,9 +175,14 @@
 14. E9-1：首轮已落地并部署到 LA：旧“额度管理”“管理员”“额度统计”已合并为“用户管理”，表格查看授权范围内用户；操作列提供调整额度、指派管理员、禁用和删除。
 15. E9-2：首轮已落地并部署到 LA：后台用户管理、用户统计和使用记录均按服务端 admin scope 裁剪；系统管理员可看全部，部门管理员只能覆盖本部门下属用户；部门管理员直接访问部门统计 API 返回 403。
 16. E9-3：首轮已落地并部署到 LA：系统管理员专用“部门统计”展示成员数、已发放 key 用户数、当前账期发放额度、剩余额度、当前账期已用 tokens、请求数、最近调用和占比。
-17. E9-4：首轮已落地并部署到 LA：Aether 风格“使用记录”已迁入用户后台和管理后台；用户后台只看本人记录，管理后台按系统/部门管理范围查看记录。模型、时间范围和更细筛选留 P2 深化。
+17. E9-4：首轮已落地并部署到 LA：Aether 风格“使用记录”已迁入用户后台和管理后台；用户后台只看本人记录，管理后台按系统/部门管理范围查看记录。该首轮口径已被用户最新要求取代，不能再把模型、时间范围和更细筛选留到 P2。
 18. E9-5：首轮已落地并部署到 LA：禁用会禁用 active key 并阻断 `/v1`；删除为软删除/撤销资格，禁用 active key 并让用户重新进入申请流程，历史用量和审计不删除。
-19. P2：E9 首轮已部署；后续继续更完整的部门历史快照、NewAPI logs 校准、模型维度/时间范围筛选、复杂报表和生产部署策略收口。
+19. E9-6：已本地落地、构建并部署到 LA：管理后台禁用用户后的启用恢复能力。仅 `status=disabled` 的用户可启用；禁用后用户管理操作列中的“禁用”按钮切换为“启用”；启用时同步把 NewAPI token 状态改回 enabled、本地用户状态改回 active、本地 tokenAccount 改回 active。`deleted` 用户不允许启用，仍按重新申请链路处理；禁用和删除现有语义保持不变。当前已完成未登录鉴权、健康检查和 `/admin` 页面冒烟；真实管理员会话下的按钮点击需由具备飞书管理员会话的用户复测。
+20. E9-7：已本地落地 root 管理员与取消管理员。`TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS` 中的 open_id 是 root 来源；root 继承系统管理员全部权限；只有 root 可以看到“指派系统管理员”按钮，也只有 root 能通过 API 指派或取消系统管理员；普通系统管理员仍可管理部门管理员；环境变量 root 范围只读，不能在页面取消。
+21. E9-8：已本地落地并部署到 LA。用户后台和管理后台使用记录均按 Aether 结构重做：顶部可折叠“用量分析”；管理后台保留三列表格“按模型分析 / 按部门分析 / 按API格式分析”，删除“总体活跃天数”和“请求间隔时间线”；用户后台保留“按模型分析 / 按API格式分析”；下方使用记录表支持动态刷新、筛选、分页、列配置和状态展示，记录字段包含时间、用户/密钥、模型、提供商、API格式、类型、Tokens（输入/输出/缓存）、费用、首字/总耗时；请求生命周期可展示等待中、传输中/进行中、失败、用户手动取消等状态。LA 当前运行 `voidintheshell/tokeninside:e9-8-aether-usage-20260708-1445`。
+22. E9-9：已落地并部署到 LA。代码新增 `lib/newapi.ts` 的 `/api/log/self` 封装、`lib/usage-sync.ts` 同步编排、`POST /api/admin/usage-sync`、`backfillProxyLogsFromNewApiUsage()` 和 `/v1` SSE usage parser；`proxy_request_logs` 现在保留 `usageSource`、`newapiLogId`、`newapiRequestId`、`quota`、`providerChannelName` 和 `newapiUseTimeSeconds` 等追溯字段。LA 已执行一次受控同步，NewAPI 59 条日志中 4 条匹配 TokenInside 代理日志并写回，当前 `proxy_request_logs` 汇总为 `total_logs=7`、`logs_with_tokens=5`、`total_tokens=23106`、`cost=0.023066`，2026-07-08 两条 stream 调用分别回填为 265 和 22549 tokens。LA 当前镜像已更新为 `voidintheshell/tokeninside:e9-9-usage-ui-20260709-1`，公网 `/api/health` 正常；本次追加完成使用记录 provider 列移除、Tokens/费用右对齐、筛选区两排布局、用户管理卡片上移到管理员范围前、用户管理分页和长表内部滚动。
+23. E9-10：部门名称展示修复排在 log 同步之后执行。当前原因已收敛为飞书 `department_ids` 本身就是部门 ID；TokenInside 需要在登录/懒同步/日志写入/管理统计响应里补齐 `departmentName`，前端再按 `departmentName -> departmentId 脱敏` 兜底展示。权限和过滤仍使用稳定 `departmentId`，不能把部门名称作为权限主键。
+24. P2：E9 首轮、E9-8、E9-9 和 E9-10 之后，P2 仅保留更完整的部门历史快照、详情抽屉深度追踪、真实管理员会话下的 usage-sync 操作体验、定时/自动 NewAPI logs 同步策略和生产部署策略收口。
 
 ## 当前外部阻塞
 

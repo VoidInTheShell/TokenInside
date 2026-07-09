@@ -185,6 +185,14 @@
 154. LA JSON -> PG 导入校验通过：`db:import-json -- --confirm-replace` 导入 users=3、tokenRequests=10、tokenAccounts=2、userBillingPeriods=2、feishuEvents=3、proxyRequestLogs=28、adminScopes=0；`db:verify-import` 返回 `ok:true` 且所有集合/表计数匹配。
 155. LA 与生产机当前均已使用 PostgreSQL backend，`/api/health` 均显示 `store.type=postgres`、`schema.ready=true`、`missingTables=[]`、`tableCount=8`、`postgresPool.max=10`；两边 PG 参数均为 `max_connections=30`、`shared_buffers=256MB`、`effective_cache_size=768MB`、`work_mem=4MB`、`statement_timeout=30s`。
 156. 生产机 compose 已修正为 postgres 服务通过 `env_file: .env.production` 接收 `POSTGRES_PASSWORD`，不再依赖 `${POSTGRES_PASSWORD}` 插值；仓库 `docker-compose.production.example.yml` 已同步同样写法，避免后续普通 `docker compose` 操作出现空密码插值警告或重建风险。
+157. 完整计费模块不能只提供执行接口，必须有持久化操作审计。当前实现把用量同步和月度重置统一写入 `app_settings.billingOperations`，记录操作者、dry-run/执行状态、输入参数、摘要和失败原因；由于复用现有 `app_settings` JSONB，不需要新增 PostgreSQL 表迁移。
+158. 保存默认额度属于计费配置写操作，不能覆盖同一设置对象里的审计字段。`updateAppSettings()` 必须保留已有 `store.settings` 扩展字段，否则管理员每次保存默认额度都会丢失 `billingOperations`。
+159. NewAPI logs 同步属于计费校准动作，执行入口必须保持飞书 session + TokenInside 全局管理员授权，不应引入 cron secret 或独立认证；未来若要自动同步，应复用内部任务调度或现有管理员触发链路，并保留同等审计粒度。
+160. 月度账期重置必须保持双保险：dry-run 可随时执行，真实执行必须同时满足全局管理员会话和 `TOKENINSIDE_MONTHLY_RESET_ENABLED=true`；幂等标记仍是 active token account 的 `billingPeriod`，目标账期相同时不得重复改写 NewAPI quota。
+161. 子 agent 设计审查后补充修复结论：系统设置 API 必须服务端强制 global 管理员，不可只依赖前端隐藏；overview/settings 对部门管理员不得暴露全局计费操作历史；默认额度变更也必须进入 `settings_update` 审计。
+162. 月度账期重置当前已加同进程 period 锁，可覆盖当前单容器单 Node 进程并发误补额风险；但这不是分布式锁。未来如果部署多副本或多进程，必须改为 PostgreSQL advisory lock 或持久化 operation lock。
+163. 当前前端已要求同参数 dry-run 后才能点击执行，但后端尚未强制 dry-run plan id 绑定；全局管理员直接调用 API 仍可执行。生产环境依赖全局管理员边界、月度重置环境开关和操作审计兜底，后续如要进一步收紧，应增加服务端 plan id / nonce。
+164. usage-sync 的部分失败必须按 `partial_failed` 记录已经完成页的 totals；否则已经落地的回填副作用与审计不一致。当前实现已修复为累计式审计，重复同步也不再因刷新 `usageSyncedAt` 被误计为 updated。
 
 ## 官方文档来源
 
@@ -254,6 +262,7 @@
 30. 系统管理员兜底审批应优先进入近期实现：初始化环境变量应支持手动配置系统管理员，建议新增 `TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS` 并兼容旧 `TOKENINSIDE_ADMIN_OPEN_IDS`；审批目标解析失败时写入 `approvalTargetSource=system_admin_fallback`，并把卡片发送给系统管理员。
 31. 用户界面必须在无组织/主管不可识别兜底时提示固定文案：“您当前不属于任何组织，请求将发送给系统管理员，请联系系统管理员审批”。该提示是业务状态提示，不是错误 toast，用户仍应能提交申请。
 32. 系统管理员能力需要补“查看全部管理员”和“指派管理员”：系统管理员可查看环境变量、手动和自动同步产生的全部管理员范围；可指派系统管理员或部门管理员；部门主管不能越权创建系统管理员或扩大自己的部门范围。
+33. 最新管理员治理口径收紧：`TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS` 不再只是普通系统管理员白名单，而是 root 管理员来源；root 继承系统管理员全部权限，且有且仅有 root 能指派或取消系统管理员。手动指派的系统管理员不是 root，只能指派/取消部门管理员；环境变量 root 范围只读，不能在页面取消。
 33. 当前用户后台已经有账期额度、token usage 和代理请求统计，但用户要求补“剩余额度”。实现时不能简单用 `monthlyQuota - totalTokens`，因为 display quota、NewAPI 内部 quota 和 token usage 不是同一单位；应按 TokenInside 账期额度口径和 NewAPI quota 单位换算后展示。
 34. 当前用户后台代码中“最新审批请求”卡片只要存在 `adminScope` 就常驻，且管理后台入口同时存在于用户卡片和子菜单；用户要求收口为：管理后台入口只在用户卡片处展示，最新审批请求只在管理员用户后台首屏用户卡片下方展示，切换子菜单后不常驻。
 35. 当前用户卡片状态在 loading/busy 时直接显示“自动识别中”，用户指出文字会超出圆圈边界；应改为加载动画或旋转图标，保持组件尺寸稳定，并通过 aria-label/title 表达自动识别状态。
@@ -283,6 +292,8 @@
 6. 系统管理员可以查看“部门统计”；部门管理员不能查看该页面或 API。部门管理员的用户管理和使用记录同样只能覆盖本部门下属用户，跨部门 userId/departmentId/logId 请求必须返回 403。
 7. “删除用户”不能物理删除历史数据，应实现为软删除或资格撤销：禁用 active key、清理当前可用资格、让用户重新进入申请流程，同时保留用户、申请、token account、账期汇总和代理日志的历史归属。
 8. 新调用应补写 `ProxyRequestLog.departmentId` 与 `departmentName` 快照，保证后续部门统计不因用户调岗追溯改写历史。旧日志没有快照时只能作为降级口径处理。
+9. E9-6 启用能力范围已收敛：只允许 `status=disabled` 的用户通过管理后台恢复，`deleted` 用户仍必须重新申请；禁用和删除现有语义不变。NewAPI 源码确认 token 状态常量为 `TokenStatusEnabled = 1`、`TokenStatusDisabled = 2`，因此启用动作应把 NewAPI token status_only 更新为 `1`，禁用继续使用 `2`。
+10. 当前 `listAdminUsers()` 只按 active tokenAccount 生成 `activeTokenStatus`，禁用后前端无法看到 disabled tokenAccount；要让禁用按钮切换为启用，需要用户列表返回最近或可恢复 tokenAccount 状态，并让前端对 `user.status === "disabled"` 渲染“启用”按钮。
 
 ## 本地计划文档
 
@@ -293,3 +304,39 @@
 5. `.agent-docs/TokenInside-D阶段部署运维计划.md`
 6. `.agent-docs/TokenInside-E阶段管理后台与用量统计计划.md`
 7. `.agent-docs/TokenInside-真实链路实测记录.md`
+
+## 2026-07-08 补充发现
+
+1. 用户最新口径明确覆盖旧 E9-4/P2 安排：管理后台使用记录不能继续停留在“迁入 Aether 风格/思想”，必须按 Aether `/admin/usage` 的结构和细节实现；唯一差异是删除“总体活跃天数”“请求间隔时间线”，并把“按提供商分析”替换为“按部门分析”。
+2. Aether 参考实现已重新只读核对：`C:\0.01.Project\Aether\frontend\src\views\shared\Usage.vue` 组合可折叠用量分析区、三张分析表和 `UsageRecordsTable`；`UsageRecordsTable.vue` 的管理端默认列为时间、用户、模型、提供商、API格式、类型、Tokens、费用、首字/总耗时，并支持时间范围、搜索、用户/模型/提供商/API格式/状态/客户端筛选、列显示、隐藏 unknown、自动刷新、分页和管理员详情抽屉。
+3. Aether 请求状态不是只看 HTTP status code：`pending`、`streaming`、`completed`、`failed`、`cancelled` 是独立状态；失败还会结合 `status_code >= 400` 和 `error_message`；`streaming` 且无首字时间时显示为等待。
+4. TokenInside 当前 `/v1/[...path]` 只在 upstream 返回后调用 `addProxyLog()`，因此无法展示正在等待、传输中、用户取消等动态状态。E9-8 必须先补 `begin/update proxy log` 生命周期，再做前端动态刷新。
+5. TokenInside PostgreSQL store 当前从各表 `data` JSON 读写完整对象，`proxy_request_logs` 物理列虽少，但新增模型、提供商、API格式、缓存 tokens、费用、首字时间、状态、错误摘要等字段可先写入 JSON `data`，无需立即迁移 schema。
+6. 当前管理端使用记录 API 只支持 `userId`、`departmentId` 和 `limit`，不返回 `total`、分页、可用筛选项或聚合表数据；E9-8 需要扩展为按 admin scope 裁剪后的记录、分页、filters、modelStats、departmentStats、apiFormatStats 一次返回。
+7. 当前 `components/usage-records-table.tsx` 是固定列表格，只显示用户、部门、接口、状态码、耗时、输入、输出、总量、时间；需要重做为 Aether 维度列，同时保持用户后台旧调用兼容。
+
+## 2026-07-08 token统计与计费发现
+
+1. LA 当前版本请求能通过 TokenInside `/v1` 透传，`proxy_request_logs` 也会记录请求；但 2026-07-08 最新两条真实 LLM 调用均为流式响应，TokenInside 本地日志只记录了生命周期、模型、API格式和 tokenAccount 归属，没有写入 `promptTokens`、`completionTokens`、`totalTokens`、cache tokens 或 cost。
+2. LA `proxy_request_logs` 只读统计结果：总日志 7 条，stream-like 日志 2 条，有 `promptTokens` 的日志 2 条，有 `completionTokens` 的日志 2 条，cache/cost 字段均为 0 条；两条有 tokens 的日志来自 2026-07-03 非流式 chat，说明非流式 JSON usage 解析可用，流式路径缺失。
+3. LA 最新 stream 记录对照：`2026-07-08 09:32:35` `/v1/chat/completions` 使用 `newapi_token_id=49`、模型 `deepseek/deepseek-v3.2`、`openai:chat`、`requestType=stream`；`2026-07-08 09:25:09` `/v1/messages?beta=true` 使用 `newapi_token_id=45`、模型 `deepseek/deepseek-v3.2`、`claude:messages`、`requestType=stream`。两条在 TokenInside proxy log 中 tokens/cost 均为空。
+4. NewAPI 当前可用日志接口是 `/api/log/self`，不是旧计划里试探过的 `/api/log/self/search`；`/api/log/self/search` 当前返回 `this interface is deprecated`，`/api/log/token` 用当前控制面身份返回 `invalid token`。
+5. NewAPI `/api/log/self` 已确认返回 `data.page/page_size/total/items`，单条日志字段包括 `id`、`created_at`、`token_id`、`token_name`、`request_id`、`model_name`、`prompt_tokens`、`completion_tokens`、`quota`、`is_stream`、`type`、`use_time`、`channel_name`、`user_id`、`username` 等，满足以 `token_id` 归属用量和计费的设计前提。
+6. NewAPI 最近日志已证明权威用量存在：token id 49 的 stream chat 日志有 `prompt_tokens=5`、`completion_tokens=260`、`quota=133`；token id 45 的 stream messages 日志有 `prompt_tokens=22031`、`completion_tokens=518`、`quota=11275`。因此当前 0 值不是 NewAPI 没计费，而是 TokenInside 没有同步 NewAPI logs，也没有解析 SSE usage。
+7. 下一步必须把 NewAPI logs 同步前置为 E9-9：先实现 `/api/log/self` 拉取、标准化、`token_id -> token_accounts.newapiTokenId -> feishuUserId` 归属和 backfill，再补 `/v1` 流式 SSE usage parser。费用/额度消耗必须用 `NEWAPI_QUOTA_PER_UNIT` / `fromNewApiQuota(quota)` 换算，不能把 NewAPI 内部 `quota` 直接当金额展示。
+8. cache 统计需要区分来源：OpenAI/Claude 流式或非流式响应里如果带 cache read/write 字段，则由 TokenInside 代理层 best-effort 记录；当前 NewAPI `/api/log/self` 样例没有 cache 字段，所以 NewAPI logs 只能作为 tokens、quota、模型和最终计费状态的权威来源，不能伪造 cache。
+9. E9-9 已完成代码落地：新增 NewAPI `/api/log/self` 客户端、usage-sync 编排、全局管理员 `POST /api/admin/usage-sync`、proxy log 回填函数和 `/v1` 流式 SSE usage parser；OpenAI chat stream 会自动带上 `stream_options.include_usage=true`。
+10. E9-9 验证通过：`npm run typecheck`、`npm run build` 和 Docker build 均成功；新 production build 路由表包含 `/api/admin/usage-sync`，镜像 `voidintheshell/tokeninside:e9-9-usage-billing-20260708-1` 已推送，digest 为 `sha256:adb9ca82104ac560ef768a21a5bd091cad7eff6a4fa848966a19251e25091254`。
+11. LA 已部署 E9-9 镜像并保持 healthy；公网 `https://ti.kumiko-love.com/api/health` 返回 `status=ok`、`store.type=postgres`、`schema.ready=true`、`newapiQuotaPerUnit=500000`。
+12. 已在 LA 通过现有管理员 session 机制做一次受控 usage-sync：dry-run 显示 NewAPI 59 条日志中 4 条可匹配并会更新，实际执行后同样更新 4 条；55 条因 NewAPI token_id 不属于 TokenInside 管理的 token account 被跳过，0 条因匹配窗口失败跳过。
+13. LA 回填后 `proxy_request_logs` 汇总为 `total_logs=7`、`logs_with_tokens=5`、`prompt_tokens=22073`、`completion_tokens=1033`、`total_tokens=23106`、`cost=0.023066`；`usageSource=newapi_log` 的 4 条日志贡献 `total_tokens=23064`、`cost=0.023066`。
+14. 两条 2026-07-08 stream 记录已从 0 修正：`/v1/chat/completions` 回填 `totalTokens=265`、`cost=0.000266`、`newapiLogId=1`；`/v1/messages?beta=true` 回填 `totalTokens=22549`、`cost=0.02255`、`newapiLogId=2`。
+15. LA `user_billing_periods` 已刷新：两个 2026-07 用户账期分别显示 `prompt/completion/total = 5/260/265` 和 `22031/518/22549`；说明账期计费不再全为 0，已由回填后的 proxy logs 聚合产生。
+
+## 2026-07-09 部门名称展示修复排期
+
+1. 当前部门显示仍会暴露部门 ID，根因是飞书 `department_ids` 官方语义就是“用户所属部门 ID 列表”，不是名称；TokenInside 必须额外调用部门详情接口读取 `department.name` / `i18n_name`。
+2. 现有代码虽然保留了 `getFeishuDepartmentNameById()` 这类 helper，但用户模型、登录回调、懒同步、会话响应、管理概览和 proxy log 快照没有形成完整 `departmentName` 主链路，因此前端只能回退显示 `departmentId`。
+3. 用户明确要求该修复排在 log 同步之后；因此新增 E9-10，依赖 E9-9 NewAPI logs 同步、usage-sync 回填、流式 usage parser 和使用记录 UI 收口完成后再统一落地。
+4. 修复边界是“ID 做权限和过滤主键，名称只做展示字段”：部门管理员 scope、部门筛选请求参数和历史归属仍用稳定 `departmentId`，所有前端展示才按 `departmentName -> departmentId 脱敏` 兜底。
+5. 新 proxy log 应补写调用发生时的 `departmentName` 快照；旧日志缺名称时可从当前用户 `departmentName` 兜底展示，但不能为了显示名称改写历史部门归属。

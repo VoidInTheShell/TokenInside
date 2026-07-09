@@ -1,0 +1,46 @@
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { requireAdminScope } from "@/lib/admin";
+import { syncNewApiUsageLogs } from "@/lib/usage-sync";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const usageSyncSchema = z.object({
+  dryRun: z.boolean().default(true),
+  page: z.number().int().min(0).default(0),
+  size: z.number().int().positive().max(500).default(100),
+  maxPages: z.number().int().positive().max(20).default(1),
+  matchWindowMinutes: z.number().positive().max(24 * 60).default(30),
+});
+
+export async function POST(request: Request) {
+  const auth = await requireAdminScope();
+  if (auth.error) return auth.error;
+  if (auth.scope.scopeType !== "global") {
+    return NextResponse.json(
+      { error: "NewAPI 用量同步只能由全局管理员执行" },
+      { status: 403 },
+    );
+  }
+
+  const parsed = usageSyncSchema.safeParse(await request.json().catch(() => ({})));
+  if (!parsed.success) {
+    return NextResponse.json(
+      {
+        error: "dryRun 必须是布尔值，page/size/maxPages 必须是正整数，matchWindowMinutes 必须是正数",
+      },
+      { status: 400 },
+    );
+  }
+
+  const result = await syncNewApiUsageLogs({
+    dryRun: parsed.data.dryRun,
+    page: parsed.data.page,
+    size: parsed.data.size,
+    maxPages: parsed.data.maxPages,
+    matchWindowMs: parsed.data.matchWindowMinutes * 60 * 1000,
+    operatedByFeishuUserId: auth.user.id,
+  });
+  return NextResponse.json(result);
+}

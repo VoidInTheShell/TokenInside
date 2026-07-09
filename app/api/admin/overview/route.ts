@@ -11,6 +11,15 @@ function responseStatus(request: Request, status: 401 | 403) {
   return url.searchParams.get("mode") === "soft" ? 200 : status;
 }
 
+function settingsForScope<T extends Awaited<ReturnType<typeof getAppSettings>>>(
+  settings: T,
+  scope: Awaited<ReturnType<typeof getEffectiveAdminScopeForUser>>,
+) {
+  if (scope?.scopeType === "global") return settings;
+  const { billingOperations: _billingOperations, ...visibleSettings } = settings;
+  return visibleSettings;
+}
+
 export async function GET(request: Request) {
   const user = await hydrateUserDepartment(await getCurrentUser());
   if (!user) {
@@ -60,6 +69,6 @@ export async function GET(request: Request) {
       departmentId: user.departmentId,
     },
     overview,
-    settings,
+    settings: settingsForScope(settings, scope),
   });
 }

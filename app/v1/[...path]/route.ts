@@ -16,6 +16,16 @@ type RouteContext = {
   params: Promise<{ path: string[] }>;
 };
 
+type UsageMetrics = {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+  cost?: number;
+  actualCost?: number;
+};
+
 function normalizeProxyPath(path: string[]) {
   return path[0] === "v1" ? path.slice(1) : path;
 }
@@ -84,11 +94,13 @@ function sumDefinedNumbers(...values: Array<number | undefined>) {
   return defined.reduce((sum, value) => sum + value, 0);
 }
 
-function extractUsageFromJson(body: unknown) {
+function extractUsageFromJson(body: unknown): UsageMetrics {
   const root = objectValue(body);
   const usage = objectValue(root?.usage);
   if (!usage) return {};
 
+  const promptDetails = objectValue(usage.prompt_tokens_details ?? usage.input_tokens_details);
+  const cacheCreation = objectValue(usage.cache_creation);
   const promptTokens = numberFromUsage(usage.prompt_tokens ?? usage.input_tokens);
   const completionTokens = numberFromUsage(
     usage.completion_tokens ?? usage.output_tokens,
@@ -96,7 +108,8 @@ function extractUsageFromJson(body: unknown) {
   const cacheReadTokens = numberFromUsage(
     usage.cache_read_tokens ??
       usage.cache_read_input_tokens ??
-      usage.prompt_cache_hit_tokens,
+      usage.prompt_cache_hit_tokens ??
+      promptDetails?.cached_tokens,
   );
   const directCacheCreationTokens = numberFromUsage(
     usage.cache_creation_tokens ?? usage.cache_creation_input_tokens,
@@ -104,6 +117,8 @@ function extractUsageFromJson(body: unknown) {
   const splitCacheCreationTokens = sumDefinedNumbers(
     numberFromUsage(usage.cache_creation_ephemeral_5m_input_tokens),
     numberFromUsage(usage.cache_creation_ephemeral_1h_input_tokens),
+    numberFromUsage(cacheCreation?.ephemeral_5m_input_tokens ?? cacheCreation?.ephemeral_5m),
+    numberFromUsage(cacheCreation?.ephemeral_1h_input_tokens ?? cacheCreation?.ephemeral_1h),
   );
   const cacheCreationTokens = directCacheCreationTokens ?? splitCacheCreationTokens;
   const explicitTotalTokens = numberFromUsage(usage.total_tokens);
@@ -119,6 +134,107 @@ function extractUsageFromJson(body: unknown) {
     cost: numberFromUsage(root?.cost ?? root?.total_cost ?? usage.cost ?? usage.total_cost),
     actualCost: numberFromUsage(root?.actual_cost ?? usage.actual_cost),
   };
+}
+
+function hasUsageMetrics(usage: UsageMetrics) {
+  return Object.values(usage).some((value) => value !== undefined);
+}
+
+function mergeUsageMetrics(target: UsageMetrics, patch: UsageMetrics) {
+  for (const [key, value] of Object.entries(patch)) {
+    if (value !== undefined) {
+      target[key as keyof UsageMetrics] = value;
+    }
+  }
+}
+
+function extractUsageFromJsonDeep(body: unknown): UsageMetrics {
+  const usage: UsageMetrics = {};
+  const root = objectValue(body);
+  const candidates = [
+    body,
+    root?.response,
+    root?.message,
+    root?.delta,
+    root?.event,
+  ];
+  for (const candidate of candidates) {
+    mergeUsageMetrics(usage, extractUsageFromJson(candidate));
+  }
+  return usage;
+}
+
+function createSseUsageCollector() {
+  const decoder = new TextDecoder();
+  const usage: UsageMetrics = {};
+  let pendingText = "";
+  let eventLines: string[] = [];
+
+  function flushEvent() {
+    if (!eventLines.length) return;
+    const data = eventLines
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n")
+      .trim();
+    eventLines = [];
+    if (!data || data === "[DONE]") return;
+    const json = parseJsonText(data);
+    if (json === undefined) return;
+    mergeUsageMetrics(usage, extractUsageFromJsonDeep(json));
+  }
+
+  function ingest(chunk: Uint8Array) {
+    pendingText += decoder.decode(chunk, { stream: true });
+    const lines = pendingText.split(/\r?\n/);
+    pendingText = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line) {
+        flushEvent();
+      } else {
+        eventLines.push(line);
+      }
+    }
+  }
+
+  function finish() {
+    pendingText += decoder.decode();
+    if (pendingText) {
+      eventLines.push(pendingText);
+      pendingText = "";
+    }
+    flushEvent();
+    return usage;
+  }
+
+  return {
+    ingest,
+    finish,
+  };
+}
+
+function bodyWithStreamUsageOptions(input: {
+  body: ArrayBuffer | undefined;
+  requestBody: unknown;
+  apiFormat: string;
+  clientRequestedStream: boolean;
+}) {
+  if (!input.body || input.apiFormat !== "openai:chat" || !input.clientRequestedStream) {
+    return input.body;
+  }
+  const root = objectValue(input.requestBody);
+  if (!root) return input.body;
+  const streamOptions = objectValue(root.stream_options);
+  if (streamOptions?.include_usage === true) return input.body;
+  return new TextEncoder().encode(
+    JSON.stringify({
+      ...root,
+      stream_options: {
+        ...streamOptions,
+        include_usage: true,
+      },
+    }),
+  );
 }
 
 function extractErrorMessage(body: unknown) {
@@ -183,19 +299,24 @@ function streamWithProxyLog(input: {
   statusCode: number;
 }) {
   const reader = input.body.getReader();
+  const usageCollector = createSseUsageCollector();
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const result = await reader.read();
         if (result.done) {
+          const usage = usageCollector.finish();
           await updateProxyLog(input.logId, {
             status: terminalStatus(input.statusCode),
             durationMs: Date.now() - input.startedAt,
             responseTimeUpdatedAt: new Date().toISOString(),
+            usageSource: hasUsageMetrics(usage) ? "proxy_stream" : "missing",
+            ...usage,
           });
           controller.close();
           return;
         }
+        usageCollector.ingest(result.value);
         controller.enqueue(result.value);
       } catch (err) {
         await updateProxyLog(input.logId, {
@@ -248,6 +369,7 @@ async function recordFinishedProxyLog(input: {
     durationMs: Date.now() - input.startedAt,
     firstByteMs: input.firstByteMs,
     responseTimeUpdatedAt: new Date().toISOString(),
+    usageSource: hasUsageMetrics(usage) ? "proxy_json" : "missing",
     ...usage,
     errorMessage:
       input.upstream.status >= 400 ? extractErrorMessage(input.responseJson) : undefined,
@@ -342,6 +464,12 @@ async function proxy(request: Request, context: RouteContext) {
   const requestBody = parseJsonBody(body, request.headers.get("content-type"));
   const apiFormat = detectApiFormat(path);
   const metadata = requestMetadata(path, requestBody);
+  const upstreamBody = bodyWithStreamUsageOptions({
+    body,
+    requestBody,
+    apiFormat,
+    clientRequestedStream: metadata.clientRequestedStream,
+  });
   const userAgent = request.headers.get("user-agent");
   const clientIp = request.headers.get("x-forwarded-for") ?? undefined;
   const proxyLog = await beginProxyLog({
@@ -370,7 +498,7 @@ async function proxy(request: Request, context: RouteContext) {
     const upstream = await fetch(upstreamUrl, {
       method: request.method,
       headers: filteredProxyHeaders(request, key),
-      body,
+      body: upstreamBody,
       cache: "no-store",
       signal: request.signal,
     });
