@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { isRootAdminScope, isSystemAdminScope, requireAdminScope } from "@/lib/admin";
-import { getAdminScopeById, updateManualAdminScope } from "@/lib/store";
+import { getAdminScopeById, revokeAdminScopesForUser, updateManualAdminScope } from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -71,10 +71,12 @@ export async function DELETE(
     return NextResponse.json({ error: "只有 root 管理员可以取消系统管理员" }, { status: 403 });
   }
 
-  const admin = await updateManualAdminScope({
-    scopeId: id,
-    status: "disabled",
+  const revoked = await revokeAdminScopesForUser({
+    feishuUserId: current.feishuUserId,
+    reason: "manual_revoke",
+    disabledByFeishuUserId: auth.user.id,
   });
+  const admin = revoked.find((scope) => scope.id === id) ?? revoked[0] ?? null;
   if (!admin) {
     return NextResponse.json({ error: "取消管理员失败" }, { status: 404 });
   }

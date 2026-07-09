@@ -166,6 +166,9 @@ export type AdminScope = {
   source: "manual" | "department_supervisor" | "environment";
   role?: "root";
   status: "active" | "disabled";
+  disabledReason?: "manual_revoke" | "user_deleted" | "auto_sync_lost";
+  disabledByFeishuUserId?: string;
+  disabledAt?: string;
   createdAt: string;
   updatedAt: string;
 };

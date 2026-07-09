@@ -38,6 +38,7 @@ export async function DELETE(
     status: "deleted",
     reason: parsed.data.reason ?? `管理员 ${auth.user.openId} 删除用户，需重新申请`,
     tokenStatus: "revoked",
+    adminRevokedByFeishuUserId: auth.user.id,
   });
 
   return NextResponse.json({

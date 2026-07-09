@@ -365,3 +365,12 @@
 4. NewAPI usage records 是 tokens、quota、cost、NewAPI 模型和计费状态的权威；proxy logs 是 API格式、客户端/IP、路径、状态、耗时、错误摘要和请求生命周期的权威；`user_billing_periods` 只作为派生聚合快照。
 5. unknown token 和 no proxy match 不应只存在于接口返回或计费操作摘要中，必须写入可追踪的 `usage_sync_issues`，以便管理员后续排查和忽略/关闭。
 6. 用量同步周期配置与自动执行、active key `remain_quota` 校准写回已从 E5R 迁出到 F 阶段；F 阶段必须复用 E5R 的 source records、checkpoint、issues、PostgreSQL advisory lock 和计费审计口径，不新增独立认证入口。
+
+## 2026-07-09 管理员撤权与自动恢复阻断发现
+
+1. 原实现里删除用户和取消管理员只处理用户/key 或单条管理员范围，没有把目标用户的所有非环境 `adminScopes` 统一置为不可用；被删除或取消的管理员仍可能保留管理入口和管理 API 授权。
+2. `getEffectiveAdminScopeForUser()` 在存量 scope 不存在或被动丢失时会调用部门主管自动同步；因此“自动识别出的部门管理员”被 root 手动取消后，如果该用户仍是飞书部门负责人，后续登录可能重新恢复部门管理员资格。
+3. 修复边界应区分自动丢失和 root 主动撤权：`auto_sync_lost` 表示部门主管关系变化导致的可自动恢复禁用；`manual_revoke`、`user_deleted` 和旧 `disabled=true` 表示 root 或删除动作导致的显式阻断，不能被部门主管自动识别恢复。
+4. 删除任意用户必须同时禁用其 active key、撤销申请资格、撤销其全部非环境管理员范围，并让该用户重新进入普通申请/审批界面；root 重新指派部门管理员或系统管理员时，才允许恢复用户 active 状态和对应管理员范围。
+5. root 删除或取消部门/系统管理员后，前端需要收回管理员入口并回退为普通用户后台；服务端管理 API 不能只依赖前端隐藏入口，必须在 `admin.ts` / `admin-sync.ts` effective scope 计算处拒绝 disabled scope。
+6. 本地修复已覆盖 JSON/PostgreSQL store、管理员取消 API、用户删除 API、部门主管自动同步、有效 admin scope 计算和前端 revoked fallback；本轮 `npm run typecheck`、`npm run build` 和 `git diff --check` 均通过，未部署公网实例。

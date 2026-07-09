@@ -312,6 +312,83 @@ async function saveAdminScopeRow(client: PoolClient, scope: AdminScope) {
   return result.rows[0].data;
 }
 
+function isInactiveUser(user: FeishuUser) {
+  return Boolean(user.status && user.status !== "active");
+}
+
+function blocksAutomaticAdminRestore(scope: AdminScope) {
+  if (scope.status !== "disabled") return false;
+  return (
+    scope.disabledReason === "manual_revoke" ||
+    scope.disabledReason === "user_deleted" ||
+    scope.disabledReason === undefined
+  );
+}
+
+function blocksAllAutomaticAdminRestoreForUser(scope: AdminScope) {
+  return scope.scopeType === "global" && blocksAutomaticAdminRestore(scope);
+}
+
+function disabledAdminScope(
+  scope: AdminScope,
+  input: {
+    now: string;
+    reason: NonNullable<AdminScope["disabledReason"]>;
+    disabledByFeishuUserId?: string;
+  },
+) {
+  return {
+    ...scope,
+    status: "disabled" as const,
+    disabledReason: input.reason,
+    disabledByFeishuUserId: input.disabledByFeishuUserId,
+    disabledAt: input.now,
+    updatedAt: input.now,
+  } satisfies AdminScope;
+}
+
+function activeAdminScope(scope: AdminScope, now: string) {
+  return {
+    ...scope,
+    status: "active" as const,
+    disabledReason: undefined,
+    disabledByFeishuUserId: undefined,
+    disabledAt: undefined,
+    updatedAt: now,
+  } satisfies AdminScope;
+}
+
+async function revokeAdminScopesForUserInTransaction(
+  client: PoolClient,
+  input: {
+    feishuUserId: string;
+    reason: NonNullable<AdminScope["disabledReason"]>;
+    disabledByFeishuUserId?: string;
+    now: string;
+  },
+) {
+  const result = await client.query<{ data: AdminScope }>(
+    `select data from admin_scopes
+     where feishu_user_id = $1 and source <> 'environment'
+     for update`,
+    [input.feishuUserId],
+  );
+  const revoked: AdminScope[] = [];
+  for (const row of result.rows) {
+    revoked.push(
+      await saveAdminScopeRow(
+        client,
+        disabledAdminScope(row.data, {
+          now: input.now,
+          reason: input.reason,
+          disabledByFeishuUserId: input.disabledByFeishuUserId,
+        }),
+      ),
+    );
+  }
+  return revoked;
+}
+
 async function syncPostgresBillingPeriodForUser(
   client: PoolClient,
   feishuUserId: string,
@@ -937,13 +1014,22 @@ export async function upsertPostgresManualAdminScope(input: {
       [targetUser.id, input.scopeType, input.departmentId ?? null],
     );
     const now = nowIso();
+    if (isInactiveUser(targetUser)) {
+      await saveFeishuUserRow(client, {
+        ...targetUser,
+        status: "active",
+        disabledAt: undefined,
+        disabledReason: undefined,
+        deletedAt: undefined,
+        deletedReason: undefined,
+        updatedAt: now,
+      });
+    }
     const existing = existingResult.rows[0]?.data;
     if (existing) {
       const updated: AdminScope = {
-        ...existing,
-        status: "active",
+        ...activeAdminScope(existing, now),
         departmentId: input.scopeType === "department" ? input.departmentId : undefined,
-        updatedAt: now,
       };
       return { scope: await saveAdminScopeRow(client, updated), error: null };
     }
@@ -966,6 +1052,8 @@ export async function updatePostgresManualAdminScope(input: {
   scopeId: string;
   status?: AdminScope["status"];
   departmentId?: string;
+  disabledReason?: AdminScope["disabledReason"];
+  disabledByFeishuUserId?: string;
 }) {
   return withTransaction(async (client) => {
     const result = await client.query<{ data: AdminScope }>(
@@ -974,15 +1062,26 @@ export async function updatePostgresManualAdminScope(input: {
     );
     const scope = result.rows[0]?.data;
     if (!scope || scope.source === "environment") return null;
+    const now = nowIso();
+
+    const statusUpdated =
+      input.status === "active"
+        ? activeAdminScope(scope, now)
+        : input.status === "disabled"
+          ? disabledAdminScope(scope, {
+              now,
+              reason: input.disabledReason ?? "manual_revoke",
+              disabledByFeishuUserId: input.disabledByFeishuUserId,
+            })
+          : scope;
 
     const updated: AdminScope = {
-      ...scope,
-      status: input.status ?? scope.status,
+      ...statusUpdated,
       departmentId:
         scope.scopeType === "department" && input.departmentId !== undefined
           ? input.departmentId
           : scope.departmentId,
-      updatedAt: nowIso(),
+      updatedAt: now,
     };
     return saveAdminScopeRow(client, updated);
   });
@@ -1010,25 +1109,57 @@ export async function syncPostgresDepartmentSupervisorAdminScope(input: {
     );
     const existing = result.rows[0]?.data;
     const now = nowIso();
+    const userResult = await client.query<{ data: FeishuUser }>(
+      "select data from feishu_users where id = $1",
+      [input.feishuUserId],
+    );
+    const user = userResult.rows[0]?.data;
+    if (!user || isInactiveUser(user)) return null;
+
+    const globalRevocationResult = await client.query<{ data: AdminScope }>(
+      `select data from admin_scopes
+       where feishu_user_id = $1
+         and scope_type = 'global'
+         and status = 'disabled'`,
+      [input.feishuUserId],
+    );
+    if (
+      globalRevocationResult.rows.some((row) =>
+        blocksAllAutomaticAdminRestoreForUser(row.data),
+      )
+    ) {
+      return null;
+    }
 
     if (!input.isSupervisor) {
-      if (existing && existing.status !== "disabled") {
-        await saveAdminScopeRow(client, {
-          ...existing,
-          status: "disabled",
-          updatedAt: now,
-        });
+      if (existing) {
+        if (blocksAutomaticAdminRestore(existing)) return null;
+        await saveAdminScopeRow(
+          client,
+          disabledAdminScope(existing, {
+            now,
+            reason: "auto_sync_lost",
+          }),
+        );
       }
       return null;
     }
 
     if (existing) {
-      return saveAdminScopeRow(client, {
-        ...existing,
-        status: "active",
-        updatedAt: now,
-      });
+      if (blocksAutomaticAdminRestore(existing)) return null;
+      return saveAdminScopeRow(client, activeAdminScope(existing, now));
     }
+
+    const blockedResult = await client.query<{ data: AdminScope }>(
+      `select data from admin_scopes
+       where feishu_user_id = $1
+         and scope_type = 'department'
+         and department_id = $2
+         and status = 'disabled'
+       order by updated_at desc, id`,
+      [input.feishuUserId, input.departmentId],
+    );
+    if (blockedResult.rows.some((row) => blocksAutomaticAdminRestore(row.data))) return null;
 
     const scope: AdminScope = {
       id: randomId("as"),
@@ -1049,6 +1180,7 @@ export async function updatePostgresUserAccessStatus(input: {
   status: "disabled" | "deleted";
   reason?: string;
   tokenStatus: Extract<TokenStatus, "disabled" | "revoked">;
+  adminRevokedByFeishuUserId?: string;
 }) {
   return withTransaction(async (client) => {
     const now = nowIso();
@@ -1087,6 +1219,14 @@ export async function updatePostgresUserAccessStatus(input: {
       deletedReason: input.status === "deleted" ? input.reason : user.deletedReason,
     };
     const storedUser = await saveFeishuUserRow(client, updatedUser);
+    if (input.status === "deleted") {
+      await revokeAdminScopesForUserInTransaction(client, {
+        feishuUserId: input.feishuUserId,
+        reason: "user_deleted",
+        disabledByFeishuUserId: input.adminRevokedByFeishuUserId,
+        now,
+      });
+    }
     if (storedAccount) {
       await syncPostgresBillingPeriodForUser(
         client,
@@ -1096,6 +1236,19 @@ export async function updatePostgresUserAccessStatus(input: {
     }
     return { user: storedUser, tokenAccount: storedAccount };
   });
+}
+
+export async function revokePostgresAdminScopesForUser(input: {
+  feishuUserId: string;
+  reason: NonNullable<AdminScope["disabledReason"]>;
+  disabledByFeishuUserId?: string;
+}) {
+  return withTransaction((client) =>
+    revokeAdminScopesForUserInTransaction(client, {
+      ...input,
+      now: nowIso(),
+    }),
+  );
 }
 
 export async function enablePostgresUserAccess(input: {

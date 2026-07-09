@@ -18,6 +18,16 @@ export async function requireAdminScope() {
       error: NextResponse.json({ error: "需要飞书 OAuth 会话" }, { status: 401 }),
     };
   }
+  if (user.status === "deleted") {
+    return {
+      error: NextResponse.json({ error: "该用户已删除，需要重新申请后才能访问后台" }, { status: 403 }),
+    };
+  }
+  if (user.status === "disabled") {
+    return {
+      error: NextResponse.json({ error: "该用户已禁用，不能访问管理后台" }, { status: 403 }),
+    };
+  }
 
   const scope = await getEffectiveAdminScopeForUser(user);
   if (!scope) {

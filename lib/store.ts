@@ -18,6 +18,7 @@ import {
   recordPostgresMonthlyResetApplied,
   replacePostgresActiveTokenAccount,
   readPostgresStore,
+  revokePostgresAdminScopesForUser,
   syncPostgresDepartmentSupervisorAdminScope,
   transitionPostgresTokenRequest,
   updatePostgresManualAdminScope,
@@ -71,6 +72,64 @@ const invalidatableFirstApplyStatuses = new Set<RequestStatus>([
   "approved_provisioning",
   "approved_provision_failed",
 ]);
+
+function isInactiveUser(user: FeishuUser) {
+  return Boolean(user.status && user.status !== "active");
+}
+
+function blocksAutomaticAdminRestore(scope: AdminScope) {
+  if (scope.status !== "disabled") return false;
+  return (
+    scope.disabledReason === "manual_revoke" ||
+    scope.disabledReason === "user_deleted" ||
+    scope.disabledReason === undefined
+  );
+}
+
+function blocksAllAutomaticAdminRestoreForUser(scope: AdminScope) {
+  return scope.scopeType === "global" && blocksAutomaticAdminRestore(scope);
+}
+
+function disableAdminScope(
+  scope: AdminScope,
+  input: {
+    now: string;
+    reason: NonNullable<AdminScope["disabledReason"]>;
+    disabledByFeishuUserId?: string;
+  },
+) {
+  scope.status = "disabled";
+  scope.disabledReason = input.reason;
+  scope.disabledByFeishuUserId = input.disabledByFeishuUserId;
+  scope.disabledAt = input.now;
+  scope.updatedAt = input.now;
+}
+
+function activateAdminScope(scope: AdminScope, now: string) {
+  scope.status = "active";
+  scope.disabledReason = undefined;
+  scope.disabledByFeishuUserId = undefined;
+  scope.disabledAt = undefined;
+  scope.updatedAt = now;
+}
+
+function revokeAdminScopesForUserInStore(
+  store: StoreShape,
+  input: {
+    feishuUserId: string;
+    reason: NonNullable<AdminScope["disabledReason"]>;
+    disabledByFeishuUserId?: string;
+    now: string;
+  },
+) {
+  const revoked: AdminScope[] = [];
+  for (const scope of store.adminScopes) {
+    if (scope.feishuUserId !== input.feishuUserId || scope.source === "environment") continue;
+    disableAdminScope(scope, input);
+    revoked.push(scope);
+  }
+  return revoked;
+}
 
 function isPostgresBackend() {
   return getConfig().storeBackend === "postgres";
@@ -1333,6 +1392,7 @@ export async function getAdminScopeForUser(feishuUserId: string) {
   const store = await readStore();
   const user = store.users.find((item) => item.id === feishuUserId);
   if (!user) return null;
+  if (isInactiveUser(user)) return null;
 
   if (getConfig().admin.systemAdminOpenIds.includes(user.openId)) {
     const now = nowIso();
@@ -1358,6 +1418,21 @@ export async function getAdminScopeForUser(feishuUserId: string) {
     .filter((request) => request.approvalTargetOpenId === user.openId)
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
   if (assignedRequest?.approvalDepartmentId) {
+    const blockedByGlobalRevocation = store.adminScopes.some(
+      (scope) =>
+        scope.feishuUserId === feishuUserId && blocksAllAutomaticAdminRestoreForUser(scope),
+    );
+    if (blockedByGlobalRevocation) return null;
+
+    const blockedByRevokedScope = store.adminScopes.some(
+      (scope) =>
+        scope.feishuUserId === feishuUserId &&
+        scope.scopeType === "department" &&
+        scope.departmentId === assignedRequest.approvalDepartmentId &&
+        blocksAutomaticAdminRestore(scope),
+    );
+    if (blockedByRevokedScope) return null;
+
     const now = nowIso();
     return {
       id: `assigned-admin-${feishuUserId}`,
@@ -1420,6 +1495,14 @@ export async function upsertManualAdminScope(input: {
     }
 
     const now = nowIso();
+    if (isInactiveUser(targetUser)) {
+      targetUser.status = "active";
+      targetUser.disabledAt = undefined;
+      targetUser.disabledReason = undefined;
+      targetUser.deletedAt = undefined;
+      targetUser.deletedReason = undefined;
+      targetUser.updatedAt = now;
+    }
     const existing = store.adminScopes.find(
       (scope) =>
         scope.feishuUserId === targetUser.id &&
@@ -1429,9 +1512,8 @@ export async function upsertManualAdminScope(input: {
     );
 
     if (existing) {
-      existing.status = "active";
+      activateAdminScope(existing, now);
       existing.departmentId = input.scopeType === "department" ? input.departmentId : undefined;
-      existing.updatedAt = now;
       return { scope: existing, error: null };
     }
 
@@ -1454,17 +1536,28 @@ export async function updateManualAdminScope(input: {
   scopeId: string;
   status?: AdminScope["status"];
   departmentId?: string;
+  disabledReason?: AdminScope["disabledReason"];
+  disabledByFeishuUserId?: string;
 }) {
   if (isPostgresBackend()) return updatePostgresManualAdminScope(input);
 
   return mutate((store) => {
     const scope = store.adminScopes.find((item) => item.id === input.scopeId);
     if (!scope || scope.source === "environment") return null;
-    if (input.status) scope.status = input.status;
+    const now = nowIso();
+    if (input.status === "active") {
+      activateAdminScope(scope, now);
+    } else if (input.status === "disabled") {
+      disableAdminScope(scope, {
+        now,
+        reason: input.disabledReason ?? "manual_revoke",
+        disabledByFeishuUserId: input.disabledByFeishuUserId,
+      });
+    }
     if (scope.scopeType === "department" && input.departmentId !== undefined) {
       scope.departmentId = input.departmentId;
     }
-    scope.updatedAt = nowIso();
+    scope.updatedAt = now;
     return scope;
   });
 }
@@ -1483,6 +1576,8 @@ export async function syncDepartmentSupervisorAdminScope(input: {
 
   return mutate((store) => {
     const now = nowIso();
+    const user = store.users.find((item) => item.id === input.feishuUserId);
+    if (!user || isInactiveUser(user)) return null;
     const existing = store.adminScopes.find(
       (scope) =>
         scope.feishuUserId === input.feishuUserId &&
@@ -1490,20 +1585,37 @@ export async function syncDepartmentSupervisorAdminScope(input: {
         scope.departmentId === input.departmentId &&
         scope.source === "department_supervisor",
     );
+    const blockedByGlobalRevocation = store.adminScopes.some(
+      (scope) =>
+        scope.feishuUserId === input.feishuUserId && blocksAllAutomaticAdminRestoreForUser(scope),
+    );
+    if (blockedByGlobalRevocation) return null;
 
     if (!input.isSupervisor) {
-      if (existing && existing.status !== "disabled") {
-        existing.status = "disabled";
-        existing.updatedAt = now;
+      if (existing) {
+        if (blocksAutomaticAdminRestore(existing)) return null;
+        disableAdminScope(existing, {
+          now,
+          reason: "auto_sync_lost",
+        });
       }
       return null;
     }
 
     if (existing) {
-      existing.status = "active";
-      existing.updatedAt = now;
+      if (blocksAutomaticAdminRestore(existing)) return null;
+      activateAdminScope(existing, now);
       return existing;
     }
+
+    const blockedByRevokedScope = store.adminScopes.some(
+      (scope) =>
+        scope.feishuUserId === input.feishuUserId &&
+        scope.scopeType === "department" &&
+        scope.departmentId === input.departmentId &&
+        blocksAutomaticAdminRestore(scope),
+    );
+    if (blockedByRevokedScope) return null;
 
     const scope: AdminScope = {
       id: randomId("as"),
@@ -1562,6 +1674,7 @@ function userInAdminScope(user: FeishuUser, scope: AdminScope) {
 }
 
 function activeAdminScopesForUser(user: FeishuUser, store: StoreShape) {
+  if (isInactiveUser(user)) return [];
   const scopes = store.adminScopes.filter(
     (scope) => scope.feishuUserId === user.id && scope.status === "active",
   );
@@ -1624,6 +1737,7 @@ export async function updateUserAccessStatus(input: {
   status: "disabled" | "deleted";
   reason?: string;
   tokenStatus: Extract<TokenStatus, "disabled" | "revoked">;
+  adminRevokedByFeishuUserId?: string;
 }) {
   if (isPostgresBackend()) return updatePostgresUserAccessStatus(input);
 
@@ -1651,10 +1765,31 @@ export async function updateUserAccessStatus(input: {
       user.deletedReason = input.reason;
       user.disabledAt = user.disabledAt ?? now;
       user.disabledReason = user.disabledReason ?? input.reason;
+      revokeAdminScopesForUserInStore(store, {
+        feishuUserId: input.feishuUserId,
+        reason: "user_deleted",
+        disabledByFeishuUserId: input.adminRevokedByFeishuUserId,
+        now,
+      });
     }
 
     return { user, tokenAccount: activeAccount };
   });
+}
+
+export async function revokeAdminScopesForUser(input: {
+  feishuUserId: string;
+  reason: NonNullable<AdminScope["disabledReason"]>;
+  disabledByFeishuUserId?: string;
+}) {
+  if (isPostgresBackend()) return revokePostgresAdminScopesForUser(input);
+
+  return mutate((store) =>
+    revokeAdminScopesForUserInStore(store, {
+      ...input,
+      now: nowIso(),
+    }),
+  );
 }
 
 export async function enableUserAccess(input: {

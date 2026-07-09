@@ -60,6 +60,9 @@ type AdminScopeRecord = {
   source: "manual" | "department_supervisor" | "environment";
   role?: "root";
   status: "active" | "disabled";
+  disabledReason?: "manual_revoke" | "user_deleted" | "auto_sync_lost";
+  disabledByFeishuUserId?: string;
+  disabledAt?: string;
   configuredOpenId?: string;
   readonly?: boolean;
   user?: {
@@ -361,6 +364,12 @@ const adminScopeSourceLabel: Record<AdminScopeRecord["source"], string> = {
   manual: "手动指派",
   department_supervisor: "部门主管同步",
   environment: "环境变量 root",
+};
+
+const adminScopeDisabledReasonLabel: Record<NonNullable<AdminScopeRecord["disabledReason"]>, string> = {
+  manual_revoke: "root 取消",
+  user_deleted: "用户删除",
+  auto_sync_lost: "主管变更",
 };
 
 function displayName(user?: AdminOverviewResponse["user"]) {
@@ -1112,6 +1121,41 @@ export function AdminClient() {
   const monthlyResetReadyToExecute =
     lastMonthlyResetDryRunSignature === monthlyResetDraftSignature(monthlyResetDraft);
 
+  if (!loading && data && !data.authorized) {
+    return (
+      <>
+        <FeishuSdkScript
+          onReady={() => setFeishuSdkReady(true)}
+          onError={(sdkError) => setError(sdkError)}
+        />
+        <div className="app-shell">
+          <main className="main-panel">
+            <Card>
+              <CardHeader>
+                <CardTitle>管理权限已收回</CardTitle>
+                <CardDescription>{data.error ?? "当前飞书用户没有启用的管理范围。"}</CardDescription>
+              </CardHeader>
+              <CardContent>
+                {error && <div className="alert alert-danger">{error}</div>}
+                {message && <div className="alert">{message}</div>}
+                <div className="toolbar toolbar-left">
+                  <a className="button button-outline" href="/">
+                    回到用户后台
+                  </a>
+                  {!data.authenticated && (
+                    <Button variant="outline" disabled={busy} onClick={() => void connectFeishu()}>
+                      飞书登录
+                    </Button>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+          </main>
+        </div>
+      </>
+    );
+  }
+
   return (
     <>
       <FeishuSdkScript
@@ -1610,9 +1654,14 @@ export function AdminClient() {
                                     )}
                                   </td>
                                   <td>
-                                    <Badge variant={badgeVariant(scope.status)}>
-                                      {scope.status === "active" ? "启用" : "已取消"}
-                                    </Badge>
+                                    <div className="meta-stack">
+                                      <Badge variant={badgeVariant(scope.status)}>
+                                        {scope.status === "active" ? "启用" : "已取消"}
+                                      </Badge>
+                                      {scope.status === "disabled" && scope.disabledReason && (
+                                        <span>{adminScopeDisabledReasonLabel[scope.disabledReason]}</span>
+                                      )}
+                                    </div>
                                   </td>
                                   <td>{formatDateTime(scope.updatedAt)}</td>
                                   <td>

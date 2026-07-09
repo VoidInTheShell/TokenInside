@@ -14,6 +14,10 @@ function firstDepartmentId(value?: string[]) {
   return value?.find((item) => item.length > 0);
 }
 
+function isInactiveUser(user: FeishuUser) {
+  return Boolean(user.status && user.status !== "active");
+}
+
 export async function hydrateUserDepartment<T extends FeishuUser | null>(user: T) {
   if (!user) return user;
   if (user.departmentId && user.departmentName) return user;
@@ -51,6 +55,7 @@ export async function hydrateUserDepartment<T extends FeishuUser | null>(user: T
 }
 
 export async function syncDepartmentSupervisorScopeForUser(user: FeishuUser) {
+  if (isInactiveUser(user)) return null;
   if (!user.departmentId) return null;
   try {
     const department = await getFeishuDepartmentById(user.departmentId);
@@ -68,6 +73,7 @@ export async function syncDepartmentSupervisorScopeForUser(user: FeishuUser) {
 }
 
 export async function getEffectiveAdminScopeForUser(user: FeishuUser) {
+  if (isInactiveUser(user)) return null;
   const storedScope = await getAdminScopeForUser(user.id);
   if (storedScope) return storedScope;
   return syncDepartmentSupervisorScopeForUser(user);
