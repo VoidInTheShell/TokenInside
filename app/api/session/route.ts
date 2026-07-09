@@ -137,6 +137,7 @@ export async function GET() {
       tenantKey: user.tenantKey,
       openId: user.openId,
       departmentId: user.departmentId,
+      departmentName: user.departmentName,
     },
     activeToken: activeTokenResponse,
     billingPeriod: billingPeriod
@@ -149,6 +150,8 @@ export async function GET() {
       ? {
           type: adminScope.scopeType,
           departmentId: adminScope.departmentId,
+          departmentName:
+            adminScope.departmentId === user.departmentId ? user.departmentName : undefined,
           source: adminScope.source,
           role: adminScope.role,
         }

@@ -5,7 +5,7 @@ import { EyeOffIcon, RefreshCcwIcon, SearchIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { formatDateTime, formatTokenAmount, maskSecret } from "@/lib/utils";
+import { formatDateTime, formatDepartmentName, formatTokenAmount, maskSecret } from "@/lib/utils";
 
 export type UsageRequestStatus =
   | "pending"
@@ -544,6 +544,11 @@ export function UsageRecordsTable({
                     {record.userName ?? maskSecret(record.userOpenId) ?? "-"}
                   </div>
                 )}
+                {showDepartment && (
+                  <div className="usage-record-card-line">
+                    {formatDepartmentName(record.departmentName, record.departmentId)}
+                  </div>
+                )}
                 <div className="usage-record-card-line">
                   {dateTime.time} · {dateTime.date} · {record.method} {record.requestPath}
                 </div>
@@ -609,7 +614,7 @@ export function UsageRecordsTable({
                       </td>
                     )}
                     {showDepartment && visibleSet.has("department") && (
-                      <td>{record.departmentName ?? maskSecret(record.departmentId) ?? "-"}</td>
+                      <td>{formatDepartmentName(record.departmentName, record.departmentId)}</td>
                     )}
                     {visibleSet.has("model") && (
                       <td>

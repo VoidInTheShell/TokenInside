@@ -195,10 +195,19 @@ export async function getFeishuDepartmentById(departmentId: string) {
   return data.department ?? (data as FeishuDepartment);
 }
 
+function feishuDepartmentDisplayName(department: FeishuDepartment) {
+  return (
+    department.name ??
+    department.i18n_name?.zh_cn ??
+    department.i18n_name?.en_us ??
+    department.i18n_name?.ja_jp
+  );
+}
+
 export async function getFeishuDepartmentNameById(departmentId?: string) {
   if (!departmentId || departmentId === "0") return undefined;
   const department = await getFeishuDepartmentById(departmentId);
-  return department.name ?? department.i18n_name?.zh_cn ?? department.i18n_name?.en_us;
+  return feishuDepartmentDisplayName(department);
 }
 
 function resolveSystemAdminFallback(error: unknown): ApprovalTarget {

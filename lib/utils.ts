@@ -85,6 +85,16 @@ export function maskSecret(value?: string | null) {
   return `${value.slice(0, 7)}...${value.slice(-5)}`;
 }
 
+export function formatDepartmentName(
+  departmentName?: string | null,
+  departmentId?: string | null,
+  fallback = "-",
+) {
+  const name = departmentName?.trim();
+  if (name) return name;
+  return departmentId ? maskSecret(departmentId) : fallback;
+}
+
 export function maskApiKey(value?: string | null) {
   if (!value) return "未发放";
   if (value.length <= 14) return value;

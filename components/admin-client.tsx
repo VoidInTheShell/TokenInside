@@ -41,11 +41,12 @@ import {
   UsageAnalysisTable,
   type UsageAggregateRow,
 } from "@/components/usage-analysis-tables";
-import { formatDateTime, formatTokenAmount, maskSecret } from "@/lib/utils";
+import { formatDateTime, formatDepartmentName, formatTokenAmount, maskSecret } from "@/lib/utils";
 
 type AdminScopeSummary = {
   type: "global" | "department";
   departmentId?: string;
+  departmentName?: string;
   source: "manual" | "department_supervisor" | "environment";
   role?: "root";
 };
@@ -55,6 +56,7 @@ type AdminScopeRecord = {
   feishuUserId: string;
   scopeType: "global" | "department";
   departmentId?: string;
+  departmentName?: string;
   source: "manual" | "department_supervisor" | "environment";
   role?: "root";
   status: "active" | "disabled";
@@ -65,6 +67,7 @@ type AdminScopeRecord = {
     name?: string;
     openId?: string;
     departmentId?: string;
+    departmentName?: string;
   } | null;
   createdAt: string;
   updatedAt: string;
@@ -95,6 +98,7 @@ type AdminOverviewResponse = {
     tenantKey: string;
     openId: string;
     departmentId?: string;
+    departmentName?: string;
   };
   overview?: {
     scope: AdminScopeSummary;
@@ -136,6 +140,7 @@ type AdminOverviewResponse = {
       requesterName?: string;
       requesterOpenId?: string;
       departmentId?: string;
+      departmentName?: string;
       updatedAt: string;
       createdAt: string;
     }>;
@@ -161,6 +166,7 @@ type AdminUser = {
   name?: string;
   openId: string;
   departmentId?: string;
+  departmentName?: string;
   status: "active" | "disabled" | "deleted";
   role: string;
   activeTokenStatus?: string;
@@ -195,6 +201,7 @@ type UserStatsRow = {
   name?: string;
   openId: string;
   departmentId?: string;
+  departmentName?: string;
   role: string;
   activeTokenStatus?: string;
   billingPeriod?: string;
@@ -240,7 +247,7 @@ type UsageRecordsResponse = {
   limit?: number;
   offset?: number;
   filters?: {
-    users?: Array<{ id: string; name?: string; openId?: string; departmentId?: string }>;
+    users?: Array<{ id: string; name?: string; openId?: string; departmentId?: string; departmentName?: string }>;
     departments?: Array<{ id: string; name?: string }>;
     models?: string[];
     providers?: string[];
@@ -652,7 +659,7 @@ export function AdminClient() {
           })),
           departments: (body.filters.departments ?? []).map((department) => ({
             id: department.id,
-            label: department.name ?? maskSecret(department.id) ?? department.id,
+            label: formatDepartmentName(department.name, department.id),
           })),
           models: body.filters.models ?? [],
           apiFormats: body.filters.apiFormats ?? [],
@@ -1425,7 +1432,7 @@ export function AdminClient() {
                                     <span>{maskSecret(user.openId)}</span>
                                   </div>
                                 </td>
-                                <td>{maskSecret(user.departmentId) ?? "-"}</td>
+                                <td>{formatDepartmentName(user.departmentName, user.departmentId)}</td>
                                 <td>
                                   <Badge variant={badgeVariant(user.status)}>{userStatusLabel[user.status]}</Badge>
                                 </td>
@@ -1596,7 +1603,12 @@ export function AdminClient() {
                                   </td>
                                   <td>{adminScopeLabel(scope)}</td>
                                   <td>{adminScopeSourceLabel[scope.source]}</td>
-                                  <td>{maskSecret(scope.departmentId) ?? "-"}</td>
+                                  <td>
+                                    {formatDepartmentName(
+                                      scope.departmentName ?? scope.user?.departmentName,
+                                      scope.departmentId,
+                                    )}
+                                  </td>
                                   <td>
                                     <Badge variant={badgeVariant(scope.status)}>
                                       {scope.status === "active" ? "启用" : "已取消"}
@@ -1657,7 +1669,7 @@ export function AdminClient() {
                       <tbody>
                         {departmentStats.map((item) => (
                           <tr key={item.departmentId}>
-                            <td>{item.departmentName ?? maskSecret(item.departmentId) ?? "未知部门"}</td>
+                            <td>{formatDepartmentName(item.departmentName, item.departmentId, "未知部门")}</td>
                             <td>{item.memberCount}</td>
                             <td>{item.keyedUsers}</td>
                             <td>{formatTokenAmount(item.monthlyQuota, "0")}</td>
@@ -1711,7 +1723,7 @@ export function AdminClient() {
                         {userStats.map((user) => (
                           <tr key={user.id}>
                             <td>{user.name ?? maskSecret(user.openId)}</td>
-                            <td>{maskSecret(user.departmentId) ?? "-"}</td>
+                            <td>{formatDepartmentName(user.departmentName, user.departmentId)}</td>
                             <td>{user.role}</td>
                             <td>{user.billingPeriod ?? "-"}</td>
                             <td>{formatTokenAmount(user.monthlyQuota, "0")}</td>

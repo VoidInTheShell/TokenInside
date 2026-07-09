@@ -31,6 +31,7 @@ export type FeishuUser = {
   name?: string;
   avatarUrl?: string;
   departmentId?: string;
+  departmentName?: string;
   status?: "active" | "disabled" | "deleted";
   disabledAt?: string;
   disabledReason?: string;

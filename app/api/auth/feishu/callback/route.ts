@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   exchangeFeishuCode,
   getFeishuContactUserByOpenId,
+  getFeishuDepartmentNameById,
   getFeishuUserInfo,
 } from "@/lib/feishu";
 import { createSessionToken, setSessionCookie } from "@/lib/session";
@@ -24,11 +25,20 @@ export async function POST(request: Request) {
     const token = await exchangeFeishuCode(input.code);
     const userInfo = await getFeishuUserInfo(token.access_token);
     let departmentId: string | undefined;
+    let departmentName: string | undefined;
     try {
       const contactUser = await getFeishuContactUserByOpenId(userInfo.open_id);
       departmentId = firstDepartmentId(contactUser.department_ids);
+      if (departmentId) {
+        try {
+          departmentName = await getFeishuDepartmentNameById(departmentId);
+        } catch {
+          departmentName = undefined;
+        }
+      }
     } catch {
       departmentId = undefined;
+      departmentName = undefined;
     }
 
     const user = await upsertFeishuUser({
@@ -39,6 +49,7 @@ export async function POST(request: Request) {
       name: userInfo.name,
       avatarUrl: userInfo.avatar_url,
       departmentId,
+      departmentName,
     });
 
     const sessionToken = createSessionToken({

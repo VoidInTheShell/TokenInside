@@ -500,6 +500,7 @@ export async function upsertFeishuUser(input: {
   name?: string;
   avatarUrl?: string;
   departmentId?: string;
+  departmentName?: string;
 }) {
   if (isPostgresBackend()) {
     return upsertPostgresFeishuUser({
@@ -522,6 +523,7 @@ export async function upsertFeishuUser(input: {
         name: input.name ?? existing.name,
         avatarUrl: input.avatarUrl ?? existing.avatarUrl,
         departmentId: input.departmentId ?? existing.departmentId,
+        departmentName: input.departmentName ?? existing.departmentName,
         updatedAt: now,
       });
       return existing;
@@ -536,6 +538,7 @@ export async function upsertFeishuUser(input: {
       name: input.name,
       avatarUrl: input.avatarUrl,
       departmentId: input.departmentId,
+      departmentName: input.departmentName,
       status: "active",
       createdAt: now,
       updatedAt: now,
@@ -1375,6 +1378,7 @@ export async function listAdminScopes() {
   const usersById = new Map(store.users.map((user) => [user.id, user]));
   const stored = store.adminScopes.map((scope) => ({
     ...scope,
+    departmentName: departmentNameForId(store, scope.departmentId),
     user: usersById.get(scope.feishuUserId) ?? null,
     readonly: false,
   }));
@@ -1723,6 +1727,7 @@ export async function listAdminUsers(scope: AdminScope) {
         name: user.name,
         openId: user.openId,
         departmentId: user.departmentId,
+        departmentName: user.departmentName,
         status: user.status ?? "active",
         role: userRoleLabel(user, store),
         activeTokenStatus: latestAccount?.status,
@@ -1760,6 +1765,7 @@ export async function listAdminUserStats(scope: AdminScope) {
       name: user.name,
       openId: user.openId,
       departmentId: user.departmentId,
+      departmentName: user.departmentName,
       role: user.role,
       activeTokenStatus: user.activeTokenStatus,
       billingPeriod: user.billingPeriod,
@@ -1833,6 +1839,18 @@ function logIsStream(log: ProxyRequestLog) {
 
 function logDepartmentId(log: ProxyRequestLog, user?: FeishuUser) {
   return log.departmentId ?? user?.departmentId;
+}
+
+function logDepartmentName(log: ProxyRequestLog, user?: FeishuUser) {
+  return log.departmentName ?? user?.departmentName;
+}
+
+function departmentNameForId(store: StoreShape, departmentId?: string) {
+  if (!departmentId) return undefined;
+  const user = store.users.find((item) => item.departmentId === departmentId && item.departmentName);
+  if (user?.departmentName) return user.departmentName;
+  return store.proxyRequestLogs.find((item) => item.departmentId === departmentId && item.departmentName)
+    ?.departmentName;
 }
 
 function matchesStatusFilter(log: ProxyRequestLog, status?: string) {
@@ -1917,6 +1935,8 @@ function matchesSearch(log: ProxyRequestLog, user: FeishuUser | undefined, searc
     log.model,
     log.provider,
     log.providerKeyName,
+    user?.departmentName,
+    log.departmentName,
     log.apiFormat,
     log.clientFamily,
     log.clientIp,
@@ -1936,7 +1956,7 @@ function mapUsageRecord(log: ProxyRequestLog, usersById: Map<string, FeishuUser>
     userName: user?.name,
     userOpenId: user?.openId,
     departmentId: logDepartmentId(log, user),
-    departmentName: log.departmentName,
+    departmentName: logDepartmentName(log, user),
     requestPath: log.requestPath,
     method: log.method,
     status: logDisplayStatus(log),
@@ -2142,6 +2162,7 @@ export async function listAdminUsageRecords(input: UsageRecordFilters & {
                 name: user.name,
                 openId: user.openId,
                 departmentId: user.departmentId,
+                departmentName: user.departmentName,
               }
             : null;
         })
@@ -2155,7 +2176,7 @@ export async function listAdminUsageRecords(input: UsageRecordFilters & {
             id,
             {
               id,
-              name: log.departmentName,
+              name: logDepartmentName(log, user),
             },
           ] as const;
         }),
@@ -2174,7 +2195,7 @@ export async function listAdminUsageRecords(input: UsageRecordFilters & {
       const id = logDepartmentId(log, user) ?? "unknown";
       return {
         key: id,
-        label: log.departmentName ?? id,
+        label: logDepartmentName(log, user) ?? id,
       };
     }),
     apiFormatStats: aggregateUsage(filteredLogs, usersById, (log) => ({
@@ -2279,24 +2300,24 @@ export async function listDepartmentStats(scope: AdminScope) {
   }
 
   for (const user of store.users) {
-    ensure(user.departmentId).memberCount += 1;
+    ensure(user.departmentId, user.departmentName).memberCount += 1;
   }
 
   for (const account of activeAccounts) {
     const user = usersById.get(account.feishuUserId);
-    ensure(user?.departmentId).keyedUsers.add(account.feishuUserId);
+    ensure(user?.departmentId, user?.departmentName).keyedUsers.add(account.feishuUserId);
   }
 
   for (const period of store.userBillingPeriods.filter((item) => item.period === currentPeriod)) {
     const user = usersById.get(period.feishuUserId);
-    const item = ensure(user?.departmentId);
+    const item = ensure(user?.departmentId, user?.departmentName);
     item.monthlyQuota += period.monthlyQuota;
     item.remainingQuota += Math.max(period.monthlyQuota - period.totalTokens, 0);
   }
 
   for (const log of store.proxyRequestLogs) {
     const user = log.feishuUserId ? usersById.get(log.feishuUserId) : undefined;
-    const item = ensure(log.departmentId ?? user?.departmentId, log.departmentName);
+    const item = ensure(logDepartmentId(log, user), logDepartmentName(log, user));
     item.promptTokens += log.promptTokens ?? 0;
     item.completionTokens += log.completionTokens ?? 0;
     item.totalTokens += log.totalTokens ?? 0;
@@ -2414,6 +2435,7 @@ export async function getAdminOverview(scope: AdminScope) {
     scope: {
       type: scope.scopeType,
       departmentId: scope.departmentId,
+      departmentName: departmentNameForId(store, scope.departmentId),
       source: scope.source,
       role: scope.role,
     },
@@ -2478,6 +2500,7 @@ export async function getAdminOverview(scope: AdminScope) {
           requesterName: user?.name,
           requesterOpenId: user?.openId,
           departmentId: user?.departmentId,
+          departmentName: user?.departmentName,
           updatedAt: request.updatedAt,
           createdAt: request.createdAt,
         };
@@ -2494,6 +2517,7 @@ export async function getAdminOverview(scope: AdminScope) {
           name: user.name,
           openId: user.openId,
           departmentId: user.departmentId,
+          departmentName: user.departmentName,
           activeTokenStatus: activeAccount?.status,
           activeTokenCreatedAt: activeAccount?.createdAt,
           billingPeriod,

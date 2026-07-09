@@ -39,7 +39,7 @@ import {
   UsageAnalysisTable,
   type UsageAggregateRow,
 } from "@/components/usage-analysis-tables";
-import { formatDateTime, formatTokenAmount, maskSecret } from "@/lib/utils";
+import { formatDateTime, formatDepartmentName, formatTokenAmount, maskSecret } from "@/lib/utils";
 
 type SessionResponse = {
   authenticated: boolean;
@@ -54,6 +54,7 @@ type SessionResponse = {
     tenantKey: string;
     openId: string;
     departmentId?: string;
+    departmentName?: string;
   };
   activeToken?: {
     id: string;
@@ -76,6 +77,7 @@ type SessionResponse = {
   adminScope?: {
     type: "global" | "department";
     departmentId?: string;
+    departmentName?: string;
     source: "manual" | "department_supervisor" | "environment";
   } | null;
   requests: Array<{
@@ -679,6 +681,11 @@ export function ExperienceClient() {
                   <span className="user-card-label">当前飞书用户</span>
                   <strong>{session?.authenticated ? displayName(session.user) : "等待飞书身份"}</strong>
                   <span>{session?.user?.openId ? maskSecret(session.user.openId) : "-"}</span>
+                  {(session?.user?.departmentName || session?.user?.departmentId) && (
+                    <span>
+                      部门：{formatDepartmentName(session.user.departmentName, session.user.departmentId)}
+                    </span>
+                  )}
                 </div>
                 {session?.adminScope && (
                   <div className="user-card-action">

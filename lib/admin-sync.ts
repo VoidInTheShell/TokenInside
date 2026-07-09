@@ -1,6 +1,7 @@
 import {
   getFeishuContactUserByOpenId,
   getFeishuDepartmentById,
+  getFeishuDepartmentNameById,
 } from "@/lib/feishu";
 import {
   getAdminScopeForUser,
@@ -14,11 +15,26 @@ function firstDepartmentId(value?: string[]) {
 }
 
 export async function hydrateUserDepartment<T extends FeishuUser | null>(user: T) {
-  if (!user || user.departmentId) return user;
+  if (!user) return user;
+  if (user.departmentId && user.departmentName) return user;
   try {
-    const contactUser = await getFeishuContactUserByOpenId(user.openId);
-    const departmentId = firstDepartmentId(contactUser.department_ids);
+    let departmentId = user.departmentId;
+    if (!departmentId) {
+      const contactUser = await getFeishuContactUserByOpenId(user.openId);
+      departmentId = firstDepartmentId(contactUser.department_ids);
+    }
     if (!departmentId) return user;
+
+    let departmentName = user.departmentName;
+    if (!departmentName) {
+      try {
+        departmentName = await getFeishuDepartmentNameById(departmentId);
+      } catch {
+        departmentName = undefined;
+      }
+    }
+    if (departmentId === user.departmentId && departmentName === user.departmentName) return user;
+
     return upsertFeishuUser({
       tenantKey: user.tenantKey,
       openId: user.openId,
@@ -27,6 +43,7 @@ export async function hydrateUserDepartment<T extends FeishuUser | null>(user: T
       name: user.name,
       avatarUrl: user.avatarUrl,
       departmentId,
+      departmentName,
     }) as Promise<NonNullable<T>>;
   } catch {
     return user;

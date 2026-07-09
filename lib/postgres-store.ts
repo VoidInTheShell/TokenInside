@@ -567,6 +567,7 @@ export async function upsertPostgresFeishuUser(input: {
   name?: string;
   avatarUrl?: string;
   departmentId?: string;
+  departmentName?: string;
   now: string;
 }) {
   return withTransaction(async (client) => {
@@ -588,6 +589,7 @@ export async function upsertPostgresFeishuUser(input: {
         name: input.name ?? user.name,
         avatarUrl: input.avatarUrl ?? user.avatarUrl,
         departmentId: input.departmentId ?? user.departmentId,
+        departmentName: input.departmentName ?? user.departmentName,
         updatedAt: input.now,
       };
       return saveFeishuUserRow(client, updated);
@@ -602,6 +604,7 @@ export async function upsertPostgresFeishuUser(input: {
       name: input.name,
       avatarUrl: input.avatarUrl,
       departmentId: input.departmentId,
+      departmentName: input.departmentName,
       status: "active",
       createdAt: input.now,
       updatedAt: input.now,
