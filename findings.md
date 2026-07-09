@@ -333,13 +333,17 @@
 14. 两条 2026-07-08 stream 记录已从 0 修正：`/v1/chat/completions` 回填 `totalTokens=265`、`cost=0.000266`、`newapiLogId=1`；`/v1/messages?beta=true` 回填 `totalTokens=22549`、`cost=0.02255`、`newapiLogId=2`。
 15. LA `user_billing_periods` 已刷新：两个 2026-07 用户账期分别显示 `prompt/completion/total = 5/260/265` 和 `22031/518/22549`；说明账期计费不再全为 0，已由回填后的 proxy logs 聚合产生。
 
-## 2026-07-09 部门名称展示修复排期
+## 2026-07-09 部门名称展示修复落地
 
 1. 当前部门显示仍会暴露部门 ID，根因是飞书 `department_ids` 官方语义就是“用户所属部门 ID 列表”，不是名称；TokenInside 必须额外调用部门详情接口读取 `department.name` / `i18n_name`。
 2. 现有代码虽然保留了 `getFeishuDepartmentNameById()` 这类 helper，但用户模型、登录回调、懒同步、会话响应、管理概览和 proxy log 快照没有形成完整 `departmentName` 主链路，因此前端只能回退显示 `departmentId`。
 3. 用户明确要求该修复排在 log 同步之后；因此新增 E9-10，依赖 E9-9 NewAPI logs 同步、usage-sync 回填、流式 usage parser 和使用记录 UI 收口完成后再统一落地。
 4. 修复边界是“ID 做权限和过滤主键，名称只做展示字段”：部门管理员 scope、部门筛选请求参数和历史归属仍用稳定 `departmentId`，所有前端展示才按 `departmentName -> departmentId 脱敏` 兜底。
 5. 新 proxy log 应补写调用发生时的 `departmentName` 快照；旧日志缺名称时可从当前用户 `departmentName` 兜底展示，但不能为了显示名称改写历史部门归属。
+6. E9-10 已本地落地：`FeishuUser.departmentName` 进入模型和 JSON/PostgreSQL upsert；登录回调与 `hydrateUserDepartment()` 会 best-effort 调飞书部门详情补名称，失败不阻断登录或会话刷新。
+7. 服务端展示链路已贯通：`/api/session`、`/api/admin/overview`、`listAdminUsers()`、`listAdminUserStats()`、`listDepartmentStats()`、`listAdminUsageRecords()` 和 `/v1` 新 proxy log 均带入或推导 `departmentName`。
+8. 前端显示已统一：用户卡片、管理端用户列表、管理员范围、部门统计、用户统计、usage filter options 和 usage records 使用 `formatDepartmentName(departmentName, departmentId)`；部门管理员 scope 和筛选参数仍使用 `departmentId`。
+9. 本地验证通过：`npm run typecheck` 和 `npm run build` 成功；本轮未构建 Docker 镜像、未推送镜像、未部署 LA。
 
 ## 2026-07-09 C 阶段 PostgreSQL 收口发现
 
