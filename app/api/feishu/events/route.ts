@@ -13,7 +13,7 @@ import {
   findTokenRequestById,
   findTokenRequestByInstance,
   getFeishuEventByUuid,
-  updateTokenRequest,
+  transitionTokenRequestStatus,
 } from "@/lib/store";
 import type { TokenRequest } from "@/lib/types";
 
@@ -389,7 +389,11 @@ async function handleCardActionEvent(input: {
     return cardToast("当前用户无权审批此申请", "error");
   }
 
-  if (tokenRequest.status !== "pending_card_approval") {
+  const normalizedAction = cardAction.toLowerCase();
+  const isApproveAction = normalizedAction === "approve" || normalizedAction === "approved";
+  const canRetryProvisioningFailure =
+    isApproveAction && tokenRequest.status === "approved_provision_failed";
+  if (tokenRequest.status !== "pending_card_approval" && !canRetryProvisioningFailure) {
     await addFeishuEvent({
       eventUuid,
       eventType,
@@ -404,21 +408,33 @@ async function handleCardActionEvent(input: {
     return cardToast("该申请已处理", "success");
   }
 
-  const normalizedAction = cardAction.toLowerCase();
   const operatedAt = nowIso();
-  if (normalizedAction === "approve" || normalizedAction === "approved") {
-    const approved = await updateTokenRequest(tokenRequest.id, {
-      status: "approved",
-      approvalOperatorOpenId: operatorOpenId,
-      approvalOperatedAt: operatedAt,
-    });
-    scheduleTokenProvisionAfterResponse({
-      request: approved ?? {
-        ...tokenRequest,
+  if (isApproveAction) {
+    const approved = await transitionTokenRequestStatus(
+      tokenRequest.id,
+      {
         status: "approved",
         approvalOperatorOpenId: operatorOpenId,
         approvalOperatedAt: operatedAt,
       },
+      ["pending_card_approval", "approved_provision_failed"],
+    );
+    if (!approved) {
+      await addFeishuEvent({
+        eventUuid,
+        eventType,
+        cardRequestId,
+        cardAction,
+        operatorOpenId,
+        messageId,
+        processingStatus: "ignored",
+        payloadJson: { encrypted, payload },
+        errorMessage: "Token request was already handled before approve transition",
+      });
+      return cardToast("该申请已处理", "success");
+    }
+    scheduleTokenProvisionAfterResponse({
+      request: approved,
       eventUuid,
       eventType,
       cardRequestId,
@@ -427,11 +443,29 @@ async function handleCardActionEvent(input: {
       messageId,
     });
   } else if (normalizedAction === "reject" || normalizedAction === "rejected") {
-    await updateTokenRequest(tokenRequest.id, {
-      status: "rejected",
-      approvalOperatorOpenId: operatorOpenId,
-      approvalOperatedAt: operatedAt,
-    });
+    const rejected = await transitionTokenRequestStatus(
+      tokenRequest.id,
+      {
+        status: "rejected",
+        approvalOperatorOpenId: operatorOpenId,
+        approvalOperatedAt: operatedAt,
+      },
+      ["pending_card_approval"],
+    );
+    if (!rejected) {
+      await addFeishuEvent({
+        eventUuid,
+        eventType,
+        cardRequestId,
+        cardAction,
+        operatorOpenId,
+        messageId,
+        processingStatus: "ignored",
+        payloadJson: { encrypted, payload },
+        errorMessage: "Token request was already handled before reject transition",
+      });
+      return cardToast("该申请已处理", "success");
+    }
   } else {
     await addFeishuEvent({
       eventUuid,
@@ -591,12 +625,22 @@ export async function POST(request: Request) {
 
     const normalizedStatus = approvalStatus.toUpperCase();
     if (normalizedStatus === "APPROVED") {
-      await updateTokenRequest(tokenRequest.id, { status: "approved" });
-      await provisionTokenForRequest({ ...tokenRequest, status: "approved" });
+      const approved = await transitionTokenRequestStatus(
+        tokenRequest.id,
+        { status: "approved" },
+        ["pending_feishu_approval", "approved_provision_failed"],
+      );
+      if (approved) {
+        await provisionTokenForRequest(approved);
+      }
     } else if (["REJECTED", "CANCELED", "CANCELLED"].includes(normalizedStatus)) {
-      await updateTokenRequest(tokenRequest.id, {
-        status: normalizedStatus === "REJECTED" ? "rejected" : "cancelled",
-      });
+      await transitionTokenRequestStatus(
+        tokenRequest.id,
+        {
+          status: normalizedStatus === "REJECTED" ? "rejected" : "cancelled",
+        },
+        ["pending_feishu_approval"],
+      );
     }
 
     await addFeishuEvent({

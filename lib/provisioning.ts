@@ -13,6 +13,7 @@ import {
   getActiveTokenForUser,
   invalidateOtherOpenFirstApplyRequests,
   replaceActiveTokenAccount,
+  transitionTokenRequestStatus,
   updateTokenRequest,
 } from "@/lib/store";
 import type { FeishuUser, TokenRequest } from "@/lib/types";
@@ -33,13 +34,21 @@ async function updateActiveTokenQuotaForRequest(request: TokenRequest) {
     throw new Error("当前飞书用户没有可调整额度的 active NewAPI key");
   }
 
-  await updateTokenRequest(request.id, {
-    status: "approved_provisioning",
-    errorMessage: undefined,
-  });
+  const provisioningRequest = await transitionTokenRequestStatus(
+    request.id,
+    {
+      status: "approved_provisioning",
+      errorMessage: undefined,
+    },
+    ["approved", "approved_provision_failed"],
+  );
+  if (!provisioningRequest) {
+    throw new Error("申请单已在发放中或已处理");
+  }
 
   try {
-    const finalMonthlyQuota = request.approvedMonthlyQuota ?? request.requestedMonthlyQuota;
+    const finalMonthlyQuota =
+      provisioningRequest.approvedMonthlyQuota ?? provisioningRequest.requestedMonthlyQuota;
     await updateNewApiTokenQuota({
       newapiTokenId: existing.newapiTokenId,
       remainQuota: toNewApiQuota(finalMonthlyQuota),
@@ -80,37 +89,74 @@ export async function provisionTokenForRequest(request: TokenRequest) {
     return existing;
   }
 
-  await updateTokenRequest(request.id, {
-    status: "approved_provisioning",
-    errorMessage: undefined,
-  });
+  const provisioningRequest = await transitionTokenRequestStatus(
+    request.id,
+    {
+      status: "approved_provisioning",
+      errorMessage: undefined,
+    },
+    ["approved", "approved_provision_failed"],
+  );
+  if (!provisioningRequest) {
+    const existingAfterRace = await getActiveTokenForUser(request.feishuUserId);
+    if (existingAfterRace) {
+      await updateTokenRequest(request.id, {
+        status: "provisioned",
+        tokenAccountId: existingAfterRace.id,
+        errorMessage: undefined,
+      });
+      await invalidateOtherFirstApplyRequestsAfterProvision(request);
+      return existingAfterRace;
+    }
+    throw new Error("申请单已在发放中或已处理");
+  }
 
+  let createdNewApiTokenId: string | undefined;
+  let accountSaved = false;
   try {
-    const finalMonthlyQuota = request.approvedMonthlyQuota ?? request.requestedMonthlyQuota;
+    const finalMonthlyQuota =
+      provisioningRequest.approvedMonthlyQuota ?? provisioningRequest.requestedMonthlyQuota;
     const token = await createNewApiToken({
-      name: `TI ${request.id.slice(0, 18)} ${request.feishuUserId.slice(0, 12)}`,
+      name: `TI ${provisioningRequest.id.slice(0, 18)} ${provisioningRequest.feishuUserId.slice(0, 12)}`,
       remainQuota: toNewApiQuota(finalMonthlyQuota),
     });
+    createdNewApiTokenId = token.newapiTokenId;
     if (!token.key) {
       throw new Error("NewAPI did not return a token key; cannot create proxy hash mapping");
     }
 
     const account = await addTokenAccount({
-      feishuUserId: request.feishuUserId,
-      tokenRequestId: request.id,
+      feishuUserId: provisioningRequest.feishuUserId,
+      tokenRequestId: provisioningRequest.id,
       newapiTokenId: token.newapiTokenId,
       keyHash: sha256Hex(token.key),
     });
+    accountSaved = true;
 
-    await updateTokenRequest(request.id, {
+    await updateTokenRequest(provisioningRequest.id, {
       status: "provisioned",
       tokenAccountId: account.id,
       errorMessage: undefined,
     });
-    await invalidateOtherFirstApplyRequestsAfterProvision(request);
+    await invalidateOtherFirstApplyRequestsAfterProvision(provisioningRequest);
     return account;
   } catch (err) {
-    await updateTokenRequest(request.id, {
+    if (createdNewApiTokenId && !accountSaved) {
+      await disableNewApiToken(createdNewApiTokenId).catch((disableErr) => {
+        console.error("Failed to disable orphaned NewAPI token", disableErr);
+      });
+    }
+    const existingAfterRace = await getActiveTokenForUser(request.feishuUserId);
+    if (existingAfterRace) {
+      await updateTokenRequest(request.id, {
+        status: "provisioned",
+        tokenAccountId: existingAfterRace.id,
+        errorMessage: undefined,
+      });
+      await invalidateOtherFirstApplyRequestsAfterProvision(request);
+      return existingAfterRace;
+    }
+    await updateTokenRequest(provisioningRequest.id, {
       status: "approved_provision_failed",
       errorMessage: err instanceof Error ? err.message : "NewAPI token provisioning failed",
     });
@@ -140,11 +186,14 @@ export async function resetActiveTokenForUser(user: FeishuUser, reason = "用户
     approvalMode: "manual",
   });
 
+  let createdNewApiTokenId: string | undefined;
+  let accountSaved = false;
   try {
     const token = await createNewApiToken({
       name: `TI reset ${resetRequest.id.slice(0, 14)} ${user.id.slice(0, 10)}`,
       remainQuota,
     });
+    createdNewApiTokenId = token.newapiTokenId;
     if (!token.key) {
       throw new Error("NewAPI did not return a reset token key");
     }
@@ -160,6 +209,7 @@ export async function resetActiveTokenForUser(user: FeishuUser, reason = "用户
     if (!account) {
       throw new Error("Active token account was changed before key reset completed");
     }
+    accountSaved = true;
 
     await disableNewApiToken(existing.newapiTokenId);
     const request = await updateTokenRequest(resetRequest.id, {
@@ -169,6 +219,11 @@ export async function resetActiveTokenForUser(user: FeishuUser, reason = "用户
     });
     return { request, account, key: token.key };
   } catch (err) {
+    if (createdNewApiTokenId && !accountSaved) {
+      await disableNewApiToken(createdNewApiTokenId).catch((disableErr) => {
+        console.error("Failed to disable orphaned reset NewAPI token", disableErr);
+      });
+    }
     await updateTokenRequest(resetRequest.id, {
       status: "approved_provision_failed",
       errorMessage: err instanceof Error ? err.message : "NewAPI key reset failed",

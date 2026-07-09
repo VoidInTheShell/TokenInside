@@ -340,3 +340,24 @@
 3. 用户明确要求该修复排在 log 同步之后；因此新增 E9-10，依赖 E9-9 NewAPI logs 同步、usage-sync 回填、流式 usage parser 和使用记录 UI 收口完成后再统一落地。
 4. 修复边界是“ID 做权限和过滤主键，名称只做展示字段”：部门管理员 scope、部门筛选请求参数和历史归属仍用稳定 `departmentId`，所有前端展示才按 `departmentName -> departmentId 脱敏` 兜底。
 5. 新 proxy log 应补写调用发生时的 `departmentName` 快照；旧日志缺名称时可从当前用户 `departmentName` 兜底展示，但不能为了显示名称改写历史部门归属。
+
+## 2026-07-09 C 阶段 PostgreSQL 收口发现
+
+1. C 阶段剩余核心缺口已从“是否使用 PostgreSQL”收敛为“关键写路径是否行级事务化”。本轮已在 PostgreSQL backend 下补齐行级 SQL 原语，不再让用户、申请、token、事件、proxy log 和 app settings 关键写入依赖 `writePostgresStore()` 整表删除重插。
+2. 审批卡片和旧审批事件入口现在都使用条件状态迁移：只有待审批状态能进入 `approved` / `rejected` / `cancelled`，重复点击或重复投递不会再次触发 NewAPI 发放。
+3. NewAPI 发放流程现在先抢占 `approved -> approved_provisioning`；抢占失败时不会创建 NewAPI token。若 NewAPI token 已创建但本地 token account 落库失败，会尝试禁用孤儿 token，并把申请保留为 `approved_provision_failed`，让管理端可追踪和重试。
+4. PostgreSQL backend 下 `proxy_request_logs` 改为增量行写入和按用户账期同步 `user_billing_periods`，避免每次 `/v1` 请求都触发整库快照重写。读侧管理统计仍保留快照读，作为后续性能优化边界。
+5. 月度重置在 PostgreSQL backend 下已从同进程锁升级为 session advisory lock；JSON backend 继续保留原同进程锁。这样未来多进程/多副本不会同时执行同一账期重置。
+6. 子 agent 首轮复查指出同类残留风险：`upsertManualAdminScope()`、`updateManualAdminScope()`、`syncDepartmentSupervisorAdminScope()`、`updateUserAccessStatus()`、`enableUserAccess()` 在 PostgreSQL backend 下仍会走 `mutate()`，触发 `writePostgresStore()` 全表 delete/reinsert，可能覆盖并发 proxy log、审批状态或账期行级写入。
+7. 已补齐上述残留：管理员范围写入、部门主管范围同步、用户禁用/删除、用户启用和 disabled token 查询均新增 PostgreSQL 行级事务分支；剩余 `mutate()` 调用仅作为 JSON backend 分支保留。
+8. 子 agent 第二轮复查指出另一个同类 High：PostgreSQL backend 下普通读路径 `readStore()` 仍可能因 `normalizeStore()` 自动修正旧数据而调用 `writePostgresStore()`，使读请求变成全表 delete/reinsert 写入。已改为 PostgreSQL 读路径只读 `readPostgresStore()`，并让 `writeStore()` 在 PostgreSQL backend 下直接抛错，防止未来漏接行级 helper 时静默全表覆盖。
+9. 子 agent 最终复查结论：普通业务路径已不再调用 `writePostgresStore()`，剩余 `mutate()` 均位于 JSON fallback 分支，审批/发放、管理员范围、用户禁用启用、usage-sync 和月度重置路径未再发现 blocker/high 一致性风险；剩余风险是缺少真实 PostgreSQL 并发压测和自动化并发测试覆盖。
+
+## 2026-07-09 E5R 用量同步生产化重评估
+
+1. E9-9/E9-11 已经前置完成 NewAPI `/api/log/self` 拉取、手动 usage-sync、proxy log 回填、流式 usage parser、账期汇总刷新和最近 50 条计费操作审计；E5 不应再按“从零补用量统计”执行。
+2. E5 重新命名为 E5R，目标收敛为 NewAPI 用量同步生产化、增量化、可审计化；本轮 E5R 只包含 1 到 5：独立同步持久化模型、checkpoint + overlap 增量同步、usage records 与 proxy logs 匹配回填、账期聚合 source record 化、管理端同步状态和问题追踪。
+3. E5R 需要新增 `newapi_usage_records`、`usage_sync_checkpoints`、`usage_sync_issues` 三类持久化结构，并同步更新迁移、`REQUIRED_POSTGRES_TABLES`、health schema readiness、导入导出和校验脚本。
+4. NewAPI usage records 是 tokens、quota、cost、NewAPI 模型和计费状态的权威；proxy logs 是 API格式、客户端/IP、路径、状态、耗时、错误摘要和请求生命周期的权威；`user_billing_periods` 只作为派生聚合快照。
+5. unknown token 和 no proxy match 不应只存在于接口返回或计费操作摘要中，必须写入可追踪的 `usage_sync_issues`，以便管理员后续排查和忽略/关闭。
+6. 用量同步周期配置与自动执行、active key `remain_quota` 校准写回已从 E5R 迁出到 F 阶段；F 阶段必须复用 E5R 的 source records、checkpoint、issues、PostgreSQL advisory lock 和计费审计口径，不新增独立认证入口。

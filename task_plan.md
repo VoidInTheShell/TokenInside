@@ -19,7 +19,7 @@
 | P1 | complete_e9_9_deployed | E9-9 token 统计与计费修复已本地落地并部署到 LA：新增 NewAPI `/api/log/self` 同步、`/api/admin/usage-sync` 全局管理员 dry-run/执行入口、`token_id -> token_accounts.newapiTokenId -> feishuUserId` 回填、`quota -> fromNewApiQuota()` 换算、`/v1` 流式 SSE usage parser，并为 OpenAI chat stream 自动补 `stream_options.include_usage=true`。LA 已回填 4 条 NewAPI 记录；2026-07-08 两条 stream 调用已从 0 更新为 265 tokens 与 22549 tokens，账期汇总已同步。2026-07-09 已追加部署 `voidintheshell/tokeninside:e9-9-usage-ui-20260709-1`，完成使用记录 provider 列移除、Tokens/费用对齐、两排筛选布局、用户管理上移、用户表分页和长表内部滚动。 |
 | P1 | complete_e9_11_local | E9-11 完整计费模块本地落地并经子 agent 设计复核：计费操作审计持久化到 `app_settings.billingOperations`，默认保留最近 50 条；NewAPI 用量同步、月度账期重置和默认额度变更均写入审计；计费写 API 收紧为全局管理员；月度重置补同进程账期锁、有效月份校验和 open_id 操作人字段；usage-sync 部分失败记录 `partial_failed` 与已完成 totals；后台系统设置页新增用量同步、月度重置和计费操作历史；使用记录费用列补 NewAPI/代理来源、quota 和同步追踪信息。 |
 | P1 | pending_e9_10_after_log_sync | E9-10 部门名称展示修复：必须排在 E9-9 NewAPI logs 同步、usage-sync 回填和使用记录 UI 收口之后。修复目标是保留 `departmentId` 作为权限/过滤主键，同时通过飞书部门详情接口补齐 `departmentName`，让前端用户卡片、管理端用户列表、部门统计、用量筛选和 usage records 优先显示部门名称而不是 `od-...` ID。 |
-| P2 | pending | 审批闭环完成后再继续管理员取消用户权限、部门归属历史快照、真实月度重置和更完整报表；这些任务保留在 E 阶段，但暂不抢占 P0 |
+| P2 | pending | E5R 完成后进入 F 阶段：用量同步周期配置/自动执行、active key `remain_quota` 校准写回、部门历史快照深化、详情抽屉深度追踪、真实月度重置和更完整报表；这些任务不抢占当前 P0/P1 |
 
 ## 阶段
 
@@ -65,9 +65,10 @@
 | A4 | complete | 实现根路径 `/v1/[...path]` NewAPI 透传代理、key hash 绑定校验和代理审计 |
 | A5 | complete | 完成依赖安装、类型检查、生产构建、依赖审计和本地页面/API 冒烟验证 |
 | B | in_progress | P0：服务器优先真实链路当前聚焦审批闭环与状态同步；`ti.kumiko-love.com` 当前调试入口仍以可访问公网链路为准，必须完成真实飞书卡片点击、事件审计、App 状态回写、NewAPI 发放/失败补偿和 `/v1` 复测后才能把 B3/B5 视为闭环 |
-| C | in_progress | PostgreSQL foundation 已落地并在生产机切换启用：新增 schema 迁移脚本、JSON 导入脚本、可选 Postgres store、健康检查和 2C2G 默认容器/连接池参数；后续仍需补齐行级事务状态机和备份/恢复运维 |
+| C | complete_local | PostgreSQL 生产化已本地补齐：schema 迁移、JSON 导入/校验、Postgres store、健康检查、2C2G compose/env、生产 PG 备份/恢复护栏均已落地；本轮新增关键写路径行级 SQL/事务状态机，覆盖用户 upsert、申请状态迁移、飞书事件幂等、active token 创建/替换、proxy log 增量写入、账期汇总同步、管理员范围写入、用户禁用/删除/启用和月度重置 PostgreSQL advisory lock。读侧管理统计仍保留快照读，后续仅按性能压力做查询下推。 |
 | D | pulled_forward | 部署运维工作前置并合入 B0；当前生产机使用统一 compose 管理 PG/app、Nginx Proxy Manager 内网反代 `tokeninside:16878`。2026-07-08 起发布路径升级为 GitHub Actions + 公司 GitLab CI 双 CI/CD 自动构建并推送 `ghcr.io/voidintheshell/tokeninside`；公司 GitLab 与 GitHub 公开库主分支均为 `main`，每次更新先推 `company/main`，公开发布只推 `public-export/*` 到 `github-public/main`；远端仍只执行 pull-only compose 更新，不做源码构建；Docker Hub/save-load 保留为历史回退路径 |
 | E | in_progress | P1/P2：已按最新口径前置补齐申请界面/用户后台分流、用户后台模型列表、管理员入口权限展示、`/admin` 入口壳、管理范围数据结构和只读概览 API；已继续补齐默认额度配置、审批单额度覆盖、管理端审批、基础用量统计、用户后台 key 头尾省略展示与点击查看复制、key 重置、用户侧额度重置申请、部门主管自动同步、管理端主动调额、基础账期同步汇总和默认关闭的月度账期重置执行入口；已补入管理员取消用户权限/禁用 active key 的计划任务、被取消资格触发条件和跨部门调动额度继承规则。E8 近期优先修复包已本地落地并部署到 LA：系统管理员兜底审批、系统管理员配置/命名/指派能力、用户后台剩余额度、UI 文案布局收口、`.env` 中文变量说明，以及 token/额度按 K/M/B/T 紧凑单位展示；E8-8 前端细节修复包已本地落地并部署到 LA，覆盖对齐、管理范围卡片和指标卡片口径。E9 管理后台重做首轮已本地落地并部署到 LA，覆盖用户管理、系统管理员部门统计、部门管理员范围内用户统计、用户/管理两侧使用记录、禁用/删除重新申请链路和 `/v1` 用户状态保护。E9-8 已本地落地并部署到 LA：用户后台和管理后台使用记录完整按 Aether 页面结构和表格维度实现，管理后台删除“总体活跃天数”“请求间隔时间线”，将“按提供商分析”改为“按部门分析”，并补代理请求生命周期、动态刷新、筛选、分页和聚合。 |
+| F | pending | 从 E5R 迁出的生产化增强阶段：用量同步周期配置/自动执行，以及 active key `remain_quota` 校准写回。F 阶段必须复用 E5R 的 source records、checkpoint、issues、PostgreSQL advisory lock 和计费审计口径，不新增独立认证入口。 |
 
 ## 当前落地状态
 
@@ -182,7 +183,8 @@
 21. E9-8：已本地落地并部署到 LA。用户后台和管理后台使用记录均按 Aether 结构重做：顶部可折叠“用量分析”；管理后台保留三列表格“按模型分析 / 按部门分析 / 按API格式分析”，删除“总体活跃天数”和“请求间隔时间线”；用户后台保留“按模型分析 / 按API格式分析”；下方使用记录表支持动态刷新、筛选、分页、列配置和状态展示，记录字段包含时间、用户/密钥、模型、提供商、API格式、类型、Tokens（输入/输出/缓存）、费用、首字/总耗时；请求生命周期可展示等待中、传输中/进行中、失败、用户手动取消等状态。LA 当前运行 `voidintheshell/tokeninside:e9-8-aether-usage-20260708-1445`。
 22. E9-9：已落地并部署到 LA。代码新增 `lib/newapi.ts` 的 `/api/log/self` 封装、`lib/usage-sync.ts` 同步编排、`POST /api/admin/usage-sync`、`backfillProxyLogsFromNewApiUsage()` 和 `/v1` SSE usage parser；`proxy_request_logs` 现在保留 `usageSource`、`newapiLogId`、`newapiRequestId`、`quota`、`providerChannelName` 和 `newapiUseTimeSeconds` 等追溯字段。LA 已执行一次受控同步，NewAPI 59 条日志中 4 条匹配 TokenInside 代理日志并写回，当前 `proxy_request_logs` 汇总为 `total_logs=7`、`logs_with_tokens=5`、`total_tokens=23106`、`cost=0.023066`，2026-07-08 两条 stream 调用分别回填为 265 和 22549 tokens。LA 当前镜像已更新为 `voidintheshell/tokeninside:e9-9-usage-ui-20260709-1`，公网 `/api/health` 正常；本次追加完成使用记录 provider 列移除、Tokens/费用右对齐、筛选区两排布局、用户管理卡片上移到管理员范围前、用户管理分页和长表内部滚动。
 23. E9-10：部门名称展示修复排在 log 同步之后执行。当前原因已收敛为飞书 `department_ids` 本身就是部门 ID；TokenInside 需要在登录/懒同步/日志写入/管理统计响应里补齐 `departmentName`，前端再按 `departmentName -> departmentId 脱敏` 兜底展示。权限和过滤仍使用稳定 `departmentId`，不能把部门名称作为权限主键。
-24. P2：E9 首轮、E9-8、E9-9 和 E9-10 之后，P2 仅保留更完整的部门历史快照、详情抽屉深度追踪、真实管理员会话下的 usage-sync 操作体验、定时/自动 NewAPI logs 同步策略和生产部署策略收口。
+24. E5R：基于当前代码重新评估后，E5 不再按“从零补用量统计”执行，改为 NewAPI 用量同步生产化：新增 `newapi_usage_records`、`usage_sync_checkpoints`、`usage_sync_issues`，补 checkpoint + overlap 增量同步、usage records 与 proxy logs 匹配回填、账期聚合 source record 化、管理端同步状态和问题追踪。自动同步周期配置和 active key `remain_quota` 校准写回迁入 F 阶段。
+25. P2/F：E9 首轮、E9-8、E9-9、E9-10 和 E5R 之后，F 阶段再处理用量同步周期配置/自动执行、active key `remain_quota` 校准写回，以及更完整的部门历史快照、详情抽屉深度追踪、真实月度重置和生产部署策略收口。
 
 ## 当前外部阻塞
 

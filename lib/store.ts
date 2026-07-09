@@ -3,7 +3,31 @@ import path from "node:path";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
 import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
-import { readPostgresStore, writePostgresStore } from "@/lib/postgres-store";
+import {
+  enablePostgresUserAccess,
+  findPostgresActiveTokenByHash,
+  getPostgresDisabledTokenForUser,
+  getPostgresActiveTokenForUser,
+  getPostgresAppSettings,
+  getPostgresFeishuEventByUuid,
+  insertPostgresProxyLog,
+  insertPostgresTokenAccount,
+  insertPostgresTokenRequest,
+  invalidatePostgresOpenFirstApplyRequests,
+  mutatePostgresAppSettings,
+  recordPostgresMonthlyResetApplied,
+  replacePostgresActiveTokenAccount,
+  readPostgresStore,
+  syncPostgresDepartmentSupervisorAdminScope,
+  transitionPostgresTokenRequest,
+  updatePostgresManualAdminScope,
+  updatePostgresProxyLog,
+  updatePostgresTokenRequest,
+  updatePostgresUserAccessStatus,
+  upsertPostgresFeishuEvent,
+  upsertPostgresFeishuUser,
+  upsertPostgresManualAdminScope,
+} from "@/lib/postgres-store";
 import type {
   AdminScope,
   BillingOperationKind,
@@ -48,14 +72,14 @@ const invalidatableFirstApplyStatuses = new Set<RequestStatus>([
   "approved_provision_failed",
 ]);
 
+function isPostgresBackend() {
+  return getConfig().storeBackend === "postgres";
+}
+
 async function readStore(): Promise<StoreShape> {
   const config = getConfig();
   if (config.storeBackend === "postgres") {
-    const store = await readPostgresStore();
-    if (normalizeStore(store)) {
-      await writePostgresStore(store);
-    }
-    return store;
+    return readPostgresStore();
   }
 
   const filePath = config.storePath;
@@ -312,8 +336,7 @@ function syncBillingPeriods(store: StoreShape) {
 async function writeStore(store: StoreShape) {
   const config = getConfig();
   if (config.storeBackend === "postgres") {
-    await writePostgresStore(store);
-    return;
+    throw new Error("PostgreSQL store writes must use row-level helpers, not writeStore()");
   }
 
   const filePath = config.storePath;
@@ -335,6 +358,7 @@ export async function getStoreSnapshot() {
 }
 
 export async function getAppSettings() {
+  if (isPostgresBackend()) return getPostgresAppSettings();
   const store = await readStore();
   return store.settings;
 }
@@ -368,6 +392,41 @@ export async function updateAppSettings(input: {
   defaultMonthlyQuota: number;
   updatedByFeishuUserId: string;
 }) {
+  if (isPostgresBackend()) {
+    return mutatePostgresAppSettings((settings) => {
+      const store = {
+        ...structuredClone(initialStore),
+        settings: {
+          ...initialStore.settings,
+          ...settings,
+        },
+      };
+      const previousDefaultMonthlyQuota = store.settings.defaultMonthlyQuota;
+      store.settings = {
+        ...store.settings,
+        defaultMonthlyQuota: input.defaultMonthlyQuota,
+        updatedAt: nowIso(),
+        updatedByFeishuUserId: input.updatedByFeishuUserId,
+      };
+      prependBillingOperation(store, {
+        kind: "settings_update",
+        status: "applied",
+        dryRun: false,
+        operatedByFeishuUserId: input.updatedByFeishuUserId,
+        input: {
+          previousDefaultMonthlyQuota,
+          defaultMonthlyQuota: input.defaultMonthlyQuota,
+        },
+        summary: {
+          previousDefaultMonthlyQuota,
+          defaultMonthlyQuota: input.defaultMonthlyQuota,
+        },
+      });
+      Object.assign(settings, store.settings);
+      return store.settings;
+    });
+  }
+
   return mutate((store) => {
     const previousDefaultMonthlyQuota = store.settings.defaultMonthlyQuota;
     store.settings = {
@@ -404,12 +463,31 @@ export async function recordBillingOperation(input: {
   summary: BillingOperationRecord["summary"];
   errorMessage?: string;
 }) {
+  if (isPostgresBackend()) {
+    return mutatePostgresAppSettings((settings) => {
+      const store = {
+        ...structuredClone(initialStore),
+        settings: {
+          ...initialStore.settings,
+          ...settings,
+        },
+      };
+      const record = prependBillingOperation(store, input);
+      Object.assign(settings, store.settings);
+      return record;
+    });
+  }
+
   return mutate((store) => {
     return prependBillingOperation(store, input);
   });
 }
 
 export async function listBillingOperations(limit = 20) {
+  if (isPostgresBackend()) {
+    const settings = await getPostgresAppSettings();
+    return (settings.billingOperations ?? []).slice(0, Math.max(limit, 0));
+  }
   const store = await readStore();
   return (store.settings.billingOperations ?? []).slice(0, Math.max(limit, 0));
 }
@@ -423,6 +501,14 @@ export async function upsertFeishuUser(input: {
   avatarUrl?: string;
   departmentId?: string;
 }) {
+  if (isPostgresBackend()) {
+    return upsertPostgresFeishuUser({
+      ...input,
+      id: randomId("fu"),
+      now: nowIso(),
+    });
+  }
+
   return mutate((store) => {
     const existing = store.users.find(
       (user) => user.tenantKey === input.tenantKey && user.openId === input.openId,
@@ -485,6 +571,32 @@ export async function createTokenRequest(input: {
   approvalOperatedAt?: string;
   status?: TokenRequest["status"];
 }) {
+  if (isPostgresBackend()) {
+    const now = nowIso();
+    const requestType = input.requestType ?? "first_apply";
+    const request: TokenRequest = {
+      id: randomId("tr"),
+      feishuUserId: input.feishuUserId,
+      requestType,
+      status: input.status ?? "pending_feishu_approval",
+      reason: input.reason,
+      requestedMonthlyQuota: input.requestedMonthlyQuota,
+      approvedMonthlyQuota: input.approvedMonthlyQuota,
+      approvalCode: input.approvalCode,
+      approvalUuid: randomId("approval"),
+      approvalDepartmentId: input.approvalDepartmentId,
+      approvalMode: input.approvalMode,
+      approvalTargetOpenId: input.approvalTargetOpenId,
+      approvalTargetSource: input.approvalTargetSource,
+      approvalActionNonceHash: input.approvalActionNonceHash,
+      approvalOperatorOpenId: input.approvalOperatorOpenId,
+      approvalOperatedAt: input.approvalOperatedAt,
+      createdAt: now,
+      updatedAt: now,
+    };
+    return insertPostgresTokenRequest(request);
+  }
+
   return mutate((store) => {
     const now = nowIso();
     const requestType = input.requestType ?? "first_apply";
@@ -526,9 +638,28 @@ export async function updateTokenRequest(
   id: string,
   patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
 ) {
+  if (isPostgresBackend()) return updatePostgresTokenRequest(id, patch);
+
   return mutate((store) => {
     const request = store.tokenRequests.find((item) => item.id === id);
     if (!request) return null;
+    Object.assign(request, patch, { updatedAt: nowIso() });
+    return request;
+  });
+}
+
+export async function transitionTokenRequestStatus(
+  id: string,
+  patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
+  allowedStatuses: RequestStatus[],
+) {
+  if (isPostgresBackend()) {
+    return transitionPostgresTokenRequest(id, patch, allowedStatuses);
+  }
+
+  return mutate((store) => {
+    const request = store.tokenRequests.find((item) => item.id === id);
+    if (!request || !allowedStatuses.includes(request.status)) return null;
     Object.assign(request, patch, { updatedAt: nowIso() });
     return request;
   });
@@ -540,6 +671,13 @@ export async function invalidateOtherOpenFirstApplyRequests(input: {
   approvalOperatorOpenId?: string;
   approvalOperatedAt?: string;
 }) {
+  if (isPostgresBackend()) {
+    return invalidatePostgresOpenFirstApplyRequests({
+      ...input,
+      statuses: [...invalidatableFirstApplyStatuses],
+    });
+  }
+
   return mutate((store) => {
     const now = nowIso();
     const invalidated: TokenRequest[] = [];
@@ -587,6 +725,8 @@ export async function listUserTokenRequests(feishuUserId: string) {
 }
 
 export async function getActiveTokenForUser(feishuUserId: string) {
+  if (isPostgresBackend()) return getPostgresActiveTokenForUser(feishuUserId);
+
   const store = await readStore();
   return (
     store.tokenAccounts.find(
@@ -596,6 +736,8 @@ export async function getActiveTokenForUser(feishuUserId: string) {
 }
 
 export async function getDisabledTokenForUser(feishuUserId: string) {
+  if (isPostgresBackend()) return getPostgresDisabledTokenForUser(feishuUserId);
+
   const store = await readStore();
   return (
     [...store.tokenAccounts]
@@ -626,6 +768,8 @@ export async function getUserBillingPeriod(feishuUserId: string, period: string)
 }
 
 export async function findActiveTokenByHash(keyHash: string) {
+  if (isPostgresBackend()) return findPostgresActiveTokenByHash(keyHash);
+
   const store = await readStore();
   return (
     store.tokenAccounts.find(
@@ -641,6 +785,21 @@ export async function addTokenAccount(input: {
   newapiTokenId?: string;
   billingPeriod?: string;
 }) {
+  if (isPostgresBackend()) {
+    const now = nowIso();
+    const account: TokenAccount = {
+      id: randomId("ta"),
+      feishuUserId: input.feishuUserId,
+      tokenRequestId: input.tokenRequestId,
+      keyHash: input.keyHash,
+      newapiTokenId: input.newapiTokenId,
+      status: "active",
+      billingPeriod: input.billingPeriod ?? now.slice(0, 7),
+      createdAt: now,
+    };
+    return insertPostgresTokenAccount(account);
+  }
+
   return mutate((store) => {
     const now = nowIso();
     const account: TokenAccount = {
@@ -666,6 +825,16 @@ export async function recordMonthlyResetApplied(input: {
   operatedByFeishuUserId: string;
   approvalOperatorOpenId: string;
 }) {
+  if (isPostgresBackend()) {
+    const now = nowIso();
+    return recordPostgresMonthlyResetApplied({
+      ...input,
+      now,
+      requestId: randomId("tr"),
+      approvalUuid: randomId("approval"),
+    });
+  }
+
   return mutate((store) => {
     const account = store.tokenAccounts.find(
       (item) =>
@@ -726,6 +895,24 @@ export async function replaceActiveTokenAccount(input: {
   newapiTokenId?: string;
   billingPeriod?: string;
 }) {
+  if (isPostgresBackend()) {
+    const now = nowIso();
+    const account: TokenAccount = {
+      id: randomId("ta"),
+      feishuUserId: input.feishuUserId,
+      tokenRequestId: input.tokenRequestId,
+      keyHash: input.keyHash,
+      newapiTokenId: input.newapiTokenId,
+      status: "active",
+      billingPeriod: input.billingPeriod ?? now.slice(0, 7),
+      createdAt: now,
+    };
+    return replacePostgresActiveTokenAccount({
+      oldTokenAccountId: input.oldTokenAccountId,
+      account,
+    });
+  }
+
   return mutate((store) => {
     const oldAccount = store.tokenAccounts.find(
       (account) =>
@@ -755,6 +942,8 @@ export async function replaceActiveTokenAccount(input: {
 }
 
 export async function addFeishuEvent(event: Omit<FeishuEvent, "id" | "createdAt">) {
+  if (isPostgresBackend()) return upsertPostgresFeishuEvent(event);
+
   return mutate((store) => {
     const existing = store.feishuEvents.find(
       (item) => item.eventUuid === event.eventUuid,
@@ -775,11 +964,31 @@ export async function addFeishuEvent(event: Omit<FeishuEvent, "id" | "createdAt"
 }
 
 export async function getFeishuEventByUuid(eventUuid: string) {
+  if (isPostgresBackend()) return getPostgresFeishuEventByUuid(eventUuid);
+
   const store = await readStore();
   return store.feishuEvents.find((event) => event.eventUuid === eventUuid) ?? null;
 }
 
 export async function addProxyLog(log: Omit<ProxyRequestLog, "id" | "createdAt">) {
+  if (isPostgresBackend()) {
+    const now = nowIso();
+    const stored: ProxyRequestLog = {
+      id: randomId("pl"),
+      createdAt: now,
+      updatedAt: now,
+      ...log,
+      status:
+        log.status ??
+        (log.statusCode === 499
+          ? "cancelled"
+          : log.statusCode >= 400
+            ? "failed"
+            : "completed"),
+    };
+    return insertPostgresProxyLog(stored);
+  }
+
   return mutate((store) => {
     const now = nowIso();
     const stored: ProxyRequestLog = {
@@ -804,6 +1013,20 @@ export async function beginProxyLog(
   log: Omit<ProxyRequestLog, "id" | "createdAt" | "statusCode" | "durationMs"> &
     Partial<Pick<ProxyRequestLog, "statusCode" | "durationMs">>,
 ) {
+  if (isPostgresBackend()) {
+    const now = nowIso();
+    const stored: ProxyRequestLog = {
+      id: randomId("pl"),
+      createdAt: now,
+      updatedAt: now,
+      statusCode: log.statusCode ?? 0,
+      durationMs: log.durationMs ?? 0,
+      ...log,
+      status: log.status ?? "pending",
+    };
+    return insertPostgresProxyLog(stored);
+  }
+
   return mutate((store) => {
     const now = nowIso();
     const stored: ProxyRequestLog = {
@@ -824,6 +1047,8 @@ export async function updateProxyLog(
   id: string,
   patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">>,
 ) {
+  if (isPostgresBackend()) return updatePostgresProxyLog(id, patch);
+
   return mutate((store) => {
     const log = store.proxyRequestLogs.find((item) => item.id === id);
     if (!log) return null;
@@ -993,7 +1218,14 @@ export async function backfillProxyLogsFromNewApiUsage(
   const dryRun = input.dryRun ?? true;
   const matchWindowMs = input.matchWindowMs ?? 30 * 60 * 1000;
 
-  return mutate((store) => {
+  const runBackfill = async (
+    store: StoreShape,
+    persistLog?: (
+      proxyLog: ProxyRequestLog,
+      patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">>,
+      syncedAt: string,
+    ) => Promise<void>,
+  ) => {
     const syncedAt = nowIso();
     const accountByNewApiTokenId = new Map(
       store.tokenAccounts
@@ -1053,10 +1285,14 @@ export async function backfillProxyLogsFromNewApiUsage(
       if (changed) {
         result.updated += 1;
         if (!dryRun) {
-          Object.assign(proxyLog, patch, {
-            usageSyncedAt: syncedAt,
-            updatedAt: syncedAt,
-          });
+          if (persistLog) {
+            await persistLog(proxyLog, patch, syncedAt);
+          } else {
+            Object.assign(proxyLog, patch, {
+              usageSyncedAt: syncedAt,
+              updatedAt: syncedAt,
+            });
+          }
         }
       }
       result.items.push({
@@ -1070,11 +1306,24 @@ export async function backfillProxyLogsFromNewApiUsage(
       });
     }
 
-    if (!dryRun && result.updated > 0) {
+    if (!dryRun && result.updated > 0 && !persistLog) {
       syncBillingPeriods(store);
     }
     return result;
-  });
+  };
+
+  if (isPostgresBackend()) {
+    const store = await readPostgresStore();
+    return runBackfill(store, async (proxyLog, patch, syncedAt) => {
+      const updated = await updatePostgresProxyLog(proxyLog.id, {
+        ...patch,
+        usageSyncedAt: syncedAt,
+      });
+      if (updated) Object.assign(proxyLog, updated);
+    });
+  }
+
+  return mutate((store) => runBackfill(store));
 }
 
 export async function getAdminScopeForUser(feishuUserId: string) {
@@ -1155,6 +1404,8 @@ export async function upsertManualAdminScope(input: {
   scopeType: AdminScope["scopeType"];
   departmentId?: string;
 }) {
+  if (isPostgresBackend()) return upsertPostgresManualAdminScope(input);
+
   return mutate((store) => {
     const targetUser = store.users.find((user) => user.openId === input.targetOpenId);
     if (!targetUser) {
@@ -1200,6 +1451,8 @@ export async function updateManualAdminScope(input: {
   status?: AdminScope["status"];
   departmentId?: string;
 }) {
+  if (isPostgresBackend()) return updatePostgresManualAdminScope(input);
+
   return mutate((store) => {
     const scope = store.adminScopes.find((item) => item.id === input.scopeId);
     if (!scope || scope.source === "environment") return null;
@@ -1222,6 +1475,8 @@ export async function syncDepartmentSupervisorAdminScope(input: {
   departmentId: string;
   isSupervisor: boolean;
 }) {
+  if (isPostgresBackend()) return syncPostgresDepartmentSupervisorAdminScope(input);
+
   return mutate((store) => {
     const now = nowIso();
     const existing = store.adminScopes.find(
@@ -1366,6 +1621,8 @@ export async function updateUserAccessStatus(input: {
   reason?: string;
   tokenStatus: Extract<TokenStatus, "disabled" | "revoked">;
 }) {
+  if (isPostgresBackend()) return updatePostgresUserAccessStatus(input);
+
   return mutate((store) => {
     const now = nowIso();
     const user = store.users.find((item) => item.id === input.feishuUserId);
@@ -1400,6 +1657,8 @@ export async function enableUserAccess(input: {
   feishuUserId: string;
   reason?: string;
 }) {
+  if (isPostgresBackend()) return enablePostgresUserAccess(input);
+
   return mutate((store) => {
     const now = nowIso();
     const user = store.users.find((item) => item.id === input.feishuUserId);
