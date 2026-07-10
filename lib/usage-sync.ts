@@ -1,4 +1,5 @@
 import { listNewApiUsageLogs } from "@/lib/newapi";
+import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
 import { getConfig } from "@/lib/config";
 import { nowIso } from "@/lib/crypto";
 import { withPostgresAdvisoryLock } from "@/lib/postgres-store";
@@ -51,6 +52,13 @@ let jsonUsageSyncRunning = false;
 let schedulerStarted = false;
 let schedulerTimer: ReturnType<typeof setTimeout> | undefined;
 
+const immediateSettlementDefaults = {
+  maxAttempts: 6,
+  retryDelayMs: 750,
+  pageSize: 20,
+  matchWindowMs: 10 * 60 * 1000,
+};
+
 function addMinutes(value: string, minutes: number) {
   return new Date(new Date(value).getTime() + minutes * 60 * 1000).toISOString();
 }
@@ -73,6 +81,120 @@ async function withUsageSyncLock<T>(dryRun: boolean, fn: () => Promise<T>) {
   } finally {
     jsonUsageSyncRunning = false;
   }
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function usageLogIdentity(log: NormalizedNewApiUsageLog) {
+  return [
+    log.newapiLogId,
+    log.newapiRequestId,
+    log.newapiTokenId,
+    log.createdAt,
+    log.model,
+    log.quota,
+  ]
+    .filter((value) => value !== undefined && value !== null && String(value).length > 0)
+    .join(":");
+}
+
+function uniqueUsageLogs(logs: NormalizedNewApiUsageLog[]) {
+  const seen = new Set<string>();
+  return logs.filter((log) => {
+    const identity = usageLogIdentity(log);
+    if (!identity) return true;
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+}
+
+async function listUsageLogsForRequestId(requestId: string, pageSize: number) {
+  const byRequestId = await listNewApiUsageLogs({
+    requestId,
+    size: pageSize,
+  });
+  const byUpstreamRequestId = await listNewApiUsageLogs({
+    upstreamRequestId: requestId,
+    size: pageSize,
+  });
+
+  return uniqueUsageLogs([...byRequestId.items, ...byUpstreamRequestId.items]);
+}
+
+export type NewApiProxyUsageSettlementResult = {
+  attempted: boolean;
+  newapiRequestId?: string;
+  attempts: number;
+  found: number;
+  reason?: "missing_request_id" | "not_found";
+  backfill?: NewApiUsageBackfillResult;
+};
+
+export async function syncNewApiUsageForProxyRequest(input: {
+  newapiRequestId?: string;
+  maxAttempts?: number;
+  retryDelayMs?: number;
+  pageSize?: number;
+  matchWindowMs?: number;
+}): Promise<NewApiProxyUsageSettlementResult> {
+  const newapiRequestId = input.newapiRequestId?.trim();
+  if (!newapiRequestId) {
+    return {
+      attempted: false,
+      attempts: 0,
+      found: 0,
+      reason: "missing_request_id",
+    };
+  }
+
+  const maxAttempts = Math.min(
+    Math.max(Math.trunc(input.maxAttempts ?? immediateSettlementDefaults.maxAttempts), 1),
+    20,
+  );
+  const retryDelayMs = Math.min(
+    Math.max(Math.trunc(input.retryDelayMs ?? immediateSettlementDefaults.retryDelayMs), 0),
+    10_000,
+  );
+  const pageSize = Math.min(
+    Math.max(Math.trunc(input.pageSize ?? immediateSettlementDefaults.pageSize), 1),
+    100,
+  );
+  const matchWindowMs = Math.min(
+    Math.max(Math.trunc(input.matchWindowMs ?? immediateSettlementDefaults.matchWindowMs), 1_000),
+    24 * 60 * 60 * 1000,
+  );
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (attempt > 1 && retryDelayMs > 0) {
+      await sleep(retryDelayMs);
+    }
+
+    const usageLogs = await listUsageLogsForRequestId(newapiRequestId, pageSize);
+    if (!usageLogs.length) continue;
+
+    const backfill = await backfillProxyLogsFromNewApiUsage(usageLogs, {
+      dryRun: false,
+      matchWindowMs,
+    });
+    return {
+      attempted: true,
+      newapiRequestId,
+      attempts: attempt,
+      found: usageLogs.length,
+      backfill,
+    };
+  }
+
+  return {
+    attempted: true,
+    newapiRequestId,
+    attempts: maxAttempts,
+    found: 0,
+    reason: "not_found",
+  };
 }
 
 export async function syncNewApiUsageLogs(input: {

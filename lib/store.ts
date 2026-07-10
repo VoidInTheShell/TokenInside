@@ -56,7 +56,7 @@ import type {
 
 export function defaultUsageSyncPolicy(): UsageSyncPolicy {
   return {
-    enabled: false,
+    enabled: true,
     intervalMinutes: 60,
     pageSize: 100,
     maxPagesPerRun: 3,
@@ -190,10 +190,12 @@ async function readStore(): Promise<StoreShape> {
 
 function normalizeUsageSyncPolicy(policy?: Partial<UsageSyncPolicy>): UsageSyncPolicy {
   const defaults = defaultUsageSyncPolicy();
+  const legacyImplicitDisabled =
+    policy?.enabled === false && !policy.updatedAt && !policy.updatedByFeishuUserId;
   return {
     ...defaults,
     ...policy,
-    enabled: policy?.enabled ?? defaults.enabled,
+    enabled: legacyImplicitDisabled ? true : policy?.enabled ?? defaults.enabled,
     intervalMinutes: Math.min(Math.max(Math.trunc(policy?.intervalMinutes ?? defaults.intervalMinutes), 1), 24 * 60),
     pageSize: Math.min(Math.max(Math.trunc(policy?.pageSize ?? defaults.pageSize), 1), 100),
     maxPagesPerRun: Math.min(Math.max(Math.trunc(policy?.maxPagesPerRun ?? defaults.maxPagesPerRun), 1), 20),
@@ -313,6 +315,7 @@ function finiteUsageAmount(value?: number) {
 }
 
 function proxyLogQuotaConsumed(log: ProxyRequestLog) {
+  if (log.usageSource !== "newapi_log") return 0;
   return finiteUsageAmount(log.cost ?? log.quota);
 }
 
@@ -2530,8 +2533,8 @@ function mapUsageRecord(log: ProxyRequestLog, usersById: Map<string, FeishuUser>
     totalTokens: log.totalTokens,
     cacheReadTokens: log.cacheReadTokens,
     cacheCreationTokens: log.cacheCreationTokens,
-    quota: log.quota,
-    cost: log.cost,
+    quota: log.usageSource === "newapi_log" ? log.quota : undefined,
+    cost: log.usageSource === "newapi_log" ? log.cost : undefined,
     actualCost: log.actualCost,
     usageSource: log.usageSource,
     usageSyncedAt: log.usageSyncedAt,
@@ -2610,7 +2613,7 @@ function aggregateUsage(
     row.totalTokens += log.totalTokens ?? 0;
     row.cacheReadTokens += log.cacheReadTokens ?? 0;
     row.cacheCreationTokens += log.cacheCreationTokens ?? 0;
-    row.cost += log.cost ?? 0;
+    row.cost += log.usageSource === "newapi_log" ? log.cost ?? 0 : 0;
     row.actualCost += log.actualCost ?? 0;
     if (logDisplayStatus(log) === "completed") row.successCount += 1;
     if (log.durationMs > 0) {

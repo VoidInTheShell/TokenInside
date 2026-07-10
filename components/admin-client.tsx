@@ -588,7 +588,7 @@ export function AdminClient() {
     matchWindowMinutes: "30",
   } satisfies UsageSyncDraft);
   const [usageSyncPolicyDraft, setUsageSyncPolicyDraft] = useState<UsageSyncPolicyDraft>({
-    enabled: false,
+    enabled: true,
     intervalMinutes: "60",
     pageSize: "100",
     maxPagesPerRun: "3",

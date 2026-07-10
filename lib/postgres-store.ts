@@ -108,6 +108,7 @@ function finiteUsageAmount(value?: number) {
 }
 
 function proxyLogQuotaConsumed(log: ProxyRequestLog) {
+  if (log.usageSource !== "newapi_log") return 0;
   return finiteUsageAmount(log.cost ?? log.quota);
 }
 

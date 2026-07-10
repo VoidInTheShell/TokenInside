@@ -1,6 +1,7 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { buildNewApiProxyUrl } from "@/lib/newapi";
 import { sha256Hex } from "@/lib/crypto";
+import { syncNewApiUsageForProxyRequest } from "@/lib/usage-sync";
 import {
   addProxyLog,
   beginProxyLog,
@@ -295,6 +296,18 @@ function newApiRequestIdPatch(newapiRequestId?: string) {
   return newapiRequestId ? { newapiRequestId } : {};
 }
 
+async function settleNewApiUsageNow(newapiRequestId?: string) {
+  if (!newapiRequestId) return;
+  await syncNewApiUsageForProxyRequest({ newapiRequestId }).catch(() => undefined);
+}
+
+function settleNewApiUsageAfterResponse(newapiRequestId?: string) {
+  if (!newapiRequestId) return;
+  after(async () => {
+    await syncNewApiUsageForProxyRequest({ newapiRequestId }).catch(() => undefined);
+  });
+}
+
 function sanitizedErrorMessage(err: unknown) {
   if (err instanceof Error && err.message.trim()) return err.message.slice(0, 500);
   return "Upstream request failed";
@@ -336,6 +349,7 @@ function streamWithProxyLog(input: {
           errorMessage: sanitizedErrorMessage(err),
           responseTimeUpdatedAt: new Date().toISOString(),
         });
+        void settleNewApiUsageNow(input.newapiRequestId);
         controller.error(err);
       }
     },
@@ -350,6 +364,7 @@ function streamWithProxyLog(input: {
           errorMessage: "Client cancelled the request",
           responseTimeUpdatedAt: new Date().toISOString(),
         });
+        await settleNewApiUsageNow(input.newapiRequestId);
       }
     },
   });
@@ -386,6 +401,7 @@ async function recordFinishedProxyLog(input: {
     errorMessage:
       input.upstream.status >= 400 ? extractErrorMessage(input.responseJson) : undefined,
   });
+  settleNewApiUsageAfterResponse(newapiRequestId);
 }
 
 async function recordFailedProxyLog(input: {
@@ -532,6 +548,7 @@ async function proxy(request: Request, context: RouteContext) {
         ...newApiRequestIdPatch(newapiRequestId),
         responseTimeUpdatedAt: new Date().toISOString(),
       });
+      settleNewApiUsageAfterResponse(newapiRequestId);
       return new Response(
         streamWithProxyLog({
           body: upstream.body,
