@@ -1686,68 +1686,72 @@ export function AdminClient() {
                                 <td>{formatTokenAmount(user.billingTotalTokens, "0")}</td>
                                 <td>{user.latestProxyLogAt ? formatDateTime(user.latestProxyLogAt) : "-"}</td>
                                 <td>
-                                  <div className="toolbar toolbar-left">
-                                    <div className="quota-control">
-                                      <Input
-                                        min={1}
-                                        step={1}
-                                        type="number"
-                                        value={quotaDrafts[user.id] ?? ""}
-                                        placeholder="额度"
-                                        onChange={(event) =>
-                                          setQuotaDrafts((current) => ({
-                                            ...current,
-                                            [user.id]: event.target.value,
-                                          }))
-                                        }
-                                        disabled={busy || user.activeTokenStatus !== "active"}
-                                      />
-                                      <Button
-                                        variant="outline"
-                                        size="sm"
-                                        disabled={busy || user.activeTokenStatus !== "active"}
-                                        onClick={() => void adjustUserQuota(user.id)}
-                                      >
-                                        调额
+                                  <div className="user-management-actions">
+                                    <div className="user-management-action-primary">
+                                      <div className="quota-control">
+                                        <Input
+                                          min={1}
+                                          step={1}
+                                          type="number"
+                                          value={quotaDrafts[user.id] ?? ""}
+                                          placeholder="额度"
+                                          onChange={(event) =>
+                                            setQuotaDrafts((current) => ({
+                                              ...current,
+                                              [user.id]: event.target.value,
+                                            }))
+                                          }
+                                          disabled={busy || user.activeTokenStatus !== "active"}
+                                        />
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          disabled={busy || user.activeTokenStatus !== "active"}
+                                          onClick={() => void adjustUserQuota(user.id)}
+                                        >
+                                          调额
+                                        </Button>
+                                      </div>
+                                      {isSystemAdmin && (
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          disabled={busy}
+                                          onClick={() => {
+                                            setAdminTargetOpenId(user.openId);
+                                            setAdminDepartmentId(user.departmentId ?? "");
+                                          }}
+                                        >
+                                          <UserCogIcon data-icon="inline-start" />
+                                          指派
+                                        </Button>
+                                      )}
+                                    </div>
+                                    <div className="user-management-status-actions">
+                                      {user.status === "disabled" ? (
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          disabled={busy || user.activeTokenStatus !== "disabled"}
+                                          onClick={() => void enableUser(user)}
+                                        >
+                                          启用
+                                        </Button>
+                                      ) : (
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          disabled={busy || user.status !== "active" || user.activeTokenStatus !== "active"}
+                                          onClick={() => void disableUser(user)}
+                                        >
+                                          禁用
+                                        </Button>
+                                      )}
+                                      <Button variant="outline" size="sm" disabled={busy} onClick={() => void deleteUser(user)}>
+                                        <Trash2Icon data-icon="inline-start" />
+                                        删除
                                       </Button>
                                     </div>
-                                    {isSystemAdmin && (
-                                      <Button
-                                        variant="outline"
-                                        size="sm"
-                                        disabled={busy}
-                                        onClick={() => {
-                                          setAdminTargetOpenId(user.openId);
-                                          setAdminDepartmentId(user.departmentId ?? "");
-                                        }}
-                                      >
-                                        <UserCogIcon data-icon="inline-start" />
-                                        指派
-                                      </Button>
-                                    )}
-                                    {user.status === "disabled" ? (
-                                      <Button
-                                        variant="outline"
-                                        size="sm"
-                                        disabled={busy || user.activeTokenStatus !== "disabled"}
-                                        onClick={() => void enableUser(user)}
-                                      >
-                                        启用
-                                      </Button>
-                                    ) : (
-                                      <Button
-                                        variant="outline"
-                                        size="sm"
-                                        disabled={busy || user.status !== "active" || user.activeTokenStatus !== "active"}
-                                        onClick={() => void disableUser(user)}
-                                      >
-                                        禁用
-                                      </Button>
-                                    )}
-                                    <Button variant="outline" size="sm" disabled={busy} onClick={() => void deleteUser(user)}>
-                                      <Trash2Icon data-icon="inline-start" />
-                                      删除
-                                    </Button>
                                   </div>
                                 </td>
                               </tr>
@@ -2018,7 +2022,7 @@ export function AdminClient() {
                 </CardHeader>
                 {usageStatsExpanded && (
                   <CardContent>
-                    <div className="usage-analysis-grid">
+                    <div className="usage-analysis-grid usage-analysis-grid-admin">
                       <UsageAnalysisTable
                         title="按模型分析"
                         emptyText="暂无模型统计数据"
@@ -2026,16 +2030,17 @@ export function AdminClient() {
                         terminalColumn="efficiency"
                       />
                       <UsageAnalysisTable
-                        title="按部门分析"
-                        emptyText="暂无部门统计数据"
-                        rows={usageDepartmentStats}
-                        terminalColumn="successRate"
-                      />
-                      <UsageAnalysisTable
                         title="按API格式分析"
                         emptyText="暂无API格式统计数据"
                         rows={usageApiFormatStats}
                         terminalColumn="avgDuration"
+                      />
+                      <UsageAnalysisTable
+                        className="usage-analysis-card-department"
+                        title="按部门分析"
+                        emptyText="暂无部门统计数据"
+                        rows={usageDepartmentStats}
+                        terminalColumn="successRate"
                       />
                     </div>
                   </CardContent>

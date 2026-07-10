@@ -624,6 +624,30 @@ a {
   min-width: 96px;
 }
 
+.user-management-actions {
+  min-width: 280px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.user-management-action-primary,
+.user-management-status-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+
+.user-management-action-primary .quota-control {
+  flex: 1 1 auto;
+}
+
+.user-management-actions .quota-control .input {
+  height: 32px;
+}
+
 .settings-section {
   display: grid;
   gap: 12px;
@@ -827,12 +851,16 @@ a {
 
 .usage-analysis-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
 }
 
 .usage-analysis-grid-user {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.usage-analysis-card-department {
+  grid-column: 1 / -1;
 }
 
 .usage-analysis-card .card-header,
@@ -849,6 +877,7 @@ a {
 }
 
 .usage-analysis-table {
+  min-width: 680px;
   font-size: 12px;
   table-layout: fixed;
 }
@@ -886,8 +915,20 @@ a {
 }
 
 .usage-analysis-table .usage-tokens-compact {
-  width: 108px;
+  width: 100%;
+  min-width: 112px;
+  max-width: 128px;
   margin-left: auto;
+}
+
+.usage-analysis-table td:first-child strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.usage-token-labels {
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .usage-th-stack {
@@ -926,6 +967,18 @@ a {
 
 .usage-records-secondary-row {
   grid-template-columns: repeat(4, minmax(120px, 1fr)) minmax(430px, auto);
+}
+
+.usage-records-controls-user .usage-records-primary-row {
+  grid-template-columns: minmax(96px, 0.65fr) minmax(160px, 1.4fr) repeat(3, minmax(96px, 1fr));
+}
+
+.usage-records-controls-user .usage-records-secondary-row {
+  grid-template-columns: minmax(140px, 1fr) minmax(500px, auto);
+}
+
+.usage-records-controls-user .usage-records-actions {
+  flex-wrap: nowrap;
 }
 
 .usage-records-actions {
@@ -1374,8 +1427,17 @@ a {
     grid-template-columns: 1fr;
   }
 
+  .usage-records-controls-user .usage-records-primary-row,
+  .usage-records-controls-user .usage-records-secondary-row {
+    grid-template-columns: 1fr;
+  }
+
   .usage-records-actions {
     justify-content: flex-start;
+  }
+
+  .usage-records-controls-user .usage-records-actions {
+    flex-wrap: wrap;
   }
 
   .usage-filter,

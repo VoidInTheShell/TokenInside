@@ -1,7 +1,7 @@
 "use client";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { formatQuotaAmount, formatTokenAmount } from "@/lib/utils";
+import { cn, formatQuotaAmount, formatTokenAmount } from "@/lib/utils";
 
 export type UsageAggregateRow = {
   id: string;
@@ -25,6 +25,7 @@ type UsageAnalysisTableProps = {
   emptyText: string;
   rows: UsageAggregateRow[];
   terminalColumn?: "successRate" | "avgDuration" | "efficiency";
+  className?: string;
 };
 
 function formatQuota(value?: number) {
@@ -49,7 +50,7 @@ function terminalValue(row: UsageAggregateRow, terminalColumn: UsageAnalysisTabl
     case "avgDuration":
       return formatDuration(row.avgDurationMs);
     case "efficiency":
-      return row.totalTokens > 0 ? `${formatQuota(row.costPerMillionTokens)}/M tok` : "-";
+      return row.totalTokens > 0 ? `${formatQuota(row.costPerMillionTokens)}/M` : "-";
     default:
       return formatDuration(row.avgDurationMs);
   }
@@ -71,9 +72,10 @@ export function UsageAnalysisTable({
   emptyText,
   rows,
   terminalColumn = "avgDuration",
+  className,
 }: UsageAnalysisTableProps) {
   return (
-    <Card className="usage-analysis-card">
+    <Card className={cn("usage-analysis-card", className)}>
       <CardHeader>
         <CardTitle>{title}</CardTitle>
       </CardHeader>
@@ -93,9 +95,17 @@ export function UsageAnalysisTable({
                 <th>{title.replace(/^按/, "").replace(/分析$/, "")}</th>
                 <th>请求数</th>
                 <th>
-                  <div className="usage-th-stack">
-                    <span>输入/输出</span>
-                    <span>缓存</span>
+                  <div className="usage-tokens usage-tokens-compact usage-token-labels">
+                    <div>
+                      <span>输入</span>
+                      <span>/</span>
+                      <span>输出</span>
+                    </div>
+                    <div>
+                      <span>缓存读</span>
+                      <span>/</span>
+                      <span>缓存写</span>
+                    </div>
                   </div>
                 </th>
                 <th>额度消耗</th>

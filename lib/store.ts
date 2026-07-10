@@ -5,6 +5,7 @@ import { nowIso, randomId } from "@/lib/crypto";
 import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
 import { sameNewApiUsageSource } from "@/lib/newapi-usage-identity";
 import { findProxyLogForNewApiUsage } from "@/lib/usage-matching";
+import { isUsageRecordRequest } from "@/lib/usage-record-visibility";
 import {
   enablePostgresUserAccess,
   findPostgresActiveTokenByHash,
@@ -2650,9 +2651,9 @@ export async function listAdminUsageRecords(input: UsageRecordFilters & {
 }) {
   const store = await readStore();
   const usersById = new Map(store.users.map((user) => [user.id, user]));
-  const scopedLogs = store.proxyRequestLogs.filter((log) =>
-    proxyLogInScope(log, input.scope, usersById),
-  );
+  const scopedLogs = store.proxyRequestLogs
+    .filter((log) => proxyLogInScope(log, input.scope, usersById))
+    .filter(isUsageRecordRequest);
   const dateScopedLogs = scopedLogs.filter((log) => matchesDateRange(log, input));
   const filteredLogs = filterUsageLogs(scopedLogs, usersById, input).sort((a, b) =>
     b.createdAt.localeCompare(a.createdAt),
@@ -2728,6 +2729,7 @@ export async function listUserUsageRecords(feishuUserId: string, limit = 100) {
   const bounded = boundedLimit(limit, 100);
   return store.proxyRequestLogs
     .filter((log) => log.feishuUserId === feishuUserId)
+    .filter(isUsageRecordRequest)
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
     .slice(0, bounded)
     .map((log) => mapUsageRecord(log, usersById));
@@ -2738,7 +2740,9 @@ export async function listUserUsageReport(input: UsageRecordFilters & {
 }) {
   const store = await readStore();
   const usersById = new Map(store.users.map((user) => [user.id, user]));
-  const scopedLogs = store.proxyRequestLogs.filter((log) => log.feishuUserId === input.feishuUserId);
+  const scopedLogs = store.proxyRequestLogs
+    .filter((log) => log.feishuUserId === input.feishuUserId)
+    .filter(isUsageRecordRequest);
   const dateScopedLogs = scopedLogs.filter((log) => matchesDateRange(log, input));
   const filteredLogs = filterUsageLogs(scopedLogs, usersById, input).sort((a, b) =>
     b.createdAt.localeCompare(a.createdAt),

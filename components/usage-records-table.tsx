@@ -6,7 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PageSelector } from "@/components/page-selector";
-import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
+import { cn, formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
 import { calculateOutputTokensPerSecond } from "@/lib/usage-rate";
 
 export type UsageRequestStatus =
@@ -395,10 +395,36 @@ export function UsageRecordsTable({
     onFiltersChange({ ...filters, [key]: value });
   };
 
+  const isUserOnlyView = !showUser && !showDepartment;
+  const modelFilter = usageSelect(
+    "模型",
+    filters?.model ?? "__all__",
+    [{ value: "__all__", label: "全部模型" }, ...availableModels.map((model) => ({
+      value: model,
+      label: model,
+    }))],
+    (value) => updateFilter("model", value),
+  );
+  const apiFormatFilter = usageSelect(
+    "格式",
+    filters?.apiFormat ?? "__all__",
+    [{ value: "__all__", label: "全部格式" }, ...availableApiFormats.map((format) => ({
+      value: format,
+      label: formatApiFormat(format),
+    }))],
+    (value) => updateFilter("apiFormat", value),
+  );
+  const statusFilter = usageSelect(
+    "状态",
+    filters?.status ?? "__all__",
+    STATUS_OPTIONS,
+    (value) => updateFilter("status", value),
+  );
+
   return (
     <div className="usage-records">
       {showControls && filters && (
-        <div className="usage-records-controls">
+        <div className={cn("usage-records-controls", isUserOnlyView && "usage-records-controls-user")}>
           <div className="usage-records-control-row usage-records-primary-row">
             {usageSelect("时间", filters.preset, PRESET_OPTIONS, (value) => updateFilter("preset", value))}
             <label className="usage-filter usage-search-filter">
@@ -432,27 +458,14 @@ export function UsageRecordsTable({
                 }))],
                 (value) => updateFilter("departmentId", value),
               )}
+            {isUserOnlyView && modelFilter}
+            {isUserOnlyView && apiFormatFilter}
+            {isUserOnlyView && statusFilter}
           </div>
           <div className="usage-records-control-row usage-records-secondary-row">
-            {usageSelect(
-              "模型",
-              filters.model,
-              [{ value: "__all__", label: "全部模型" }, ...availableModels.map((model) => ({
-                value: model,
-                label: model,
-              }))],
-              (value) => updateFilter("model", value),
-            )}
-            {usageSelect(
-              "格式",
-              filters.apiFormat,
-              [{ value: "__all__", label: "全部格式" }, ...availableApiFormats.map((format) => ({
-                value: format,
-                label: formatApiFormat(format),
-              }))],
-              (value) => updateFilter("apiFormat", value),
-            )}
-            {usageSelect("状态", filters.status, STATUS_OPTIONS, (value) => updateFilter("status", value))}
+            {!isUserOnlyView && modelFilter}
+            {!isUserOnlyView && apiFormatFilter}
+            {!isUserOnlyView && statusFilter}
             {usageSelect(
               "客户端 UA",
               filters.userAgent,
