@@ -136,19 +136,20 @@ type QuickApprovalRequest = {
   createdAt: string;
 };
 
-type AdminOverviewResponse = {
-  authenticated: boolean;
-  authorized: boolean;
+type AdminTokenRequestsResponse = {
+  requests: QuickApprovalRequest[];
+  total?: number;
+  limit?: number;
+  offset?: number;
   error?: string;
-  overview?: {
-    latestRequests: QuickApprovalRequest[];
-  };
 };
 
 type WorkspacePanel = "account" | "usage" | "models" | "requests";
 
 const DEFAULT_REASON_PLACEHOLDER = "请说明使用场景、接入工具和预计调用方式。";
 const FALLBACK_MONTHLY_QUOTA = 200;
+const RECENT_APPROVAL_WINDOW_MS = 24 * 60 * 60 * 1000;
+const RECENT_APPROVAL_LIMIT = 500;
 
 const statusLabel: Record<string, string> = {
   pending_card_send: "发送审批卡片中",
@@ -208,6 +209,10 @@ function canDecideRequest(status: string) {
   ].includes(status);
 }
 
+function canEditQuota(status: string) {
+  return ["pending_card_send", "pending_card_approval", "approval_card_send_failed"].includes(status);
+}
+
 function appendUsageParam(params: URLSearchParams, key: string, value?: string) {
   if (!value || value === "__all__") return;
   params.set(key, value);
@@ -244,7 +249,8 @@ export function ExperienceClient() {
     apiFormats: [],
     userAgents: [],
   });
-  const [quickApproval, setQuickApproval] = useState<QuickApprovalRequest | null>(null);
+  const [quickApprovals, setQuickApprovals] = useState<QuickApprovalRequest[]>([]);
+  const [quickApprovalTotal, setQuickApprovalTotal] = useState(0);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [modelsLoading, setModelsLoading] = useState(false);
@@ -255,7 +261,7 @@ export function ExperienceClient() {
   const [key, setKey] = useState<string | null>(null);
   const [reason, setReason] = useState("");
   const [quotaResetReason, setQuotaResetReason] = useState("");
-  const [quickApprovalQuotaDraft, setQuickApprovalQuotaDraft] = useState("");
+  const [quickApprovalQuotaDrafts, setQuickApprovalQuotaDrafts] = useState<Record<string, string>>({});
   const [panel, setPanel] = useState<WorkspacePanel>("account");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -342,34 +348,51 @@ export function ExperienceClient() {
     usagePageSize,
   ]);
 
-  const loadQuickApproval = useCallback(async () => {
+  const loadQuickApprovals = useCallback(async () => {
     if (!session?.adminScope) {
-      setQuickApproval(null);
-      setQuickApprovalQuotaDraft("");
+      setQuickApprovals([]);
+      setQuickApprovalTotal(0);
+      setQuickApprovalQuotaDrafts({});
       return;
     }
 
     setQuickApprovalLoading(true);
     try {
-      const res = await fetch("/api/admin/overview?mode=soft", { cache: "no-store" });
-      const data = (await res.json()) as AdminOverviewResponse;
-      if (!res.ok || (data.error && data.authenticated)) {
-        throw new Error(data.error ?? "读取最新审批请求失败");
-      }
-      const latestRequest =
-        data.overview?.latestRequests.find((request) => canDecideRequest(request.status)) ??
-        data.overview?.latestRequests[0] ??
-        null;
-      setQuickApproval(latestRequest);
-      setQuickApprovalQuotaDraft(
-        latestRequest
-          ? String(latestRequest.approvedMonthlyQuota ?? latestRequest.requestedMonthlyQuota)
-          : "",
-      );
+      const createdAfter = new Date(Date.now() - RECENT_APPROVAL_WINDOW_MS).toISOString();
+      const requests: QuickApprovalRequest[] = [];
+      let offset = 0;
+      let total = 0;
+
+      do {
+        const params = new URLSearchParams();
+        params.set("limit", String(RECENT_APPROVAL_LIMIT));
+        params.set("offset", String(offset));
+        params.set("createdAfter", createdAfter);
+        const res = await fetch(`/api/admin/token-requests?${params.toString()}`, { cache: "no-store" });
+        const data = (await res.json()) as AdminTokenRequestsResponse;
+        if (!res.ok) throw new Error(data.error ?? "读取最近24小时审批请求失败");
+        requests.push(...data.requests);
+        total = data.total ?? requests.length;
+        offset += data.requests.length;
+        if (!data.requests.length) break;
+      } while (offset < total);
+
+      setQuickApprovals(requests);
+      setQuickApprovalTotal(total);
+      setQuickApprovalQuotaDrafts((current) => ({
+        ...Object.fromEntries(
+          requests.map((request) => [
+            request.id,
+            String(request.approvedMonthlyQuota ?? request.requestedMonthlyQuota),
+          ]),
+        ),
+        ...current,
+      }));
     } catch (err) {
-      setQuickApproval(null);
-      setQuickApprovalQuotaDraft("");
-      setError(err instanceof Error ? err.message : "读取最新审批请求失败");
+      setQuickApprovals([]);
+      setQuickApprovalTotal(0);
+      setQuickApprovalQuotaDrafts({});
+      setError(err instanceof Error ? err.message : "读取最近24小时审批请求失败");
     } finally {
       setQuickApprovalLoading(false);
     }
@@ -380,8 +403,8 @@ export function ExperienceClient() {
   }, [refresh]);
 
   useEffect(() => {
-    void loadQuickApproval();
-  }, [loadQuickApproval]);
+    void loadQuickApprovals();
+  }, [loadQuickApprovals]);
 
   useEffect(() => {
     if (panel === "models" && session?.activeToken && !modelsLoaded && !modelsLoading) {
@@ -419,7 +442,6 @@ export function ExperienceClient() {
     currentBillingPeriod?.remainingQuota ?? session?.activeToken?.remainingQuota;
   const upstreamRemainingQuota =
     currentBillingPeriod?.upstreamRemainingQuota ?? session?.activeToken?.remainingQuota;
-  const quickApprovalCanDecide = quickApproval ? canDecideRequest(quickApproval.status) : false;
   const fallbackNotice =
     latestRequest?.approvalTargetSource === "system_admin_fallback"
       ? "您当前不属于任何组织，请求将发送给系统管理员，请联系系统管理员审批"
@@ -559,10 +581,35 @@ export function ExperienceClient() {
     setMessage("已复制 Base URL。");
   }
 
-  async function decideQuickApproval(action: "approve" | "reject") {
-    if (!quickApproval) return;
+  async function saveQuickApprovalQuota(requestId: string) {
+    const approvedMonthlyQuota = Number(quickApprovalQuotaDrafts[requestId]);
+    if (!Number.isInteger(approvedMonthlyQuota) || approvedMonthlyQuota <= 0) {
+      setError("最终额度必须是正整数");
+      return;
+    }
 
-    const approvedMonthlyQuota = Number(quickApprovalQuotaDraft);
+    setQuickApprovalBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(`/api/admin/token-requests/${encodeURIComponent(requestId)}/quota`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ approvedMonthlyQuota }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "保存最终额度失败");
+      setMessage("最终额度已保存。");
+      await Promise.all([refresh(), loadQuickApprovals()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存最终额度失败");
+    } finally {
+      setQuickApprovalBusy(false);
+    }
+  }
+
+  async function decideQuickApproval(requestId: string, action: "approve" | "reject") {
+    const approvedMonthlyQuota = Number(quickApprovalQuotaDrafts[requestId]);
     if (action === "approve" && (!Number.isInteger(approvedMonthlyQuota) || approvedMonthlyQuota <= 0)) {
       setError("通过审批前需要填写正整数最终额度");
       return;
@@ -573,7 +620,7 @@ export function ExperienceClient() {
     setMessage(null);
     try {
       const res = await fetch(
-        `/api/admin/token-requests/${encodeURIComponent(quickApproval.id)}/decision`,
+        `/api/admin/token-requests/${encodeURIComponent(requestId)}/decision`,
         {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -585,8 +632,8 @@ export function ExperienceClient() {
       );
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error ?? "处理审批失败");
-      setMessage(action === "approve" ? "最新审批请求已通过，已触发发放。" : "最新审批请求已拒绝。");
-      await Promise.all([refresh(), loadQuickApproval()]);
+      setMessage(action === "approve" ? "审批已通过，已触发发放。" : "审批请求已拒绝。");
+      await Promise.all([refresh(), loadQuickApprovals()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "处理审批失败");
     } finally {
@@ -747,103 +794,120 @@ export function ExperienceClient() {
           {session?.adminScope && panel === "account" && (
             <Card>
               <CardHeader>
-                <CardTitle>最新审批请求</CardTitle>
+                <CardTitle>审批处理</CardTitle>
                 <CardDescription>
-                  {quickApproval
-                    ? `更新时间：${formatDateTime(quickApproval.updatedAt)}`
-                    : "当前管理范围内暂无可处理申请。"}
+                  仅展示当前管理范围内最近 24 小时创建的审批请求，共 {quickApprovalTotal} 条。
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                {quickApprovalLoading ? (
-                  <div className="empty">读取最新审批请求中</div>
-                ) : !quickApproval ? (
-                  <div className="empty">暂无审批请求</div>
-                ) : (
-                  <div className="quick-approval">
-                    <div className="quick-approval-main">
-                      <div className="meta-list">
-                        <div className="meta-row">
-                          <span>申请人</span>
-                          <strong>
-                            {quickApproval.requesterName ?? maskSecret(quickApproval.requesterOpenId)}
-                          </strong>
-                        </div>
-                        <div className="meta-row">
-                          <span>类型</span>
-                          <strong>
-                            {requestTypeLabel[quickApproval.requestType] ?? quickApproval.requestType}
-                          </strong>
-                        </div>
-                        <div className="meta-row">
-                          <span>状态</span>
-                          <Badge variant={badgeVariant(quickApproval.status)}>
-                            {statusLabel[quickApproval.status] ?? quickApproval.status}
-                          </Badge>
-                        </div>
-                        <div className="meta-row">
-                          <span>申请额度</span>
-                          <strong>{formatQuotaAmount(quickApproval.requestedMonthlyQuota)}</strong>
-                        </div>
-                        <div className="meta-row">
-                          <span>申请理由</span>
-                          <strong>{quickApproval.reason || "-"}</strong>
-                        </div>
-                      </div>
-                    </div>
+                <div className="toolbar toolbar-left recent-approval-toolbar">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={quickApprovalLoading || quickApprovalBusy}
+                    onClick={() => void loadQuickApprovals()}
+                  >
+                    <RefreshCwIcon data-icon="inline-start" />
+                    刷新
+                  </Button>
+                  <Badge>{quickApprovalTotal} 条请求</Badge>
+                  <a className="button button-outline button-sm" href="/admin">
+                    <SlidersHorizontalIcon data-icon="inline-start" />
+                    进入完整审批页
+                  </a>
+                </div>
 
-                    <div className="quick-approval-actions">
-                      <div className="field">
-                        <label htmlFor="quickApprovalQuota">最终额度</label>
-                        <div className="quota-control">
-                          <Input
-                            id="quickApprovalQuota"
-                            min={1}
-                            step={1}
-                            type="number"
-                            value={quickApprovalQuotaDraft}
-                            onChange={(event) => setQuickApprovalQuotaDraft(event.target.value)}
-                            disabled={!quickApprovalCanDecide || quickApprovalBusy}
-                          />
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={!quickApprovalCanDecide || quickApprovalBusy}
-                            onClick={() => void decideQuickApproval("approve")}
-                          >
-                            <CheckCircle2Icon data-icon="inline-start" />
-                            通过
-                          </Button>
-                        </div>
-                        <span className="field-description">
-                          {quickApprovalCanDecide ? "通过时会按最终额度发放或更新。" : "该请求当前不可直接审批。"}
-                        </span>
-                      </div>
-                      <div className="toolbar toolbar-left">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={!quickApprovalCanDecide || quickApprovalBusy}
-                          onClick={() => void decideQuickApproval("reject")}
-                        >
-                          <XCircleIcon data-icon="inline-start" />
-                          拒绝
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={quickApprovalLoading || quickApprovalBusy}
-                          onClick={() => void loadQuickApproval()}
-                        >
-                          <RefreshCwIcon data-icon="inline-start" />
-                          刷新
-                        </Button>
-                        <a className="button button-outline button-sm" href="/admin">
-                          <SlidersHorizontalIcon data-icon="inline-start" />
-                          进入审批
-                        </a>
-                      </div>
-                    </div>
+                {quickApprovalLoading && !quickApprovals.length ? (
+                  <div className="empty">读取最近 24 小时审批请求中</div>
+                ) : !quickApprovals.length ? (
+                  <div className="empty">最近 24 小时暂无审批请求</div>
+                ) : (
+                  <div className="table-wrap table-scroll recent-approval-viewport">
+                    <table className="table recent-approval-table">
+                      <thead>
+                        <tr>
+                          <th>申请人</th>
+                          <th>类型</th>
+                          <th>状态</th>
+                          <th>申请额度</th>
+                          <th>最终额度</th>
+                          <th>申请理由</th>
+                          <th>申请时间</th>
+                          <th>快速审批</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {quickApprovals.map((request) => (
+                          <tr key={request.id}>
+                            <td>{request.requesterName ?? maskSecret(request.requesterOpenId)}</td>
+                            <td>{requestTypeLabel[request.requestType] ?? request.requestType}</td>
+                            <td>
+                              <Badge variant={badgeVariant(request.status)}>
+                                {statusLabel[request.status] ?? request.status}
+                              </Badge>
+                            </td>
+                            <td>{formatQuotaAmount(request.requestedMonthlyQuota)}</td>
+                            <td>
+                              <div className="quota-control recent-approval-quota">
+                                <Input
+                                  aria-label={`最终额度-${request.id}`}
+                                  min={1}
+                                  step={1}
+                                  type="number"
+                                  value={
+                                    quickApprovalQuotaDrafts[request.id] ??
+                                    String(request.approvedMonthlyQuota ?? request.requestedMonthlyQuota)
+                                  }
+                                  onChange={(event) =>
+                                    setQuickApprovalQuotaDrafts((current) => ({
+                                      ...current,
+                                      [request.id]: event.target.value,
+                                    }))
+                                  }
+                                  disabled={!canEditQuota(request.status) || quickApprovalBusy}
+                                />
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={!canEditQuota(request.status) || quickApprovalBusy}
+                                  onClick={() => void saveQuickApprovalQuota(request.id)}
+                                >
+                                  保存
+                                </Button>
+                              </div>
+                            </td>
+                            <td>
+                              <span className="recent-approval-reason" title={request.reason || undefined}>
+                                {request.reason || "-"}
+                              </span>
+                            </td>
+                            <td>{formatDateTime(request.createdAt)}</td>
+                            <td>
+                              <div className="toolbar toolbar-left recent-approval-actions">
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={!canDecideRequest(request.status) || quickApprovalBusy}
+                                  onClick={() => void decideQuickApproval(request.id, "approve")}
+                                >
+                                  <CheckCircle2Icon data-icon="inline-start" />
+                                  通过
+                                </Button>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={!canDecideRequest(request.status) || quickApprovalBusy}
+                                  onClick={() => void decideQuickApproval(request.id, "reject")}
+                                >
+                                  <XCircleIcon data-icon="inline-start" />
+                                  拒绝
+                                </Button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
                 )}
               </CardContent>

@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
+import { isAtOrAfterIsoTimestamp } from "@/lib/iso-time";
 import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
 import { sameNewApiUsageSource } from "@/lib/newapi-usage-identity";
 import { findProxyLogForNewApiUsage } from "@/lib/usage-matching";
@@ -3014,11 +3015,16 @@ export async function listAdminTokenRequests(input: {
   scope: AdminScope;
   limit?: number;
   offset?: number;
+  createdAfter?: string;
 }) {
   const store = await readStore();
   const usersById = new Map(store.users.map((user) => [user.id, user]));
   const scopedRequests = store.tokenRequests
-    .filter((request) => tokenRequestInScope(request, input.scope, usersById))
+    .filter(
+      (request) =>
+        tokenRequestInScope(request, input.scope, usersById) &&
+        isAtOrAfterIsoTimestamp(request.createdAt, input.createdAfter),
+    )
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   const limit = boundedLimit(input.limit, 50);
   const offset = boundedOffset(input.offset);

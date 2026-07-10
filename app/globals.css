@@ -27,7 +27,10 @@
 
 html,
 body {
+  width: 100%;
+  height: 100%;
   min-height: 100%;
+  overflow: hidden;
 }
 
 body {
@@ -37,6 +40,7 @@ body {
   font-family:
     Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
   letter-spacing: 0;
+  overscroll-behavior: none;
 }
 
 button,
@@ -51,18 +55,26 @@ a {
 }
 
 .app-shell {
-  min-height: 100vh;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .sidebar {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
   border-right: 1px solid var(--border);
   background: #edf5ff;
   padding: 24px;
   display: flex;
   flex-direction: column;
   gap: 24px;
+  overflow: hidden;
 }
 
 .sidebar-head {
@@ -78,6 +90,10 @@ a {
   display: flex;
   flex-direction: column;
   gap: 24px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .sidebar-toggle {
@@ -170,10 +186,35 @@ a {
 
 .main {
   min-width: 0;
+  min-height: 0;
+  height: 100%;
   padding: 26px;
   display: flex;
   flex-direction: column;
   gap: 20px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.main > * {
+  min-width: 0;
+}
+
+.main-panel {
+  grid-column: 1 / -1;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  padding: 26px;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+}
+
+.main-panel > .card {
+  width: min(100%, 680px);
 }
 
 .topbar {
@@ -197,6 +238,8 @@ a {
 }
 
 .toolbar {
+  min-width: 0;
+  max-width: 100%;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -205,11 +248,13 @@ a {
 }
 
 .grid {
+  min-width: 0;
   display: grid;
   gap: 16px;
 }
 
 .stack {
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -224,6 +269,8 @@ a {
 }
 
 .card {
+  min-width: 0;
+  max-width: 100%;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--card);
@@ -234,6 +281,7 @@ a {
 .card-header,
 .card-content,
 .card-footer {
+  min-width: 0;
   padding: 18px;
 }
 
@@ -483,12 +531,14 @@ a {
 }
 
 .field-group {
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 12px;
 }
 
 .field {
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 7px;
@@ -533,18 +583,29 @@ a {
 }
 
 .table-wrap {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   overflow-x: auto;
 }
 
 .table-scroll {
   max-height: 480px;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable both-edges;
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
 
 .table-scroll-users {
-  max-height: 520px;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  height: clamp(360px, 58dvh, 640px);
+  min-height: 360px;
+  max-height: none;
+  flex: 0 0 auto;
 }
 
 .table-scroll-usage {
@@ -751,22 +812,80 @@ a {
   max-height: 360px;
 }
 
-.quick-approval {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(280px, 0.45fr);
-  align-items: start;
-  gap: 16px;
+.recent-approval-toolbar {
+  justify-content: flex-start;
 }
 
-.quick-approval-main,
-.quick-approval-actions {
-  min-width: 0;
+.recent-approval-viewport {
+  height: clamp(320px, 48dvh, 520px);
+  min-height: 320px;
+  max-height: none;
+  flex: 0 0 auto;
 }
 
-.quick-approval-actions {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+.recent-approval-table {
+  min-width: 1180px;
+  table-layout: fixed;
+}
+
+.recent-approval-table th,
+.recent-approval-table td {
+  padding: 9px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: top;
+}
+
+.recent-approval-table th:nth-child(1) {
+  width: 132px;
+}
+
+.recent-approval-table th:nth-child(2) {
+  width: 92px;
+}
+
+.recent-approval-table th:nth-child(3) {
+  width: 126px;
+}
+
+.recent-approval-table th:nth-child(4) {
+  width: 90px;
+}
+
+.recent-approval-table th:nth-child(5) {
+  width: 210px;
+}
+
+.recent-approval-table th:nth-child(6) {
+  width: 220px;
+}
+
+.recent-approval-table th:nth-child(7) {
+  width: 150px;
+}
+
+.recent-approval-table th:nth-child(8) {
+  width: 160px;
+}
+
+.recent-approval-table td:nth-child(5),
+.recent-approval-table td:nth-child(8) {
+  overflow: visible;
+}
+
+.recent-approval-quota {
+  grid-template-columns: minmax(0, 120px) auto;
+}
+
+.recent-approval-actions {
+  flex-wrap: nowrap;
+}
+
+.recent-approval-reason {
+  display: block;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
 }
 
 .alert {
@@ -1520,8 +1639,36 @@ a {
   }
 
   .sidebar {
+    position: fixed;
+    inset: 0 0 auto;
+    z-index: 40;
+    width: 100%;
+    height: auto;
+    max-height: 100vh;
+    max-height: 100dvh;
     border-right: 0;
     border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+    gap: 14px;
+    box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+  }
+
+  .sidebar-toggle {
+    display: inline-flex;
+  }
+
+  .sidebar-menu {
+    display: none;
+    flex: 0 1 auto;
+    max-height: calc(100dvh - 84px);
+  }
+
+  .sidebar-open .sidebar-menu {
+    display: flex;
+  }
+
+  .main {
+    padding: 96px 24px 24px;
   }
 
   .grid-4,
@@ -1540,25 +1687,18 @@ a {
 }
 
 @media (max-width: 720px) {
-  .main,
-  .sidebar {
-    padding: 18px;
+  .main {
+    padding: 84px 18px 18px;
+    gap: 16px;
   }
 
   .sidebar {
+    padding: 14px 18px;
     gap: 14px;
   }
 
-  .sidebar-toggle {
-    display: inline-flex;
-  }
-
   .sidebar-menu {
-    display: none;
-  }
-
-  .sidebar-open .sidebar-menu {
-    display: flex;
+    max-height: calc(100dvh - 72px);
   }
 
   .topbar {
@@ -1647,14 +1787,12 @@ a {
   .usage-records-mobile {
     display: block;
     width: 100%;
-    height: 420px;
-    overflow-y: scroll;
-    overscroll-behavior: contain;
-    scrollbar-gutter: stable;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 0 10px;
-    background: var(--card);
+    height: auto;
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+    background: transparent;
   }
 
   .usage-records-mobile .usage-record-card:last-child {
@@ -1666,8 +1804,18 @@ a {
     flex-direction: column;
   }
 
-  .quick-approval {
-    grid-template-columns: 1fr;
+  .recent-approval-viewport {
+    height: clamp(300px, 50dvh, 440px);
+    min-height: 300px;
+  }
+
+  .table-scroll-users {
+    height: clamp(300px, 52dvh, 480px);
+    min-height: 300px;
+  }
+
+  .main-panel {
+    padding: 18px;
   }
 
   .page-title {
