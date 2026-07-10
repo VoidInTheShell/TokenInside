@@ -6,9 +6,21 @@ import { getAppSettings, updateAppSettings } from "@/lib/store";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const settingsSchema = z.object({
-  defaultMonthlyQuota: z.number().int().positive().max(1000000),
+const usageSyncPolicySchema = z.object({
+  enabled: z.boolean().optional(),
+  intervalMinutes: z.number().int().min(1).max(24 * 60).optional(),
+  pageSize: z.number().int().min(1).max(100).optional(),
+  maxPagesPerRun: z.number().int().min(1).max(20).optional(),
+  overlapMinutes: z.number().int().min(0).max(7 * 24 * 60).optional(),
+  matchWindowMinutes: z.number().int().min(1).max(24 * 60).optional(),
 });
+
+const settingsSchema = z
+  .object({
+    defaultMonthlyQuota: z.number().int().positive().max(1000000).optional(),
+    usageSyncPolicy: usageSyncPolicySchema.optional(),
+  })
+  .refine((value) => value.defaultMonthlyQuota !== undefined || value.usageSyncPolicy !== undefined);
 
 export async function GET() {
   const auth = await requireAdminScope();
@@ -33,10 +45,14 @@ export async function PATCH(request: Request) {
   }
   const parsed = settingsSchema.safeParse(await request.json());
   if (!parsed.success) {
-    return NextResponse.json({ error: "默认额度必须是正整数" }, { status: 400 });
+    return NextResponse.json(
+      { error: "默认额度必须是正整数，同步周期/页数/窗口必须在允许范围内" },
+      { status: 400 },
+    );
   }
   const settings = await updateAppSettings({
     defaultMonthlyQuota: parsed.data.defaultMonthlyQuota,
+    usageSyncPolicy: parsed.data.usageSyncPolicy,
     updatedByFeishuUserId: auth.user.id,
   });
   return NextResponse.json({ settings });

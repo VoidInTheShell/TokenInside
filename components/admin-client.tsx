@@ -41,7 +41,7 @@ import {
   UsageAnalysisTable,
   type UsageAggregateRow,
 } from "@/components/usage-analysis-tables";
-import { formatDateTime, formatDepartmentName, formatTokenAmount, maskSecret } from "@/lib/utils";
+import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
 
 type AdminScopeSummary = {
   type: "global" | "department";
@@ -119,7 +119,10 @@ type AdminOverviewResponse = {
       totalTokens?: number;
       currentBillingPeriod?: string;
       currentPeriodMonthlyQuota?: number;
+      currentPeriodQuotaConsumed?: number;
+      currentPeriodCost?: number;
       currentPeriodRemainingQuota?: number;
+      currentPeriodUsageRecords?: number;
       currentPeriodProxyLogs?: number;
       currentPeriodPromptTokens?: number;
       currentPeriodCompletionTokens?: number;
@@ -150,6 +153,37 @@ type AdminOverviewResponse = {
   };
   settings?: {
     defaultMonthlyQuota: number;
+    usageSyncPolicy?: {
+      enabled: boolean;
+      intervalMinutes: number;
+      pageSize: number;
+      maxPagesPerRun: number;
+      overlapMinutes: number;
+      matchWindowMinutes: number;
+      updatedAt?: string;
+      updatedByFeishuUserId?: string;
+      lastRunAt?: string;
+      lastRunStatus?: BillingOperationRecord["status"];
+      lastRunMessage?: string;
+      lastRunBy?: "manual" | "auto";
+      nextRunAfter?: string;
+    };
+    usageSyncCheckpoint?: {
+      id: string;
+      scope: "newapi_usage_logs";
+      pageStart: number;
+      pageSize: number;
+      maxPages: number;
+      overlapMinutes: number;
+      matchWindowMinutes: number;
+      lastSeenNewapiLogId?: string;
+      lastSeenNewapiCreatedAt?: string;
+      lastRunAt?: string;
+      lastRunStatus?: BillingOperationRecord["status"];
+      lastRunBy?: "manual" | "auto";
+      nextRunAfter?: string;
+      updatedAt: string;
+    } | null;
     billingOperations?: BillingOperationRecord[];
     updatedAt?: string;
   };
@@ -177,10 +211,13 @@ type AdminUser = {
   billingPeriod?: string;
   billingMonthlyQuota?: number;
   billingRemainingQuota?: number;
+  billingQuotaConsumed?: number;
+  billingCost?: number;
   billingTotalTokens?: number;
   billingPromptTokens?: number;
   billingCompletionTokens?: number;
   billingProxyLogCount?: number;
+  billingUsageRecordCount?: number;
   latestRequestStatus?: string;
   latestRequestType?: string;
   latestRequestUpdatedAt?: string;
@@ -210,10 +247,13 @@ type UserStatsRow = {
   billingPeriod?: string;
   monthlyQuota: number;
   remainingQuota?: number;
+  quotaConsumed: number;
+  cost: number;
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
   proxyLogCount: number;
+  usageRecordCount: number;
   quotaUsageRate: number;
   latestProxyLogAt?: string;
 };
@@ -230,10 +270,13 @@ type DepartmentStatsRow = {
   keyedUsers: number;
   monthlyQuota: number;
   remainingQuota: number;
+  quotaConsumed: number;
+  cost: number;
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
   proxyLogCount: number;
+  usageRecordCount: number;
   usageShare: number;
   quotaUsageRate: number;
   latestProxyLogAt?: string;
@@ -268,6 +311,16 @@ type UsageSyncDraft = {
   page: string;
   size: string;
   maxPages: string;
+  overlapMinutes: string;
+  matchWindowMinutes: string;
+};
+
+type UsageSyncPolicyDraft = {
+  enabled: boolean;
+  intervalMinutes: string;
+  pageSize: string;
+  maxPagesPerRun: string;
+  overlapMinutes: string;
   matchWindowMinutes: string;
 };
 
@@ -288,6 +341,8 @@ type UsageSyncResult = {
     updated: number;
     skippedUnknownToken: number;
     skippedNoMatch: number;
+    recordsUpserted: number;
+    issuesUpserted: number;
   };
 };
 
@@ -438,10 +493,10 @@ function billingStatusVariant(status: BillingOperationRecord["status"]) {
 function billingSummaryText(operation: BillingOperationRecord) {
   const summary = operation.summary ?? {};
   if (operation.kind === "usage_sync") {
-    return `取回 ${summary.fetched ?? 0}，匹配 ${summary.matched ?? 0}，更新 ${summary.updated ?? 0}`;
+    return `取回 ${summary.fetched ?? 0}，匹配 ${summary.matched ?? 0}，更新 ${summary.updated ?? 0}，记录 ${summary.recordsUpserted ?? 0}，异常 ${summary.issuesUpserted ?? 0}`;
   }
   if (operation.kind === "settings_update") {
-    return `默认额度 ${summary.previousDefaultMonthlyQuota ?? "-"} -> ${summary.defaultMonthlyQuota ?? "-"}`;
+    return `默认额度 ${summary.previousDefaultMonthlyQuota ?? "-"} -> ${summary.defaultMonthlyQuota ?? "-"}${summary.usageSyncPolicyUpdated ? "，同步策略已更新" : ""}`;
   }
   return `计划 ${summary.planned ?? 0}，应用 ${summary.applied ?? 0}，失败 ${summary.failed ?? 0}`;
 }
@@ -451,6 +506,7 @@ function usageSyncDraftSignature(draft: UsageSyncDraft) {
     page: draft.page.trim(),
     size: draft.size.trim(),
     maxPages: draft.maxPages.trim(),
+    overlapMinutes: draft.overlapMinutes.trim(),
     matchWindowMinutes: draft.matchWindowMinutes.trim(),
   });
 }
@@ -528,8 +584,17 @@ export function AdminClient() {
     page: "0",
     size: "100",
     maxPages: "1",
+    overlapMinutes: "120",
     matchWindowMinutes: "30",
   } satisfies UsageSyncDraft);
+  const [usageSyncPolicyDraft, setUsageSyncPolicyDraft] = useState<UsageSyncPolicyDraft>({
+    enabled: false,
+    intervalMinutes: "60",
+    pageSize: "100",
+    maxPagesPerRun: "3",
+    overlapMinutes: "120",
+    matchWindowMinutes: "30",
+  });
   const [monthlyResetDraft, setMonthlyResetDraft] = useState({
     period: currentBillingPeriod(),
     limit: "",
@@ -556,6 +621,24 @@ export function AdminClient() {
       setData(body);
       if (body.settings) {
         setDefaultQuotaDraft(String(body.settings.defaultMonthlyQuota));
+        const policy = body.settings.usageSyncPolicy;
+        if (policy) {
+          setUsageSyncPolicyDraft({
+            enabled: Boolean(policy.enabled),
+            intervalMinutes: String(policy.intervalMinutes ?? 60),
+            pageSize: String(policy.pageSize ?? 100),
+            maxPagesPerRun: String(policy.maxPagesPerRun ?? 3),
+            overlapMinutes: String(policy.overlapMinutes ?? 120),
+            matchWindowMinutes: String(policy.matchWindowMinutes ?? 30),
+          });
+          setUsageSyncDraft((current) => ({
+            ...current,
+            size: String(policy.pageSize ?? current.size),
+            maxPages: String(policy.maxPagesPerRun ?? current.maxPages),
+            overlapMinutes: String(policy.overlapMinutes ?? current.overlapMinutes),
+            matchWindowMinutes: String(policy.matchWindowMinutes ?? current.matchWindowMinutes),
+          }));
+        }
       }
       if (body.overview?.latestRequests) {
         setQuotaDrafts((current) => ({
@@ -777,12 +860,67 @@ export function AdminClient() {
     }
   }
 
+  async function saveUsageSyncPolicy() {
+    try {
+      const intervalMinutes = parseIntegerDraft(usageSyncPolicyDraft.intervalMinutes, "自动同步周期", {
+        min: 1,
+        max: 24 * 60,
+      });
+      const pageSize = parseIntegerDraft(usageSyncPolicyDraft.pageSize, "自动同步每页数量", {
+        min: 1,
+        max: 100,
+      });
+      const maxPagesPerRun = parseIntegerDraft(usageSyncPolicyDraft.maxPagesPerRun, "自动同步最大页数", {
+        min: 1,
+        max: 20,
+      });
+      const overlapMinutes = parseIntegerDraft(usageSyncPolicyDraft.overlapMinutes, "自动同步重叠窗口", {
+        min: 0,
+        max: 7 * 24 * 60,
+      });
+      const matchWindowMinutes = parseIntegerDraft(usageSyncPolicyDraft.matchWindowMinutes, "自动同步匹配窗口", {
+        min: 1,
+        max: 24 * 60,
+      });
+
+      setBusy(true);
+      setError(null);
+      setMessage(null);
+      const res = await fetch("/api/admin/settings", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          usageSyncPolicy: {
+            enabled: usageSyncPolicyDraft.enabled,
+            intervalMinutes,
+            pageSize,
+            maxPagesPerRun,
+            overlapMinutes,
+            matchWindowMinutes,
+          },
+        }),
+      });
+      const body = await readJsonResponse<AdminOverviewResponse>(res);
+      if (!res.ok) throw new Error(body.error ?? "保存自动同步策略失败");
+      setMessage("自动同步策略已保存。");
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存自动同步策略失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function runUsageSync(dryRun: boolean) {
     try {
       const signature = usageSyncDraftSignature(usageSyncDraft);
       const page = parseIntegerDraft(usageSyncDraft.page, "起始页", { min: 0 });
-      const size = parseIntegerDraft(usageSyncDraft.size, "每页数量", { min: 1, max: 500 });
+      const size = parseIntegerDraft(usageSyncDraft.size, "每页数量", { min: 1, max: 100 });
       const maxPages = parseIntegerDraft(usageSyncDraft.maxPages, "最大页数", { min: 1, max: 20 });
+      const overlapMinutes = parseIntegerDraft(usageSyncDraft.overlapMinutes, "重叠窗口", {
+        min: 0,
+        max: 7 * 24 * 60,
+      });
       const matchWindowMinutes = parseIntegerDraft(usageSyncDraft.matchWindowMinutes, "匹配窗口", {
         min: 1,
         max: 24 * 60,
@@ -811,12 +949,13 @@ export function AdminClient() {
           page,
           size,
           maxPages,
+          overlapMinutes,
           matchWindowMinutes,
         }),
       });
       const body = await readJsonResponse<UsageSyncResult>(res);
       if (!res.ok) throw new Error(body.error ?? "同步 NewAPI 用量失败");
-      const summary = `取回 ${body.totals.fetched}，匹配 ${body.totals.matched}，更新 ${body.totals.updated}，未绑定 ${body.totals.skippedUnknownToken}，未匹配 ${body.totals.skippedNoMatch}`;
+      const summary = `取回 ${body.totals.fetched}，匹配 ${body.totals.matched}，更新 ${body.totals.updated}，记录 ${body.totals.recordsUpserted}，异常 ${body.totals.issuesUpserted}，未绑定 ${body.totals.skippedUnknownToken}，未匹配 ${body.totals.skippedNoMatch}`;
       setBillingResult(`NewAPI 用量${dryRun ? "试算" : "同步"}完成：${summary}`);
       setMessage(`NewAPI 用量${dryRun ? "试算" : "同步"}完成。`);
       if (dryRun) {
@@ -1120,6 +1259,8 @@ export function AdminClient() {
     lastUsageSyncDryRunSignature === usageSyncDraftSignature(usageSyncDraft);
   const monthlyResetReadyToExecute =
     lastMonthlyResetDryRunSignature === monthlyResetDraftSignature(monthlyResetDraft);
+  const usageSyncPolicy = data?.settings?.usageSyncPolicy;
+  const usageSyncCheckpoint = data?.settings?.usageSyncCheckpoint;
 
   if (!loading && data && !data.authorized) {
     return (
@@ -1364,7 +1505,15 @@ export function AdminClient() {
                   <CardContent>
                     <div className="metric">
                       <span className="metric-label">当前账期发放额度</span>
-                      <span className="metric-value">{formatTokenAmount(totals?.currentPeriodMonthlyQuota, "0")}</span>
+                      <span className="metric-value">{formatQuotaAmount(totals?.currentPeriodMonthlyQuota, "0")}</span>
+                    </div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardContent>
+                    <div className="metric">
+                      <span className="metric-label">当前账期已用额度</span>
+                      <span className="metric-value">{formatQuotaAmount(totals?.currentPeriodQuotaConsumed, "0")}</span>
                     </div>
                   </CardContent>
                 </Card>
@@ -1372,7 +1521,7 @@ export function AdminClient() {
                   <CardContent>
                     <div className="metric">
                       <span className="metric-label">当前账期剩余额度</span>
-                      <span className="metric-value">{formatTokenAmount(totals?.currentPeriodRemainingQuota, "0")}</span>
+                      <span className="metric-value">{formatQuotaAmount(totals?.currentPeriodRemainingQuota, "0")}</span>
                     </div>
                   </CardContent>
                 </Card>
@@ -1462,7 +1611,8 @@ export function AdminClient() {
                               <th>账期</th>
                               <th>发放额度</th>
                               <th>剩余额度</th>
-                              <th>已用</th>
+                              <th>已用额度</th>
+                              <th>Tokens</th>
                               <th>最近调用</th>
                               <th>操作</th>
                             </tr>
@@ -1483,8 +1633,9 @@ export function AdminClient() {
                                 <td>{user.role}</td>
                                 <td>{user.activeTokenStatus ?? "-"}</td>
                                 <td>{user.billingPeriod ?? "-"}</td>
-                                <td>{formatTokenAmount(user.billingMonthlyQuota)}</td>
-                                <td>{formatTokenAmount(user.billingRemainingQuota)}</td>
+                                <td>{formatQuotaAmount(user.billingMonthlyQuota)}</td>
+                                <td>{formatQuotaAmount(user.billingRemainingQuota)}</td>
+                                <td>{formatQuotaAmount(user.billingQuotaConsumed, "0")}</td>
                                 <td>{formatTokenAmount(user.billingTotalTokens, "0")}</td>
                                 <td>{user.latestProxyLogAt ? formatDateTime(user.latestProxyLogAt) : "-"}</td>
                                 <td>
@@ -1708,7 +1859,8 @@ export function AdminClient() {
                           <th>key 用户</th>
                           <th>发放额度</th>
                           <th>剩余额度</th>
-                          <th>已用</th>
+                          <th>已用额度</th>
+                          <th>Tokens</th>
                           <th>请求数</th>
                           <th>用量占比</th>
                           <th>消耗率</th>
@@ -1721,8 +1873,9 @@ export function AdminClient() {
                             <td>{formatDepartmentName(item.departmentName, item.departmentId, "未知部门")}</td>
                             <td>{item.memberCount}</td>
                             <td>{item.keyedUsers}</td>
-                            <td>{formatTokenAmount(item.monthlyQuota, "0")}</td>
-                            <td>{formatTokenAmount(item.remainingQuota, "0")}</td>
+                            <td>{formatQuotaAmount(item.monthlyQuota, "0")}</td>
+                            <td>{formatQuotaAmount(item.remainingQuota, "0")}</td>
+                            <td>{formatQuotaAmount(item.quotaConsumed, "0")}</td>
                             <td>{formatTokenAmount(item.totalTokens, "0")}</td>
                             <td>{item.proxyLogCount}</td>
                             <td>{formatRate(item.usageShare)}</td>
@@ -1760,6 +1913,7 @@ export function AdminClient() {
                           <th>账期</th>
                           <th>发放额度</th>
                           <th>剩余额度</th>
+                          <th>已用额度</th>
                           <th>输入</th>
                           <th>输出</th>
                           <th>总量</th>
@@ -1775,8 +1929,9 @@ export function AdminClient() {
                             <td>{formatDepartmentName(user.departmentName, user.departmentId)}</td>
                             <td>{user.role}</td>
                             <td>{user.billingPeriod ?? "-"}</td>
-                            <td>{formatTokenAmount(user.monthlyQuota, "0")}</td>
-                            <td>{formatTokenAmount(user.remainingQuota)}</td>
+                            <td>{formatQuotaAmount(user.monthlyQuota, "0")}</td>
+                            <td>{formatQuotaAmount(user.remainingQuota)}</td>
+                            <td>{formatQuotaAmount(user.quotaConsumed, "0")}</td>
                             <td>{formatTokenAmount(user.promptTokens, "0")}</td>
                             <td>{formatTokenAmount(user.completionTokens, "0")}</td>
                             <td>{formatTokenAmount(user.totalTokens, "0")}</td>
@@ -1843,7 +1998,7 @@ export function AdminClient() {
               <Card>
                 <CardHeader>
                   <CardTitle>使用记录</CardTitle>
-                  <CardDescription>按 Aether 维度展示请求、tokens、费用和首字/总耗时。</CardDescription>
+                  <CardDescription>按 Aether 维度展示请求、tokens、额度消耗和首字/总耗时。</CardDescription>
                 </CardHeader>
                 <CardContent>
                   <UsageRecordsTable
@@ -1910,7 +2065,7 @@ export function AdminClient() {
                                 {statusLabel[request.status] ?? request.status}
                               </Badge>
                             </td>
-                            <td>{formatTokenAmount(request.requestedMonthlyQuota)}</td>
+                            <td>{formatQuotaAmount(request.requestedMonthlyQuota)}</td>
                             <td>
                               <div className="quota-control">
                                 <Input
@@ -2001,7 +2156,7 @@ export function AdminClient() {
                       </Button>
                     </div>
                     <span className="field-description">
-                      当前值：{formatTokenAmount(data?.settings?.defaultMonthlyQuota ?? 200)}
+                      当前值：{formatQuotaAmount(data?.settings?.defaultMonthlyQuota ?? 200)}
                     </span>
                   </div>
                 </section>
@@ -2009,7 +2164,138 @@ export function AdminClient() {
                 <section className="settings-section">
                   <div>
                     <h3>NewAPI 用量同步</h3>
-                    <p>从 NewAPI 日志回填 token、费用和渠道字段。</p>
+                    <p>从 NewAPI 日志回填 tokens、额度消耗和渠道字段。</p>
+                    <span className="field-description">
+                      上次同步：{usageSyncCheckpoint?.lastRunAt ? formatDateTime(usageSyncCheckpoint.lastRunAt) : "-"}
+                      {" · "}
+                      下次同步：{usageSyncCheckpoint?.nextRunAfter ? formatDateTime(usageSyncCheckpoint.nextRunAfter) : "-"}
+                      {" · "}
+                      最近日志：{usageSyncCheckpoint?.lastSeenNewapiLogId ? maskSecret(usageSyncCheckpoint.lastSeenNewapiLogId) : "-"}
+                    </span>
+                  </div>
+                  <div className="billing-control-grid">
+                    <label className="field">
+                      <span>自动同步</span>
+                      <input
+                        type="checkbox"
+                        checked={usageSyncPolicyDraft.enabled}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setUsageSyncPolicyDraft((current) => ({
+                            ...current,
+                            enabled: event.target.checked,
+                          }))
+                        }
+                      />
+                    </label>
+                    <div className="field">
+                      <label htmlFor="usageSyncPolicyInterval">同步周期(分钟)</label>
+                      <Input
+                        id="usageSyncPolicyInterval"
+                        min={1}
+                        max={1440}
+                        step={1}
+                        type="number"
+                        value={usageSyncPolicyDraft.intervalMinutes}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setUsageSyncPolicyDraft((current) => ({
+                            ...current,
+                            intervalMinutes: event.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="usageSyncPolicyPageSize">每页数量</label>
+                      <Input
+                        id="usageSyncPolicyPageSize"
+                        min={1}
+                        max={100}
+                        step={1}
+                        type="number"
+                        value={usageSyncPolicyDraft.pageSize}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setUsageSyncPolicyDraft((current) => ({
+                            ...current,
+                            pageSize: event.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="usageSyncPolicyMaxPages">每轮页数</label>
+                      <Input
+                        id="usageSyncPolicyMaxPages"
+                        min={1}
+                        max={20}
+                        step={1}
+                        type="number"
+                        value={usageSyncPolicyDraft.maxPagesPerRun}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setUsageSyncPolicyDraft((current) => ({
+                            ...current,
+                            maxPagesPerRun: event.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="usageSyncPolicyOverlap">重叠窗口(分钟)</label>
+                      <Input
+                        id="usageSyncPolicyOverlap"
+                        min={0}
+                        max={10080}
+                        step={1}
+                        type="number"
+                        value={usageSyncPolicyDraft.overlapMinutes}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setUsageSyncPolicyDraft((current) => ({
+                            ...current,
+                            overlapMinutes: event.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="usageSyncPolicyMatchWindow">匹配窗口(分钟)</label>
+                      <Input
+                        id="usageSyncPolicyMatchWindow"
+                        min={1}
+                        max={1440}
+                        step={1}
+                        type="number"
+                        value={usageSyncPolicyDraft.matchWindowMinutes}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setUsageSyncPolicyDraft((current) => ({
+                            ...current,
+                            matchWindowMinutes: event.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                  </div>
+                  <div className="toolbar toolbar-left">
+                    <Button variant="outline" size="sm" disabled={!data?.authorized || busy} onClick={() => void saveUsageSyncPolicy()}>
+                      <SaveIcon data-icon="inline-start" />
+                      保存自动同步
+                    </Button>
+                    <Badge variant={usageSyncPolicy?.enabled ? "success" : "warning"}>
+                      {usageSyncPolicy?.enabled ? "自动同步已开启" : "自动同步未开启"}
+                    </Badge>
+                    {usageSyncCheckpoint?.lastRunStatus && (
+                      <Badge variant={billingStatusVariant(usageSyncCheckpoint.lastRunStatus)}>
+                        {billingStatusLabel(usageSyncCheckpoint.lastRunStatus)}
+                      </Badge>
+                    )}
+                  </div>
+                  <div>
+                    <h3>手动同步</h3>
+                    <p>试算确认后把 NewAPI 日志写入 source records 并回填请求额度消耗。</p>
                   </div>
                   <div className="billing-control-grid">
                     <div className="field">
@@ -2031,7 +2317,7 @@ export function AdminClient() {
                       <Input
                         id="usageSyncSize"
                         min={1}
-                        max={500}
+                        max={100}
                         step={1}
                         type="number"
                         value={usageSyncDraft.size}
@@ -2053,6 +2339,21 @@ export function AdminClient() {
                         disabled={!data?.authorized || busy}
                         onChange={(event) =>
                           setUsageSyncDraft((current) => ({ ...current, maxPages: event.target.value }))
+                        }
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="usageSyncOverlap">重叠窗口(分钟)</label>
+                      <Input
+                        id="usageSyncOverlap"
+                        min={0}
+                        max={10080}
+                        step={1}
+                        type="number"
+                        value={usageSyncDraft.overlapMinutes}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setUsageSyncDraft((current) => ({ ...current, overlapMinutes: event.target.value }))
                         }
                       />
                     </div>

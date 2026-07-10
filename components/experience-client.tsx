@@ -39,7 +39,7 @@ import {
   UsageAnalysisTable,
   type UsageAggregateRow,
 } from "@/components/usage-analysis-tables";
-import { formatDateTime, formatDepartmentName, formatTokenAmount, maskSecret } from "@/lib/utils";
+import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
 
 type SessionResponse = {
   authenticated: boolean;
@@ -68,11 +68,15 @@ type SessionResponse = {
   billingPeriod?: {
     period: string;
     monthlyQuota: number;
+    quotaConsumed: number;
+    cost: number;
+    remainingQuota: number;
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
     proxyLogCount: number;
-    remainingQuota?: number;
+    usageRecordCount: number;
+    upstreamRemainingQuota?: number;
   } | null;
   adminScope?: {
     type: "global" | "department";
@@ -413,6 +417,8 @@ export function ExperienceClient() {
     currentBillingPeriod?.period ?? session?.activeToken?.billingPeriod ?? "-";
   const remainingQuota =
     currentBillingPeriod?.remainingQuota ?? session?.activeToken?.remainingQuota;
+  const upstreamRemainingQuota =
+    currentBillingPeriod?.upstreamRemainingQuota ?? session?.activeToken?.remainingQuota;
   const quickApprovalCanDecide = quickApproval ? canDecideRequest(quickApproval.status) : false;
   const fallbackNotice =
     latestRequest?.approvalTargetSource === "system_admin_fallback"
@@ -777,7 +783,7 @@ export function ExperienceClient() {
                         </div>
                         <div className="meta-row">
                           <span>申请额度</span>
-                          <strong>{formatTokenAmount(quickApproval.requestedMonthlyQuota)}</strong>
+                          <strong>{formatQuotaAmount(quickApproval.requestedMonthlyQuota)}</strong>
                         </div>
                         <div className="meta-row">
                           <span>申请理由</span>
@@ -969,11 +975,19 @@ export function ExperienceClient() {
                         <div className="meta-list">
                           <div className="meta-row">
                             <span>账期额度</span>
-                            <strong>{formatTokenAmount(currentBillingPeriod?.monthlyQuota)}</strong>
+                            <strong>{formatQuotaAmount(currentBillingPeriod?.monthlyQuota)}</strong>
+                          </div>
+                          <div className="meta-row">
+                            <span>已用额度</span>
+                            <strong>{formatQuotaAmount(currentBillingPeriod?.quotaConsumed, "0")}</strong>
                           </div>
                           <div className="meta-row">
                             <span>剩余额度</span>
-                            <strong>{formatTokenAmount(remainingQuota)}</strong>
+                            <strong>{formatQuotaAmount(remainingQuota)}</strong>
+                          </div>
+                          <div className="meta-row">
+                            <span>NewAPI 实时剩余</span>
+                            <strong>{formatQuotaAmount(upstreamRemainingQuota)}</strong>
                           </div>
                           <div className="meta-row">
                             <span>总 tokens</span>
@@ -1076,7 +1090,7 @@ export function ExperienceClient() {
                   <Card>
                     <CardHeader>
                       <CardTitle>使用记录</CardTitle>
-                      <CardDescription>按 Aether 维度展示请求、tokens、费用和首字/总耗时。</CardDescription>
+                      <CardDescription>按 Aether 维度展示请求、tokens、额度消耗和首字/总耗时。</CardDescription>
                     </CardHeader>
                     <CardContent>
                       <UsageRecordsTable

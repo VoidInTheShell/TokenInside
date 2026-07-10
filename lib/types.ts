@@ -144,15 +144,97 @@ export type ProxyRequestLog = {
   updatedAt?: string;
 };
 
+export type NewApiUsageMatchStatus =
+  | "matched"
+  | "unknown_token"
+  | "no_proxy_match"
+  | "malformed_log";
+
+export type NewApiUsageRecord = {
+  id: string;
+  newapiLogId?: string;
+  newapiRequestId?: string;
+  newapiTokenId?: string;
+  tokenAccountId?: string;
+  feishuUserId?: string;
+  departmentId?: string;
+  departmentName?: string;
+  matchedProxyLogId?: string;
+  matchStatus: NewApiUsageMatchStatus;
+  model?: string;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+  quota?: number;
+  cost?: number;
+  actualCost?: number;
+  isStream?: boolean;
+  newapiType?: string;
+  providerChannelName?: string;
+  newapiUseTimeSeconds?: number;
+  newapiCreatedAt?: string;
+  raw?: unknown;
+  firstSeenAt: string;
+  lastSyncedAt: string;
+};
+
+export type UsageSyncCheckpoint = {
+  id: string;
+  scope: "newapi_usage_logs";
+  pageStart: number;
+  pageSize: number;
+  maxPages: number;
+  overlapMinutes: number;
+  matchWindowMinutes: number;
+  lastSeenNewapiLogId?: string;
+  lastSeenNewapiCreatedAt?: string;
+  lastRunAt?: string;
+  lastRunStatus?: BillingOperationStatus;
+  lastRunBy?: "manual" | "auto";
+  lastRunSummary?: Record<string, string | number | boolean | undefined>;
+  nextRunAfter?: string;
+  updatedAt: string;
+};
+
+export type UsageSyncIssueType =
+  | "unknown_token"
+  | "no_proxy_match"
+  | "missing_cost"
+  | "malformed_log";
+
+export type UsageSyncIssue = {
+  id: string;
+  issueType: UsageSyncIssueType;
+  status: "open" | "closed";
+  newapiLogId?: string;
+  newapiRequestId?: string;
+  newapiTokenId?: string;
+  tokenAccountId?: string;
+  feishuUserId?: string;
+  matchedProxyLogId?: string;
+  message: string;
+  occurrences: number;
+  raw?: unknown;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  lastSyncedAt: string;
+};
+
 export type UserBillingPeriod = {
   id: string;
   feishuUserId: string;
   period: string;
   monthlyQuota: number;
+  quotaConsumed: number;
+  cost: number;
+  remainingQuota: number;
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
   proxyLogCount: number;
+  usageRecordCount: number;
   activeTokenAccountId?: string;
   tokenAccountIds: string[];
   updatedAt: string;
@@ -191,8 +273,25 @@ export type BillingOperationRecord = {
   updatedAt: string;
 };
 
+export type UsageSyncPolicy = {
+  enabled: boolean;
+  intervalMinutes: number;
+  pageSize: number;
+  maxPagesPerRun: number;
+  overlapMinutes: number;
+  matchWindowMinutes: number;
+  updatedAt?: string;
+  updatedByFeishuUserId?: string;
+  lastRunAt?: string;
+  lastRunStatus?: BillingOperationStatus;
+  lastRunMessage?: string;
+  lastRunBy?: "manual" | "auto";
+  nextRunAfter?: string;
+};
+
 export type AppSettings = {
   defaultMonthlyQuota: number;
+  usageSyncPolicy?: UsageSyncPolicy;
   billingOperations?: BillingOperationRecord[];
   updatedAt?: string;
   updatedByFeishuUserId?: string;
@@ -207,5 +306,8 @@ export type StoreShape = {
   userBillingPeriods: UserBillingPeriod[];
   feishuEvents: FeishuEvent[];
   proxyRequestLogs: ProxyRequestLog[];
+  newapiUsageRecords: NewApiUsageRecord[];
+  usageSyncCheckpoints: UsageSyncCheckpoint[];
+  usageSyncIssues: UsageSyncIssue[];
   adminScopes: AdminScope[];
 };

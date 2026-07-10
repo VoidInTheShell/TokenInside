@@ -6,12 +6,15 @@ import type {
   AppSettings,
   FeishuEvent,
   FeishuUser,
+  NewApiUsageRecord,
   ProxyRequestLog,
   RequestStatus,
   StoreShape,
   TokenAccount,
   TokenStatus,
   TokenRequest,
+  UsageSyncCheckpoint,
+  UsageSyncIssue,
   UserBillingPeriod,
 } from "@/lib/types";
 
@@ -25,6 +28,9 @@ export const REQUIRED_POSTGRES_TABLES = [
   "user_billing_periods",
   "feishu_events",
   "proxy_request_logs",
+  "newapi_usage_records",
+  "usage_sync_checkpoints",
+  "usage_sync_issues",
   "admin_scopes",
 ] as const;
 
@@ -95,6 +101,22 @@ function latestIso(...values: Array<string | undefined>) {
 
 function sameStringArray(left: string[], right: string[]) {
   return left.length === right.length && left.every((item, index) => item === right[index]);
+}
+
+function finiteUsageAmount(value?: number) {
+  return Number.isFinite(value) ? (value as number) : 0;
+}
+
+function proxyLogQuotaConsumed(log: ProxyRequestLog) {
+  return finiteUsageAmount(log.cost ?? log.quota);
+}
+
+function usageRecordQuotaConsumed(record: NewApiUsageRecord) {
+  return finiteUsageAmount(record.cost ?? record.quota);
+}
+
+function usageRecordPeriod(record: NewApiUsageRecord) {
+  return periodFromIso(record.newapiCreatedAt ?? record.lastSyncedAt ?? record.firstSeenAt);
 }
 
 async function readSettingsRow(client: PoolClient) {
@@ -282,6 +304,86 @@ async function saveProxyLogRow(client: PoolClient, log: ProxyRequestLog) {
   return result.rows[0].data;
 }
 
+async function saveNewApiUsageRecordRow(client: PoolClient, record: NewApiUsageRecord) {
+  const result = await client.query<{ data: NewApiUsageRecord }>(
+    `insert into newapi_usage_records
+      (id, newapi_log_id, newapi_request_id, newapi_token_id, token_account_id,
+       feishu_user_id, match_status, data, newapi_created_at, first_seen_at, last_synced_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+     on conflict (id) do update set
+       newapi_log_id = excluded.newapi_log_id,
+       newapi_request_id = excluded.newapi_request_id,
+       newapi_token_id = excluded.newapi_token_id,
+       token_account_id = excluded.token_account_id,
+       feishu_user_id = excluded.feishu_user_id,
+       match_status = excluded.match_status,
+       data = excluded.data,
+       newapi_created_at = excluded.newapi_created_at,
+       last_synced_at = excluded.last_synced_at
+     returning data`,
+    [
+      record.id,
+      record.newapiLogId ?? null,
+      record.newapiRequestId ?? null,
+      record.newapiTokenId ?? null,
+      record.tokenAccountId ?? null,
+      record.feishuUserId ?? null,
+      record.matchStatus,
+      record,
+      record.newapiCreatedAt ?? null,
+      record.firstSeenAt,
+      record.lastSyncedAt,
+    ],
+  );
+  return result.rows[0].data;
+}
+
+async function saveUsageSyncCheckpointRow(client: PoolClient, checkpoint: UsageSyncCheckpoint) {
+  const result = await client.query<{ data: UsageSyncCheckpoint }>(
+    `insert into usage_sync_checkpoints
+      (id, scope, data, updated_at)
+     values ($1, $2, $3, $4)
+     on conflict (scope) do update set
+       data = excluded.data,
+       updated_at = excluded.updated_at
+     returning data`,
+    [checkpoint.id, checkpoint.scope, checkpoint, checkpoint.updatedAt],
+  );
+  return result.rows[0].data;
+}
+
+async function saveUsageSyncIssueRow(client: PoolClient, issue: UsageSyncIssue) {
+  const result = await client.query<{ data: UsageSyncIssue }>(
+    `insert into usage_sync_issues
+      (id, issue_type, status, newapi_log_id, newapi_request_id, newapi_token_id,
+       data, first_seen_at, last_seen_at, last_synced_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     on conflict (id) do update set
+       issue_type = excluded.issue_type,
+       status = excluded.status,
+       newapi_log_id = excluded.newapi_log_id,
+       newapi_request_id = excluded.newapi_request_id,
+       newapi_token_id = excluded.newapi_token_id,
+       data = excluded.data,
+       last_seen_at = excluded.last_seen_at,
+       last_synced_at = excluded.last_synced_at
+     returning data`,
+    [
+      issue.id,
+      issue.issueType,
+      issue.status,
+      issue.newapiLogId ?? null,
+      issue.newapiRequestId ?? null,
+      issue.newapiTokenId ?? null,
+      issue,
+      issue.firstSeenAt,
+      issue.lastSeenAt,
+      issue.lastSyncedAt,
+    ],
+  );
+  return result.rows[0].data;
+}
+
 async function saveAdminScopeRow(client: PoolClient, scope: AdminScope) {
   const result = await client.query<{ data: AdminScope }>(
     `insert into admin_scopes
@@ -401,10 +503,14 @@ async function syncPostgresBillingPeriodForUser(
     feishuUserId,
     period,
     monthlyQuota: settings.defaultMonthlyQuota,
+    quotaConsumed: 0,
+    cost: 0,
+    remainingQuota: settings.defaultMonthlyQuota,
     promptTokens: 0,
     completionTokens: 0,
     totalTokens: 0,
     proxyLogCount: 0,
+    usageRecordCount: 0,
     tokenAccountIds: [],
     updatedAt: seededAt,
   };
@@ -441,6 +547,14 @@ async function syncPostgresBillingPeriodForUser(
       [feishuUserId],
     )
   ).rows.map((row) => row.data);
+  const usageRecords = (
+    await client.query<{ data: NewApiUsageRecord }>(
+      `select data from newapi_usage_records
+       where feishu_user_id = $1
+       order by coalesce(newapi_created_at, last_synced_at), id`,
+      [feishuUserId],
+    )
+  ).rows.map((row) => row.data);
 
   const requestById = new Map(requests.map((request) => [request.id, request]));
   const accountById = new Map(accounts.map((account) => [account.id, account]));
@@ -449,10 +563,14 @@ async function syncPostgresBillingPeriodForUser(
     feishuUserId,
     period,
     monthlyQuota: existing?.monthlyQuota ?? settings.defaultMonthlyQuota,
+    quotaConsumed: 0,
+    cost: 0,
+    remainingQuota: existing?.monthlyQuota ?? settings.defaultMonthlyQuota,
     promptTokens: 0,
     completionTokens: 0,
     totalTokens: 0,
     proxyLogCount: 0,
+    usageRecordCount: 0,
     activeTokenAccountId: undefined,
     tokenAccountIds: [],
     updatedAt: existing?.updatedAt ?? nowIso(),
@@ -504,16 +622,44 @@ async function syncPostgresBillingPeriodForUser(
     summary.sourceUpdatedAt = latestIso(summary.sourceUpdatedAt, request.updatedAt);
   }
 
+  const proxyLogIdsBackedByNewApiRecords = new Set<string>();
+  for (const record of usageRecords) {
+    if (record.matchedProxyLogId) proxyLogIdsBackedByNewApiRecords.add(record.matchedProxyLogId);
+    if (usageRecordPeriod(record) !== period) continue;
+    if (record.matchStatus === "unknown_token" || record.matchStatus === "malformed_log") continue;
+    const quotaConsumed = usageRecordQuotaConsumed(record);
+    summary.quotaConsumed += quotaConsumed;
+    summary.cost += quotaConsumed;
+    summary.usageRecordCount += 1;
+    summary.sourceUpdatedAt = latestIso(
+      summary.sourceUpdatedAt,
+      record.newapiCreatedAt,
+      record.lastSyncedAt,
+      record.firstSeenAt,
+    );
+  }
+
   for (const log of logs) {
     if (periodFromIso(log.createdAt) !== period) continue;
     summary.promptTokens += log.promptTokens ?? 0;
     summary.completionTokens += log.completionTokens ?? 0;
     summary.totalTokens += log.totalTokens ?? 0;
     summary.proxyLogCount += 1;
+    if (!proxyLogIdsBackedByNewApiRecords.has(log.id)) {
+      const quotaConsumed = proxyLogQuotaConsumed(log);
+      if (quotaConsumed || log.cost !== undefined || log.quota !== undefined) {
+        summary.quotaConsumed += quotaConsumed;
+        summary.cost += quotaConsumed;
+        summary.usageRecordCount += 1;
+      }
+    }
     summary.sourceUpdatedAt = latestIso(summary.sourceUpdatedAt, log.createdAt, log.updatedAt);
   }
 
   summary.tokenAccountIds = [...new Set(summary.tokenAccountIds)].sort();
+  summary.quotaConsumed = Number(summary.quotaConsumed.toFixed(8));
+  summary.cost = Number(summary.cost.toFixed(8));
+  summary.remainingQuota = Math.max(Number((summary.monthlyQuota - summary.quotaConsumed).toFixed(8)), 0);
   summary.updatedAt = summary.sourceUpdatedAt ?? summary.updatedAt;
   delete summary.quotaUpdatedAt;
   delete summary.sourceUpdatedAt;
@@ -521,10 +667,14 @@ async function syncPostgresBillingPeriodForUser(
   if (
     !existing ||
     existing.monthlyQuota !== summary.monthlyQuota ||
+    existing.quotaConsumed !== summary.quotaConsumed ||
+    existing.cost !== summary.cost ||
+    existing.remainingQuota !== summary.remainingQuota ||
     existing.promptTokens !== summary.promptTokens ||
     existing.completionTokens !== summary.completionTokens ||
     existing.totalTokens !== summary.totalTokens ||
     existing.proxyLogCount !== summary.proxyLogCount ||
+    existing.usageRecordCount !== summary.usageRecordCount ||
     existing.activeTokenAccountId !== summary.activeTokenAccountId ||
     !sameStringArray(existing.tokenAccountIds, summary.tokenAccountIds) ||
     existing.updatedAt !== summary.updatedAt
@@ -596,6 +746,21 @@ export async function readPostgresStore(): Promise<StoreShape> {
         client,
         "proxy_request_logs",
         "created_at, id",
+      ),
+      newapiUsageRecords: await readDataRows<NewApiUsageRecord>(
+        client,
+        "newapi_usage_records",
+        "coalesce(newapi_created_at, last_synced_at), id",
+      ),
+      usageSyncCheckpoints: await readDataRows<UsageSyncCheckpoint>(
+        client,
+        "usage_sync_checkpoints",
+        "updated_at, id",
+      ),
+      usageSyncIssues: await readDataRows<UsageSyncIssue>(
+        client,
+        "usage_sync_issues",
+        "last_seen_at, id",
       ),
       adminScopes: await readDataRows<AdminScope>(client, "admin_scopes", "created_at, id"),
     };
@@ -1354,6 +1519,64 @@ export async function updatePostgresProxyLog(
   });
 }
 
+export async function upsertPostgresNewApiUsageRecord(record: NewApiUsageRecord) {
+  return withTransaction(async (client) => {
+    const existingResult = await client.query<{ data: NewApiUsageRecord }>(
+      "select data from newapi_usage_records where id = $1 for update",
+      [record.id],
+    );
+    const existing = existingResult.rows[0]?.data;
+    const stored = await saveNewApiUsageRecordRow(client, {
+      ...existing,
+      ...record,
+      id: existing?.id ?? record.id,
+      firstSeenAt: existing?.firstSeenAt ?? record.firstSeenAt,
+    });
+
+    const affected = new Map<string, { feishuUserId: string; period: string }>();
+    if (existing?.feishuUserId) {
+      const period = usageRecordPeriod(existing);
+      affected.set(`${existing.feishuUserId}\n${period}`, {
+        feishuUserId: existing.feishuUserId,
+        period,
+      });
+    }
+    if (stored.feishuUserId) {
+      const period = usageRecordPeriod(stored);
+      affected.set(`${stored.feishuUserId}\n${period}`, {
+        feishuUserId: stored.feishuUserId,
+        period,
+      });
+    }
+    for (const item of affected.values()) {
+      await syncPostgresBillingPeriodForUser(client, item.feishuUserId, item.period);
+    }
+    return stored;
+  });
+}
+
+export async function upsertPostgresUsageSyncIssue(issue: UsageSyncIssue) {
+  return withTransaction(async (client) => {
+    const existingResult = await client.query<{ data: UsageSyncIssue }>(
+      "select data from usage_sync_issues where id = $1 for update",
+      [issue.id],
+    );
+    const existing = existingResult.rows[0]?.data;
+    return saveUsageSyncIssueRow(client, {
+      ...existing,
+      ...issue,
+      id: existing?.id ?? issue.id,
+      firstSeenAt: existing?.firstSeenAt ?? issue.firstSeenAt,
+      occurrences: existing ? existing.occurrences + 1 : issue.occurrences,
+      status: "open",
+    });
+  });
+}
+
+export async function upsertPostgresUsageSyncCheckpoint(checkpoint: UsageSyncCheckpoint) {
+  return withTransaction(async (client) => saveUsageSyncCheckpointRow(client, checkpoint));
+}
+
 export async function withPostgresAdvisoryLock<T>(key: string, fn: () => Promise<T>) {
   if (getConfig().postgres.poolMax < 2) {
     throw new Error(
@@ -1382,6 +1605,9 @@ export async function writePostgresStore(store: StoreShape) {
     await client.query("begin");
     await client.query("delete from app_settings");
     await client.query("delete from admin_scopes");
+    await client.query("delete from usage_sync_issues");
+    await client.query("delete from usage_sync_checkpoints");
+    await client.query("delete from newapi_usage_records");
     await client.query("delete from proxy_request_logs");
     await client.query("delete from feishu_events");
     await client.query("delete from user_billing_periods");
@@ -1494,6 +1720,57 @@ export async function writePostgresStore(store: StoreShape) {
         log.statusCode,
         log,
         log.createdAt,
+      ],
+    }));
+
+    await insertJsonRows(client, "newapi_usage_records", store.newapiUsageRecords, (record) => ({
+      sql: `insert into newapi_usage_records
+        (id, newapi_log_id, newapi_request_id, newapi_token_id, token_account_id,
+         feishu_user_id, match_status, data, newapi_created_at, first_seen_at, last_synced_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+      values: [
+        record.id,
+        record.newapiLogId ?? null,
+        record.newapiRequestId ?? null,
+        record.newapiTokenId ?? null,
+        record.tokenAccountId ?? null,
+        record.feishuUserId ?? null,
+        record.matchStatus,
+        record,
+        record.newapiCreatedAt ?? null,
+        record.firstSeenAt,
+        record.lastSyncedAt,
+      ],
+    }));
+
+    await insertJsonRows(
+      client,
+      "usage_sync_checkpoints",
+      store.usageSyncCheckpoints,
+      (checkpoint) => ({
+        sql: `insert into usage_sync_checkpoints
+          (id, scope, data, updated_at)
+          values ($1, $2, $3, $4)`,
+        values: [checkpoint.id, checkpoint.scope, checkpoint, checkpoint.updatedAt],
+      }),
+    );
+
+    await insertJsonRows(client, "usage_sync_issues", store.usageSyncIssues, (issue) => ({
+      sql: `insert into usage_sync_issues
+        (id, issue_type, status, newapi_log_id, newapi_request_id, newapi_token_id,
+         data, first_seen_at, last_seen_at, last_synced_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      values: [
+        issue.id,
+        issue.issueType,
+        issue.status,
+        issue.newapiLogId ?? null,
+        issue.newapiRequestId ?? null,
+        issue.newapiTokenId ?? null,
+        issue,
+        issue.firstSeenAt,
+        issue.lastSeenAt,
+        issue.lastSyncedAt,
       ],
     }));
 

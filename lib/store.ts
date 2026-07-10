@@ -27,6 +27,9 @@ import {
   updatePostgresUserAccessStatus,
   upsertPostgresFeishuEvent,
   upsertPostgresFeishuUser,
+  upsertPostgresNewApiUsageRecord,
+  upsertPostgresUsageSyncCheckpoint,
+  upsertPostgresUsageSyncIssue,
   upsertPostgresManualAdminScope,
 } from "@/lib/postgres-store";
 import type {
@@ -36,19 +39,37 @@ import type {
   BillingOperationStatus,
   FeishuEvent,
   FeishuUser,
+  NewApiUsageMatchStatus,
+  NewApiUsageRecord,
   ProxyRequestLog,
   RequestStatus,
   StoreShape,
   TokenAccount,
   TokenStatus,
   TokenRequest,
+  UsageSyncCheckpoint,
+  UsageSyncIssue,
+  UsageSyncIssueType,
+  UsageSyncPolicy,
   UserBillingPeriod,
 } from "@/lib/types";
+
+export function defaultUsageSyncPolicy(): UsageSyncPolicy {
+  return {
+    enabled: false,
+    intervalMinutes: 60,
+    pageSize: 100,
+    maxPagesPerRun: 3,
+    overlapMinutes: 120,
+    matchWindowMinutes: 30,
+  };
+}
 
 const initialStore: StoreShape = {
   version: 1,
   settings: {
     defaultMonthlyQuota: 200,
+    usageSyncPolicy: defaultUsageSyncPolicy(),
     billingOperations: [],
   },
   users: [],
@@ -57,6 +78,9 @@ const initialStore: StoreShape = {
   userBillingPeriods: [],
   feishuEvents: [],
   proxyRequestLogs: [],
+  newapiUsageRecords: [],
+  usageSyncCheckpoints: [],
+  usageSyncIssues: [],
   adminScopes: [],
 };
 
@@ -164,10 +188,29 @@ async function readStore(): Promise<StoreShape> {
   }
 }
 
+function normalizeUsageSyncPolicy(policy?: Partial<UsageSyncPolicy>): UsageSyncPolicy {
+  const defaults = defaultUsageSyncPolicy();
+  return {
+    ...defaults,
+    ...policy,
+    enabled: policy?.enabled ?? defaults.enabled,
+    intervalMinutes: Math.min(Math.max(Math.trunc(policy?.intervalMinutes ?? defaults.intervalMinutes), 1), 24 * 60),
+    pageSize: Math.min(Math.max(Math.trunc(policy?.pageSize ?? defaults.pageSize), 1), 100),
+    maxPagesPerRun: Math.min(Math.max(Math.trunc(policy?.maxPagesPerRun ?? defaults.maxPagesPerRun), 1), 20),
+    overlapMinutes: Math.min(Math.max(Math.trunc(policy?.overlapMinutes ?? defaults.overlapMinutes), 0), 7 * 24 * 60),
+    matchWindowMinutes: Math.min(Math.max(Math.trunc(policy?.matchWindowMinutes ?? defaults.matchWindowMinutes), 1), 24 * 60),
+  };
+}
+
 function normalizeStore(store: StoreShape) {
   let changed = false;
   if (!store.settings) {
     store.settings = structuredClone(initialStore.settings);
+    changed = true;
+  }
+  const normalizedPolicy = normalizeUsageSyncPolicy(store.settings.usageSyncPolicy);
+  if (JSON.stringify(store.settings.usageSyncPolicy ?? null) !== JSON.stringify(normalizedPolicy)) {
+    store.settings.usageSyncPolicy = normalizedPolicy;
     changed = true;
   }
   if (!Array.isArray(store.settings.billingOperations)) {
@@ -179,6 +222,18 @@ function normalizeStore(store: StoreShape) {
       0,
       maxBillingOperationRecords,
     );
+    changed = true;
+  }
+  if (!Array.isArray(store.newapiUsageRecords)) {
+    store.newapiUsageRecords = [];
+    changed = true;
+  }
+  if (!Array.isArray(store.usageSyncCheckpoints)) {
+    store.usageSyncCheckpoints = [];
+    changed = true;
+  }
+  if (!Array.isArray(store.usageSyncIssues)) {
+    store.usageSyncIssues = [];
     changed = true;
   }
   const accountsByRequestId = new Map(
@@ -253,6 +308,22 @@ function sameStringArray(left: string[], right: string[]) {
   return left.length === right.length && left.every((item, index) => item === right[index]);
 }
 
+function finiteUsageAmount(value?: number) {
+  return Number.isFinite(value) ? (value as number) : 0;
+}
+
+function proxyLogQuotaConsumed(log: ProxyRequestLog) {
+  return finiteUsageAmount(log.cost ?? log.quota);
+}
+
+function usageRecordQuotaConsumed(record: NewApiUsageRecord) {
+  return finiteUsageAmount(record.cost ?? record.quota);
+}
+
+function usageRecordPeriod(record: NewApiUsageRecord) {
+  return periodFromIso(record.newapiCreatedAt ?? record.lastSyncedAt ?? record.firstSeenAt);
+}
+
 function syncBillingPeriods(store: StoreShape) {
   let changed = false;
   const existingByKey = new Map(
@@ -278,10 +349,14 @@ function syncBillingPeriods(store: StoreShape) {
         feishuUserId,
         period,
         monthlyQuota: existing?.monthlyQuota ?? initialStore.settings.defaultMonthlyQuota,
+        quotaConsumed: 0,
+        cost: 0,
+        remainingQuota: existing?.monthlyQuota ?? initialStore.settings.defaultMonthlyQuota,
         promptTokens: 0,
         completionTokens: 0,
         totalTokens: 0,
         proxyLogCount: 0,
+        usageRecordCount: 0,
         activeTokenAccountId: undefined,
         tokenAccountIds: [],
         updatedAt: existing?.updatedAt ?? nowIso(),
@@ -342,6 +417,27 @@ function syncBillingPeriods(store: StoreShape) {
     summary.sourceUpdatedAt = latestIso(summary.sourceUpdatedAt, request.updatedAt);
   }
 
+  const proxyLogIdsBackedByNewApiRecords = new Set<string>();
+  for (const record of store.newapiUsageRecords) {
+    if (record.matchedProxyLogId) {
+      proxyLogIdsBackedByNewApiRecords.add(record.matchedProxyLogId);
+    }
+    if (!record.feishuUserId) continue;
+    if (record.matchStatus === "unknown_token" || record.matchStatus === "malformed_log") continue;
+    const quotaConsumed = usageRecordQuotaConsumed(record);
+    const period = usageRecordPeriod(record);
+    const summary = ensure(record.feishuUserId, period);
+    summary.quotaConsumed += quotaConsumed;
+    summary.cost += quotaConsumed;
+    summary.usageRecordCount += 1;
+    summary.sourceUpdatedAt = latestIso(
+      summary.sourceUpdatedAt,
+      record.newapiCreatedAt,
+      record.lastSyncedAt,
+      record.firstSeenAt,
+    );
+  }
+
   for (const log of store.proxyRequestLogs) {
     if (!log.feishuUserId) continue;
     const period = periodFromIso(log.createdAt);
@@ -350,11 +446,22 @@ function syncBillingPeriods(store: StoreShape) {
     summary.completionTokens += log.completionTokens ?? 0;
     summary.totalTokens += log.totalTokens ?? 0;
     summary.proxyLogCount += 1;
+    if (!proxyLogIdsBackedByNewApiRecords.has(log.id)) {
+      const quotaConsumed = proxyLogQuotaConsumed(log);
+      if (quotaConsumed || log.cost !== undefined || log.quota !== undefined) {
+        summary.quotaConsumed += quotaConsumed;
+        summary.cost += quotaConsumed;
+        summary.usageRecordCount += 1;
+      }
+    }
     summary.sourceUpdatedAt = latestIso(summary.sourceUpdatedAt, log.createdAt);
   }
 
   for (const summary of computed.values()) {
     summary.tokenAccountIds = [...new Set(summary.tokenAccountIds)].sort();
+    summary.quotaConsumed = Number(summary.quotaConsumed.toFixed(8));
+    summary.cost = Number(summary.cost.toFixed(8));
+    summary.remainingQuota = Math.max(Number((summary.monthlyQuota - summary.quotaConsumed).toFixed(8)), 0);
     summary.updatedAt = summary.sourceUpdatedAt ?? summary.updatedAt;
     delete summary.quotaUpdatedAt;
     delete summary.sourceUpdatedAt;
@@ -370,12 +477,18 @@ function syncBillingPeriods(store: StoreShape) {
     }
     const patch: Partial<UserBillingPeriod> = {};
     if (existing.monthlyQuota !== summary.monthlyQuota) patch.monthlyQuota = summary.monthlyQuota;
+    if (existing.quotaConsumed !== summary.quotaConsumed) patch.quotaConsumed = summary.quotaConsumed;
+    if (existing.cost !== summary.cost) patch.cost = summary.cost;
+    if (existing.remainingQuota !== summary.remainingQuota) patch.remainingQuota = summary.remainingQuota;
     if (existing.promptTokens !== summary.promptTokens) patch.promptTokens = summary.promptTokens;
     if (existing.completionTokens !== summary.completionTokens) {
       patch.completionTokens = summary.completionTokens;
     }
     if (existing.totalTokens !== summary.totalTokens) patch.totalTokens = summary.totalTokens;
     if (existing.proxyLogCount !== summary.proxyLogCount) patch.proxyLogCount = summary.proxyLogCount;
+    if (existing.usageRecordCount !== summary.usageRecordCount) {
+      patch.usageRecordCount = summary.usageRecordCount;
+    }
     if (existing.activeTokenAccountId !== summary.activeTokenAccountId) {
       patch.activeTokenAccountId = summary.activeTokenAccountId;
     }
@@ -417,7 +530,14 @@ export async function getStoreSnapshot() {
 }
 
 export async function getAppSettings() {
-  if (isPostgresBackend()) return getPostgresAppSettings();
+  if (isPostgresBackend()) {
+    const settings = await getPostgresAppSettings();
+    return {
+      ...settings,
+      usageSyncPolicy: normalizeUsageSyncPolicy(settings.usageSyncPolicy),
+      billingOperations: settings.billingOperations ?? [],
+    };
+  }
   const store = await readStore();
   return store.settings;
 }
@@ -448,7 +568,8 @@ function prependBillingOperation(
 }
 
 export async function updateAppSettings(input: {
-  defaultMonthlyQuota: number;
+  defaultMonthlyQuota?: number;
+  usageSyncPolicy?: Partial<UsageSyncPolicy>;
   updatedByFeishuUserId: string;
 }) {
   if (isPostgresBackend()) {
@@ -461,9 +582,21 @@ export async function updateAppSettings(input: {
         },
       };
       const previousDefaultMonthlyQuota = store.settings.defaultMonthlyQuota;
+      const previousUsageSyncPolicy = normalizeUsageSyncPolicy(store.settings.usageSyncPolicy);
+      const nextDefaultMonthlyQuota =
+        input.defaultMonthlyQuota ?? store.settings.defaultMonthlyQuota;
+      const nextUsageSyncPolicy = input.usageSyncPolicy
+        ? normalizeUsageSyncPolicy({
+            ...previousUsageSyncPolicy,
+            ...input.usageSyncPolicy,
+            updatedAt: nowIso(),
+            updatedByFeishuUserId: input.updatedByFeishuUserId,
+          })
+        : previousUsageSyncPolicy;
       store.settings = {
         ...store.settings,
-        defaultMonthlyQuota: input.defaultMonthlyQuota,
+        defaultMonthlyQuota: nextDefaultMonthlyQuota,
+        usageSyncPolicy: nextUsageSyncPolicy,
         updatedAt: nowIso(),
         updatedByFeishuUserId: input.updatedByFeishuUserId,
       };
@@ -474,11 +607,13 @@ export async function updateAppSettings(input: {
         operatedByFeishuUserId: input.updatedByFeishuUserId,
         input: {
           previousDefaultMonthlyQuota,
-          defaultMonthlyQuota: input.defaultMonthlyQuota,
+          defaultMonthlyQuota: nextDefaultMonthlyQuota,
+          usageSyncPolicyUpdated: Boolean(input.usageSyncPolicy),
         },
         summary: {
           previousDefaultMonthlyQuota,
-          defaultMonthlyQuota: input.defaultMonthlyQuota,
+          defaultMonthlyQuota: nextDefaultMonthlyQuota,
+          usageSyncPolicyUpdated: Boolean(input.usageSyncPolicy),
         },
       });
       Object.assign(settings, store.settings);
@@ -488,9 +623,20 @@ export async function updateAppSettings(input: {
 
   return mutate((store) => {
     const previousDefaultMonthlyQuota = store.settings.defaultMonthlyQuota;
+    const previousUsageSyncPolicy = normalizeUsageSyncPolicy(store.settings.usageSyncPolicy);
+    const nextDefaultMonthlyQuota = input.defaultMonthlyQuota ?? store.settings.defaultMonthlyQuota;
+    const nextUsageSyncPolicy = input.usageSyncPolicy
+      ? normalizeUsageSyncPolicy({
+          ...previousUsageSyncPolicy,
+          ...input.usageSyncPolicy,
+          updatedAt: nowIso(),
+          updatedByFeishuUserId: input.updatedByFeishuUserId,
+        })
+      : previousUsageSyncPolicy;
     store.settings = {
       ...store.settings,
-      defaultMonthlyQuota: input.defaultMonthlyQuota,
+      defaultMonthlyQuota: nextDefaultMonthlyQuota,
+      usageSyncPolicy: nextUsageSyncPolicy,
       updatedAt: nowIso(),
       updatedByFeishuUserId: input.updatedByFeishuUserId,
     };
@@ -501,11 +647,13 @@ export async function updateAppSettings(input: {
       operatedByFeishuUserId: input.updatedByFeishuUserId,
       input: {
         previousDefaultMonthlyQuota,
-        defaultMonthlyQuota: input.defaultMonthlyQuota,
+        defaultMonthlyQuota: nextDefaultMonthlyQuota,
+        usageSyncPolicyUpdated: Boolean(input.usageSyncPolicy),
       },
       summary: {
         previousDefaultMonthlyQuota,
-        defaultMonthlyQuota: input.defaultMonthlyQuota,
+        defaultMonthlyQuota: nextDefaultMonthlyQuota,
+        usageSyncPolicyUpdated: Boolean(input.usageSyncPolicy),
       },
     });
     return store.settings;
@@ -549,6 +697,38 @@ export async function listBillingOperations(limit = 20) {
   }
   const store = await readStore();
   return (store.settings.billingOperations ?? []).slice(0, Math.max(limit, 0));
+}
+
+export async function getUsageSyncCheckpoint(scope: UsageSyncCheckpoint["scope"] = "newapi_usage_logs") {
+  const store = await readStore();
+  return store.usageSyncCheckpoints.find((checkpoint) => checkpoint.scope === scope) ?? null;
+}
+
+export async function saveUsageSyncCheckpoint(
+  checkpoint: Omit<UsageSyncCheckpoint, "id" | "updatedAt"> &
+    Partial<Pick<UsageSyncCheckpoint, "id" | "updatedAt">>,
+) {
+  const stored: UsageSyncCheckpoint = {
+    ...checkpoint,
+    id: checkpoint.id ?? `usc_${checkpoint.scope}`,
+    updatedAt: checkpoint.updatedAt ?? nowIso(),
+  };
+  if (isPostgresBackend()) return upsertPostgresUsageSyncCheckpoint(stored);
+
+  return mutate((store) => {
+    const index = store.usageSyncCheckpoints.findIndex((item) => item.scope === stored.scope);
+    if (index === -1) {
+      store.usageSyncCheckpoints.push(stored);
+    } else {
+      store.usageSyncCheckpoints[index] = {
+        ...store.usageSyncCheckpoints[index],
+        ...stored,
+        id: store.usageSyncCheckpoints[index].id,
+        updatedAt: stored.updatedAt,
+      };
+    }
+    return store.usageSyncCheckpoints.find((item) => item.scope === stored.scope) ?? stored;
+  });
 }
 
 export async function upsertFeishuUser(input: {
@@ -1135,6 +1315,10 @@ export type NewApiUsageBackfillItem = {
   proxyLogId?: string;
   feishuUserId?: string;
   tokenAccountId?: string;
+  usageRecordId?: string;
+  issueId?: string;
+  cost?: number;
+  quota?: number;
   reason?: string;
 };
 
@@ -1145,6 +1329,8 @@ export type NewApiUsageBackfillResult = {
   updated: number;
   skippedUnknownToken: number;
   skippedNoMatch: number;
+  recordsUpserted: number;
+  issuesUpserted: number;
   items: NewApiUsageBackfillItem[];
 };
 
@@ -1270,6 +1456,145 @@ function findProxyLogForNewApiUsage(input: {
   return candidates[0]?.log;
 }
 
+function stableUsageIdentity(usageLog: NormalizedNewApiUsageLog) {
+  return [
+    usageLog.newapiLogId,
+    usageLog.newapiRequestId,
+    usageLog.newapiTokenId,
+    usageLog.createdAt,
+    usageLog.model,
+    usageLog.quota,
+  ]
+    .filter((value) => value !== undefined && value !== null && String(value).length > 0)
+    .join(":");
+}
+
+function stableRecordId(prefix: string, identity: string) {
+  return `${prefix}_${identity.replace(/[^a-zA-Z0-9_.:-]/g, "_").slice(0, 180) || randomId(prefix)}`;
+}
+
+function usageRecordIdFromLog(usageLog: NormalizedNewApiUsageLog) {
+  return stableRecordId("nur", stableUsageIdentity(usageLog));
+}
+
+function usageIssueIdFromLog(type: UsageSyncIssueType, usageLog: NormalizedNewApiUsageLog) {
+  return stableRecordId(`usi_${type}`, stableUsageIdentity(usageLog));
+}
+
+function buildNewApiUsageRecord(input: {
+  store: StoreShape;
+  usageLog: NormalizedNewApiUsageLog;
+  matchStatus: NewApiUsageMatchStatus;
+  syncedAt: string;
+  account?: TokenAccount;
+  proxyLog?: ProxyRequestLog;
+}): NewApiUsageRecord {
+  const user = input.account ? input.store.users.find((item) => item.id === input.account?.feishuUserId) : undefined;
+  return {
+    id: usageRecordIdFromLog(input.usageLog),
+    newapiLogId: input.usageLog.newapiLogId,
+    newapiRequestId: input.usageLog.newapiRequestId,
+    newapiTokenId: input.usageLog.newapiTokenId,
+    tokenAccountId: input.proxyLog?.tokenAccountId ?? input.account?.id,
+    feishuUserId: input.proxyLog?.feishuUserId ?? input.account?.feishuUserId,
+    departmentId: input.proxyLog?.departmentId ?? user?.departmentId,
+    departmentName: input.proxyLog?.departmentName ?? user?.departmentName,
+    matchedProxyLogId: input.proxyLog?.id,
+    matchStatus: input.matchStatus,
+    model: input.usageLog.model,
+    promptTokens: input.usageLog.promptTokens,
+    completionTokens: input.usageLog.completionTokens,
+    totalTokens: input.usageLog.totalTokens,
+    quota: input.usageLog.quota,
+    cost: input.usageLog.cost,
+    isStream: input.usageLog.isStream,
+    newapiType: input.usageLog.type,
+    providerChannelName: input.usageLog.providerChannelName,
+    newapiUseTimeSeconds: input.usageLog.newapiUseTimeSeconds,
+    newapiCreatedAt: input.usageLog.createdAt,
+    raw: input.usageLog,
+    firstSeenAt: input.syncedAt,
+    lastSyncedAt: input.syncedAt,
+  };
+}
+
+function buildUsageSyncIssue(input: {
+  issueType: UsageSyncIssueType;
+  usageLog: NormalizedNewApiUsageLog;
+  syncedAt: string;
+  message: string;
+  account?: TokenAccount;
+  proxyLog?: ProxyRequestLog;
+}): UsageSyncIssue {
+  return {
+    id: usageIssueIdFromLog(input.issueType, input.usageLog),
+    issueType: input.issueType,
+    status: "open",
+    newapiLogId: input.usageLog.newapiLogId,
+    newapiRequestId: input.usageLog.newapiRequestId,
+    newapiTokenId: input.usageLog.newapiTokenId,
+    tokenAccountId: input.proxyLog?.tokenAccountId ?? input.account?.id,
+    feishuUserId: input.proxyLog?.feishuUserId ?? input.account?.feishuUserId,
+    matchedProxyLogId: input.proxyLog?.id,
+    message: input.message,
+    occurrences: 1,
+    raw: input.usageLog,
+    firstSeenAt: input.syncedAt,
+    lastSeenAt: input.syncedAt,
+    lastSyncedAt: input.syncedAt,
+  };
+}
+
+function sameUsageSourceRecord(left: NewApiUsageRecord, right: NewApiUsageRecord) {
+  if (right.newapiLogId && left.newapiLogId === right.newapiLogId) return true;
+  if (right.newapiRequestId && left.newapiRequestId === right.newapiRequestId) return true;
+  return left.id === right.id;
+}
+
+function upsertUsageRecordInStore(store: StoreShape, record: NewApiUsageRecord) {
+  const index = store.newapiUsageRecords.findIndex((item) => sameUsageSourceRecord(item, record));
+  if (index === -1) {
+    store.newapiUsageRecords.push(record);
+    return record;
+  }
+  const existing = store.newapiUsageRecords[index];
+  const updated: NewApiUsageRecord = {
+    ...existing,
+    ...record,
+    id: existing.id,
+    firstSeenAt: existing.firstSeenAt,
+    lastSyncedAt: record.lastSyncedAt,
+  };
+  store.newapiUsageRecords[index] = updated;
+  return updated;
+}
+
+function upsertUsageIssueInStore(store: StoreShape, issue: UsageSyncIssue) {
+  const index = store.usageSyncIssues.findIndex((item) => {
+    if (item.issueType !== issue.issueType) return false;
+    if (issue.newapiLogId && item.newapiLogId === issue.newapiLogId) return true;
+    if (issue.newapiRequestId && item.newapiRequestId === issue.newapiRequestId) return true;
+    return item.id === issue.id;
+  });
+  if (index === -1) {
+    store.usageSyncIssues.push(issue);
+    return issue;
+  }
+  const existing = store.usageSyncIssues[index];
+  const updated: UsageSyncIssue = {
+    ...existing,
+    ...issue,
+    id: existing.id,
+    firstSeenAt: existing.firstSeenAt,
+    occurrences: existing.occurrences + 1,
+    lastSeenAt: issue.lastSeenAt,
+    lastSyncedAt: issue.lastSyncedAt,
+    status: "open",
+  };
+  store.usageSyncIssues[index] = updated;
+  return updated;
+}
+
 export async function backfillProxyLogsFromNewApiUsage(
   usageLogs: NormalizedNewApiUsageLog[],
   input: {
@@ -1287,6 +1612,8 @@ export async function backfillProxyLogsFromNewApiUsage(
       patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">>,
       syncedAt: string,
     ) => Promise<void>,
+    persistUsageRecord?: (record: NewApiUsageRecord) => Promise<NewApiUsageRecord>,
+    persistIssue?: (issue: UsageSyncIssue) => Promise<UsageSyncIssue>,
   ) => {
     const syncedAt = nowIso();
     const accountByNewApiTokenId = new Map(
@@ -1301,8 +1628,24 @@ export async function backfillProxyLogsFromNewApiUsage(
       updated: 0,
       skippedUnknownToken: 0,
       skippedNoMatch: 0,
+      recordsUpserted: 0,
+      issuesUpserted: 0,
       items: [],
     };
+
+    async function persistRecord(record: NewApiUsageRecord) {
+      if (dryRun) return record;
+      result.recordsUpserted += 1;
+      if (persistUsageRecord) return persistUsageRecord(record);
+      return upsertUsageRecordInStore(store, record);
+    }
+
+    async function persistSyncIssue(issue: UsageSyncIssue) {
+      if (dryRun) return issue;
+      result.issuesUpserted += 1;
+      if (persistIssue) return persistIssue(issue);
+      return upsertUsageIssueInStore(store, issue);
+    }
 
     for (const usageLog of usageLogs) {
       const account =
@@ -1310,12 +1653,30 @@ export async function backfillProxyLogsFromNewApiUsage(
           ? undefined
           : accountByNewApiTokenId.get(usageLog.newapiTokenId);
       if (!account) {
+        const record = buildNewApiUsageRecord({
+          store,
+          usageLog,
+          matchStatus: "unknown_token",
+          syncedAt,
+        });
+        const issue = buildUsageSyncIssue({
+          issueType: "unknown_token",
+          usageLog,
+          syncedAt,
+          message: "NewAPI token_id is not bound to a TokenInside token account",
+        });
+        await persistRecord(record);
+        await persistSyncIssue(issue);
         result.skippedUnknownToken += 1;
         result.items.push({
           action: "skipped_unknown_token",
           newapiLogId: usageLog.newapiLogId,
           newapiRequestId: usageLog.newapiRequestId,
           newapiTokenId: usageLog.newapiTokenId,
+          usageRecordId: record.id,
+          issueId: issue.id,
+          cost: usageLog.cost,
+          quota: usageLog.quota,
           reason: "NewAPI token_id is not bound to a TokenInside token account",
         });
         continue;
@@ -1328,6 +1689,22 @@ export async function backfillProxyLogsFromNewApiUsage(
         matchWindowMs,
       });
       if (!proxyLog) {
+        const record = buildNewApiUsageRecord({
+          store,
+          usageLog,
+          matchStatus: "no_proxy_match",
+          syncedAt,
+          account,
+        });
+        const issue = buildUsageSyncIssue({
+          issueType: "no_proxy_match",
+          usageLog,
+          syncedAt,
+          account,
+          message: "No proxy request log matched token, model, stream flag and time window",
+        });
+        await persistRecord(record);
+        await persistSyncIssue(issue);
         result.skippedNoMatch += 1;
         result.items.push({
           action: "skipped_no_match",
@@ -1336,12 +1713,36 @@ export async function backfillProxyLogsFromNewApiUsage(
           newapiTokenId: usageLog.newapiTokenId,
           feishuUserId: account.feishuUserId,
           tokenAccountId: account.id,
+          usageRecordId: record.id,
+          issueId: issue.id,
+          cost: usageLog.cost,
+          quota: usageLog.quota,
           reason: "No proxy request log matched token, model, stream flag and time window",
         });
         continue;
       }
 
       result.matched += 1;
+      const record = buildNewApiUsageRecord({
+        store,
+        usageLog,
+        matchStatus: "matched",
+        syncedAt,
+        account,
+        proxyLog,
+      });
+      await persistRecord(record);
+      if (usageLog.cost === undefined && usageLog.quota === undefined) {
+        const issue = buildUsageSyncIssue({
+          issueType: "missing_cost",
+          usageLog,
+          syncedAt,
+          account,
+          proxyLog,
+          message: "NewAPI log has no quota/cost field, so billing consumption cannot be corrected",
+        });
+        await persistSyncIssue(issue);
+      }
       const patch = buildUsagePatch(usageLog, proxyLog);
       const changed = patchChangesLog(proxyLog, patch);
       if (changed) {
@@ -1365,10 +1766,13 @@ export async function backfillProxyLogsFromNewApiUsage(
         proxyLogId: proxyLog.id,
         feishuUserId: proxyLog.feishuUserId ?? account.feishuUserId,
         tokenAccountId: proxyLog.tokenAccountId ?? account.id,
+        usageRecordId: record.id,
+        cost: usageLog.cost,
+        quota: usageLog.quota,
       });
     }
 
-    if (!dryRun && result.updated > 0 && !persistLog) {
+    if (!dryRun && (result.updated > 0 || result.recordsUpserted > 0) && !persistLog) {
       syncBillingPeriods(store);
     }
     return result;
@@ -1376,13 +1780,18 @@ export async function backfillProxyLogsFromNewApiUsage(
 
   if (isPostgresBackend()) {
     const store = await readPostgresStore();
-    return runBackfill(store, async (proxyLog, patch, syncedAt) => {
-      const updated = await updatePostgresProxyLog(proxyLog.id, {
-        ...patch,
-        usageSyncedAt: syncedAt,
-      });
-      if (updated) Object.assign(proxyLog, updated);
-    });
+    return runBackfill(
+      store,
+      async (proxyLog, patch, syncedAt) => {
+        const updated = await updatePostgresProxyLog(proxyLog.id, {
+          ...patch,
+          usageSyncedAt: syncedAt,
+        });
+        if (updated) Object.assign(proxyLog, updated);
+      },
+      upsertPostgresNewApiUsageRecord,
+      upsertPostgresUsageSyncIssue,
+    );
   }
 
   return mutate((store) => runBackfill(store));
@@ -1872,11 +2281,14 @@ export async function listAdminUsers(scope: AdminScope) {
         billingRemainingQuota:
           billing?.monthlyQuota === undefined
             ? undefined
-            : Math.max(billing.monthlyQuota - billing.totalTokens, 0),
+            : billing.remainingQuota ?? Math.max(billing.monthlyQuota - (billing.quotaConsumed ?? 0), 0),
+        billingQuotaConsumed: billing?.quotaConsumed ?? 0,
+        billingCost: billing?.cost ?? billing?.quotaConsumed ?? 0,
         billingTotalTokens: billing?.totalTokens,
         billingPromptTokens: billing?.promptTokens,
         billingCompletionTokens: billing?.completionTokens,
         billingProxyLogCount: billing?.proxyLogCount,
+        billingUsageRecordCount: billing?.usageRecordCount ?? 0,
         latestRequestStatus: latestRequest?.status,
         latestRequestType: latestRequest?.requestType,
         latestRequestUpdatedAt: latestRequest?.updatedAt,
@@ -1906,17 +2318,20 @@ export async function listAdminUserStats(scope: AdminScope) {
       billingPeriod: user.billingPeriod,
       monthlyQuota: user.billingMonthlyQuota ?? 0,
       remainingQuota: user.billingRemainingQuota,
+      quotaConsumed: user.billingQuotaConsumed ?? 0,
+      cost: user.billingCost ?? user.billingQuotaConsumed ?? 0,
       promptTokens: user.billingPromptTokens ?? 0,
       completionTokens: user.billingCompletionTokens ?? 0,
       totalTokens: user.billingTotalTokens ?? 0,
       proxyLogCount: user.billingProxyLogCount ?? 0,
+      usageRecordCount: user.billingUsageRecordCount ?? 0,
       quotaUsageRate:
         user.billingMonthlyQuota && user.billingMonthlyQuota > 0
-          ? (user.billingTotalTokens ?? 0) / user.billingMonthlyQuota
+          ? (user.billingQuotaConsumed ?? 0) / user.billingMonthlyQuota
           : 0,
       latestProxyLogAt: user.latestProxyLogAt,
     }))
-    .sort((a, b) => b.totalTokens - a.totalTokens);
+    .sort((a, b) => b.quotaConsumed - a.quotaConsumed || b.totalTokens - a.totalTokens);
 }
 
 type UsageRecordFilters = {
@@ -2404,10 +2819,13 @@ export async function listDepartmentStats(scope: AdminScope) {
       keyedUsers: Set<string>;
       monthlyQuota: number;
       remainingQuota: number;
+      quotaConsumed: number;
+      cost: number;
       promptTokens: number;
       completionTokens: number;
       totalTokens: number;
       proxyLogCount: number;
+      usageRecordCount: number;
       latestProxyLogAt?: string;
     }
   >();
@@ -2423,10 +2841,13 @@ export async function listDepartmentStats(scope: AdminScope) {
         keyedUsers: new Set<string>(),
         monthlyQuota: 0,
         remainingQuota: 0,
+        quotaConsumed: 0,
+        cost: 0,
         promptTokens: 0,
         completionTokens: 0,
         totalTokens: 0,
         proxyLogCount: 0,
+        usageRecordCount: 0,
       };
       stats.set(id, item);
     }
@@ -2447,7 +2868,10 @@ export async function listDepartmentStats(scope: AdminScope) {
     const user = usersById.get(period.feishuUserId);
     const item = ensure(user?.departmentId, user?.departmentName);
     item.monthlyQuota += period.monthlyQuota;
-    item.remainingQuota += Math.max(period.monthlyQuota - period.totalTokens, 0);
+    item.remainingQuota += period.remainingQuota ?? Math.max(period.monthlyQuota - (period.quotaConsumed ?? 0), 0);
+    item.quotaConsumed += period.quotaConsumed ?? 0;
+    item.cost += period.cost ?? period.quotaConsumed ?? 0;
+    item.usageRecordCount += period.usageRecordCount ?? 0;
   }
 
   for (const log of store.proxyRequestLogs) {
@@ -2462,7 +2886,7 @@ export async function listDepartmentStats(scope: AdminScope) {
     }
   }
 
-  const totalTokens = [...stats.values()].reduce((sum, item) => sum + item.totalTokens, 0);
+  const totalQuotaConsumed = [...stats.values()].reduce((sum, item) => sum + item.quotaConsumed, 0);
   return [...stats.values()]
     .map((item) => ({
       departmentId: item.departmentId,
@@ -2471,15 +2895,18 @@ export async function listDepartmentStats(scope: AdminScope) {
       keyedUsers: item.keyedUsers.size,
       monthlyQuota: item.monthlyQuota,
       remainingQuota: item.remainingQuota,
+      quotaConsumed: item.quotaConsumed,
+      cost: item.cost,
       promptTokens: item.promptTokens,
       completionTokens: item.completionTokens,
       totalTokens: item.totalTokens,
       proxyLogCount: item.proxyLogCount,
-      usageShare: totalTokens > 0 ? item.totalTokens / totalTokens : 0,
-      quotaUsageRate: item.monthlyQuota > 0 ? item.totalTokens / item.monthlyQuota : 0,
+      usageRecordCount: item.usageRecordCount,
+      usageShare: totalQuotaConsumed > 0 ? item.quotaConsumed / totalQuotaConsumed : 0,
+      quotaUsageRate: item.monthlyQuota > 0 ? item.quotaConsumed / item.monthlyQuota : 0,
       latestProxyLogAt: item.latestProxyLogAt,
     }))
-    .sort((a, b) => b.totalTokens - a.totalTokens);
+    .sort((a, b) => b.quotaConsumed - a.quotaConsumed || b.totalTokens - a.totalTokens);
 }
 
 export async function getAdminOverview(scope: AdminScope) {
@@ -2561,8 +2988,17 @@ export async function getAdminOverview(scope: AdminScope) {
     (sum, period) => sum + period.totalTokens,
     0,
   );
+  const currentPeriodQuotaConsumed = currentBillingPeriods.reduce(
+    (sum, period) => sum + (period.quotaConsumed ?? 0),
+    0,
+  );
+  const currentPeriodCost = currentBillingPeriods.reduce(
+    (sum, period) => sum + (period.cost ?? period.quotaConsumed ?? 0),
+    0,
+  );
   const currentPeriodRemainingQuota = currentBillingPeriods.reduce(
-    (sum, period) => sum + Math.max(period.monthlyQuota - period.totalTokens, 0),
+    (sum, period) =>
+      sum + (period.remainingQuota ?? Math.max(period.monthlyQuota - (period.quotaConsumed ?? 0), 0)),
     0,
   );
 
@@ -2597,7 +3033,13 @@ export async function getAdminOverview(scope: AdminScope) {
       totalTokens,
       currentBillingPeriod: currentPeriod,
       currentPeriodMonthlyQuota,
+      currentPeriodQuotaConsumed,
+      currentPeriodCost,
       currentPeriodRemainingQuota,
+      currentPeriodUsageRecords: currentBillingPeriods.reduce(
+        (sum, period) => sum + (period.usageRecordCount ?? 0),
+        0,
+      ),
       currentPeriodProxyLogs: currentBillingPeriods.reduce(
         (sum, period) => sum + period.proxyLogCount,
         0,
@@ -2660,7 +3102,11 @@ export async function getAdminOverview(scope: AdminScope) {
           billingPromptTokens: billingSummary?.promptTokens,
           billingCompletionTokens: billingSummary?.completionTokens,
           billingTotalTokens: billingSummary?.totalTokens,
+          billingQuotaConsumed: billingSummary?.quotaConsumed,
+          billingCost: billingSummary?.cost,
+          billingRemainingQuota: billingSummary?.remainingQuota,
           billingProxyLogCount: billingSummary?.proxyLogCount,
+          billingUsageRecordCount: billingSummary?.usageRecordCount,
           requestCount: requestCountsByUserId.get(user.id) ?? 0,
           proxyLogCount: proxyLogCountsByUserId.get(user.id) ?? 0,
           totalTokens: tokenUsageByUserId.get(user.id) ?? 0,

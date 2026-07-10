@@ -22,6 +22,9 @@ const pairs = [
   ["userBillingPeriods", "user_billing_periods"],
   ["feishuEvents", "feishu_events"],
   ["proxyRequestLogs", "proxy_request_logs"],
+  ["newapiUsageRecords", "newapi_usage_records"],
+  ["usageSyncCheckpoints", "usage_sync_checkpoints"],
+  ["usageSyncIssues", "usage_sync_issues"],
   ["adminScopes", "admin_scopes"],
 ];
 

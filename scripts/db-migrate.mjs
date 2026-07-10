@@ -109,6 +109,51 @@ const statements = [
     on proxy_request_logs (token_account_id, created_at)`,
   `create index if not exists proxy_request_logs_status_created_idx
     on proxy_request_logs (status_code, created_at)`,
+  `create table if not exists newapi_usage_records (
+    id text primary key,
+    newapi_log_id text,
+    newapi_request_id text,
+    newapi_token_id text,
+    token_account_id text,
+    feishu_user_id text,
+    match_status text not null,
+    data jsonb not null,
+    newapi_created_at timestamptz,
+    first_seen_at timestamptz not null,
+    last_synced_at timestamptz not null
+  )`,
+  `create unique index if not exists newapi_usage_records_log_unique
+    on newapi_usage_records (newapi_log_id)
+    where newapi_log_id is not null`,
+  `create index if not exists newapi_usage_records_user_created_idx
+    on newapi_usage_records (feishu_user_id, newapi_created_at)`,
+  `create index if not exists newapi_usage_records_token_created_idx
+    on newapi_usage_records (newapi_token_id, newapi_created_at)`,
+  `create index if not exists newapi_usage_records_match_status_idx
+    on newapi_usage_records (match_status, last_synced_at)`,
+  `create table if not exists usage_sync_checkpoints (
+    id text primary key,
+    scope text not null unique,
+    data jsonb not null,
+    updated_at timestamptz not null
+  )`,
+  `create table if not exists usage_sync_issues (
+    id text primary key,
+    issue_type text not null,
+    status text not null,
+    newapi_log_id text,
+    newapi_request_id text,
+    newapi_token_id text,
+    data jsonb not null,
+    first_seen_at timestamptz not null,
+    last_seen_at timestamptz not null,
+    last_synced_at timestamptz not null
+  )`,
+  `create index if not exists usage_sync_issues_status_seen_idx
+    on usage_sync_issues (status, last_seen_at)`,
+  `create index if not exists usage_sync_issues_log_idx
+    on usage_sync_issues (newapi_log_id)
+    where newapi_log_id is not null`,
   `create table if not exists admin_scopes (
     id text primary key,
     feishu_user_id text not null,

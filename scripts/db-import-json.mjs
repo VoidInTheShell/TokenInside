@@ -37,6 +37,9 @@ const summary = {
   userBillingPeriods: count("userBillingPeriods"),
   feishuEvents: count("feishuEvents"),
   proxyRequestLogs: count("proxyRequestLogs"),
+  newapiUsageRecords: count("newapiUsageRecords"),
+  usageSyncCheckpoints: count("usageSyncCheckpoints"),
+  usageSyncIssues: count("usageSyncIssues"),
   adminScopes: count("adminScopes"),
 };
 
@@ -58,6 +61,9 @@ try {
   await client.query("begin");
   await client.query("delete from app_settings");
   await client.query("delete from admin_scopes");
+  await client.query("delete from usage_sync_issues");
+  await client.query("delete from usage_sync_checkpoints");
+  await client.query("delete from newapi_usage_records");
   await client.query("delete from proxy_request_logs");
   await client.query("delete from feishu_events");
   await client.query("delete from user_billing_periods");
@@ -165,6 +171,52 @@ try {
       log.statusCode,
       log,
       log.createdAt,
+    ],
+  }));
+
+  await insertRows(client, store.newapiUsageRecords, (record) => ({
+    sql: `insert into newapi_usage_records
+      (id, newapi_log_id, newapi_request_id, newapi_token_id, token_account_id,
+       feishu_user_id, match_status, data, newapi_created_at, first_seen_at, last_synced_at)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    values: [
+      record.id,
+      record.newapiLogId ?? null,
+      record.newapiRequestId ?? null,
+      record.newapiTokenId ?? null,
+      record.tokenAccountId ?? null,
+      record.feishuUserId ?? null,
+      record.matchStatus,
+      record,
+      record.newapiCreatedAt ?? null,
+      record.firstSeenAt,
+      record.lastSyncedAt,
+    ],
+  }));
+
+  await insertRows(client, store.usageSyncCheckpoints, (checkpoint) => ({
+    sql: `insert into usage_sync_checkpoints
+      (id, scope, data, updated_at)
+      values ($1, $2, $3, $4)`,
+    values: [checkpoint.id, checkpoint.scope, checkpoint, checkpoint.updatedAt],
+  }));
+
+  await insertRows(client, store.usageSyncIssues, (issue) => ({
+    sql: `insert into usage_sync_issues
+      (id, issue_type, status, newapi_log_id, newapi_request_id, newapi_token_id,
+       data, first_seen_at, last_seen_at, last_synced_at)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    values: [
+      issue.id,
+      issue.issueType,
+      issue.status,
+      issue.newapiLogId ?? null,
+      issue.newapiRequestId ?? null,
+      issue.newapiTokenId ?? null,
+      issue,
+      issue.firstSeenAt,
+      issue.lastSeenAt,
+      issue.lastSyncedAt,
     ],
   }));
 

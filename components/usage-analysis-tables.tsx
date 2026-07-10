@@ -1,7 +1,7 @@
 "use client";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { formatTokenAmount } from "@/lib/utils";
+import { formatQuotaAmount, formatTokenAmount } from "@/lib/utils";
 
 export type UsageAggregateRow = {
   id: string;
@@ -27,12 +27,12 @@ type UsageAnalysisTableProps = {
   terminalColumn?: "successRate" | "avgDuration" | "efficiency";
 };
 
-function formatCurrency(value?: number) {
-  if (!Number.isFinite(value)) return "$0";
+function formatQuota(value?: number) {
+  if (!Number.isFinite(value)) return "0";
   const amount = value ?? 0;
-  if (amount === 0) return "$0";
-  if (Math.abs(amount) < 0.01) return `$${amount.toFixed(4)}`;
-  return `$${amount.toFixed(2)}`;
+  if (amount === 0) return "0";
+  if (Math.abs(amount) < 0.01) return amount.toFixed(4);
+  return formatQuotaAmount(amount, "0");
 }
 
 function formatRate(value?: number) {
@@ -53,7 +53,7 @@ function terminalValue(row: UsageAggregateRow, terminalColumn: UsageAnalysisTabl
     case "avgDuration":
       return formatDuration(row.avgDurationMs);
     case "efficiency":
-      return row.totalTokens > 0 ? `$${row.costPerMillionTokens.toFixed(2)}/M` : "-";
+      return row.totalTokens > 0 ? `${formatQuota(row.costPerMillionTokens)}/M tok` : "-";
     default:
       return formatDuration(row.avgDurationMs);
   }
@@ -94,7 +94,7 @@ export function UsageAnalysisTable({
                     <span>缓存</span>
                   </div>
                 </th>
-                <th>费用</th>
+                <th>额度消耗</th>
                 <th>缓存命中率</th>
                 <th>{terminalLabel(terminalColumn)}</th>
               </tr>
@@ -129,8 +129,8 @@ export function UsageAnalysisTable({
                     </td>
                     <td>
                       <div className="usage-cost">
-                        <span>{formatCurrency(row.cost)}</span>
-                        {row.actualCost > 0 && <span>{formatCurrency(row.actualCost)}</span>}
+                        <span>{formatQuota(row.cost)}</span>
+                        {row.actualCost > 0 && <span>{formatQuota(row.actualCost)}</span>}
                       </div>
                     </td>
                     <td>{formatRate(row.cacheHitRate)}</td>

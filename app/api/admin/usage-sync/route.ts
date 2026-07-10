@@ -9,8 +9,9 @@ export const dynamic = "force-dynamic";
 const usageSyncSchema = z.object({
   dryRun: z.boolean().default(true),
   page: z.number().int().min(0).default(0),
-  size: z.number().int().positive().max(500).default(100),
+  size: z.number().int().positive().max(100).default(100),
   maxPages: z.number().int().positive().max(20).default(1),
+  overlapMinutes: z.number().int().min(0).max(7 * 24 * 60).default(120),
   matchWindowMinutes: z.number().positive().max(24 * 60).default(30),
 });
 
@@ -28,7 +29,7 @@ export async function POST(request: Request) {
   if (!parsed.success) {
     return NextResponse.json(
       {
-        error: "dryRun 必须是布尔值，page/size/maxPages 必须是正整数，matchWindowMinutes 必须是正数",
+        error: "dryRun 必须是布尔值，page/size/maxPages 必须是正整数，overlapMinutes/matchWindowMinutes 必须在允许范围内",
       },
       { status: 400 },
     );
@@ -39,8 +40,10 @@ export async function POST(request: Request) {
     page: parsed.data.page,
     size: parsed.data.size,
     maxPages: parsed.data.maxPages,
+    overlapMinutes: parsed.data.overlapMinutes,
     matchWindowMs: parsed.data.matchWindowMinutes * 60 * 1000,
     operatedByFeishuUserId: auth.user.id,
+    trigger: "manual",
   });
   return NextResponse.json(result);
 }

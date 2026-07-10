@@ -143,7 +143,7 @@ export async function GET() {
     billingPeriod: billingPeriod
       ? {
           ...billingPeriod,
-          remainingQuota,
+          upstreamRemainingQuota: remainingQuota,
         }
       : null,
     adminScope: adminScope

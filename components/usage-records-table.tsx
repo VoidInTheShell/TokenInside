@@ -5,7 +5,7 @@ import { EyeOffIcon, RefreshCcwIcon, SearchIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { formatDateTime, formatDepartmentName, formatTokenAmount, maskSecret } from "@/lib/utils";
+import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
 
 export type UsageRequestStatus =
   | "pending"
@@ -136,7 +136,7 @@ const COLUMN_LABELS: Record<UsageColumnId, string> = {
   apiFormat: "API格式",
   status: "类型",
   tokens: "Tokens",
-  cost: "费用",
+  cost: "额度消耗",
   performance: "首字/总耗时",
   clientFamily: "客户端UA",
 };
@@ -192,12 +192,12 @@ function statusLabel(record: UsageRecordRow) {
   return requestIsStream(record) ? "流式" : "标准";
 }
 
-function formatCurrency(value?: number) {
-  if (!Number.isFinite(value)) return "$0";
+function formatQuota(value?: number) {
+  if (!Number.isFinite(value)) return "0";
   const amount = value ?? 0;
-  if (amount === 0) return "$0";
-  if (Math.abs(amount) < 0.01) return `$${amount.toFixed(4)}`;
-  return `$${amount.toFixed(2)}`;
+  if (amount === 0) return "0";
+  if (Math.abs(amount) < 0.01) return amount.toFixed(4);
+  return formatQuotaAmount(amount, "0");
 }
 
 function formatMs(value?: number) {
@@ -535,7 +535,7 @@ export function UsageRecordsTable({
                     <span>{formatApiFormat(record.apiFormat)}</span>
                   </div>
                   <div>
-                    <span>{formatCurrency(record.cost)}</span>
+                    <span>{formatQuota(record.cost)}</span>
                     <StatusCell record={record} />
                   </div>
                 </div>
@@ -573,7 +573,7 @@ export function UsageRecordsTable({
               {visibleSet.has("apiFormat") && <th>API格式</th>}
               {visibleSet.has("status") && <th>类型</th>}
               {visibleSet.has("tokens") && <th className="usage-number-heading">Tokens</th>}
-              {visibleSet.has("cost") && <th className="usage-number-heading">费用</th>}
+              {visibleSet.has("cost") && <th className="usage-number-heading">额度消耗</th>}
               {visibleSet.has("performance") && (
                 <th>
                   <div className="usage-th-stack">
@@ -646,9 +646,9 @@ export function UsageRecordsTable({
                             record.providerChannelName ? `渠道：${record.providerChannelName}` : undefined,
                           ].filter(Boolean).join("\n") || undefined}
                         >
-                          <span>{formatCurrency(record.cost)}</span>
-                          {record.actualCost !== undefined && <span>{formatCurrency(record.actualCost)}</span>}
-                          {record.quota !== undefined && <span>{formatTokenAmount(record.quota, "0")} quota</span>}
+                          <span>{formatQuota(record.cost)}</span>
+                          {record.actualCost !== undefined && <span>{formatQuota(record.actualCost)}</span>}
+                          {record.quota !== undefined && <span>{formatQuotaAmount(record.quota, "0")} quota</span>}
                           <span>{usageSourceLabel(record.usageSource)}</span>
                         </div>
                       </td>

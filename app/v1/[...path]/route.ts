@@ -287,6 +287,14 @@ function terminalStatus(statusCode: number) {
   return "completed" as const;
 }
 
+function newApiRequestIdFrom(upstream: Response) {
+  return upstream.headers.get("x-oneapi-request-id") ?? undefined;
+}
+
+function newApiRequestIdPatch(newapiRequestId?: string) {
+  return newapiRequestId ? { newapiRequestId } : {};
+}
+
 function sanitizedErrorMessage(err: unknown) {
   if (err instanceof Error && err.message.trim()) return err.message.slice(0, 500);
   return "Upstream request failed";
@@ -297,6 +305,7 @@ function streamWithProxyLog(input: {
   logId: string;
   startedAt: number;
   statusCode: number;
+  newapiRequestId?: string;
 }) {
   const reader = input.body.getReader();
   const usageCollector = createSseUsageCollector();
@@ -311,6 +320,7 @@ function streamWithProxyLog(input: {
             durationMs: Date.now() - input.startedAt,
             responseTimeUpdatedAt: new Date().toISOString(),
             usageSource: hasUsageMetrics(usage) ? "proxy_stream" : "missing",
+            ...newApiRequestIdPatch(input.newapiRequestId),
             ...usage,
           });
           controller.close();
@@ -363,6 +373,7 @@ async function recordFinishedProxyLog(input: {
   responseJson: unknown;
 }) {
   const usage = extractUsageFromJson(input.responseJson);
+  const newapiRequestId = newApiRequestIdFrom(input.upstream);
   await updateProxyLog(input.logId, {
     status: terminalStatus(input.upstream.status),
     statusCode: input.upstream.status,
@@ -370,6 +381,7 @@ async function recordFinishedProxyLog(input: {
     firstByteMs: input.firstByteMs,
     responseTimeUpdatedAt: new Date().toISOString(),
     usageSource: hasUsageMetrics(usage) ? "proxy_json" : "missing",
+    ...newApiRequestIdPatch(newapiRequestId),
     ...usage,
     errorMessage:
       input.upstream.status >= 400 ? extractErrorMessage(input.responseJson) : undefined,
@@ -506,6 +518,7 @@ async function proxy(request: Request, context: RouteContext) {
     const firstByteMs = Date.now() - startedAt;
     const contentType = upstream.headers.get("content-type") ?? "";
     const upstreamIsStream = contentType.includes("text/event-stream");
+    const newapiRequestId = newApiRequestIdFrom(upstream);
     const responseHeaders = responseHeadersFrom(upstream);
 
     if (upstreamIsStream && upstream.body) {
@@ -516,6 +529,7 @@ async function proxy(request: Request, context: RouteContext) {
         firstByteMs,
         isStream: true,
         upstreamIsStream: true,
+        ...newApiRequestIdPatch(newapiRequestId),
         responseTimeUpdatedAt: new Date().toISOString(),
       });
       return new Response(
@@ -524,6 +538,7 @@ async function proxy(request: Request, context: RouteContext) {
           logId: proxyLog.id,
           startedAt,
           statusCode: upstream.status,
+          newapiRequestId,
         }),
         {
           status: upstream.status,

@@ -331,10 +331,16 @@ function normalizeNewApiUsageLog(record: NewApiLogRecord): NormalizedNewApiUsage
 export async function listNewApiUsageLogs(input: {
   page?: number;
   size?: number;
+  requestId?: string;
+  upstreamRequestId?: string;
+  startTimestamp?: number;
+  endTimestamp?: number;
+  tokenName?: string;
+  modelName?: string;
 } = {}): Promise<NewApiUsageLogPage> {
   const { newapi } = getConfig();
   const page = Math.max(input.page ?? 0, 0);
-  const size = Math.min(Math.max(input.size ?? 100, 1), 500);
+  const size = Math.min(Math.max(input.size ?? 100, 1), 100);
   if (newapi.mock) {
     return {
       items: [],
@@ -345,9 +351,16 @@ export async function listNewApiUsageLogs(input: {
   }
 
   const params = new URLSearchParams({
-    p: String(page),
-    size: String(size),
+    p: String(page + 1),
+    page_size: String(size),
+    type: "2",
   });
+  if (input.requestId) params.set("request_id", input.requestId);
+  if (input.upstreamRequestId) params.set("upstream_request_id", input.upstreamRequestId);
+  if (input.startTimestamp !== undefined) params.set("start_timestamp", String(input.startTimestamp));
+  if (input.endTimestamp !== undefined) params.set("end_timestamp", String(input.endTimestamp));
+  if (input.tokenName) params.set("token_name", input.tokenName);
+  if (input.modelName) params.set("model_name", input.modelName);
   const data = await newApiFetch<NewApiLogPage>(`/api/log/self?${params.toString()}`);
   const items = (data.items ?? []).map(normalizeNewApiUsageLog);
   return {

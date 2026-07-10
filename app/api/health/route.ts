@@ -4,6 +4,7 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 import { getConfig } from "@/lib/config";
 import { checkPostgresSchema } from "@/lib/postgres-store";
+import { ensureUsageSyncScheduler } from "@/lib/usage-sync";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -32,6 +33,7 @@ function configured(value: unknown) {
 }
 
 export async function GET() {
+  void ensureUsageSyncScheduler().catch(() => undefined);
   const config = getConfig();
   const postgresSchema =
     config.storeBackend === "postgres"

@@ -79,6 +79,10 @@ export function formatTokenAmount(value: number | null | undefined, nullLabel = 
   return formatCompactNumber(value, { nullLabel });
 }
 
+export function formatQuotaAmount(value: number | null | undefined, nullLabel = "-") {
+  return formatCompactNumber(value, { nullLabel });
+}
+
 export function maskSecret(value?: string | null) {
   if (!value) return "未发放";
   if (value.length <= 12) return value;

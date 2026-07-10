@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { getEffectiveAdminScopeForUser, hydrateUserDepartment } from "@/lib/admin-sync";
 import { getCurrentUser } from "@/lib/session";
-import { getAdminOverview, getAppSettings } from "@/lib/store";
+import { getAdminOverview, getAppSettings, getUsageSyncCheckpoint } from "@/lib/store";
+import { ensureUsageSyncScheduler } from "@/lib/usage-sync";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,6 +22,7 @@ function settingsForScope<T extends Awaited<ReturnType<typeof getAppSettings>>>(
 }
 
 export async function GET(request: Request) {
+  void ensureUsageSyncScheduler().catch(() => undefined);
   const user = await hydrateUserDepartment(await getCurrentUser());
   if (!user) {
     return NextResponse.json(
@@ -54,9 +56,10 @@ export async function GET(request: Request) {
     );
   }
 
-  const [overview, settings] = await Promise.all([
+  const [overview, settings, usageSyncCheckpoint] = await Promise.all([
     getAdminOverview(scope),
     getAppSettings(),
+    scope.scopeType === "global" ? getUsageSyncCheckpoint() : Promise.resolve(null),
   ]);
   return NextResponse.json({
     authenticated: true,
@@ -71,6 +74,9 @@ export async function GET(request: Request) {
       departmentName: user.departmentName,
     },
     overview,
-    settings: settingsForScope(settings, scope),
+    settings: settingsForScope(
+      scope.scopeType === "global" ? { ...settings, usageSyncCheckpoint } : settings,
+      scope,
+    ),
   });
 }
