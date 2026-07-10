@@ -578,7 +578,7 @@ export function UsageRecordsTable({
       </div>
 
       <div className="table-wrap table-scroll table-scroll-usage usage-records-desktop">
-        <table className="table usage-table">
+        <table className={cn("table usage-table", isUserOnlyView ? "usage-table-user" : "usage-table-admin")}>
           <colgroup>
             {visibleSet.has("time") && <col className="usage-col-time" />}
             {showUser && visibleSet.has("user") && <col className="usage-col-user" />}
@@ -599,10 +599,10 @@ export function UsageRecordsTable({
               {visibleSet.has("model") && <th>模型</th>}
               {visibleSet.has("apiFormat") && <th>API格式</th>}
               {visibleSet.has("status") && <th>类型</th>}
-              {visibleSet.has("tokens") && <th className="usage-number-heading">Tokens</th>}
+              {visibleSet.has("tokens") && <th className="usage-number-heading usage-tokens-heading">Tokens</th>}
               {visibleSet.has("cost") && <th className="usage-number-heading">额度消耗</th>}
               {visibleSet.has("performance") && (
-                <th>
+                <th className="usage-performance-heading">
                   <div className="usage-th-stack">
                     <span>首字/总耗时</span>
                     <span>输出速度</span>
@@ -658,7 +658,7 @@ export function UsageRecordsTable({
                       </td>
                     )}
                     {visibleSet.has("tokens") && (
-                      <td className="usage-number-cell">
+                      <td className="usage-number-cell usage-tokens-cell">
                         <TokensCell record={record} />
                       </td>
                     )}
@@ -681,7 +681,7 @@ export function UsageRecordsTable({
                       </td>
                     )}
                     {visibleSet.has("performance") && (
-                      <td>
+                      <td className="usage-performance-cell">
                         <PerformanceCell record={record} />
                       </td>
                     )}

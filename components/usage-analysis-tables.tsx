@@ -1,7 +1,7 @@
 "use client";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { cn, formatQuotaAmount, formatTokenAmount } from "@/lib/utils";
+import { cn, formatTokenAmount } from "@/lib/utils";
 
 export type UsageAggregateRow = {
   id: string;
@@ -18,6 +18,9 @@ export type UsageAggregateRow = {
   avgDurationMs: number;
   cacheHitRate: number;
   costPerMillionTokens: number;
+  issuedQuota?: number;
+  usedQuota?: number;
+  usageRate?: number;
 };
 
 type UsageAnalysisTableProps = {
@@ -25,16 +28,21 @@ type UsageAnalysisTableProps = {
   emptyText: string;
   rows: UsageAggregateRow[];
   terminalColumn?: "successRate" | "avgDuration" | "efficiency";
+  showQuotaAllocation?: boolean;
   className?: string;
 };
 
-function formatQuota(value?: number) {
-  return formatQuotaAmount(value, "0");
+function formatQuotaFixed(value?: number) {
+  if (!Number.isFinite(value)) return "0.00";
+  return (value ?? 0).toFixed(2);
 }
 
-function formatRate(value?: number) {
+function formatRate(value?: number, fractionDigits = 1) {
   if (!Number.isFinite(value)) return "-";
-  return `${Math.round((value ?? 0) * 1000) / 10}%`;
+  const percentage = (value ?? 0) * 100;
+  return fractionDigits === 1
+    ? `${Math.round(percentage * 10) / 10}%`
+    : `${percentage.toFixed(fractionDigits)}%`;
 }
 
 function formatDuration(value?: number) {
@@ -50,7 +58,7 @@ function terminalValue(row: UsageAggregateRow, terminalColumn: UsageAnalysisTabl
     case "avgDuration":
       return formatDuration(row.avgDurationMs);
     case "efficiency":
-      return row.totalTokens > 0 ? `${formatQuota(row.costPerMillionTokens)}/M` : "-";
+      return row.totalTokens > 0 ? `${formatQuotaFixed(row.costPerMillionTokens)}/M` : "-";
     default:
       return formatDuration(row.avgDurationMs);
   }
@@ -72,21 +80,27 @@ export function UsageAnalysisTable({
   emptyText,
   rows,
   terminalColumn = "avgDuration",
+  showQuotaAllocation = false,
   className,
 }: UsageAnalysisTableProps) {
+  const columnCount = showQuotaAllocation ? 9 : 6;
+
   return (
-    <Card className={cn("usage-analysis-card", className)}>
+    <Card className={cn("usage-analysis-card", showQuotaAllocation && "usage-analysis-card-quota", className)}>
       <CardHeader>
         <CardTitle>{title}</CardTitle>
       </CardHeader>
       <CardContent>
         <div className="table-wrap usage-analysis-table-wrap">
-          <table className="table usage-analysis-table">
+          <table className={cn("table usage-analysis-table", showQuotaAllocation && "usage-analysis-table-quota")}>
             <colgroup>
               <col className="usage-analysis-col-label" />
               <col className="usage-analysis-col-count" />
               <col className="usage-analysis-col-tokens" />
               <col className="usage-analysis-col-cost" />
+              {showQuotaAllocation && <col className="usage-analysis-col-issued" />}
+              {showQuotaAllocation && <col className="usage-analysis-col-used" />}
+              {showQuotaAllocation && <col className="usage-analysis-col-usage-rate" />}
               <col className="usage-analysis-col-rate" />
               <col className="usage-analysis-col-terminal" />
             </colgroup>
@@ -109,6 +123,9 @@ export function UsageAnalysisTable({
                   </div>
                 </th>
                 <th>额度消耗</th>
+                {showQuotaAllocation && <th>发放总额</th>}
+                {showQuotaAllocation && <th>已用额度</th>}
+                {showQuotaAllocation && <th>使用率</th>}
                 <th>缓存命中率</th>
                 <th>{terminalLabel(terminalColumn)}</th>
               </tr>
@@ -116,7 +133,7 @@ export function UsageAnalysisTable({
             <tbody>
               {!rows.length ? (
                 <tr>
-                  <td colSpan={6} className="usage-empty-cell">
+                  <td colSpan={columnCount} className="usage-empty-cell">
                     {emptyText}
                   </td>
                 </tr>
@@ -143,10 +160,13 @@ export function UsageAnalysisTable({
                     </td>
                     <td>
                       <div className="usage-cost">
-                        <span>{formatQuota(row.cost)}</span>
-                        {row.actualCost > 0 && <span>{formatQuota(row.actualCost)}</span>}
+                        <span>{formatQuotaFixed(row.cost)}</span>
+                        {row.actualCost > 0 && <span>{formatQuotaFixed(row.actualCost)}</span>}
                       </div>
                     </td>
+                    {showQuotaAllocation && <td>{formatQuotaFixed(row.issuedQuota)}</td>}
+                    {showQuotaAllocation && <td>{formatQuotaFixed(row.usedQuota)}</td>}
+                    {showQuotaAllocation && <td>{formatRate(row.usageRate, 2)}</td>}
                     <td>{formatRate(row.cacheHitRate)}</td>
                     <td>{terminalValue(row, terminalColumn)}</td>
                   </tr>

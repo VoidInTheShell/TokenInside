@@ -2662,6 +2662,34 @@ export async function listAdminUsageRecords(input: UsageRecordFilters & {
   const offset = boundedOffset(input.offset);
   const pageLogs = filteredLogs.slice(offset, offset + limit);
   const userIdsWithLogs = new Set(dateScopedLogs.map((log) => log.feishuUserId).filter(Boolean));
+  const currentPeriod = nowIso().slice(0, 7);
+  const departmentQuotaById = new Map<string, { issuedQuota: number; usedQuota: number }>();
+
+  for (const period of store.userBillingPeriods.filter((item) => item.period === currentPeriod)) {
+    const user = usersById.get(period.feishuUserId);
+    const departmentId = user?.departmentId ?? "unknown";
+    const quota = departmentQuotaById.get(departmentId) ?? { issuedQuota: 0, usedQuota: 0 };
+    quota.issuedQuota += period.monthlyQuota ?? 0;
+    quota.usedQuota += period.quotaConsumed ?? 0;
+    departmentQuotaById.set(departmentId, quota);
+  }
+
+  const departmentStats = aggregateUsage(filteredLogs, usersById, (log, user) => {
+    const id = logDepartmentId(log, user) ?? "unknown";
+    const name = logDepartmentName(log, user) ?? departmentNameForId(store, id);
+    return {
+      key: id,
+      label: name ?? id,
+    };
+  }).map((row) => {
+    const quota = departmentQuotaById.get(row.id) ?? { issuedQuota: 0, usedQuota: 0 };
+    return {
+      ...row,
+      issuedQuota: quota.issuedQuota,
+      usedQuota: quota.usedQuota,
+      usageRate: quota.issuedQuota > 0 ? quota.usedQuota / quota.issuedQuota : 0,
+    };
+  });
 
   return {
     records: pageLogs.map((log) => mapUsageRecord(log, usersById)),
@@ -2708,14 +2736,7 @@ export async function listAdminUsageRecords(input: UsageRecordFilters & {
       key: log.model ?? "unknown",
       label: log.model ?? "unknown",
     })),
-    departmentStats: aggregateUsage(filteredLogs, usersById, (log, user) => {
-      const id = logDepartmentId(log, user) ?? "unknown";
-      const name = logDepartmentName(log, user) ?? departmentNameForId(store, id);
-      return {
-        key: id,
-        label: name ?? id,
-      };
-    }),
+    departmentStats,
     apiFormatStats: aggregateUsage(filteredLogs, usersById, (log) => ({
       key: log.apiFormat ?? "unknown",
       label: log.apiFormat ?? "unknown",

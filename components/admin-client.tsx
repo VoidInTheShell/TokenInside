@@ -1631,9 +1631,13 @@ export function AdminClient() {
                 </CardHeader>
                 <CardContent>
                   <div className="toolbar toolbar-left">
-                    <Button variant="outline" disabled={panelLoading} onClick={() => void loadAdminUsers()}>
+                    <Button variant="outline" size="sm" disabled={panelLoading} onClick={() => void loadAdminUsers()}>
                       <RefreshCwIcon data-icon="inline-start" />
                       刷新用户
+                    </Button>
+                    <Button variant="outline" size="sm" onClick={() => selectPanel("approvals")}>
+                      <CheckCircle2Icon data-icon="inline-start" />
+                      审批处理
                     </Button>
                     <Badge>{adminUsers.length} 个用户</Badge>
                     {adminUsers.length > 0 && (
@@ -1647,7 +1651,21 @@ export function AdminClient() {
                   ) : (
                     <>
                       <div className="table-wrap table-scroll table-scroll-users">
-                        <table className="table">
+                        <table className="table admin-users-table">
+                          <colgroup>
+                            <col className="admin-users-col-user" />
+                            <col className="admin-users-col-department" />
+                            <col className="admin-users-col-status" />
+                            <col className="admin-users-col-role" />
+                            <col className="admin-users-col-key" />
+                            <col className="admin-users-col-period" />
+                            <col className="admin-users-col-quota" />
+                            <col className="admin-users-col-quota" />
+                            <col className="admin-users-col-quota" />
+                            <col className="admin-users-col-tokens" />
+                            <col className="admin-users-col-latest" />
+                            <col className="admin-users-col-actions" />
+                          </colgroup>
                           <thead>
                             <tr>
                               <th>用户</th>
@@ -1712,6 +1730,8 @@ export function AdminClient() {
                                           调额
                                         </Button>
                                       </div>
+                                    </div>
+                                    <div className="user-management-status-actions">
                                       {isSystemAdmin && (
                                         <Button
                                           variant="outline"
@@ -1726,8 +1746,6 @@ export function AdminClient() {
                                           指派
                                         </Button>
                                       )}
-                                    </div>
-                                    <div className="user-management-status-actions">
                                       {user.status === "disabled" ? (
                                         <Button
                                           variant="outline"
@@ -2041,6 +2059,7 @@ export function AdminClient() {
                         emptyText="暂无部门统计数据"
                         rows={usageDepartmentStats}
                         terminalColumn="successRate"
+                        showQuotaAllocation
                       />
                     </div>
                   </CardContent>

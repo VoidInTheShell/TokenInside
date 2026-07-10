@@ -614,26 +614,29 @@ a {
 
 .quota-control {
   display: grid;
-  grid-template-columns: minmax(96px, 1fr) auto;
+  grid-template-columns: minmax(0, 120px) auto;
   align-items: center;
   gap: 8px;
-  min-width: 190px;
+  width: fit-content;
+  min-width: 0;
 }
 
 .quota-control .input {
-  min-width: 96px;
+  min-width: 0;
 }
 
 .user-management-actions {
-  min-width: 280px;
+  width: 224px;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  align-items: stretch;
+  align-items: flex-start;
   gap: 8px;
 }
 
 .user-management-action-primary,
 .user-management-status-actions {
+  width: 100%;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -641,11 +644,73 @@ a {
 }
 
 .user-management-action-primary .quota-control {
-  flex: 1 1 auto;
+  width: 100%;
+  grid-template-columns: minmax(0, 168px) auto;
+  flex: 0 0 auto;
+}
+
+.user-management-status-actions .button {
+  flex: 1 1 0;
 }
 
 .user-management-actions .quota-control .input {
   height: 32px;
+}
+
+.admin-users-table {
+  min-width: 1424px;
+  table-layout: fixed;
+}
+
+.admin-users-table th,
+.admin-users-table td {
+  padding: 9px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.admin-users-table td:last-child {
+  overflow: visible;
+}
+
+.admin-users-col-user {
+  width: 132px;
+}
+
+.admin-users-col-department {
+  width: 120px;
+}
+
+.admin-users-col-status {
+  width: 72px;
+}
+
+.admin-users-col-role {
+  width: 100px;
+}
+
+.admin-users-col-key {
+  width: 78px;
+}
+
+.admin-users-col-period {
+  width: 74px;
+}
+
+.admin-users-col-quota {
+  width: 88px;
+}
+
+.admin-users-col-tokens {
+  width: 76px;
+}
+
+.admin-users-col-latest {
+  width: 132px;
+}
+
+.admin-users-col-actions {
+  width: 234px;
 }
 
 .settings-section {
@@ -863,13 +928,19 @@ a {
   grid-column: 1 / -1;
 }
 
+.usage-analysis-card,
+.usage-analysis-card .card-content,
+.usage-analysis-table-wrap {
+  min-width: 0;
+}
+
 .usage-analysis-card .card-header,
 .usage-analysis-card .card-content {
-  padding: 12px;
+  padding: 10px;
 }
 
 .usage-analysis-card .card-header {
-  min-height: 42px;
+  min-height: 38px;
 }
 
 .usage-analysis-table-wrap {
@@ -877,32 +948,66 @@ a {
 }
 
 .usage-analysis-table {
-  min-width: 680px;
+  min-width: 580px;
   font-size: 12px;
   table-layout: fixed;
 }
 
+.usage-analysis-table-quota {
+  min-width: 1040px;
+}
+
 .usage-analysis-table th,
 .usage-analysis-table td {
-  padding: 8px 7px;
+  padding: 6px;
 }
 
 .usage-analysis-col-label {
-  width: 31%;
+  width: 27%;
 }
 
 .usage-analysis-col-count {
-  width: 12%;
+  width: 9%;
 }
 
 .usage-analysis-col-tokens {
-  width: 22%;
+  width: 24%;
 }
 
-.usage-analysis-col-cost,
+.usage-analysis-col-cost {
+  width: 14%;
+}
+
 .usage-analysis-col-rate,
 .usage-analysis-col-terminal {
-  width: 11.666%;
+  width: 13%;
+}
+
+.usage-analysis-table-quota .usage-analysis-col-label {
+  width: 18%;
+}
+
+.usage-analysis-table-quota .usage-analysis-col-count {
+  width: 7%;
+}
+
+.usage-analysis-table-quota .usage-analysis-col-tokens {
+  width: 17%;
+}
+
+.usage-analysis-table-quota .usage-analysis-col-cost,
+.usage-analysis-table-quota .usage-analysis-col-issued,
+.usage-analysis-table-quota .usage-analysis-col-used {
+  width: 10%;
+}
+
+.usage-analysis-table-quota .usage-analysis-col-usage-rate {
+  width: 8%;
+}
+
+.usage-analysis-table-quota .usage-analysis-col-rate,
+.usage-analysis-table-quota .usage-analysis-col-terminal {
+  width: 9%;
 }
 
 .usage-analysis-table th:not(:first-child),
@@ -916,8 +1021,8 @@ a {
 
 .usage-analysis-table .usage-tokens-compact {
   width: 100%;
-  min-width: 112px;
-  max-width: 128px;
+  min-width: 100px;
+  max-width: 116px;
   margin-left: auto;
 }
 
@@ -962,19 +1067,21 @@ a {
 }
 
 .usage-records-primary-row {
-  grid-template-columns: minmax(120px, 0.7fr) minmax(180px, 1.3fr) repeat(2, minmax(132px, 1fr));
+  grid-template-columns: 112px minmax(220px, 320px) repeat(2, minmax(140px, 180px));
+  justify-content: start;
 }
 
 .usage-records-secondary-row {
-  grid-template-columns: repeat(4, minmax(120px, 1fr)) minmax(430px, auto);
+  grid-template-columns: 150px 140px 130px minmax(180px, 220px) minmax(360px, auto);
 }
 
 .usage-records-controls-user .usage-records-primary-row {
-  grid-template-columns: minmax(96px, 0.65fr) minmax(160px, 1.4fr) repeat(3, minmax(96px, 1fr));
+  grid-template-columns: 112px minmax(220px, 320px) repeat(3, minmax(132px, 180px));
 }
 
 .usage-records-controls-user .usage-records-secondary-row {
-  grid-template-columns: minmax(140px, 1fr) minmax(500px, auto);
+  grid-template-columns: minmax(180px, 220px) minmax(460px, auto);
+  justify-content: start;
 }
 
 .usage-records-controls-user .usage-records-actions {
@@ -1074,58 +1181,137 @@ a {
 }
 
 .usage-table {
-  min-width: 1220px;
+  min-width: 980px;
   table-layout: fixed;
 }
 
+.usage-table-user {
+  min-width: 920px;
+}
+
+.usage-table-admin {
+  min-width: 1120px;
+}
+
 .usage-col-time {
-  width: 112px;
+  width: 104px;
 }
 
 .usage-col-user {
-  width: 168px;
+  width: 142px;
 }
 
 .usage-col-department {
-  width: 132px;
+  width: 120px;
 }
 
 .usage-col-model {
-  width: 220px;
+  width: 188px;
 }
 
 .usage-col-api-format {
-  width: 180px;
+  width: 142px;
 }
 
 .usage-col-status {
-  width: 88px;
+  width: 78px;
 }
 
 .usage-col-tokens {
-  width: 118px;
+  width: 108px;
 }
 
 .usage-col-cost {
-  width: 122px;
+  width: 110px;
 }
 
 .usage-col-performance {
-  width: 136px;
+  width: 122px;
 }
 
 .usage-col-client {
-  width: 160px;
+  width: 140px;
 }
 
 .usage-table th,
 .usage-table td {
-  height: 72px;
+  height: auto;
+  min-height: 56px;
+  padding: 8px;
   vertical-align: top;
 }
 
 .usage-table th {
-  height: 48px;
+  height: 40px;
+  min-height: 40px;
+}
+
+.usage-table .meta-stack {
+  gap: 2px;
+}
+
+.usage-table-user .usage-col-time {
+  width: 9%;
+}
+
+.usage-table-user .usage-col-model {
+  width: 23%;
+}
+
+.usage-table-user .usage-col-api-format,
+.usage-table-user .usage-col-tokens {
+  width: 15%;
+}
+
+.usage-table-user .usage-col-cost,
+.usage-table-user .usage-col-performance {
+  width: 14%;
+}
+
+.usage-table-user .usage-col-status {
+  width: 10%;
+}
+
+.usage-table-admin .usage-col-time,
+.usage-table-admin .usage-col-status {
+  width: 8%;
+}
+
+.usage-table-admin .usage-col-user {
+  width: 10%;
+}
+
+.usage-table-admin .usage-col-model {
+  width: 17%;
+}
+
+.usage-table-admin .usage-col-api-format {
+  width: 12%;
+}
+
+.usage-table-admin .usage-col-tokens {
+  width: 14%;
+}
+
+.usage-table-admin .usage-col-cost {
+  width: 13%;
+}
+
+.usage-table-admin .usage-col-performance {
+  width: 18%;
+}
+
+.usage-table th.usage-number-heading.usage-tokens-heading {
+  text-align: center;
+}
+
+.usage-tokens-cell .usage-tokens {
+  margin-inline: auto;
+}
+
+.usage-table .usage-performance-heading,
+.usage-table .usage-performance-cell {
+  padding-left: 20px;
 }
 
 .usage-table th.usage-number-heading,
@@ -1451,8 +1637,28 @@ a {
     display: none;
   }
 
+  .usage-analysis-table-wrap {
+    width: 100%;
+    max-height: 230px;
+    overflow-x: scroll;
+    scrollbar-gutter: stable;
+  }
+
   .usage-records-mobile {
     display: block;
+    width: 100%;
+    height: 420px;
+    overflow-y: scroll;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0 10px;
+    background: var(--card);
+  }
+
+  .usage-records-mobile .usage-record-card:last-child {
+    border-bottom: 0;
   }
 
   .usage-record-card-metrics {
