@@ -1,6 +1,10 @@
 # Local agent/project context may contain private endpoints or credentials.
 AGENTS.md
 .agent-docs/
+task_plan.md
+findings.md
+progress.md
+TokenInside-Logo*.md
 
 # Environment and secret material.
 .env
