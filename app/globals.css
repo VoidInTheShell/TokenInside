@@ -850,11 +850,44 @@ a {
 
 .usage-analysis-table {
   font-size: 12px;
+  table-layout: fixed;
 }
 
 .usage-analysis-table th,
 .usage-analysis-table td {
   padding: 8px 7px;
+}
+
+.usage-analysis-col-label {
+  width: 31%;
+}
+
+.usage-analysis-col-count {
+  width: 12%;
+}
+
+.usage-analysis-col-tokens {
+  width: 22%;
+}
+
+.usage-analysis-col-cost,
+.usage-analysis-col-rate,
+.usage-analysis-col-terminal {
+  width: 11.666%;
+}
+
+.usage-analysis-table th:not(:first-child),
+.usage-analysis-table td:not(:first-child) {
+  text-align: right;
+}
+
+.usage-analysis-table .usage-th-stack {
+  align-items: flex-end;
+}
+
+.usage-analysis-table .usage-tokens-compact {
+  width: 108px;
+  margin-left: auto;
 }
 
 .usage-th-stack {
@@ -988,8 +1021,48 @@ a {
 }
 
 .usage-table {
-  min-width: 1040px;
+  min-width: 1220px;
   table-layout: fixed;
+}
+
+.usage-col-time {
+  width: 112px;
+}
+
+.usage-col-user {
+  width: 168px;
+}
+
+.usage-col-department {
+  width: 132px;
+}
+
+.usage-col-model {
+  width: 220px;
+}
+
+.usage-col-api-format {
+  width: 180px;
+}
+
+.usage-col-status {
+  width: 88px;
+}
+
+.usage-col-tokens {
+  width: 118px;
+}
+
+.usage-col-cost {
+  width: 122px;
+}
+
+.usage-col-performance {
+  width: 136px;
+}
+
+.usage-col-client {
+  width: 160px;
 }
 
 .usage-table th,
@@ -1140,13 +1213,56 @@ a {
   margin-top: 8px;
 }
 
-.usage-pagination {
+.usage-pagination,
+.page-selector {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   color: var(--muted-foreground);
   font-size: 12px;
+}
+
+.page-selector-summary {
+  white-space: nowrap;
+}
+
+.page-selector-controls,
+.page-selector-pages,
+.page-selector-page-slot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.page-selector-pages {
+  flex-wrap: wrap;
+}
+
+.page-selector-page-slot {
+  gap: 4px;
+}
+
+.page-selector-pages .button {
+  min-width: 34px;
+  padding-inline: 10px;
+  justify-content: center;
+}
+
+.page-selector-ellipsis {
+  color: var(--muted-foreground);
+  padding-inline: 2px;
+}
+
+.page-size-select {
+  height: 34px;
+  width: 88px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.approval-pagination {
+  margin-top: 12px;
 }
 
 @keyframes ti-pulse {
@@ -1246,7 +1362,8 @@ a {
   }
 
   .usage-section-header,
-  .usage-pagination {
+  .usage-pagination,
+  .page-selector {
     align-items: flex-start;
     flex-direction: column;
   }

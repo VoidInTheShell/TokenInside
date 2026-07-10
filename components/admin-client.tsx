@@ -41,6 +41,7 @@ import {
   UsageAnalysisTable,
   type UsageAggregateRow,
 } from "@/components/usage-analysis-tables";
+import { PageSelector } from "@/components/page-selector";
 import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
 
 type AdminScopeSummary = {
@@ -90,6 +91,29 @@ type BillingOperationRecord = {
   updatedAt: string;
 };
 
+type AdminTokenRequestRow = {
+  id: string;
+  requestType: string;
+  status: string;
+  reason: string;
+  requestedMonthlyQuota: number;
+  approvedMonthlyQuota?: number;
+  approvalInstanceCode?: string;
+  approvalTargetSource?: string;
+  approvalTargetOpenId?: string;
+  approvalCardMessageId?: string;
+  approvalOperatorOpenId?: string;
+  approvalOperatedAt?: string;
+  tokenAccountId?: string;
+  errorMessage?: string;
+  requesterName?: string;
+  requesterOpenId?: string;
+  departmentId?: string;
+  departmentName?: string;
+  updatedAt: string;
+  createdAt: string;
+};
+
 type AdminOverviewResponse = {
   authenticated: boolean;
   authorized: boolean;
@@ -128,28 +152,7 @@ type AdminOverviewResponse = {
       currentPeriodCompletionTokens?: number;
       currentPeriodTotalTokens?: number;
     };
-    latestRequests: Array<{
-      id: string;
-      requestType: string;
-      status: string;
-      reason: string;
-      requestedMonthlyQuota: number;
-      approvedMonthlyQuota?: number;
-      approvalInstanceCode?: string;
-      approvalTargetSource?: string;
-      approvalTargetOpenId?: string;
-      approvalCardMessageId?: string;
-      approvalOperatorOpenId?: string;
-      approvalOperatedAt?: string;
-      tokenAccountId?: string;
-      errorMessage?: string;
-      requesterName?: string;
-      requesterOpenId?: string;
-      departmentId?: string;
-      departmentName?: string;
-      updatedAt: string;
-      createdAt: string;
-    }>;
+    latestRequests: AdminTokenRequestRow[];
   };
   settings?: {
     defaultMonthlyQuota: number;
@@ -304,6 +307,14 @@ type UsageRecordsResponse = {
   modelStats?: UsageAggregateRow[];
   departmentStats?: UsageAggregateRow[];
   apiFormatStats?: UsageAggregateRow[];
+  error?: string;
+};
+
+type AdminTokenRequestsResponse = {
+  requests: AdminTokenRequestRow[];
+  total?: number;
+  limit?: number;
+  offset?: number;
   error?: string;
 };
 
@@ -539,6 +550,8 @@ export function AdminClient() {
   const [adminScopes, setAdminScopes] = useState<AdminScopeRecord[]>([]);
   const [userStats, setUserStats] = useState<UserStatsRow[]>([]);
   const [departmentStats, setDepartmentStats] = useState<DepartmentStatsRow[]>([]);
+  const [approvalRequests, setApprovalRequests] = useState<AdminTokenRequestRow[]>([]);
+  const [approvalTotalRequests, setApprovalTotalRequests] = useState(0);
   const [usageRecords, setUsageRecords] = useState<UsageRecordRow[]>([]);
   const [usageModelStats, setUsageModelStats] = useState<UsageAggregateRow[]>([]);
   const [usageDepartmentStats, setUsageDepartmentStats] = useState<UsageAggregateRow[]>([]);
@@ -607,6 +620,8 @@ export function AdminClient() {
   const [quotaDrafts, setQuotaDrafts] = useState<Record<string, string>>({});
   const [adminUsersPage, setAdminUsersPage] = useState(1);
   const [adminUsersPageSize, setAdminUsersPageSize] = useState(10);
+  const [approvalPage, setApprovalPage] = useState(1);
+  const [approvalPageSize, setApprovalPageSize] = useState(10);
   const [adminTargetOpenId, setAdminTargetOpenId] = useState("");
   const [adminDepartmentId, setAdminDepartmentId] = useState("");
   const [feishuSdkReady, setFeishuSdkReady] = useState(false);
@@ -765,6 +780,34 @@ export function AdminClient() {
     }
   }, [usageFilters, usageHideUnknownRecords, usagePage, usagePageSize]);
 
+  const loadApprovalRequests = useCallback(async (options: { quiet?: boolean } = {}) => {
+    if (!options.quiet) setPanelLoading(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      params.set("limit", String(approvalPageSize));
+      params.set("offset", String((approvalPage - 1) * approvalPageSize));
+      const res = await fetch(`/api/admin/token-requests?${params.toString()}`, { cache: "no-store" });
+      const body = await readJsonResponse<AdminTokenRequestsResponse>(res);
+      if (!res.ok) throw new Error(body.error ?? "读取审批申请失败");
+      setApprovalRequests(body.requests);
+      setApprovalTotalRequests(body.total ?? body.requests.length);
+      setQuotaDrafts((current) => ({
+        ...Object.fromEntries(
+          body.requests.map((request) => [
+            request.id,
+            String(request.approvedMonthlyQuota ?? request.requestedMonthlyQuota),
+          ]),
+        ),
+        ...current,
+      }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取审批申请失败");
+    } finally {
+      if (!options.quiet) setPanelLoading(false);
+    }
+  }, [approvalPage, approvalPageSize]);
+
   useEffect(() => {
     void refresh();
   }, [refresh]);
@@ -783,9 +826,11 @@ export function AdminClient() {
     if (panel === "userStats") void loadUserStats();
     if (panel === "departmentStats" && isSystemAdmin) void loadDepartmentStats();
     if (panel === "usageRecords") void loadUsageRecords();
+    if (panel === "approvals") void loadApprovalRequests();
   }, [
     data?.authorized,
     isSystemAdmin,
+    loadApprovalRequests,
     loadAdminScopes,
     loadAdminUsers,
     loadDepartmentStats,
@@ -1047,7 +1092,7 @@ export function AdminClient() {
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error ?? "保存最终额度失败");
       setMessage("最终额度已保存。");
-      await refresh();
+      await Promise.all([refresh(), loadApprovalRequests({ quiet: true })]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存最终额度失败");
     } finally {
@@ -1077,7 +1122,7 @@ export function AdminClient() {
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error ?? "处理审批失败");
       setMessage(action === "approve" ? "审批已通过，已触发发放。" : "申请已拒绝。");
-      await Promise.all([refresh(), loadAdminUsers()]);
+      await Promise.all([refresh(), loadAdminUsers(), loadApprovalRequests({ quiet: true })]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "处理审批失败");
     } finally {
@@ -1255,6 +1300,8 @@ export function AdminClient() {
     (currentAdminUsersPage - 1) * adminUsersPageSize,
     currentAdminUsersPage * adminUsersPageSize,
   );
+  const approvalPageCount = Math.max(Math.ceil(approvalTotalRequests / approvalPageSize), 1);
+  const currentApprovalPage = Math.min(approvalPage, approvalPageCount);
   const usageSyncReadyToExecute =
     lastUsageSyncDryRunSignature === usageSyncDraftSignature(usageSyncDraft);
   const monthlyResetReadyToExecute =
@@ -2037,89 +2084,105 @@ export function AdminClient() {
                 <CardDescription>仅展示当前管理范围内的申请记录，不显示 NewAPI 明文 key。</CardDescription>
               </CardHeader>
               <CardContent>
-                {!overview?.latestRequests.length ? (
+                {!approvalRequests.length ? (
                   <div className="empty">暂无可查看申请</div>
                 ) : (
-                  <div className="table-wrap">
-                    <table className="table">
-                      <thead>
-                        <tr>
-                          <th>申请人</th>
-                          <th>类型</th>
-                          <th>状态</th>
-                          <th>额度</th>
-                          <th>最终额度</th>
-                          <th>审批消息</th>
-                          <th>错误</th>
-                          <th>更新时间</th>
-                          <th>操作</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {overview.latestRequests.map((request) => (
-                          <tr key={request.id}>
-                            <td>{request.requesterName ?? maskSecret(request.requesterOpenId)}</td>
-                            <td>{requestTypeLabel[request.requestType] ?? request.requestType}</td>
-                            <td>
-                              <Badge variant={badgeVariant(request.status)}>
-                                {statusLabel[request.status] ?? request.status}
-                              </Badge>
-                            </td>
-                            <td>{formatQuotaAmount(request.requestedMonthlyQuota)}</td>
-                            <td>
-                              <div className="quota-control">
-                                <Input
-                                  aria-label="最终额度"
-                                  min={1}
-                                  step={1}
-                                  type="number"
-                                  value={quotaDrafts[request.id] ?? String(request.requestedMonthlyQuota)}
-                                  onChange={(event) =>
-                                    setQuotaDrafts((current) => ({
-                                      ...current,
-                                      [request.id]: event.target.value,
-                                    }))
-                                  }
-                                  disabled={!canEditQuota(request.status) || busy}
-                                />
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  disabled={!canEditQuota(request.status) || busy}
-                                  onClick={() => void saveRequestQuota(request.id)}
-                                >
-                                  保存
-                                </Button>
-                              </div>
-                            </td>
-                            <td>{maskSecret(request.approvalCardMessageId ?? request.approvalInstanceCode)}</td>
-                            <td>{request.errorMessage ? maskSecret(request.errorMessage) : "-"}</td>
-                            <td>{formatDateTime(request.updatedAt)}</td>
-                            <td>
-                              <div className="toolbar toolbar-left">
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  disabled={!canDecideRequest(request.status) || busy}
-                                  onClick={() => void decideRequest(request.id, "approve")}
-                                >
-                                  通过
-                                </Button>
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  disabled={!canDecideRequest(request.status) || busy}
-                                  onClick={() => void decideRequest(request.id, "reject")}
-                                >
-                                  拒绝
-                                </Button>
-                              </div>
-                            </td>
+                  <>
+                    <div className="table-wrap">
+                      <table className="table">
+                        <thead>
+                          <tr>
+                            <th>申请人</th>
+                            <th>类型</th>
+                            <th>状态</th>
+                            <th>额度</th>
+                            <th>最终额度</th>
+                            <th>审批消息</th>
+                            <th>错误</th>
+                            <th>更新时间</th>
+                            <th>操作</th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+                        </thead>
+                        <tbody>
+                          {approvalRequests.map((request) => (
+                            <tr key={request.id}>
+                              <td>{request.requesterName ?? maskSecret(request.requesterOpenId)}</td>
+                              <td>{requestTypeLabel[request.requestType] ?? request.requestType}</td>
+                              <td>
+                                <Badge variant={badgeVariant(request.status)}>
+                                  {statusLabel[request.status] ?? request.status}
+                                </Badge>
+                              </td>
+                              <td>{formatQuotaAmount(request.requestedMonthlyQuota)}</td>
+                              <td>
+                                <div className="quota-control">
+                                  <Input
+                                    aria-label="最终额度"
+                                    min={1}
+                                    step={1}
+                                    type="number"
+                                    value={quotaDrafts[request.id] ?? String(request.requestedMonthlyQuota)}
+                                    onChange={(event) =>
+                                      setQuotaDrafts((current) => ({
+                                        ...current,
+                                        [request.id]: event.target.value,
+                                      }))
+                                    }
+                                    disabled={!canEditQuota(request.status) || busy}
+                                  />
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={!canEditQuota(request.status) || busy}
+                                    onClick={() => void saveRequestQuota(request.id)}
+                                  >
+                                    保存
+                                  </Button>
+                                </div>
+                              </td>
+                              <td>{maskSecret(request.approvalCardMessageId ?? request.approvalInstanceCode)}</td>
+                              <td>{request.errorMessage ? maskSecret(request.errorMessage) : "-"}</td>
+                              <td>{formatDateTime(request.updatedAt)}</td>
+                              <td>
+                                <div className="toolbar toolbar-left">
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={!canDecideRequest(request.status) || busy}
+                                    onClick={() => void decideRequest(request.id, "approve")}
+                                  >
+                                    通过
+                                  </Button>
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={!canDecideRequest(request.status) || busy}
+                                    onClick={() => void decideRequest(request.id, "reject")}
+                                  >
+                                    拒绝
+                                  </Button>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <PageSelector
+                      className="approval-pagination"
+                      currentPage={currentApprovalPage}
+                      pageCount={approvalPageCount}
+                      pageSize={approvalPageSize}
+                      pageSizeOptions={[10, 20, 50]}
+                      totalRecords={approvalTotalRequests}
+                      loading={busy}
+                      onPageChange={setApprovalPage}
+                      onPageSizeChange={(pageSize) => {
+                        setApprovalPageSize(pageSize);
+                        setApprovalPage(1);
+                      }}
+                    />
+                  </>
                 )}
               </CardContent>
             </Card>

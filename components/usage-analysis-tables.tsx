@@ -84,6 +84,14 @@ export function UsageAnalysisTable({
       <CardContent>
         <div className="table-wrap usage-analysis-table-wrap">
           <table className="table usage-analysis-table">
+            <colgroup>
+              <col className="usage-analysis-col-label" />
+              <col className="usage-analysis-col-count" />
+              <col className="usage-analysis-col-tokens" />
+              <col className="usage-analysis-col-cost" />
+              <col className="usage-analysis-col-rate" />
+              <col className="usage-analysis-col-terminal" />
+            </colgroup>
             <thead>
               <tr>
                 <th>{title.replace(/^按/, "").replace(/分析$/, "")}</th>

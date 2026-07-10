@@ -5,6 +5,7 @@ import { EyeOffIcon, RefreshCcwIcon, SearchIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { PageSelector } from "@/components/page-selector";
 import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
 
 export type UsageRequestStatus =
@@ -564,6 +565,18 @@ export function UsageRecordsTable({
 
       <div className="table-wrap table-scroll table-scroll-usage usage-records-desktop">
         <table className="table usage-table">
+          <colgroup>
+            {visibleSet.has("time") && <col className="usage-col-time" />}
+            {showUser && visibleSet.has("user") && <col className="usage-col-user" />}
+            {showDepartment && visibleSet.has("department") && <col className="usage-col-department" />}
+            {visibleSet.has("model") && <col className="usage-col-model" />}
+            {visibleSet.has("apiFormat") && <col className="usage-col-api-format" />}
+            {visibleSet.has("status") && <col className="usage-col-status" />}
+            {visibleSet.has("tokens") && <col className="usage-col-tokens" />}
+            {visibleSet.has("cost") && <col className="usage-col-cost" />}
+            {visibleSet.has("performance") && <col className="usage-col-performance" />}
+            {visibleSet.has("clientFamily") && <col className="usage-col-client" />}
+          </colgroup>
           <thead>
             <tr>
               {visibleSet.has("time") && <th>时间</th>}
@@ -674,40 +687,16 @@ export function UsageRecordsTable({
       </div>
 
       {showControls && totalRecords !== undefined && totalRecords > 0 && (
-        <div className="usage-pagination">
-          <span>
-            第 {currentPage} / {pageCount} 页
-          </span>
-          <div className="toolbar toolbar-left">
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={currentPage <= 1 || loading}
-              onClick={() => onPageChange?.(currentPage - 1)}
-            >
-              上一页
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={currentPage >= pageCount || loading}
-              onClick={() => onPageChange?.(currentPage + 1)}
-            >
-              下一页
-            </Button>
-            <select
-              className="input usage-select"
-              value={pageSize}
-              onChange={(event) => onPageSizeChange?.(Number(event.target.value))}
-            >
-              {pageSizeOptions.map((option) => (
-                <option key={option} value={option}>
-                  {option} / 页
-                </option>
-              ))}
-            </select>
-          </div>
-        </div>
+        <PageSelector
+          currentPage={currentPage}
+          pageCount={pageCount}
+          pageSize={pageSize}
+          pageSizeOptions={pageSizeOptions}
+          totalRecords={totalRecords}
+          loading={loading}
+          onPageChange={onPageChange}
+          onPageSizeChange={onPageSizeChange}
+        />
       )}
     </div>
   );

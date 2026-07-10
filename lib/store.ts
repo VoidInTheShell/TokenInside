@@ -2725,11 +2725,12 @@ export async function listAdminUsageRecords(input: UsageRecordFilters & {
         dateScopedLogs.map((log) => {
           const user = log.feishuUserId ? usersById.get(log.feishuUserId) : undefined;
           const id = logDepartmentId(log, user) ?? "unknown";
+          const name = logDepartmentName(log, user) ?? departmentNameForId(store, id);
           return [
             id,
             {
               id,
-              name: logDepartmentName(log, user),
+              name,
             },
           ] as const;
         }),
@@ -2746,9 +2747,10 @@ export async function listAdminUsageRecords(input: UsageRecordFilters & {
     })),
     departmentStats: aggregateUsage(filteredLogs, usersById, (log, user) => {
       const id = logDepartmentId(log, user) ?? "unknown";
+      const name = logDepartmentName(log, user) ?? departmentNameForId(store, id);
       return {
         key: id,
-        label: logDepartmentName(log, user) ?? id,
+        label: name ?? id,
       };
     }),
     apiFormatStats: aggregateUsage(filteredLogs, usersById, (log) => ({
@@ -2912,6 +2914,54 @@ export async function listDepartmentStats(scope: AdminScope) {
     .sort((a, b) => b.quotaConsumed - a.quotaConsumed || b.totalTokens - a.totalTokens);
 }
 
+function mapAdminTokenRequest(request: TokenRequest, user?: FeishuUser) {
+  return {
+    id: request.id,
+    requestType: request.requestType,
+    status: request.status,
+    reason: request.reason,
+    requestedMonthlyQuota: request.requestedMonthlyQuota,
+    approvedMonthlyQuota: request.approvedMonthlyQuota,
+    approvalInstanceCode: request.approvalInstanceCode,
+    approvalTargetSource: request.approvalTargetSource,
+    approvalTargetOpenId: request.approvalTargetOpenId,
+    approvalCardMessageId: request.approvalCardMessageId,
+    approvalOperatorOpenId: request.approvalOperatorOpenId,
+    approvalOperatedAt: request.approvalOperatedAt,
+    tokenAccountId: request.tokenAccountId,
+    errorMessage: request.errorMessage,
+    requesterName: user?.name,
+    requesterOpenId: user?.openId,
+    departmentId: user?.departmentId,
+    departmentName: user?.departmentName,
+    updatedAt: request.updatedAt,
+    createdAt: request.createdAt,
+  };
+}
+
+export async function listAdminTokenRequests(input: {
+  scope: AdminScope;
+  limit?: number;
+  offset?: number;
+}) {
+  const store = await readStore();
+  const usersById = new Map(store.users.map((user) => [user.id, user]));
+  const scopedRequests = store.tokenRequests
+    .filter((request) => tokenRequestInScope(request, input.scope, usersById))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const limit = boundedLimit(input.limit, 50);
+  const offset = boundedOffset(input.offset);
+
+  return {
+    requests: scopedRequests
+      .slice(offset, offset + limit)
+      .map((request) => mapAdminTokenRequest(request, usersById.get(request.feishuUserId))),
+    total: scopedRequests.length,
+    limit,
+    offset,
+  };
+}
+
 export async function getAdminOverview(scope: AdminScope) {
   const store = await readStore();
   const currentPeriod = nowIso().slice(0, 7);
@@ -3060,31 +3110,7 @@ export async function getAdminOverview(scope: AdminScope) {
     latestRequests: [...scopedRequests]
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
       .slice(0, 20)
-      .map((request) => {
-        const user = usersById.get(request.feishuUserId);
-        return {
-          id: request.id,
-          requestType: request.requestType,
-          status: request.status,
-          reason: request.reason,
-          requestedMonthlyQuota: request.requestedMonthlyQuota,
-          approvedMonthlyQuota: request.approvedMonthlyQuota,
-          approvalInstanceCode: request.approvalInstanceCode,
-          approvalTargetSource: request.approvalTargetSource,
-          approvalTargetOpenId: request.approvalTargetOpenId,
-          approvalCardMessageId: request.approvalCardMessageId,
-          approvalOperatorOpenId: request.approvalOperatorOpenId,
-          approvalOperatedAt: request.approvalOperatedAt,
-          tokenAccountId: request.tokenAccountId,
-          errorMessage: request.errorMessage,
-          requesterName: user?.name,
-          requesterOpenId: user?.openId,
-          departmentId: user?.departmentId,
-          departmentName: user?.departmentName,
-          updatedAt: request.updatedAt,
-          createdAt: request.createdAt,
-        };
-      }),
+      .map((request) => mapAdminTokenRequest(request, usersById.get(request.feishuUserId))),
     users: [...scopedUsers]
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
       .slice(0, 50)
