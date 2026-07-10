@@ -1,3 +1,5 @@
+import type { UsageFieldSources, UsageSemantic } from "@/lib/usage-metrics";
+
 export type RequestStatus =
   | "pending_card_send"
   | "pending_card_approval"
@@ -125,8 +127,13 @@ export type ProxyRequestLog = {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  inputTokensTotal?: number;
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
+  cacheCreationTokens5m?: number;
+  cacheCreationTokens1h?: number;
+  usageSemantic?: UsageSemantic;
+  usageFieldSources?: UsageFieldSources;
   quota?: number;
   cost?: number;
   actualCost?: number;
@@ -134,6 +141,8 @@ export type ProxyRequestLog = {
   usageSyncedAt?: string;
   newapiLogId?: string;
   newapiRequestId?: string;
+  newapiResponseRequestId?: string;
+  newapiUpstreamRequestId?: string;
   providerChannelName?: string;
   newapiUseTimeSeconds?: number;
   errorMessage?: string;
@@ -165,13 +174,19 @@ export type NewApiUsageRecord = {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  inputTokensTotal?: number;
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
+  cacheCreationTokens5m?: number;
+  cacheCreationTokens1h?: number;
+  usageSemantic?: UsageSemantic;
+  usageFieldSources?: UsageFieldSources;
   quota?: number;
   cost?: number;
   actualCost?: number;
   isStream?: boolean;
   newapiType?: string;
+  newapiUpstreamRequestId?: string;
   providerChannelName?: string;
   newapiUseTimeSeconds?: number;
   newapiCreatedAt?: string;

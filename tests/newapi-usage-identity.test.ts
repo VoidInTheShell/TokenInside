@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sameNewApiUsageSource } from "../lib/newapi-usage-identity.ts";
+import {
+  newApiUsageIdentityLockKeys,
+  sameNewApiUsageSource,
+} from "../lib/newapi-usage-identity.ts";
 
 test("does not treat reused NewAPI log ids from different tokens as the same source", () => {
   assert.equal(
@@ -26,5 +29,17 @@ test("uses request identity within a token before falling back to a log id", () 
       { newapiLogId: "99", newapiRequestId: "request-a", newapiTokenId: "54" },
     ),
     true,
+  );
+});
+
+test("locks request and log identities in a stable order before an upsert", () => {
+  assert.deepEqual(
+    newApiUsageIdentityLockKeys({
+      id: "nur_test",
+      newapiTokenId: "54",
+      newapiRequestId: "request-a",
+      newapiLogId: "9",
+    }),
+    ["newapi_usage:54:log:9", "newapi_usage:54:request:request-a"],
   );
 });

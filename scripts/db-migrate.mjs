@@ -123,11 +123,45 @@ const statements = [
     last_synced_at timestamptz not null
   )`,
   `drop index if exists newapi_usage_records_log_unique`,
-  `create unique index if not exists newapi_usage_records_source_unique
-    on newapi_usage_records (newapi_token_id, newapi_log_id, newapi_request_id)
+  `drop index if exists newapi_usage_records_source_unique`,
+  `with ranked as (
+     select id,
+            row_number() over (
+              partition by newapi_token_id, newapi_request_id
+              order by last_synced_at desc, first_seen_at asc, id asc
+            ) as row_number
+     from newapi_usage_records
+     where newapi_token_id is not null
+       and newapi_request_id is not null
+   )
+   delete from newapi_usage_records target
+   using ranked
+   where target.id = ranked.id
+     and ranked.row_number > 1`,
+  `with ranked as (
+     select id,
+            row_number() over (
+              partition by newapi_token_id, newapi_log_id
+              order by last_synced_at desc, first_seen_at asc, id asc
+            ) as row_number
+     from newapi_usage_records
+     where newapi_token_id is not null
+       and newapi_request_id is null
+       and newapi_log_id is not null
+   )
+   delete from newapi_usage_records target
+   using ranked
+   where target.id = ranked.id
+     and ranked.row_number > 1`,
+  `create unique index if not exists newapi_usage_records_request_unique
+    on newapi_usage_records (newapi_token_id, newapi_request_id)
     where newapi_token_id is not null
-      and newapi_log_id is not null
       and newapi_request_id is not null`,
+  `create unique index if not exists newapi_usage_records_log_fallback_unique
+    on newapi_usage_records (newapi_token_id, newapi_log_id)
+    where newapi_token_id is not null
+      and newapi_request_id is null
+      and newapi_log_id is not null`,
   `create index if not exists newapi_usage_records_user_created_idx
     on newapi_usage_records (feishu_user_id, newapi_created_at)`,
   `create index if not exists newapi_usage_records_token_created_idx

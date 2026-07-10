@@ -45,8 +45,12 @@ export type UsageRecordRow = {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  inputTokensTotal?: number;
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
+  cacheCreationTokens5m?: number;
+  cacheCreationTokens1h?: number;
+  usageSemantic?: "openai" | "anthropic";
   quota?: number;
   cost?: number;
   actualCost?: number;
@@ -54,6 +58,8 @@ export type UsageRecordRow = {
   usageSyncedAt?: string;
   newapiLogId?: string;
   newapiRequestId?: string;
+  newapiResponseRequestId?: string;
+  newapiUpstreamRequestId?: string;
   providerChannelName?: string;
   newapiUseTimeSeconds?: number;
   errorMessage?: string;
@@ -299,9 +305,9 @@ function TokensCell({ record }: { record: UsageRecordRow }) {
         <span>{formatTokenAmount(record.completionTokens, "0")}</span>
       </div>
       <div>
-        <span>{formatTokenAmount(record.cacheReadTokens, "0")}</span>
+        <span>{formatTokenAmount(record.cacheReadTokens, "—")}</span>
         <span>/</span>
-        <span>{formatTokenAmount(record.cacheCreationTokens, "0")}</span>
+        <span>{formatTokenAmount(record.cacheCreationTokens, "—")}</span>
       </div>
     </div>
   );

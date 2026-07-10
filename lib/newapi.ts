@@ -1,5 +1,10 @@
 import { getConfig } from "@/lib/config";
 import { randomId } from "@/lib/crypto";
+import {
+  extractUsageFromNewApiOther,
+  mergeUsageMetrics,
+  type UsageMetrics,
+} from "@/lib/usage-metrics";
 
 type NewApiEnvelope<T> = {
   success?: boolean;
@@ -28,7 +33,7 @@ type NewApiKeyResponse = {
   token?: string;
 };
 
-type NewApiLogRecord = {
+export type NewApiLogRecord = {
   id?: string | number;
   created_at?: string | number;
   token_id?: string | number;
@@ -45,6 +50,7 @@ type NewApiLogRecord = {
   channel_name?: string;
   user_id?: string | number;
   username?: string;
+  other?: unknown;
 };
 
 type NewApiLogPage = {
@@ -59,7 +65,7 @@ export type NewApiModel = {
   permission?: unknown[];
 };
 
-export type NormalizedNewApiUsageLog = {
+export type NormalizedNewApiUsageLog = UsageMetrics & {
   newapiLogId?: string;
   newapiRequestId?: string;
   newapiUpstreamRequestId?: string;
@@ -67,9 +73,6 @@ export type NormalizedNewApiUsageLog = {
   tokenName?: string;
   createdAt?: string;
   model?: string;
-  promptTokens?: number;
-  completionTokens?: number;
-  totalTokens?: number;
   quota?: number;
   cost?: number;
   isStream?: boolean;
@@ -301,10 +304,22 @@ export async function listModelsForNewApiToken(newapiTokenId: string) {
   return [];
 }
 
-function normalizeNewApiUsageLog(record: NewApiLogRecord): NormalizedNewApiUsageLog {
+export function normalizeNewApiUsageLog(record: NewApiLogRecord): NormalizedNewApiUsageLog {
   const promptTokens = numberFromNewApi(record.prompt_tokens);
   const completionTokens = numberFromNewApi(record.completion_tokens);
   const quota = numberFromNewApi(record.quota);
+  const usageMetrics = extractUsageFromNewApiOther({
+    other: record.other,
+    promptTokens,
+    completionTokens,
+  });
+  mergeUsageMetrics(usageMetrics, {
+    cost: quota === undefined ? undefined : fromNewApiQuota(quota),
+    usageFieldSources:
+      quota === undefined
+        ? usageMetrics.usageFieldSources
+        : { ...usageMetrics.usageFieldSources, cost: "newapi_log" },
+  });
 
   return {
     newapiLogId: stringFromNewApi(record.id),
@@ -314,14 +329,8 @@ function normalizeNewApiUsageLog(record: NewApiLogRecord): NormalizedNewApiUsage
     tokenName: stringFromNewApi(record.token_name),
     createdAt: isoFromNewApiTime(record.created_at),
     model: stringFromNewApi(record.model_name),
-    promptTokens,
-    completionTokens,
-    totalTokens:
-      promptTokens !== undefined || completionTokens !== undefined
-        ? (promptTokens ?? 0) + (completionTokens ?? 0)
-        : undefined,
+    ...usageMetrics,
     quota,
-    cost: quota === undefined ? undefined : fromNewApiQuota(quota),
     isStream: booleanFromNewApi(record.is_stream),
     type: stringFromNewApi(record.type),
     newapiUseTimeSeconds: numberFromNewApi(record.use_time),

@@ -78,6 +78,31 @@ test("matches a successful non-stream proxy by exact usage when request ids diff
   assert.equal(matched?.id, "pl_correct");
 });
 
+test("matches the response header id against NewAPI upstream_request_id", () => {
+  const exact = proxy({
+    id: "pl_upstream_id",
+    newapiResponseRequestId: "upstream-response-id",
+    promptTokens: undefined,
+    completionTokens: undefined,
+    totalTokens: undefined,
+    usageSource: "missing",
+  });
+  const matched = findProxyLogForNewApiUsage({
+    proxyLogs: [exact],
+    usageLog: usage({
+      newapiRequestId: "newapi-log-request-id",
+      newapiUpstreamRequestId: "upstream-response-id",
+      promptTokens: 18,
+      completionTokens: 10,
+      totalTokens: 28,
+    }),
+    account,
+    matchWindowMs: 30 * 60 * 1000,
+  });
+
+  assert.equal(matched?.id, exact.id);
+});
+
 test("does not attach a direct NewAPI non-stream request to a proxy with different usage", () => {
   const matched = findProxyLogForNewApiUsage({
     proxyLogs: [proxy({ id: "pl_other" })],

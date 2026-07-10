@@ -1,6 +1,7 @@
 import { Pool, type PoolClient } from "pg";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
+import { newApiUsageIdentityLockKeys } from "@/lib/newapi-usage-identity";
 import type {
   AdminScope,
   AppSettings,
@@ -1522,6 +1523,9 @@ export async function updatePostgresProxyLog(
 
 export async function upsertPostgresNewApiUsageRecord(record: NewApiUsageRecord) {
   return withTransaction(async (client) => {
+    for (const lockKey of newApiUsageIdentityLockKeys(record)) {
+      await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [lockKey]);
+    }
     const existingResult = await client.query<{ data: NewApiUsageRecord }>(
       `select data
        from newapi_usage_records

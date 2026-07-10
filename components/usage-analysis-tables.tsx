@@ -12,11 +12,13 @@ export type UsageAggregateRow = {
   totalTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  cacheReadReportedRequests: number;
+  cacheCreationReportedRequests: number;
   cost: number;
   actualCost: number;
   successRate: number;
   avgDurationMs: number;
-  cacheHitRate: number;
+  cacheHitRate?: number;
   costPerMillionTokens: number;
   issuedQuota?: number;
   usedQuota?: number;
@@ -38,7 +40,7 @@ function formatQuotaFixed(value?: number) {
 }
 
 function formatRate(value?: number, fractionDigits = 1) {
-  if (!Number.isFinite(value)) return "-";
+  if (!Number.isFinite(value)) return "—";
   const percentage = (value ?? 0) * 100;
   return fractionDigits === 1
     ? `${Math.round(percentage * 10) / 10}%`
@@ -152,9 +154,17 @@ export function UsageAnalysisTable({
                           <span>{formatTokenAmount(row.completionTokens, "0")}</span>
                         </div>
                         <div>
-                          <span>{formatTokenAmount(row.cacheReadTokens, "0")}</span>
+                          <span title={`已上报 ${row.cacheReadReportedRequests}/${row.requestCount} 条请求`}>
+                            {row.cacheReadReportedRequests > 0
+                              ? formatTokenAmount(row.cacheReadTokens, "0")
+                              : "—"}
+                          </span>
                           <span>/</span>
-                          <span>{formatTokenAmount(row.cacheCreationTokens, "0")}</span>
+                          <span title={`已上报 ${row.cacheCreationReportedRequests}/${row.requestCount} 条请求`}>
+                            {row.cacheCreationReportedRequests > 0
+                              ? formatTokenAmount(row.cacheCreationTokens, "0")
+                              : "—"}
+                          </span>
                         </div>
                       </div>
                     </td>

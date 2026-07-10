@@ -88,6 +88,12 @@ function sleep(ms: number) {
 }
 
 function usageLogIdentity(log: NormalizedNewApiUsageLog) {
+  if (log.newapiTokenId && log.newapiRequestId) {
+    return `request:${log.newapiTokenId}:${log.newapiRequestId}`;
+  }
+  if (log.newapiTokenId && log.newapiLogId) {
+    return `log:${log.newapiTokenId}:${log.newapiLogId}`;
+  }
   return [
     log.newapiLogId,
     log.newapiRequestId,
@@ -288,6 +294,7 @@ async function syncNewApiUsageLogsUnlocked(input: {
   let lastSeenNewapiLogId: string | undefined;
   let lastSeenNewapiCreatedAt: string | undefined;
   const reservedProxyLogIds: string[] = [];
+  const seenUsageLogIdentities = new Set<string>();
   try {
     for (let index = 0; index < maxPages; index += 1) {
       const page = pageStart + index;
@@ -301,7 +308,15 @@ async function syncNewApiUsageLogsUnlocked(input: {
           lastSeenNewapiLogId = item.newapiLogId;
         }
       }
-      const backfill = await backfillProxyLogsFromNewApiUsage(logsPage.items, {
+      const usageLogs = uniqueUsageLogs(logsPage.items).filter((log) => {
+        const identity = usageLogIdentity(log);
+        if (!identity || !seenUsageLogIdentities.has(identity)) {
+          if (identity) seenUsageLogIdentities.add(identity);
+          return true;
+        }
+        return false;
+      });
+      const backfill = await backfillProxyLogsFromNewApiUsage(usageLogs, {
         dryRun,
         matchWindowMs: input.matchWindowMs,
         reservedProxyLogIds,
@@ -510,6 +525,13 @@ function scheduleNextUsageSyncTick(delayMs: number) {
   schedulerTimer = setTimeout(async () => {
     try {
       await runDueNewApiUsageSync();
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          event: "tokeninside.usage_sync.scheduler_failed",
+          errorMessage: err instanceof Error ? err.message : "NewAPI usage sync failed",
+        }),
+      );
     } finally {
       const settings = await getAppSettings().catch(() => null);
       const policy = {

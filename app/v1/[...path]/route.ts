@@ -3,6 +3,14 @@ import { buildNewApiProxyUrl } from "@/lib/newapi";
 import { sha256Hex } from "@/lib/crypto";
 import { syncNewApiUsageForProxyRequest } from "@/lib/usage-sync";
 import {
+  createSseUsageCollector,
+  extractUsageFromJson,
+  hasUsageMetrics,
+  objectValue,
+  parseJsonText,
+  usageSemanticFromApiFormat,
+} from "@/lib/usage-metrics";
+import {
   addProxyLog,
   beginProxyLog,
   findActiveTokenByHash,
@@ -15,16 +23,6 @@ export const dynamic = "force-dynamic";
 
 type RouteContext = {
   params: Promise<{ path: string[] }>;
-};
-
-type UsageMetrics = {
-  promptTokens?: number;
-  completionTokens?: number;
-  totalTokens?: number;
-  cacheReadTokens?: number;
-  cacheCreationTokens?: number;
-  cost?: number;
-  actualCost?: number;
 };
 
 function normalizeProxyPath(path: string[]) {
@@ -65,153 +63,9 @@ function getSupportedProxyError(method: string, path: string[]) {
   };
 }
 
-function numberFromUsage(value: unknown) {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function objectValue(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function parseJsonText(text: string) {
-  if (!text.trim()) return undefined;
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return undefined;
-  }
-}
-
 function parseJsonBody(buffer: ArrayBuffer | undefined, contentType: string | null) {
   if (!buffer || !contentType?.includes("application/json")) return undefined;
   return parseJsonText(new TextDecoder().decode(buffer));
-}
-
-function sumDefinedNumbers(...values: Array<number | undefined>) {
-  const defined = values.filter((value): value is number => value !== undefined);
-  if (!defined.length) return undefined;
-  return defined.reduce((sum, value) => sum + value, 0);
-}
-
-function extractUsageFromJson(body: unknown): UsageMetrics {
-  const root = objectValue(body);
-  const usage = objectValue(root?.usage);
-  if (!usage) return {};
-
-  const promptDetails = objectValue(usage.prompt_tokens_details ?? usage.input_tokens_details);
-  const cacheCreation = objectValue(usage.cache_creation);
-  const promptTokens = numberFromUsage(usage.prompt_tokens ?? usage.input_tokens);
-  const completionTokens = numberFromUsage(
-    usage.completion_tokens ?? usage.output_tokens,
-  );
-  const cacheReadTokens = numberFromUsage(
-    usage.cache_read_tokens ??
-      usage.cache_read_input_tokens ??
-      usage.prompt_cache_hit_tokens ??
-      promptDetails?.cached_tokens,
-  );
-  const directCacheCreationTokens = numberFromUsage(
-    usage.cache_creation_tokens ?? usage.cache_creation_input_tokens,
-  );
-  const splitCacheCreationTokens = sumDefinedNumbers(
-    numberFromUsage(usage.cache_creation_ephemeral_5m_input_tokens),
-    numberFromUsage(usage.cache_creation_ephemeral_1h_input_tokens),
-    numberFromUsage(cacheCreation?.ephemeral_5m_input_tokens ?? cacheCreation?.ephemeral_5m),
-    numberFromUsage(cacheCreation?.ephemeral_1h_input_tokens ?? cacheCreation?.ephemeral_1h),
-  );
-  const cacheCreationTokens = directCacheCreationTokens ?? splitCacheCreationTokens;
-  const explicitTotalTokens = numberFromUsage(usage.total_tokens);
-
-  return {
-    promptTokens,
-    completionTokens,
-    cacheReadTokens,
-    cacheCreationTokens,
-    totalTokens:
-      explicitTotalTokens ??
-      sumDefinedNumbers(promptTokens, completionTokens, cacheReadTokens, cacheCreationTokens),
-    cost: numberFromUsage(root?.cost ?? root?.total_cost ?? usage.cost ?? usage.total_cost),
-    actualCost: numberFromUsage(root?.actual_cost ?? usage.actual_cost),
-  };
-}
-
-function hasUsageMetrics(usage: UsageMetrics) {
-  return Object.values(usage).some((value) => value !== undefined);
-}
-
-function mergeUsageMetrics(target: UsageMetrics, patch: UsageMetrics) {
-  for (const [key, value] of Object.entries(patch)) {
-    if (value !== undefined) {
-      target[key as keyof UsageMetrics] = value;
-    }
-  }
-}
-
-function extractUsageFromJsonDeep(body: unknown): UsageMetrics {
-  const usage: UsageMetrics = {};
-  const root = objectValue(body);
-  const candidates = [
-    body,
-    root?.response,
-    root?.message,
-    root?.delta,
-    root?.event,
-  ];
-  for (const candidate of candidates) {
-    mergeUsageMetrics(usage, extractUsageFromJson(candidate));
-  }
-  return usage;
-}
-
-function createSseUsageCollector() {
-  const decoder = new TextDecoder();
-  const usage: UsageMetrics = {};
-  let pendingText = "";
-  let eventLines: string[] = [];
-
-  function flushEvent() {
-    if (!eventLines.length) return;
-    const data = eventLines
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).trimStart())
-      .join("\n")
-      .trim();
-    eventLines = [];
-    if (!data || data === "[DONE]") return;
-    const json = parseJsonText(data);
-    if (json === undefined) return;
-    mergeUsageMetrics(usage, extractUsageFromJsonDeep(json));
-  }
-
-  function ingest(chunk: Uint8Array) {
-    pendingText += decoder.decode(chunk, { stream: true });
-    const lines = pendingText.split(/\r?\n/);
-    pendingText = lines.pop() ?? "";
-    for (const line of lines) {
-      if (!line) {
-        flushEvent();
-      } else {
-        eventLines.push(line);
-      }
-    }
-  }
-
-  function finish() {
-    pendingText += decoder.decode();
-    if (pendingText) {
-      eventLines.push(pendingText);
-      pendingText = "";
-    }
-    flushEvent();
-    return usage;
-  }
-
-  return {
-    ingest,
-    finish,
-  };
 }
 
 function bodyWithStreamUsageOptions(input: {
@@ -288,12 +142,12 @@ function terminalStatus(statusCode: number) {
   return "completed" as const;
 }
 
-function newApiRequestIdFrom(upstream: Response) {
+function newApiResponseRequestIdFrom(upstream: Response) {
   return upstream.headers.get("x-oneapi-request-id") ?? undefined;
 }
 
-function newApiRequestIdPatch(newapiRequestId?: string) {
-  return newapiRequestId ? { newapiRequestId } : {};
+function newApiResponseRequestIdPatch(newapiResponseRequestId?: string) {
+  return newapiResponseRequestId ? { newapiResponseRequestId } : {};
 }
 
 type ProxyUsageSettlementContext = {
@@ -351,10 +205,14 @@ function streamWithProxyLog(input: {
   logId: string;
   startedAt: number;
   statusCode: number;
-  newapiRequestId?: string;
+  newapiResponseRequestId?: string;
+  apiFormat: string;
 }) {
   const reader = input.body.getReader();
-  const usageCollector = createSseUsageCollector();
+  const usageCollector = createSseUsageCollector({
+    source: "proxy_stream",
+    fallbackSemantic: usageSemanticFromApiFormat(input.apiFormat),
+  });
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
@@ -366,7 +224,7 @@ function streamWithProxyLog(input: {
             durationMs: Date.now() - input.startedAt,
             responseTimeUpdatedAt: new Date().toISOString(),
             usageSource: hasUsageMetrics(usage) ? "proxy_stream" : "missing",
-            ...newApiRequestIdPatch(input.newapiRequestId),
+            ...newApiResponseRequestIdPatch(input.newapiResponseRequestId),
             ...usage,
           });
           controller.close();
@@ -419,11 +277,15 @@ async function recordFinishedProxyLog(input: {
   upstream: Response;
   requestPath: string;
   settlementContext: ProxyUsageSettlementContext;
+  apiFormat: string;
   responseBuffer: ArrayBuffer;
   responseJson: unknown;
 }) {
-  const usage = extractUsageFromJson(input.responseJson);
-  const newapiRequestId = newApiRequestIdFrom(input.upstream);
+  const usage = extractUsageFromJson(input.responseJson, {
+    source: "proxy_json",
+    fallbackSemantic: usageSemanticFromApiFormat(input.apiFormat),
+  });
+  const newapiResponseRequestId = newApiResponseRequestIdFrom(input.upstream);
   const errorMessage =
     input.upstream.status >= 400
       ? upstreamErrorMessage({
@@ -439,7 +301,7 @@ async function recordFinishedProxyLog(input: {
     firstByteMs: input.firstByteMs,
     responseTimeUpdatedAt: new Date().toISOString(),
     usageSource: hasUsageMetrics(usage) ? "proxy_json" : "missing",
-    ...newApiRequestIdPatch(newapiRequestId),
+    ...newApiResponseRequestIdPatch(newapiResponseRequestId),
     ...usage,
     errorMessage,
   });
@@ -450,13 +312,13 @@ async function recordFinishedProxyLog(input: {
         proxyLogId: input.logId,
         requestPath: input.requestPath,
         statusCode: input.upstream.status,
-        newapiRequestId,
+        newapiResponseRequestId,
         errorMessage,
       }),
     );
   }
   if (input.upstream.status < 400) {
-    settleNewApiUsageAfterResponse(input.settlementContext, newapiRequestId);
+    settleNewApiUsageAfterResponse(input.settlementContext, newapiResponseRequestId);
   }
 }
 
@@ -597,7 +459,7 @@ async function proxy(request: Request, context: RouteContext) {
     const firstByteMs = Date.now() - startedAt;
     const contentType = upstream.headers.get("content-type") ?? "";
     const upstreamIsStream = contentType.includes("text/event-stream");
-    const newapiRequestId = newApiRequestIdFrom(upstream);
+    const newapiResponseRequestId = newApiResponseRequestIdFrom(upstream);
     const responseHeaders = responseHeadersFrom(upstream);
 
     if (upstreamIsStream && upstream.body) {
@@ -608,11 +470,11 @@ async function proxy(request: Request, context: RouteContext) {
         firstByteMs,
         isStream: true,
         upstreamIsStream: true,
-        ...newApiRequestIdPatch(newapiRequestId),
+        ...newApiResponseRequestIdPatch(newapiResponseRequestId),
         responseTimeUpdatedAt: new Date().toISOString(),
       });
       if (upstream.status < 400) {
-        settleNewApiUsageAfterResponse(settlementContext, newapiRequestId);
+        settleNewApiUsageAfterResponse(settlementContext, newapiResponseRequestId);
       }
       return new Response(
         streamWithProxyLog({
@@ -620,7 +482,8 @@ async function proxy(request: Request, context: RouteContext) {
           logId: proxyLog.id,
           startedAt,
           statusCode: upstream.status,
-          newapiRequestId,
+          newapiResponseRequestId,
+          apiFormat,
         }),
         {
           status: upstream.status,
@@ -638,6 +501,7 @@ async function proxy(request: Request, context: RouteContext) {
       upstream,
       requestPath,
       settlementContext,
+      apiFormat,
       responseBuffer: responseBody.buffer,
       responseJson: responseBody.json,
     });

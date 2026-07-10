@@ -83,6 +83,15 @@ function matchScore(input: {
   const exactRequestId = Boolean(
     usageLog.newapiRequestId && proxyLog.newapiRequestId === usageLog.newapiRequestId,
   );
+  const exactResponseRequestId = Boolean(
+    proxyLog.newapiResponseRequestId &&
+      (proxyLog.newapiResponseRequestId === usageLog.newapiRequestId ||
+        proxyLog.newapiResponseRequestId === usageLog.newapiUpstreamRequestId),
+  );
+  const exactUpstreamRequestId = Boolean(
+    usageLog.newapiUpstreamRequestId &&
+      proxyLog.newapiUpstreamRequestId === usageLog.newapiUpstreamRequestId,
+  );
   const exactLogId = Boolean(
     usageLog.newapiLogId &&
       proxyLog.newapiLogId === usageLog.newapiLogId &&
@@ -105,6 +114,9 @@ function matchScore(input: {
   const maxTimeDelta = Math.min(Math.max(matchWindowMs, 0), MAX_SAFE_TIME_DELTA_MS);
 
   if (exactRequestId) return Number.isFinite(timeDelta) ? timeDelta : 0;
+  if (exactResponseRequestId || exactUpstreamRequestId) {
+    return 50_000 + (Number.isFinite(timeDelta) ? timeDelta : 0);
+  }
   if (exactLogId) return 100_000 + (Number.isFinite(timeDelta) ? timeDelta : 0);
   if (!Number.isFinite(timeDelta) || timeDelta > maxTimeDelta) return undefined;
 

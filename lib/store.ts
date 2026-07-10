@@ -6,6 +6,7 @@ import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
 import { sameNewApiUsageSource } from "@/lib/newapi-usage-identity";
 import { findProxyLogForNewApiUsage } from "@/lib/usage-matching";
 import { isUsageRecordRequest } from "@/lib/usage-record-visibility";
+import { normalizedInputTokensTotal } from "@/lib/usage-metrics";
 import {
   enablePostgresUserAccess,
   findPostgresActiveTokenByHash,
@@ -1354,7 +1355,19 @@ function buildUsagePatch(
   };
 
   if (usageLog.newapiLogId) patch.newapiLogId = usageLog.newapiLogId;
-  if (usageLog.newapiRequestId) patch.newapiRequestId = usageLog.newapiRequestId;
+  if (usageLog.newapiRequestId) {
+    if (
+      currentLog.newapiRequestId &&
+      currentLog.newapiRequestId !== usageLog.newapiRequestId &&
+      !currentLog.newapiResponseRequestId
+    ) {
+      patch.newapiResponseRequestId = currentLog.newapiRequestId;
+    }
+    patch.newapiRequestId = usageLog.newapiRequestId;
+  }
+  if (usageLog.newapiUpstreamRequestId) {
+    patch.newapiUpstreamRequestId = usageLog.newapiUpstreamRequestId;
+  }
   if (usageLog.providerChannelName) patch.providerChannelName = usageLog.providerChannelName;
   if (usageLog.newapiUseTimeSeconds !== undefined) {
     patch.newapiUseTimeSeconds = usageLog.newapiUseTimeSeconds;
@@ -1364,6 +1377,30 @@ function buildUsagePatch(
   if (usageLog.promptTokens !== undefined) patch.promptTokens = usageLog.promptTokens;
   if (usageLog.completionTokens !== undefined) patch.completionTokens = usageLog.completionTokens;
   if (usageLog.totalTokens !== undefined) patch.totalTokens = usageLog.totalTokens;
+  if (usageLog.inputTokensTotal !== undefined) {
+    patch.inputTokensTotal = usageLog.inputTokensTotal;
+  }
+  if (usageLog.cacheReadTokens !== undefined) {
+    patch.cacheReadTokens = usageLog.cacheReadTokens;
+  }
+  if (usageLog.cacheCreationTokens !== undefined) {
+    patch.cacheCreationTokens = usageLog.cacheCreationTokens;
+  }
+  if (usageLog.cacheCreationTokens5m !== undefined) {
+    patch.cacheCreationTokens5m = usageLog.cacheCreationTokens5m;
+  }
+  if (usageLog.cacheCreationTokens1h !== undefined) {
+    patch.cacheCreationTokens1h = usageLog.cacheCreationTokens1h;
+  }
+  if (usageLog.usageSemantic !== undefined) {
+    patch.usageSemantic = usageLog.usageSemantic;
+  }
+  if (usageLog.usageFieldSources) {
+    patch.usageFieldSources = {
+      ...currentLog.usageFieldSources,
+      ...usageLog.usageFieldSources,
+    };
+  }
   if (usageLog.isStream !== undefined) {
     patch.isStream = usageLog.isStream;
     patch.upstreamIsStream = usageLog.isStream;
@@ -1392,6 +1429,12 @@ function patchChangesLog(
 }
 
 function stableUsageIdentity(usageLog: NormalizedNewApiUsageLog) {
+  if (usageLog.newapiTokenId && usageLog.newapiRequestId) {
+    return `request:${usageLog.newapiTokenId}:${usageLog.newapiRequestId}`;
+  }
+  if (usageLog.newapiTokenId && usageLog.newapiLogId) {
+    return `log:${usageLog.newapiTokenId}:${usageLog.newapiLogId}`;
+  }
   return [
     usageLog.newapiLogId,
     usageLog.newapiRequestId,
@@ -1429,6 +1472,7 @@ function buildNewApiUsageRecord(input: {
     id: usageRecordIdFromLog(input.usageLog),
     newapiLogId: input.usageLog.newapiLogId,
     newapiRequestId: input.usageLog.newapiRequestId,
+    newapiUpstreamRequestId: input.usageLog.newapiUpstreamRequestId,
     newapiTokenId: input.usageLog.newapiTokenId,
     tokenAccountId: input.proxyLog?.tokenAccountId ?? input.account?.id,
     feishuUserId: input.proxyLog?.feishuUserId ?? input.account?.feishuUserId,
@@ -1440,6 +1484,13 @@ function buildNewApiUsageRecord(input: {
     promptTokens: input.usageLog.promptTokens,
     completionTokens: input.usageLog.completionTokens,
     totalTokens: input.usageLog.totalTokens,
+    inputTokensTotal: input.usageLog.inputTokensTotal,
+    cacheReadTokens: input.usageLog.cacheReadTokens,
+    cacheCreationTokens: input.usageLog.cacheCreationTokens,
+    cacheCreationTokens5m: input.usageLog.cacheCreationTokens5m,
+    cacheCreationTokens1h: input.usageLog.cacheCreationTokens1h,
+    usageSemantic: input.usageLog.usageSemantic,
+    usageFieldSources: input.usageLog.usageFieldSources,
     quota: input.usageLog.quota,
     cost: input.usageLog.cost,
     isStream: input.usageLog.isStream,
@@ -2494,8 +2545,13 @@ function mapUsageRecord(log: ProxyRequestLog, usersById: Map<string, FeishuUser>
     promptTokens: log.promptTokens,
     completionTokens: log.completionTokens,
     totalTokens: log.totalTokens,
+    inputTokensTotal: log.inputTokensTotal,
     cacheReadTokens: log.cacheReadTokens,
     cacheCreationTokens: log.cacheCreationTokens,
+    cacheCreationTokens5m: log.cacheCreationTokens5m,
+    cacheCreationTokens1h: log.cacheCreationTokens1h,
+    usageSemantic: log.usageSemantic,
+    usageFieldSources: log.usageFieldSources,
     quota: log.usageSource === "newapi_log" ? log.quota : undefined,
     cost: log.usageSource === "newapi_log" ? log.cost : undefined,
     actualCost: log.actualCost,
@@ -2503,6 +2559,8 @@ function mapUsageRecord(log: ProxyRequestLog, usersById: Map<string, FeishuUser>
     usageSyncedAt: log.usageSyncedAt,
     newapiLogId: log.newapiLogId,
     newapiRequestId: log.newapiRequestId,
+    newapiResponseRequestId: log.newapiResponseRequestId,
+    newapiUpstreamRequestId: log.newapiUpstreamRequestId,
     providerChannelName: log.providerChannelName,
     newapiUseTimeSeconds: log.newapiUseTimeSeconds,
     errorMessage: log.errorMessage,
@@ -2517,11 +2575,6 @@ function mapUsageRecord(log: ProxyRequestLog, usersById: Map<string, FeishuUser>
 function uniqueSorted(values: Array<string | undefined>) {
   return [...new Set(values.filter((value): value is string => Boolean(value?.trim())))]
     .sort((a, b) => a.localeCompare(b));
-}
-
-function usageCacheHitRate(inputTokens: number, cacheReadTokens: number, cacheCreationTokens: number) {
-  const totalInputContext = inputTokens + cacheReadTokens + cacheCreationTokens;
-  return totalInputContext > 0 ? cacheReadTokens / totalInputContext : 0;
 }
 
 function aggregateUsage(
@@ -2540,6 +2593,10 @@ function aggregateUsage(
       totalTokens: number;
       cacheReadTokens: number;
       cacheCreationTokens: number;
+      cacheReadReportedRequests: number;
+      cacheCreationReportedRequests: number;
+      cacheRateReadTokens: number;
+      cacheRateInputTokens: number;
       cost: number;
       actualCost: number;
       successCount: number;
@@ -2562,6 +2619,10 @@ function aggregateUsage(
         totalTokens: 0,
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
+        cacheReadReportedRequests: 0,
+        cacheCreationReportedRequests: 0,
+        cacheRateReadTokens: 0,
+        cacheRateInputTokens: 0,
         cost: 0,
         actualCost: 0,
         successCount: 0,
@@ -2574,8 +2635,30 @@ function aggregateUsage(
     row.promptTokens += log.promptTokens ?? 0;
     row.completionTokens += log.completionTokens ?? 0;
     row.totalTokens += log.totalTokens ?? 0;
-    row.cacheReadTokens += log.cacheReadTokens ?? 0;
-    row.cacheCreationTokens += log.cacheCreationTokens ?? 0;
+    if (log.cacheReadTokens !== undefined) {
+      row.cacheReadTokens += log.cacheReadTokens;
+      row.cacheReadReportedRequests += 1;
+    }
+    if (log.cacheCreationTokens !== undefined) {
+      row.cacheCreationTokens += log.cacheCreationTokens;
+      row.cacheCreationReportedRequests += 1;
+    }
+    const inputTokensTotal = normalizedInputTokensTotal({
+      promptTokens: log.promptTokens,
+      inputTokensTotal: log.inputTokensTotal,
+      cacheReadTokens: log.cacheReadTokens,
+      cacheCreationTokens: log.cacheCreationTokens,
+      usageSemantic: log.usageSemantic,
+      apiFormat: log.apiFormat,
+    });
+    if (
+      log.cacheReadTokens !== undefined &&
+      inputTokensTotal !== undefined &&
+      inputTokensTotal > 0
+    ) {
+      row.cacheRateReadTokens += log.cacheReadTokens;
+      row.cacheRateInputTokens += inputTokensTotal;
+    }
     row.cost += log.usageSource === "newapi_log" ? log.cost ?? 0 : 0;
     row.actualCost += log.actualCost ?? 0;
     if (logDisplayStatus(log) === "completed") row.successCount += 1;
@@ -2595,15 +2678,16 @@ function aggregateUsage(
       totalTokens: row.totalTokens,
       cacheReadTokens: row.cacheReadTokens,
       cacheCreationTokens: row.cacheCreationTokens,
+      cacheReadReportedRequests: row.cacheReadReportedRequests,
+      cacheCreationReportedRequests: row.cacheCreationReportedRequests,
       cost: row.cost,
       actualCost: row.actualCost,
       successRate: row.requestCount > 0 ? row.successCount / row.requestCount : 0,
       avgDurationMs: row.durationCount > 0 ? row.durationTotalMs / row.durationCount : 0,
-      cacheHitRate: usageCacheHitRate(
-        row.promptTokens,
-        row.cacheReadTokens,
-        row.cacheCreationTokens,
-      ),
+      cacheHitRate:
+        row.cacheRateInputTokens > 0
+          ? row.cacheRateReadTokens / row.cacheRateInputTokens
+          : undefined,
       costPerMillionTokens: row.totalTokens > 0 ? (row.cost / row.totalTokens) * 1_000_000 : 0,
     }))
     .sort((a, b) => b.totalTokens - a.totalTokens || b.requestCount - a.requestCount);
