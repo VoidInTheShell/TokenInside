@@ -296,21 +296,54 @@ function newApiRequestIdPatch(newapiRequestId?: string) {
   return newapiRequestId ? { newapiRequestId } : {};
 }
 
-async function settleNewApiUsageNow(newapiRequestId?: string) {
-  if (!newapiRequestId) return;
-  await syncNewApiUsageForProxyRequest({ newapiRequestId }).catch(() => undefined);
-}
+type ProxyUsageSettlementContext = {
+  proxyLogId: string;
+  newapiTokenId?: string;
+  model?: string;
+  isStream: boolean;
+  requestStartedAt: string;
+};
 
-function settleNewApiUsageAfterResponse(newapiRequestId?: string) {
-  if (!newapiRequestId) return;
+function settleNewApiUsageAfterResponse(
+  context: ProxyUsageSettlementContext,
+  newapiRequestId?: string,
+) {
   after(async () => {
-    await syncNewApiUsageForProxyRequest({ newapiRequestId }).catch(() => undefined);
+    await syncNewApiUsageForProxyRequest({
+      newapiRequestId,
+      proxyLogId: context.proxyLogId,
+      newapiTokenId: context.newapiTokenId,
+      model: context.model,
+      isStream: context.isStream,
+      requestStartedAt: context.requestStartedAt,
+    }).catch(() => undefined);
   });
 }
 
+function redactSensitiveText(value: string) {
+  return value
+    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\bsk-[A-Za-z0-9_-]+\b/g, "sk-[redacted]")
+    .replace(/\b[A-Za-z0-9_-]{48,}\b/g, "[redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 500);
+}
+
 function sanitizedErrorMessage(err: unknown) {
-  if (err instanceof Error && err.message.trim()) return err.message.slice(0, 500);
+  if (err instanceof Error && err.message.trim()) return redactSensitiveText(err.message);
   return "Upstream request failed";
+}
+
+function upstreamErrorMessage(input: {
+  statusCode: number;
+  responseJson: unknown;
+  responseBuffer: ArrayBuffer;
+}) {
+  const fromJson = extractErrorMessage(input.responseJson);
+  if (fromJson) return redactSensitiveText(fromJson);
+  const fromBody = redactSensitiveText(new TextDecoder().decode(input.responseBuffer));
+  return fromBody || `Upstream returned HTTP ${input.statusCode}`;
 }
 
 function streamWithProxyLog(input: {
@@ -349,7 +382,6 @@ function streamWithProxyLog(input: {
           errorMessage: sanitizedErrorMessage(err),
           responseTimeUpdatedAt: new Date().toISOString(),
         });
-        void settleNewApiUsageNow(input.newapiRequestId);
         controller.error(err);
       }
     },
@@ -364,7 +396,6 @@ function streamWithProxyLog(input: {
           errorMessage: "Client cancelled the request",
           responseTimeUpdatedAt: new Date().toISOString(),
         });
-        await settleNewApiUsageNow(input.newapiRequestId);
       }
     },
   });
@@ -376,6 +407,7 @@ async function readResponseBody(upstream: Response) {
   const json = parseJsonBody(buffer, contentType);
   return {
     buffer,
+    contentType,
     json,
   };
 }
@@ -385,10 +417,21 @@ async function recordFinishedProxyLog(input: {
   startedAt: number;
   firstByteMs: number;
   upstream: Response;
+  requestPath: string;
+  settlementContext: ProxyUsageSettlementContext;
+  responseBuffer: ArrayBuffer;
   responseJson: unknown;
 }) {
   const usage = extractUsageFromJson(input.responseJson);
   const newapiRequestId = newApiRequestIdFrom(input.upstream);
+  const errorMessage =
+    input.upstream.status >= 400
+      ? upstreamErrorMessage({
+          statusCode: input.upstream.status,
+          responseJson: input.responseJson,
+          responseBuffer: input.responseBuffer,
+        })
+      : undefined;
   await updateProxyLog(input.logId, {
     status: terminalStatus(input.upstream.status),
     statusCode: input.upstream.status,
@@ -398,10 +441,23 @@ async function recordFinishedProxyLog(input: {
     usageSource: hasUsageMetrics(usage) ? "proxy_json" : "missing",
     ...newApiRequestIdPatch(newapiRequestId),
     ...usage,
-    errorMessage:
-      input.upstream.status >= 400 ? extractErrorMessage(input.responseJson) : undefined,
+    errorMessage,
   });
-  settleNewApiUsageAfterResponse(newapiRequestId);
+  if (input.upstream.status >= 400) {
+    console.warn(
+      JSON.stringify({
+        event: "tokeninside.proxy.upstream_error",
+        proxyLogId: input.logId,
+        requestPath: input.requestPath,
+        statusCode: input.upstream.status,
+        newapiRequestId,
+        errorMessage,
+      }),
+    );
+  }
+  if (input.upstream.status < 400) {
+    settleNewApiUsageAfterResponse(input.settlementContext, newapiRequestId);
+  }
 }
 
 async function recordFailedProxyLog(input: {
@@ -521,6 +577,13 @@ async function proxy(request: Request, context: RouteContext) {
     clientIp,
     clientFamily: detectClientFamily(userAgent),
   });
+  const settlementContext: ProxyUsageSettlementContext = {
+    proxyLogId: proxyLog.id,
+    newapiTokenId: tokenAccount.newapiTokenId,
+    model: metadata.model,
+    isStream: metadata.clientRequestedStream,
+    requestStartedAt: new Date(startedAt).toISOString(),
+  };
 
   const upstreamUrl = buildNewApiProxyUrl(path, requestUrl.search);
   try {
@@ -548,7 +611,9 @@ async function proxy(request: Request, context: RouteContext) {
         ...newApiRequestIdPatch(newapiRequestId),
         responseTimeUpdatedAt: new Date().toISOString(),
       });
-      settleNewApiUsageAfterResponse(newapiRequestId);
+      if (upstream.status < 400) {
+        settleNewApiUsageAfterResponse(settlementContext, newapiRequestId);
+      }
       return new Response(
         streamWithProxyLog({
           body: upstream.body,
@@ -571,6 +636,9 @@ async function proxy(request: Request, context: RouteContext) {
       startedAt,
       firstByteMs,
       upstream,
+      requestPath,
+      settlementContext,
+      responseBuffer: responseBody.buffer,
       responseJson: responseBody.json,
     });
 

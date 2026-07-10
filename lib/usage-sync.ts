@@ -55,7 +55,7 @@ let schedulerTimer: ReturnType<typeof setTimeout> | undefined;
 const immediateSettlementDefaults = {
   maxAttempts: 6,
   retryDelayMs: 750,
-  pageSize: 20,
+  pageSize: 100,
   matchWindowMs: 10 * 60 * 1000,
 };
 
@@ -111,17 +111,42 @@ function uniqueUsageLogs(logs: NormalizedNewApiUsageLog[]) {
   });
 }
 
-async function listUsageLogsForRequestId(requestId: string, pageSize: number) {
-  const byRequestId = await listNewApiUsageLogs({
-    requestId,
-    size: pageSize,
-  });
-  const byUpstreamRequestId = await listNewApiUsageLogs({
-    upstreamRequestId: requestId,
-    size: pageSize,
-  });
+function normalizedModel(value?: string) {
+  return value?.trim().toLowerCase();
+}
 
-  return uniqueUsageLogs([...byRequestId.items, ...byUpstreamRequestId.items]);
+async function listUsageLogsForProxyRequest(input: {
+  newapiRequestId?: string;
+  newapiTokenId: string;
+  model?: string;
+  isStream?: boolean;
+  requestStartedAt: string;
+  pageSize: number;
+}) {
+  const requestStartedAt = new Date(input.requestStartedAt).getTime();
+  const startTimestamp = Number.isFinite(requestStartedAt)
+    ? Math.floor((requestStartedAt - 5_000) / 1000)
+    : undefined;
+  const exact = input.newapiRequestId
+    ? await listNewApiUsageLogs({ requestId: input.newapiRequestId, size: input.pageSize })
+    : { items: [] as NormalizedNewApiUsageLog[] };
+  const recent = await listNewApiUsageLogs({
+    startTimestamp,
+    size: input.pageSize,
+  });
+  const expectedModel = normalizedModel(input.model);
+
+  return uniqueUsageLogs([...exact.items, ...recent.items])
+    .filter((log) => log.newapiTokenId === input.newapiTokenId)
+    .filter(
+      (log) =>
+        !expectedModel || !normalizedModel(log.model) || normalizedModel(log.model) === expectedModel,
+    )
+    .filter((log) => input.isStream === undefined || log.isStream === input.isStream)
+    .filter((log) => {
+      if (startTimestamp === undefined || !log.createdAt) return true;
+      return new Date(log.createdAt).getTime() >= startTimestamp * 1000;
+    });
 }
 
 export type NewApiProxyUsageSettlementResult = {
@@ -129,24 +154,33 @@ export type NewApiProxyUsageSettlementResult = {
   newapiRequestId?: string;
   attempts: number;
   found: number;
-  reason?: "missing_request_id" | "not_found";
+  reason?: "missing_context" | "not_found";
   backfill?: NewApiUsageBackfillResult;
 };
 
 export async function syncNewApiUsageForProxyRequest(input: {
   newapiRequestId?: string;
+  proxyLogId?: string;
+  newapiTokenId?: string;
+  model?: string;
+  isStream?: boolean;
+  requestStartedAt?: string;
   maxAttempts?: number;
   retryDelayMs?: number;
   pageSize?: number;
   matchWindowMs?: number;
 }): Promise<NewApiProxyUsageSettlementResult> {
   const newapiRequestId = input.newapiRequestId?.trim();
-  if (!newapiRequestId) {
+  const proxyLogId = input.proxyLogId?.trim();
+  const newapiTokenId = input.newapiTokenId?.trim();
+  const requestStartedAt = input.requestStartedAt?.trim();
+  if (!proxyLogId || !newapiTokenId || !requestStartedAt) {
     return {
       attempted: false,
+      newapiRequestId,
       attempts: 0,
       found: 0,
-      reason: "missing_request_id",
+      reason: "missing_context",
     };
   }
 
@@ -172,18 +206,29 @@ export async function syncNewApiUsageForProxyRequest(input: {
       await sleep(retryDelayMs);
     }
 
-    const usageLogs = await listUsageLogsForRequestId(newapiRequestId, pageSize);
+    const usageLogs = await listUsageLogsForProxyRequest({
+      newapiRequestId,
+      newapiTokenId,
+      model: input.model,
+      isStream: input.isStream,
+      requestStartedAt,
+      pageSize,
+    });
     if (!usageLogs.length) continue;
 
     const backfill = await backfillProxyLogsFromNewApiUsage(usageLogs, {
       dryRun: false,
       matchWindowMs,
+      persistUnmatched: false,
+      targetProxyLogIds: [proxyLogId],
     });
+    const matched = backfill.items.find((item) => item.proxyLogId === proxyLogId);
+    if (!matched) continue;
     return {
       attempted: true,
       newapiRequestId,
       attempts: attempt,
-      found: usageLogs.length,
+      found: 1,
       backfill,
     };
   }
@@ -242,6 +287,7 @@ async function syncNewApiUsageLogsUnlocked(input: {
   };
   let lastSeenNewapiLogId: string | undefined;
   let lastSeenNewapiCreatedAt: string | undefined;
+  const reservedProxyLogIds: string[] = [];
   try {
     for (let index = 0; index < maxPages; index += 1) {
       const page = pageStart + index;
@@ -258,7 +304,13 @@ async function syncNewApiUsageLogsUnlocked(input: {
       const backfill = await backfillProxyLogsFromNewApiUsage(logsPage.items, {
         dryRun,
         matchWindowMs: input.matchWindowMs,
+        reservedProxyLogIds,
       });
+      for (const item of backfill.items) {
+        if (item.proxyLogId && !reservedProxyLogIds.includes(item.proxyLogId)) {
+          reservedProxyLogIds.push(item.proxyLogId);
+        }
+      }
 
       pages.push({
         page,

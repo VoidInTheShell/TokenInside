@@ -3,6 +3,8 @@ import path from "node:path";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
 import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
+import { sameNewApiUsageSource } from "@/lib/newapi-usage-identity";
+import { findProxyLogForNewApiUsage } from "@/lib/usage-matching";
 import {
   enablePostgresUserAccess,
   findPostgresActiveTokenByHash,
@@ -1342,21 +1344,6 @@ function isUnknownModel(value?: string) {
   return !normalized || normalized === "unknown" || normalized === "-" || normalized === "null";
 }
 
-function proxyLogIsStream(log: ProxyRequestLog) {
-  return Boolean(log.isStream || log.upstreamIsStream || log.clientRequestedStream || log.clientIsStream);
-}
-
-function usageLogTime(log: NormalizedNewApiUsageLog) {
-  if (!log.createdAt) return undefined;
-  const time = new Date(log.createdAt).getTime();
-  return Number.isFinite(time) ? time : undefined;
-}
-
-function proxyLogTime(log: ProxyRequestLog) {
-  const time = new Date(log.createdAt).getTime();
-  return Number.isFinite(time) ? time : undefined;
-}
-
 function buildUsagePatch(
   usageLog: NormalizedNewApiUsageLog,
   currentLog: ProxyRequestLog,
@@ -1401,62 +1388,6 @@ function patchChangesLog(
     if (value === undefined) return false;
     return log[key as keyof ProxyRequestLog] !== value;
   });
-}
-
-function findProxyLogForNewApiUsage(input: {
-  store: StoreShape;
-  usageLog: NormalizedNewApiUsageLog;
-  account: TokenAccount;
-  matchWindowMs: number;
-}) {
-  const { store, usageLog, account, matchWindowMs } = input;
-  const existingByLogId =
-    usageLog.newapiLogId &&
-    store.proxyRequestLogs.find((log) => log.newapiLogId === usageLog.newapiLogId);
-  if (existingByLogId) return existingByLogId;
-
-  const existingByRequestId =
-    usageLog.newapiRequestId &&
-    store.proxyRequestLogs.find((log) => log.newapiRequestId === usageLog.newapiRequestId);
-  if (existingByRequestId) return existingByRequestId;
-
-  const targetTime = usageLogTime(usageLog);
-  const candidates = store.proxyRequestLogs
-    .map((log) => {
-      const logTime = proxyLogTime(log);
-      const timeDelta =
-        targetTime !== undefined && logTime !== undefined
-          ? Math.abs(targetTime - logTime)
-          : Number.POSITIVE_INFINITY;
-      return { log, timeDelta };
-    })
-    .filter(({ log, timeDelta }) => {
-      if (usageLog.newapiLogId && log.newapiLogId && log.newapiLogId !== usageLog.newapiLogId) {
-        return false;
-      }
-      if (usageLog.newapiRequestId && log.newapiRequestId && log.newapiRequestId !== usageLog.newapiRequestId) {
-        return false;
-      }
-      if (log.feishuUserId && log.feishuUserId !== account.feishuUserId) return false;
-      const tokenMatches =
-        log.tokenAccountId === account.id ||
-        (usageLog.newapiTokenId !== undefined && log.providerKeyName === usageLog.newapiTokenId);
-      if (!tokenMatches) return false;
-      if (usageLog.model && !isUnknownModel(log.model) && log.model !== usageLog.model) return false;
-      if (usageLog.isStream !== undefined && proxyLogIsStream(log) !== usageLog.isStream) return false;
-      if (targetTime !== undefined && !Number.isFinite(timeDelta)) return false;
-      if (targetTime !== undefined && timeDelta > matchWindowMs) return false;
-      return true;
-    })
-    .sort((left, right) => {
-      const leftHasUsage = left.log.totalTokens !== undefined || left.log.usageSource === "newapi_log";
-      const rightHasUsage = right.log.totalTokens !== undefined || right.log.usageSource === "newapi_log";
-      if (leftHasUsage !== rightHasUsage) return leftHasUsage ? 1 : -1;
-      if (left.log.newapiLogId !== right.log.newapiLogId) return left.log.newapiLogId ? 1 : -1;
-      return left.timeDelta - right.timeDelta;
-    });
-
-  return candidates[0]?.log;
 }
 
 function stableUsageIdentity(usageLog: NormalizedNewApiUsageLog) {
@@ -1549,9 +1480,7 @@ function buildUsageSyncIssue(input: {
 }
 
 function sameUsageSourceRecord(left: NewApiUsageRecord, right: NewApiUsageRecord) {
-  if (right.newapiLogId && left.newapiLogId === right.newapiLogId) return true;
-  if (right.newapiRequestId && left.newapiRequestId === right.newapiRequestId) return true;
-  return left.id === right.id;
+  return sameNewApiUsageSource(left, right);
 }
 
 function upsertUsageRecordInStore(store: StoreShape, record: NewApiUsageRecord) {
@@ -1575,9 +1504,7 @@ function upsertUsageRecordInStore(store: StoreShape, record: NewApiUsageRecord) 
 function upsertUsageIssueInStore(store: StoreShape, issue: UsageSyncIssue) {
   const index = store.usageSyncIssues.findIndex((item) => {
     if (item.issueType !== issue.issueType) return false;
-    if (issue.newapiLogId && item.newapiLogId === issue.newapiLogId) return true;
-    if (issue.newapiRequestId && item.newapiRequestId === issue.newapiRequestId) return true;
-    return item.id === issue.id;
+    return sameNewApiUsageSource(item, issue);
   });
   if (index === -1) {
     store.usageSyncIssues.push(issue);
@@ -1603,10 +1530,14 @@ export async function backfillProxyLogsFromNewApiUsage(
   input: {
     dryRun?: boolean;
     matchWindowMs?: number;
+    persistUnmatched?: boolean;
+    reservedProxyLogIds?: string[];
+    targetProxyLogIds?: string[];
   } = {},
 ): Promise<NewApiUsageBackfillResult> {
   const dryRun = input.dryRun ?? true;
   const matchWindowMs = input.matchWindowMs ?? 30 * 60 * 1000;
+  const persistUnmatched = input.persistUnmatched ?? true;
 
   const runBackfill = async (
     store: StoreShape,
@@ -1624,6 +1555,15 @@ export async function backfillProxyLogsFromNewApiUsage(
         .filter((account) => account.newapiTokenId)
         .map((account) => [account.newapiTokenId as string, account] as const),
     );
+    const reservedProxyLogIds = new Set(input.reservedProxyLogIds ?? []);
+    for (const record of store.newapiUsageRecords) {
+      if (record.matchStatus === "matched" && record.matchedProxyLogId) {
+        reservedProxyLogIds.add(record.matchedProxyLogId);
+      }
+    }
+    const targetProxyLogIds = input.targetProxyLogIds
+      ? new Set(input.targetProxyLogIds)
+      : undefined;
     const result: NewApiUsageBackfillResult = {
       dryRun,
       seen: usageLogs.length,
@@ -1685,13 +1625,34 @@ export async function backfillProxyLogsFromNewApiUsage(
         continue;
       }
 
+      const existingRecord = store.newapiUsageRecords.find((record) =>
+        sameNewApiUsageSource(record, usageLog),
+      );
       const proxyLog = findProxyLogForNewApiUsage({
-        store,
+        proxyLogs: store.proxyRequestLogs,
         usageLog,
         account,
         matchWindowMs,
+        reservedProxyLogIds,
+        allowReservedProxyLogId: existingRecord?.matchedProxyLogId,
+        targetProxyLogIds,
       });
       if (!proxyLog) {
+        if (!persistUnmatched) {
+          result.skippedNoMatch += 1;
+          result.items.push({
+            action: "skipped_no_match",
+            newapiLogId: usageLog.newapiLogId,
+            newapiRequestId: usageLog.newapiRequestId,
+            newapiTokenId: usageLog.newapiTokenId,
+            feishuUserId: account.feishuUserId,
+            tokenAccountId: account.id,
+            cost: usageLog.cost,
+            quota: usageLog.quota,
+            reason: "No safe target proxy request match yet",
+          });
+          continue;
+        }
         const record = buildNewApiUsageRecord({
           store,
           usageLog,
@@ -1704,7 +1665,7 @@ export async function backfillProxyLogsFromNewApiUsage(
           usageLog,
           syncedAt,
           account,
-          message: "No proxy request log matched token, model, stream flag and time window",
+          message: "No successful one-to-one proxy request matched token, model, stream flag, usage and completion time",
         });
         await persistRecord(record);
         await persistSyncIssue(issue);
@@ -1720,11 +1681,12 @@ export async function backfillProxyLogsFromNewApiUsage(
           issueId: issue.id,
           cost: usageLog.cost,
           quota: usageLog.quota,
-          reason: "No proxy request log matched token, model, stream flag and time window",
+          reason: "No successful one-to-one proxy request matched token, model, stream flag, usage and completion time",
         });
         continue;
       }
 
+      reservedProxyLogIds.add(proxyLog.id);
       result.matched += 1;
       const record = buildNewApiUsageRecord({
         store,

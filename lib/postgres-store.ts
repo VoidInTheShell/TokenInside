@@ -1523,8 +1523,24 @@ export async function updatePostgresProxyLog(
 export async function upsertPostgresNewApiUsageRecord(record: NewApiUsageRecord) {
   return withTransaction(async (client) => {
     const existingResult = await client.query<{ data: NewApiUsageRecord }>(
-      "select data from newapi_usage_records where id = $1 for update",
-      [record.id],
+      `select data
+       from newapi_usage_records
+       where id = $1
+          or (
+            newapi_token_id is not distinct from $2
+            and (
+              ($3::text is not null and newapi_request_id = $3)
+              or (
+                ($3::text is null or newapi_request_id is null)
+                and $4::text is not null
+                and newapi_log_id = $4
+              )
+            )
+          )
+       order by case when id = $1 then 0 else 1 end
+       limit 1
+       for update`,
+      [record.id, record.newapiTokenId ?? null, record.newapiRequestId ?? null, record.newapiLogId ?? null],
     );
     const existing = existingResult.rows[0]?.data;
     const stored = await saveNewApiUsageRecordRow(client, {

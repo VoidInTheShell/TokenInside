@@ -80,6 +80,17 @@ export function formatTokenAmount(value: number | null | undefined, nullLabel = 
 }
 
 export function formatQuotaAmount(value: number | null | undefined, nullLabel = "-") {
+  if (value === undefined || value === null) return nullLabel;
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue)) return nullLabel;
+  if (numericValue === 0) return "0";
+
+  const sign = numericValue < 0 ? "-" : "";
+  const absValue = Math.abs(numericValue);
+  if (absValue < 1_000) {
+    const fractionDigits = absValue < 0.000001 ? 10 : absValue < 0.01 ? 8 : 6;
+    return `${sign}${trimTrailingDecimalZeros(absValue.toFixed(fractionDigits))}`;
+  }
   return formatCompactNumber(value, { nullLabel });
 }
 

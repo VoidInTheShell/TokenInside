@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/*.test.ts",
     "dev": "next dev --hostname 127.0.0.1 --port 16878",
     "build": "next build",
     "start": "next start --hostname 0.0.0.0 --port 16878",

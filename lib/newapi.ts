@@ -34,6 +34,7 @@ type NewApiLogRecord = {
   token_id?: string | number;
   token_name?: string;
   request_id?: string;
+  upstream_request_id?: string;
   model_name?: string;
   prompt_tokens?: string | number;
   completion_tokens?: string | number;
@@ -61,6 +62,7 @@ export type NewApiModel = {
 export type NormalizedNewApiUsageLog = {
   newapiLogId?: string;
   newapiRequestId?: string;
+  newapiUpstreamRequestId?: string;
   newapiTokenId?: string;
   tokenName?: string;
   createdAt?: string;
@@ -307,6 +309,7 @@ function normalizeNewApiUsageLog(record: NewApiLogRecord): NormalizedNewApiUsage
   return {
     newapiLogId: stringFromNewApi(record.id),
     newapiRequestId: stringFromNewApi(record.request_id),
+    newapiUpstreamRequestId: stringFromNewApi(record.upstream_request_id),
     newapiTokenId: stringFromNewApi(record.token_id),
     tokenName: stringFromNewApi(record.token_name),
     createdAt: isoFromNewApiTime(record.created_at),
@@ -362,7 +365,27 @@ export async function listNewApiUsageLogs(input: {
   if (input.tokenName) params.set("token_name", input.tokenName);
   if (input.modelName) params.set("model_name", input.modelName);
   const data = await newApiFetch<NewApiLogPage>(`/api/log/self?${params.toString()}`);
-  const items = (data.items ?? []).map(normalizeNewApiUsageLog);
+  const items = (data.items ?? [])
+    .map(normalizeNewApiUsageLog)
+    .filter((item) => !input.requestId || item.newapiRequestId === input.requestId)
+    .filter(
+      (item) =>
+        !input.upstreamRequestId || item.newapiUpstreamRequestId === input.upstreamRequestId,
+    )
+    .filter(
+      (item) =>
+        input.startTimestamp === undefined ||
+        (item.createdAt !== undefined &&
+          new Date(item.createdAt).getTime() >= input.startTimestamp * 1000),
+    )
+    .filter(
+      (item) =>
+        input.endTimestamp === undefined ||
+        (item.createdAt !== undefined &&
+          new Date(item.createdAt).getTime() <= input.endTimestamp * 1000),
+    )
+    .filter((item) => !input.tokenName || item.tokenName === input.tokenName)
+    .filter((item) => !input.modelName || item.model === input.modelName);
   return {
     items,
     total: typeof data.total === "number" ? data.total : items.length,

@@ -122,9 +122,12 @@ const statements = [
     first_seen_at timestamptz not null,
     last_synced_at timestamptz not null
   )`,
-  `create unique index if not exists newapi_usage_records_log_unique
-    on newapi_usage_records (newapi_log_id)
-    where newapi_log_id is not null`,
+  `drop index if exists newapi_usage_records_log_unique`,
+  `create unique index if not exists newapi_usage_records_source_unique
+    on newapi_usage_records (newapi_token_id, newapi_log_id, newapi_request_id)
+    where newapi_token_id is not null
+      and newapi_log_id is not null
+      and newapi_request_id is not null`,
   `create index if not exists newapi_usage_records_user_created_idx
     on newapi_usage_records (feishu_user_id, newapi_created_at)`,
   `create index if not exists newapi_usage_records_token_created_idx

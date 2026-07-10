@@ -28,11 +28,7 @@ type UsageAnalysisTableProps = {
 };
 
 function formatQuota(value?: number) {
-  if (!Number.isFinite(value)) return "0";
-  const amount = value ?? 0;
-  if (amount === 0) return "0";
-  if (Math.abs(amount) < 0.01) return amount.toFixed(4);
-  return formatQuotaAmount(amount, "0");
+  return formatQuotaAmount(value, "0");
 }
 
 function formatRate(value?: number) {

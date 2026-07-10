@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PageSelector } from "@/components/page-selector";
 import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
+import { calculateOutputTokensPerSecond } from "@/lib/usage-rate";
 
 export type UsageRequestStatus =
   | "pending"
@@ -194,11 +195,7 @@ function statusLabel(record: UsageRecordRow) {
 }
 
 function formatQuota(value?: number) {
-  if (!Number.isFinite(value)) return "0";
-  const amount = value ?? 0;
-  if (amount === 0) return "0";
-  if (Math.abs(amount) < 0.01) return amount.toFixed(4);
-  return formatQuotaAmount(amount, "0");
+  return formatQuotaAmount(value, "0");
 }
 
 function formatMs(value?: number) {
@@ -232,10 +229,14 @@ function formatUserAgent(value?: string) {
 }
 
 function formatOutputRate(record: UsageRecordRow) {
-  const output = record.completionTokens ?? 0;
-  const durationMs = Math.max((record.durationMs ?? 0) - (record.firstByteMs ?? 0), 0);
-  if (!output || !durationMs) return "-";
-  return `${(output / (durationMs / 1000)).toFixed(1)} tok/s`;
+  const rate = calculateOutputTokensPerSecond({
+    completionTokens: record.completionTokens,
+    durationMs: record.durationMs,
+    firstByteMs: record.firstByteMs,
+    newapiUseTimeSeconds: record.newapiUseTimeSeconds,
+    isStream: requestIsStream(record),
+  });
+  return rate === undefined ? "-" : `${rate.toFixed(1)} tok/s`;
 }
 
 function formatShortDateTime(value: string) {
