@@ -1267,7 +1267,7 @@ a {
 
   .usage-records-controls-admin .usage-records-secondary-row > :nth-child(2),
   .usage-records-controls-admin .usage-records-secondary-row > :nth-child(3) {
-    grid-column: span 2;
+    grid-column: span 1;
   }
 
   .usage-records-controls-admin .usage-records-secondary-row > :nth-child(4) {
@@ -1275,7 +1275,11 @@ a {
   }
 
   .usage-records-controls-admin .usage-records-secondary-row > :nth-child(5) {
-    grid-column: span 2;
+    grid-column: span 4;
+  }
+
+  .usage-records-controls-admin .usage-records-actions {
+    flex-wrap: nowrap;
   }
 
   .usage-records-controls-user .usage-records-primary-row > :nth-child(1) {
