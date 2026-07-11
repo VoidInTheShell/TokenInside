@@ -14,6 +14,10 @@ import {
   listUserTokenRequests,
   updateTokenRequest,
 } from "@/lib/store";
+import {
+  assertQuotaWriteActionEnabled,
+  quotaFeatureErrorStatus,
+} from "@/lib/quota-guard";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -39,6 +43,8 @@ export async function POST(request: Request) {
     if (!user) {
       return NextResponse.json({ error: "Feishu OAuth session required" }, { status: 401 });
     }
+
+    await assertQuotaWriteActionEnabled("quota_restore");
 
     const activeToken = await getActiveTokenForUser(user.id);
     if (!activeToken) {
@@ -116,7 +122,7 @@ export async function POST(request: Request) {
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Create quota reset request failed" },
-      { status: 400 },
+      { status: quotaFeatureErrorStatus(err) ?? 400 },
     );
   }
 }

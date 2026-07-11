@@ -11,6 +11,7 @@ import {
   addTokenAccount,
   createTokenRequest,
   getActiveTokenForUser,
+  getAppSettings,
   completeDepartmentQuotaReservation,
   failDepartmentQuotaReservation,
   invalidateOtherOpenFirstApplyRequests,
@@ -18,8 +19,16 @@ import {
   reserveDepartmentQuotaForTokenRequest,
   transitionTokenRequestStatus,
   updateTokenRequest,
+  getStoreSnapshot,
 } from "@/lib/store";
 import type { FeishuUser, TokenRequest } from "@/lib/types";
+import { assertLegacyAbsoluteQuotaWriteEnabled } from "@/lib/quota-guard";
+import {
+  enqueueFirstProvision,
+  enqueueQuotaAdjustment,
+  enqueueQuotaRestoreForRequest,
+  runQuotaOperation,
+} from "@/lib/quota-saga";
 
 async function invalidateOtherFirstApplyRequestsAfterProvision(request: TokenRequest) {
   if (request.requestType !== "first_apply") return;
@@ -32,6 +41,13 @@ async function invalidateOtherFirstApplyRequestsAfterProvision(request: TokenReq
 }
 
 async function updateActiveTokenQuotaForRequest(request: TokenRequest) {
+  const action =
+    request.requestType === "quota_adjust"
+      ? "quota_adjust"
+      : request.requestType === "monthly_reset"
+        ? "monthly_open"
+        : "quota_restore";
+  await assertLegacyAbsoluteQuotaWriteEnabled(action);
   const existing = await getActiveTokenForUser(request.feishuUserId);
   if (!existing?.newapiTokenId) {
     throw new Error("当前飞书用户没有可调整额度的 active NewAPI key");
@@ -168,6 +184,67 @@ async function provisionTokenForRequestWithoutDepartmentReservation(request: Tok
 }
 
 export async function provisionTokenForRequest(request: TokenRequest) {
+  if (request.requestType === "quota_reset" || request.requestType === "quota_restore") {
+    const operation = await enqueueQuotaRestoreForRequest(request);
+    await updateTokenRequest(request.id, {
+      status: "approved_provisioning",
+      errorMessage: undefined,
+    });
+    await runQuotaOperation(operation.id);
+    return getActiveTokenForUser(request.feishuUserId);
+  }
+  if (request.requestType === "quota_adjust") {
+    const store = await getStoreSnapshot();
+    const user = store.users.find((item) => item.id === request.feishuUserId);
+    const operation = await enqueueQuotaAdjustment({
+      feishuUserId: request.feishuUserId,
+      departmentId: user?.departmentId,
+      approvedMonthlyQuota:
+        request.approvedMonthlyQuota ?? request.requestedMonthlyQuota,
+      clientRequestId: request.id,
+      requestId: request.id,
+      createdByOpenId: request.approvalOperatorOpenId,
+    });
+    await runQuotaOperation(operation.id);
+    return getActiveTokenForUser(request.feishuUserId);
+  }
+  if (request.requestType === "first_apply") {
+    const existing = await getActiveTokenForUser(request.feishuUserId);
+    if (existing) {
+      await updateTokenRequest(request.id, {
+        status: "provisioned",
+        tokenAccountId: existing.id,
+        errorMessage: undefined,
+      });
+      await invalidateOtherFirstApplyRequestsAfterProvision(request);
+      return existing;
+    }
+    const settings = await getAppSettings();
+    if (settings.quotaMigration?.appliedAt) {
+      const store = await getStoreSnapshot();
+      const user = store.users.find((item) => item.id === request.feishuUserId);
+      const operation = await enqueueFirstProvision({
+        feishuUserId: request.feishuUserId,
+        departmentId: user?.departmentId,
+        approvedMonthlyQuota:
+          request.approvedMonthlyQuota ?? request.requestedMonthlyQuota,
+        requestId: request.id,
+        createdByOpenId: request.approvalOperatorOpenId,
+      });
+      await updateTokenRequest(request.id, {
+        status: "approved_provisioning",
+        errorMessage: undefined,
+      });
+      const completed = await runQuotaOperation(operation.id);
+      if (completed.state !== "completed") {
+        throw new Error(`首次发放尚未完成: ${completed.state}`);
+      }
+      const account = await getActiveTokenForUser(request.feishuUserId);
+      if (!account) throw new Error("首次发放完成后未找到 active Key");
+      await invalidateOtherFirstApplyRequestsAfterProvision(request);
+      return account;
+    }
+  }
   const existingBeforeProvision = await getActiveTokenForUser(request.feishuUserId);
   const shouldReserve = !(request.requestType === "first_apply" && existingBeforeProvision);
   let reservation: Awaited<ReturnType<typeof reserveDepartmentQuotaForTokenRequest>> = null;
@@ -199,6 +276,7 @@ export async function provisionTokenForRequest(request: TokenRequest) {
 }
 
 export async function resetActiveTokenForUser(user: FeishuUser, reason = "用户发起 key reset") {
+  await assertLegacyAbsoluteQuotaWriteEnabled("key_rotation");
   const existing = await getActiveTokenForUser(user.id);
   if (!existing?.newapiTokenId) {
     throw new Error("当前飞书用户没有可重置的 active NewAPI key");

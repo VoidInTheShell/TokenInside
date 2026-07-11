@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireAdminScope } from "@/lib/admin";
-import { getAppSettings, updateAppSettings } from "@/lib/store";
+import { getAppSettings, getStoreSnapshot, updateAppSettings } from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,15 +12,34 @@ const usageSyncPolicySchema = z.object({
   pageSize: z.number().int().min(1).max(100).optional(),
   maxPagesPerRun: z.number().int().min(1).max(20).optional(),
   overlapMinutes: z.number().int().min(0).max(7 * 24 * 60).optional(),
+  settlementLagMinutes: z.number().int().min(0).max(24 * 60).optional(),
   matchWindowMinutes: z.number().int().min(1).max(24 * 60).optional(),
+  retryBaseMinutes: z.number().int().min(1).max(24 * 60).optional(),
+});
+
+const quotaFeatureFlagsSchema = z.object({
+  legacyAbsoluteQuotaWritesEnabled: z.literal(false).optional(),
+  quotaLedgerShadowRead: z.boolean().optional(),
+  quotaSagaWritesEnabled: z.boolean().optional(),
+  keyRotationSagaEnabled: z.boolean().optional(),
+  quotaRestoreEnabled: z.boolean().optional(),
+  monthlyPeriodOpenEnabled: z.boolean().optional(),
+  reconciliationAutoDecreaseEnabled: z.boolean().optional(),
+  reconciliationAutoIncreaseEnabled: z.literal(false).optional(),
 });
 
 const settingsSchema = z
   .object({
     defaultMonthlyQuota: z.number().int().positive().max(1000000).optional(),
     usageSyncPolicy: usageSyncPolicySchema.optional(),
+    quotaFeatureFlags: quotaFeatureFlagsSchema.optional(),
   })
-  .refine((value) => value.defaultMonthlyQuota !== undefined || value.usageSyncPolicy !== undefined);
+  .refine(
+    (value) =>
+      value.defaultMonthlyQuota !== undefined ||
+      value.usageSyncPolicy !== undefined ||
+      value.quotaFeatureFlags !== undefined,
+  );
 
 export async function GET() {
   const auth = await requireAdminScope();
@@ -50,9 +69,59 @@ export async function PATCH(request: Request) {
       { status: 400 },
     );
   }
+  if (parsed.data.quotaFeatureFlags) {
+    const current = await getAppSettings();
+    const next = {
+      ...current.quotaFeatureFlags,
+      ...parsed.data.quotaFeatureFlags,
+      legacyAbsoluteQuotaWritesEnabled: false,
+      reconciliationAutoIncreaseEnabled: false,
+    };
+    const writeFeatureEnabled = Boolean(
+      next.quotaSagaWritesEnabled ||
+        next.keyRotationSagaEnabled ||
+        next.quotaRestoreEnabled ||
+        next.monthlyPeriodOpenEnabled ||
+        next.reconciliationAutoDecreaseEnabled,
+    );
+    if (writeFeatureEnabled && !current.quotaMigration?.appliedAt) {
+      return NextResponse.json(
+        { error: "历史额度账本迁移未登记，不能启用 F 阶段写功能" },
+        { status: 409 },
+      );
+    }
+    if (
+      !next.quotaSagaWritesEnabled &&
+      (next.keyRotationSagaEnabled ||
+        next.quotaRestoreEnabled ||
+        next.monthlyPeriodOpenEnabled ||
+        next.reconciliationAutoDecreaseEnabled)
+    ) {
+      return NextResponse.json(
+        { error: "具体额度动作依赖统一 Saga 写入开关" },
+        { status: 400 },
+      );
+    }
+    if (
+      current.quotaFeatureFlags?.quotaSagaWritesEnabled &&
+      !next.quotaSagaWritesEnabled
+    ) {
+      const store = await getStoreSnapshot();
+      const openOperation = store.quotaOperations.find(
+        (item) => item.state !== "completed" && item.state !== "compensated",
+      );
+      if (openOperation) {
+        return NextResponse.json(
+          { error: `存在未结额度操作 ${openOperation.id}，不能关闭 Saga worker` },
+          { status: 409 },
+        );
+      }
+    }
+  }
   const settings = await updateAppSettings({
     defaultMonthlyQuota: parsed.data.defaultMonthlyQuota,
     usageSyncPolicy: parsed.data.usageSyncPolicy,
+    quotaFeatureFlags: parsed.data.quotaFeatureFlags,
     updatedByFeishuUserId: auth.user.id,
   });
   return NextResponse.json({ settings });

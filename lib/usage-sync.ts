@@ -1,7 +1,8 @@
 import { listNewApiUsageLogs } from "@/lib/newapi";
 import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
 import { getConfig } from "@/lib/config";
-import { nowIso } from "@/lib/crypto";
+import { nowIso, randomId } from "@/lib/crypto";
+import { fixedUsageSyncWindow, hongKongBillingPeriod } from "@/lib/quota-model";
 import { withPostgresAdvisoryLock } from "@/lib/postgres-store";
 import {
   backfillProxyLogsFromNewApiUsage,
@@ -9,6 +10,7 @@ import {
   getAppSettings,
   getUsageSyncCheckpoint,
   recordBillingOperation,
+  rebuildQuotaMaterializedSnapshots,
   saveUsageSyncCheckpoint,
   type NewApiUsageBackfillResult,
 } from "@/lib/store";
@@ -28,6 +30,10 @@ export type NewApiUsageSyncResult = {
   pageStart: number;
   size: number;
   maxPages: number;
+  runId: string;
+  scanStart: string;
+  scanEnd: string;
+  completedWindow: boolean;
   pages: NewApiUsageSyncPageResult[];
   totals: {
     fetched: number;
@@ -44,6 +50,8 @@ export type NewApiUsageSyncResult = {
     nextRunAfter?: string;
     lastSeenNewapiLogId?: string;
     lastSeenNewapiCreatedAt?: string;
+    settledThrough?: string;
+    cursorPage?: number;
   };
 };
 
@@ -256,6 +264,8 @@ export async function syncNewApiUsageLogs(input: {
   matchWindowMs?: number;
   overlapMinutes?: number;
   intervalMinutes?: number;
+  settlementLagMinutes?: number;
+  retryBaseMinutes?: number;
   operatedByFeishuUserId?: string;
   trigger?: UsageSyncTrigger;
 } = {}): Promise<NewApiUsageSyncResult> {
@@ -270,16 +280,55 @@ async function syncNewApiUsageLogsUnlocked(input: {
   matchWindowMs?: number;
   overlapMinutes?: number;
   intervalMinutes?: number;
+  settlementLagMinutes?: number;
+  retryBaseMinutes?: number;
   operatedByFeishuUserId?: string;
   trigger?: UsageSyncTrigger;
 } = {}): Promise<NewApiUsageSyncResult> {
   const dryRun = input.dryRun ?? true;
-  const pageStart = Math.max(input.page ?? 0, 0);
+  const previousCheckpoint = dryRun ? null : await getUsageSyncCheckpoint();
+  const canResume = Boolean(
+    input.page === undefined &&
+      previousCheckpoint?.runId &&
+      previousCheckpoint.scanStart &&
+      previousCheckpoint.scanEnd &&
+      previousCheckpoint.cursorPage !== undefined &&
+      previousCheckpoint.lastRunStatus !== "applied",
+  );
+  const runStartedAt = canResume
+    ? previousCheckpoint?.runStartedAt ?? nowIso()
+    : nowIso();
+  const runId = canResume ? previousCheckpoint?.runId ?? randomId("usr") : randomId("usr");
+  const settlementLagMinutes = Math.min(
+    Math.max(
+      Math.trunc(
+        input.settlementLagMinutes ?? defaultUsageSyncPolicy().settlementLagMinutes ?? 5,
+      ),
+      0,
+    ),
+    24 * 60,
+  );
+  const window = canResume
+    ? {
+        scanStart: previousCheckpoint!.scanStart!,
+        scanEnd: previousCheckpoint!.scanEnd!,
+      }
+    : fixedUsageSyncWindow({
+        runStartedAt,
+        settledThrough: previousCheckpoint?.settledThrough,
+        overlapMinutes: input.overlapMinutes ?? 120,
+        settlementLagMinutes,
+      });
+  const pageStart = Math.max(input.page ?? (canResume ? previousCheckpoint?.cursorPage ?? 0 : 0), 0);
   const size = Math.min(Math.max(input.size ?? 100, 1), 100);
   const maxPages = Math.min(Math.max(input.maxPages ?? 1, 1), 20);
   const matchWindowMinutes = Math.max(Math.round((input.matchWindowMs ?? 30 * 60 * 1000) / 60_000), 1);
   const overlapMinutes = Math.max(Math.trunc(input.overlapMinutes ?? 120), 0);
   const intervalMinutes = Math.min(Math.max(Math.trunc(input.intervalMinutes ?? defaultUsageSyncPolicy().intervalMinutes), 1), 24 * 60);
+  const retryBaseMinutes = Math.min(
+    Math.max(Math.trunc(input.retryBaseMinutes ?? defaultUsageSyncPolicy().retryBaseMinutes ?? 5), 1),
+    24 * 60,
+  );
   const pages: NewApiUsageSyncPageResult[] = [];
   const totals: NewApiUsageSyncResult["totals"] = {
     fetched: 0,
@@ -295,10 +344,17 @@ async function syncNewApiUsageLogsUnlocked(input: {
   let lastSeenNewapiCreatedAt: string | undefined;
   const reservedProxyLogIds: string[] = [];
   const seenUsageLogIdentities = new Set<string>();
+  let completedWindow = false;
+  let cursorPage = pageStart;
   try {
     for (let index = 0; index < maxPages; index += 1) {
       const page = pageStart + index;
-      const logsPage = await listNewApiUsageLogs({ page, size });
+      const logsPage = await listNewApiUsageLogs({
+        page,
+        size,
+        startTimestamp: Math.floor(new Date(window.scanStart).getTime() / 1000),
+        endTimestamp: Math.floor(new Date(window.scanEnd).getTime() / 1000),
+      });
       for (const item of logsPage.items) {
         if (
           item.createdAt &&
@@ -345,11 +401,19 @@ async function syncNewApiUsageLogsUnlocked(input: {
       totals.issuesUpserted += backfill.issuesUpserted;
 
       if (!logsPage.items.length || (page + 1) * size >= logsPage.total) {
+        completedWindow = true;
+        cursorPage = 0;
         break;
       }
+      cursorPage = page + 1;
     }
 
     const lastRunAt = nowIso();
+    const successfulStatus = completedWindow ? "applied" : "partial_failed";
+    const nextRunAfter = addMinutes(
+      lastRunAt,
+      completedWindow ? intervalMinutes : retryBaseMinutes,
+    );
     const checkpoint = dryRun
       ? undefined
       : await saveUsageSyncCheckpoint({
@@ -362,8 +426,18 @@ async function syncNewApiUsageLogsUnlocked(input: {
           lastSeenNewapiLogId,
           lastSeenNewapiCreatedAt,
           lastRunAt,
-          lastRunStatus: "applied",
+          lastRunStatus: successfulStatus,
           lastRunBy: input.trigger ?? "manual",
+          runId,
+          runStartedAt,
+          scanStart: window.scanStart,
+          scanEnd: window.scanEnd,
+          settledThrough: completedWindow
+            ? window.scanEnd
+            : previousCheckpoint?.settledThrough,
+          cursorPage,
+          failureCount: completedWindow ? 0 : previousCheckpoint?.failureCount ?? 0,
+          nextRetryAt: completedWindow ? undefined : nextRunAfter,
           lastRunSummary: {
             pages: pages.length,
             fetched: totals.fetched,
@@ -374,15 +448,32 @@ async function syncNewApiUsageLogsUnlocked(input: {
             skippedNoMatch: totals.skippedNoMatch,
             recordsUpserted: totals.recordsUpserted,
             issuesUpserted: totals.issuesUpserted,
+            completedWindow,
+            scanStart: window.scanStart,
+            scanEnd: window.scanEnd,
           },
-          nextRunAfter: addMinutes(lastRunAt, intervalMinutes),
+          nextRunAfter,
         });
+
+    if (!dryRun) {
+      const affectedPeriods = new Set([
+        hongKongBillingPeriod(new Date(window.scanStart)),
+        hongKongBillingPeriod(new Date(window.scanEnd)),
+      ]);
+      for (const affectedPeriod of affectedPeriods) {
+        await rebuildQuotaMaterializedSnapshots(affectedPeriod);
+      }
+    }
 
     const result = {
       dryRun,
       pageStart,
       size,
       maxPages,
+      runId,
+      scanStart: window.scanStart,
+      scanEnd: window.scanEnd,
+      completedWindow,
       pages,
       totals,
       checkpoint: checkpoint
@@ -391,6 +482,8 @@ async function syncNewApiUsageLogsUnlocked(input: {
             nextRunAfter: checkpoint.nextRunAfter,
             lastSeenNewapiLogId: checkpoint.lastSeenNewapiLogId,
             lastSeenNewapiCreatedAt: checkpoint.lastSeenNewapiCreatedAt,
+            settledThrough: checkpoint.settledThrough,
+            cursorPage: checkpoint.cursorPage,
           }
         : undefined,
     };
@@ -398,7 +491,7 @@ async function syncNewApiUsageLogsUnlocked(input: {
     if (input.operatedByFeishuUserId) {
       await recordBillingOperation({
         kind: "usage_sync",
-        status: dryRun ? "dry_run" : "applied",
+        status: dryRun ? "dry_run" : successfulStatus,
         dryRun,
         operatedByFeishuUserId: input.operatedByFeishuUserId,
         input: {
@@ -408,6 +501,11 @@ async function syncNewApiUsageLogsUnlocked(input: {
           matchWindowMs: input.matchWindowMs,
           overlapMinutes,
           intervalMinutes,
+          settlementLagMinutes,
+          retryBaseMinutes,
+          runId,
+          scanStart: window.scanStart,
+          scanEnd: window.scanEnd,
           trigger: input.trigger ?? "manual",
         },
         summary: {
@@ -420,6 +518,7 @@ async function syncNewApiUsageLogsUnlocked(input: {
           skippedNoMatch: totals.skippedNoMatch,
           recordsUpserted: totals.recordsUpserted,
           issuesUpserted: totals.issuesUpserted,
+          completedWindow,
         },
       });
     }
@@ -439,6 +538,11 @@ async function syncNewApiUsageLogsUnlocked(input: {
           matchWindowMs: input.matchWindowMs,
           overlapMinutes,
           intervalMinutes,
+          settlementLagMinutes,
+          retryBaseMinutes,
+          runId,
+          scanStart: window.scanStart,
+          scanEnd: window.scanEnd,
           trigger: input.trigger ?? "manual",
         },
         summary: {
@@ -457,6 +561,12 @@ async function syncNewApiUsageLogsUnlocked(input: {
       });
     }
     if (!dryRun) {
+      const failedAt = nowIso();
+      const failureCount = (previousCheckpoint?.failureCount ?? 0) + 1;
+      const retryDelayMinutes = Math.min(
+        retryBaseMinutes * 2 ** Math.min(failureCount - 1, 5),
+        24 * 60,
+      );
       await saveUsageSyncCheckpoint({
         scope: "newapi_usage_logs",
         pageStart,
@@ -466,9 +576,17 @@ async function syncNewApiUsageLogsUnlocked(input: {
         matchWindowMinutes,
         lastSeenNewapiLogId,
         lastSeenNewapiCreatedAt,
-        lastRunAt: nowIso(),
+        lastRunAt: failedAt,
         lastRunStatus: statusFromError(pages.length),
         lastRunBy: input.trigger ?? "manual",
+        runId,
+        runStartedAt,
+        scanStart: window.scanStart,
+        scanEnd: window.scanEnd,
+        settledThrough: previousCheckpoint?.settledThrough,
+        cursorPage,
+        failureCount,
+        nextRetryAt: addMinutes(failedAt, retryDelayMinutes),
         lastRunSummary: {
           pages: pages.length,
           fetched: totals.fetched,
@@ -481,7 +599,7 @@ async function syncNewApiUsageLogsUnlocked(input: {
           issuesUpserted: totals.issuesUpserted,
           failed: 1,
         },
-        nextRunAfter: addMinutes(nowIso(), intervalMinutes),
+        nextRunAfter: addMinutes(failedAt, retryDelayMinutes),
       }).catch(() => undefined);
     }
     throw err;
@@ -508,11 +626,12 @@ export async function runDueNewApiUsageSync() {
 
   const result = await syncNewApiUsageLogs({
     dryRun: false,
-    page: 0,
     size: policy.pageSize,
     maxPages: policy.maxPagesPerRun,
     overlapMinutes: policy.overlapMinutes,
     intervalMinutes: policy.intervalMinutes,
+    settlementLagMinutes: policy.settlementLagMinutes,
+    retryBaseMinutes: policy.retryBaseMinutes,
     matchWindowMs: policy.matchWindowMinutes * 60_000,
     operatedByFeishuUserId: "system:usage-sync",
     trigger: "auto",

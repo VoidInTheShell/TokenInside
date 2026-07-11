@@ -1,15 +1,18 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { z } from "zod";
 import { requireAdminScope } from "@/lib/admin";
-import { nowIso } from "@/lib/crypto";
-import { provisionTokenForRequest } from "@/lib/provisioning";
+import { nowIso, randomId } from "@/lib/crypto";
 import {
-  assignDepartmentUserQuota,
   createTokenRequest,
-  getActiveTokenForUser,
+  findQuotaOperationByIdempotencyKey,
   getScopedUser,
   updateTokenRequest,
 } from "@/lib/store";
+import {
+  assertQuotaWriteActionEnabled,
+  quotaFeatureErrorStatus,
+} from "@/lib/quota-guard";
+import { enqueueQuotaAdjustment, runQuotaOperation } from "@/lib/quota-saga";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,6 +20,7 @@ export const dynamic = "force-dynamic";
 const quotaAdjustSchema = z.object({
   approvedMonthlyQuota: z.number().int().positive().max(1000000),
   reason: z.string().min(4).max(500).optional(),
+  clientRequestId: z.string().min(8).max(120).optional(),
 });
 
 export async function POST(
@@ -41,36 +45,42 @@ export async function POST(
   }
 
   const approvedMonthlyQuota = parsed.data.approvedMonthlyQuota;
-  const activeToken = await getActiveTokenForUser(targetUser.id);
-  if (!activeToken) {
-    if (!targetUser.departmentId) {
-      return NextResponse.json(
-        { error: "无 active key 的用户必须先归属部门，才能预分配额度" },
-        { status: 409 },
-      );
+  if (!targetUser.departmentId) {
+    return NextResponse.json(
+      { error: "目标用户必须先归属部门，才能执行账本化调额" },
+      { status: 409 },
+    );
+  }
+
+  try {
+    await assertQuotaWriteActionEnabled("quota_adjust");
+  } catch (err) {
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : "额度调节当前未启用" },
+      { status: quotaFeatureErrorStatus(err) ?? 503 },
+    );
+  }
+
+  const clientRequestId =
+    parsed.data.clientRequestId ?? request.headers.get("idempotency-key") ?? randomId("adjust");
+  const existingOperation = await findQuotaOperationByIdempotencyKey(
+    `quota-adjust:${clientRequestId}`,
+  );
+  if (existingOperation) {
+    if (
+      existingOperation.feishuUserId !== targetUser.id ||
+      existingOperation.operationType !== "quota_adjust"
+    ) {
+      return NextResponse.json({ error: "幂等键已被其他额度操作使用" }, { status: 409 });
     }
-    try {
-      const assignment = await assignDepartmentUserQuota({
-        departmentId: targetUser.departmentId,
-        departmentName: targetUser.departmentName,
-        feishuUserId: targetUser.id,
-        nextQuota: approvedMonthlyQuota,
-        operatedByFeishuUserId: auth.user.id,
-      });
-      return NextResponse.json({ assignment, preallocated: true });
-    } catch (err) {
-      return NextResponse.json(
-        { error: err instanceof Error ? err.message : "预分配额度失败" },
-        { status: 409 },
-      );
-    }
+    return NextResponse.json({ operation: existingOperation }, { status: 202 });
   }
 
   const operatedAt = nowIso();
   const quotaRequest = await createTokenRequest({
     feishuUserId: targetUser.id,
     requestType: "quota_adjust",
-    status: "approved",
+    status: "approved_provisioning",
     reason: parsed.data.reason ?? `管理员调额为 ${approvedMonthlyQuota}`,
     requestedMonthlyQuota: approvedMonthlyQuota,
     approvedMonthlyQuota,
@@ -80,13 +90,24 @@ export async function POST(
   });
 
   try {
-    const account = await provisionTokenForRequest(quotaRequest);
-    const updated = await updateTokenRequest(quotaRequest.id, {});
-    return NextResponse.json({ request: updated, account });
+    const operation = await enqueueQuotaAdjustment({
+      feishuUserId: targetUser.id,
+      departmentId: targetUser.departmentId,
+      approvedMonthlyQuota,
+      clientRequestId,
+      requestId: quotaRequest.id,
+      createdByOpenId: auth.user.openId,
+    });
+    after(() => runQuotaOperation(operation.id).catch(() => undefined));
+    return NextResponse.json({ request: quotaRequest, operation }, { status: 202 });
   } catch (err) {
+    await updateTokenRequest(quotaRequest.id, {
+      status: "approved_provision_failed",
+      errorMessage: err instanceof Error ? err.message : "额度调节操作创建失败",
+    });
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "NewAPI quota adjust failed" },
-      { status: 502 },
+      { status: quotaFeatureErrorStatus(err) ?? 502 },
     );
   }
 }

@@ -12,11 +12,15 @@ import {
 } from "@/lib/usage-metrics";
 import {
   addProxyLog,
-  beginProxyLog,
+  beginQuotaAwareProxyLog,
   findActiveTokenByHash,
   getUserById,
   updateProxyLog,
 } from "@/lib/store";
+import {
+  QuotaAdmissionClosedError,
+  StaleTokenGenerationError,
+} from "@/lib/quota-admission";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -174,6 +178,30 @@ function settleNewApiUsageAfterResponse(
   });
 }
 
+function startProxyLeaseHeartbeat(logId: string) {
+  let stopped = false;
+  let running = false;
+  const timer = setInterval(() => {
+    if (stopped || running) return;
+    running = true;
+    const heartbeatAt = new Date();
+    void updateProxyLog(logId, {
+      heartbeatAt: heartbeatAt.toISOString(),
+      leaseExpiresAt: new Date(heartbeatAt.getTime() + 2 * 60_000).toISOString(),
+    })
+      .catch(() => undefined)
+      .finally(() => {
+        running = false;
+      });
+  }, 15_000);
+  timer.unref?.();
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
 function redactSensitiveText(value: string) {
   return value
     .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
@@ -213,19 +241,23 @@ function streamWithProxyLog(input: {
     source: "proxy_stream",
     fallbackSemantic: usageSemanticFromApiFormat(input.apiFormat),
   });
+  const stopHeartbeat = startProxyLeaseHeartbeat(input.logId);
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const result = await reader.read();
         if (result.done) {
+          stopHeartbeat();
           const usage = usageCollector.finish();
           await updateProxyLog(input.logId, {
             status: terminalStatus(input.statusCode),
+            terminalStatus: terminalStatus(input.statusCode),
             durationMs: Date.now() - input.startedAt,
             responseTimeUpdatedAt: new Date().toISOString(),
             usageSource: hasUsageMetrics(usage) ? "proxy_stream" : "missing",
             ...newApiResponseRequestIdPatch(input.newapiResponseRequestId),
             ...usage,
+            leaseExpiresAt: undefined,
           });
           controller.close();
           return;
@@ -233,26 +265,32 @@ function streamWithProxyLog(input: {
         usageCollector.ingest(result.value);
         controller.enqueue(result.value);
       } catch (err) {
+        stopHeartbeat();
         await updateProxyLog(input.logId, {
           status: "failed",
+          terminalStatus: "failed",
           statusCode: input.statusCode >= 400 ? input.statusCode : 502,
           durationMs: Date.now() - input.startedAt,
           errorMessage: sanitizedErrorMessage(err),
           responseTimeUpdatedAt: new Date().toISOString(),
+          leaseExpiresAt: undefined,
         });
         controller.error(err);
       }
     },
     async cancel(reason) {
+      stopHeartbeat();
       try {
         await reader.cancel(reason);
       } finally {
         await updateProxyLog(input.logId, {
           status: "cancelled",
+          terminalStatus: "cancelled",
           statusCode: 499,
           durationMs: Date.now() - input.startedAt,
           errorMessage: "Client cancelled the request",
           responseTimeUpdatedAt: new Date().toISOString(),
+          leaseExpiresAt: undefined,
         });
       }
     },
@@ -296,6 +334,7 @@ async function recordFinishedProxyLog(input: {
       : undefined;
   await updateProxyLog(input.logId, {
     status: terminalStatus(input.upstream.status),
+    terminalStatus: terminalStatus(input.upstream.status),
     statusCode: input.upstream.status,
     durationMs: Date.now() - input.startedAt,
     firstByteMs: input.firstByteMs,
@@ -304,6 +343,7 @@ async function recordFinishedProxyLog(input: {
     ...newApiResponseRequestIdPatch(newapiResponseRequestId),
     ...usage,
     errorMessage,
+    leaseExpiresAt: undefined,
   });
   if (input.upstream.status >= 400) {
     console.warn(
@@ -330,10 +370,12 @@ async function recordFailedProxyLog(input: {
 }) {
   await updateProxyLog(input.logId, {
     status: input.aborted ? "cancelled" : "failed",
+    terminalStatus: input.aborted ? "cancelled" : "failed",
     statusCode: input.aborted ? 499 : 502,
     durationMs: Date.now() - input.startedAt,
     errorMessage: input.aborted ? "Client cancelled the request" : sanitizedErrorMessage(input.err),
     responseTimeUpdatedAt: new Date().toISOString(),
+    leaseExpiresAt: undefined,
   });
 }
 
@@ -419,26 +461,40 @@ async function proxy(request: Request, context: RouteContext) {
   });
   const userAgent = request.headers.get("user-agent");
   const clientIp = request.headers.get("x-forwarded-for") ?? undefined;
-  const proxyLog = await beginProxyLog({
-    feishuUserId: user.id,
-    tokenAccountId: tokenAccount.id,
-    departmentId: user.departmentId,
-    departmentName: user.departmentName,
-    requestPath,
-    method: request.method,
-    model: metadata.model,
-    provider: "NewAPI",
-    providerKeyName: tokenAccount.newapiTokenId,
-    apiFormat,
-    endpointApiFormat: apiFormat,
-    requestType: metadata.requestType,
-    isStream: metadata.clientRequestedStream,
-    clientRequestedStream: metadata.clientRequestedStream,
-    clientIsStream: metadata.clientRequestedStream,
-    userAgent: userAgent ?? undefined,
-    clientIp,
-    clientFamily: detectClientFamily(userAgent),
-  });
+  let proxyLog: Awaited<ReturnType<typeof beginQuotaAwareProxyLog>>;
+  try {
+    proxyLog = await beginQuotaAwareProxyLog(tokenAccount, {
+      feishuUserId: user.id,
+      tokenAccountId: tokenAccount.id,
+      departmentId: user.departmentId,
+      departmentName: user.departmentName,
+      requestPath,
+      method: request.method,
+      model: metadata.model,
+      provider: "NewAPI",
+      providerKeyName: tokenAccount.newapiTokenId,
+      apiFormat,
+      endpointApiFormat: apiFormat,
+      requestType: metadata.requestType,
+      isStream: metadata.clientRequestedStream,
+      clientRequestedStream: metadata.clientRequestedStream,
+      clientIsStream: metadata.clientRequestedStream,
+      userAgent: userAgent ?? undefined,
+      clientIp,
+      clientFamily: detectClientFamily(userAgent),
+    });
+  } catch (error) {
+    if (error instanceof QuotaAdmissionClosedError) {
+      return NextResponse.json(
+        { error: error.message, operationId: error.operationId, retryable: true },
+        { status: 409, headers: { "Retry-After": "2" } },
+      );
+    }
+    if (error instanceof StaleTokenGenerationError) {
+      return NextResponse.json({ error: error.message }, { status: 403 });
+    }
+    throw error;
+  }
   const settlementContext: ProxyUsageSettlementContext = {
     proxyLogId: proxyLog.id,
     newapiTokenId: tokenAccount.newapiTokenId,
@@ -446,6 +502,7 @@ async function proxy(request: Request, context: RouteContext) {
     isStream: metadata.clientRequestedStream,
     requestStartedAt: new Date(startedAt).toISOString(),
   };
+  const stopRequestHeartbeat = startProxyLeaseHeartbeat(proxyLog.id);
 
   const upstreamUrl = buildNewApiProxyUrl(path, requestUrl.search);
   try {
@@ -472,10 +529,13 @@ async function proxy(request: Request, context: RouteContext) {
         upstreamIsStream: true,
         ...newApiResponseRequestIdPatch(newapiResponseRequestId),
         responseTimeUpdatedAt: new Date().toISOString(),
+        heartbeatAt: new Date().toISOString(),
+        leaseExpiresAt: new Date(Date.now() + 2 * 60_000).toISOString(),
       });
       if (upstream.status < 400) {
         settleNewApiUsageAfterResponse(settlementContext, newapiResponseRequestId);
       }
+      stopRequestHeartbeat();
       return new Response(
         streamWithProxyLog({
           body: upstream.body,
@@ -505,6 +565,7 @@ async function proxy(request: Request, context: RouteContext) {
       responseBuffer: responseBody.buffer,
       responseJson: responseBody.json,
     });
+    stopRequestHeartbeat();
 
     return new Response(responseBody.buffer, {
       status: upstream.status,
@@ -512,6 +573,7 @@ async function proxy(request: Request, context: RouteContext) {
       headers: responseHeaders,
     });
   } catch (err) {
+    stopRequestHeartbeat();
     const aborted =
       request.signal.aborted ||
       (err instanceof DOMException && err.name === "AbortError");

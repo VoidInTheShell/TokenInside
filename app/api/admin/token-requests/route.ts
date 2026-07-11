@@ -22,10 +22,21 @@ export async function GET(request: Request) {
 
   const url = new URL(request.url);
   const createdAfterInput = url.searchParams.get("createdAfter");
+  const decisionRequiredInput = url.searchParams.get("decisionRequired");
   const createdAfter = normalizeOptionalIsoTimestamp(createdAfterInput);
   if (createdAfterInput && !createdAfter) {
     return NextResponse.json(
       { error: "createdAfter 必须是有效的 ISO 时间" },
+      { status: 400 },
+    );
+  }
+  if (
+    decisionRequiredInput &&
+    decisionRequiredInput !== "true" &&
+    decisionRequiredInput !== "false"
+  ) {
+    return NextResponse.json(
+      { error: "decisionRequired 必须是 true 或 false" },
       { status: 400 },
     );
   }
@@ -34,6 +45,7 @@ export async function GET(request: Request) {
     limit: positiveInt(url.searchParams.get("limit"), 20),
     offset: nonNegativeInt(url.searchParams.get("offset"), 0),
     createdAfter: createdAfter ?? undefined,
+    decisionRequired: decisionRequiredInput === "true",
   });
 
   return NextResponse.json(result);

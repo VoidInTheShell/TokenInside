@@ -269,6 +269,17 @@ export async function getNewApiTokenRemainQuota(newapiTokenId: string) {
   return typeof record.remain_quota === "number" ? record.remain_quota : undefined;
 }
 
+export async function getNewApiTokenControlState(newapiTokenId: string) {
+  const { newapi } = getConfig();
+  if (newapi.mock) return { status: 1, remainQuota: toNewApiQuota(200) };
+  const record = await getNewApiToken(newapiTokenId);
+  return {
+    status: record.status,
+    remainQuota:
+      typeof record.remain_quota === "number" ? record.remain_quota : undefined,
+  };
+}
+
 export async function listModelsForNewApiToken(newapiTokenId: string) {
   const { newapi } = getConfig();
   if (newapi.mock) {

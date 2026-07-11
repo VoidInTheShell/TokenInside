@@ -164,7 +164,9 @@ type AdminOverviewResponse = {
       pageSize: number;
       maxPagesPerRun: number;
       overlapMinutes: number;
+      settlementLagMinutes?: number;
       matchWindowMinutes: number;
+      retryBaseMinutes?: number;
       updatedAt?: string;
       updatedByFeishuUserId?: string;
       lastRunAt?: string;
@@ -187,9 +189,19 @@ type AdminOverviewResponse = {
       lastRunStatus?: BillingOperationRecord["status"];
       lastRunBy?: "manual" | "auto";
       nextRunAfter?: string;
+      runId?: string;
+      runStartedAt?: string;
+      scanStart?: string;
+      scanEnd?: string;
+      settledThrough?: string;
+      cursorPage?: number;
+      failureCount?: number;
+      nextRetryAt?: string;
       updatedAt: string;
     } | null;
     billingOperations?: BillingOperationRecord[];
+    quotaFeatureFlags?: QuotaControlResponse["settings"]["quotaFeatureFlags"];
+    quotaMigration?: QuotaControlResponse["settings"]["quotaMigration"];
     updatedAt?: string;
   };
 };
@@ -201,6 +213,7 @@ type AdminPanel =
   | "departmentStats"
   | "userStats"
   | "usageRecords"
+  | "quotaControl"
   | "approvals"
   | "settings";
 
@@ -387,7 +400,9 @@ type UsageSyncPolicyDraft = {
   pageSize: string;
   maxPagesPerRun: string;
   overlapMinutes: string;
+  settlementLagMinutes: string;
   matchWindowMinutes: string;
+  retryBaseMinutes: string;
 };
 
 type MonthlyResetDraft = {
@@ -415,14 +430,100 @@ type UsageSyncResult = {
 type MonthlyResetResult = {
   period: string;
   dryRun: boolean;
-  monthlyQuota: number;
-  totals: {
-    activeTokens: number;
-    skippedCurrentPeriod: number;
-    planned: number;
-    applied: number;
-    failed: number;
+  blocked: boolean;
+  blockers: Array<{ type: string; message: string }>;
+  departments: Array<{
+    departmentId: string;
+    budgetQuota: number;
+    assignedQuota: number;
+    blocked: boolean;
+    alreadyOpenedUsers?: number;
+    users: Array<{ feishuUserId: string }>;
+  }>;
+  operations?: Array<{ id: string; state: string }>;
+};
+
+type QuotaControlResponse = {
+  quotaPerUnit: number;
+  report: {
+    period: string;
+    observedUpstream: boolean;
+    settledThrough?: string;
+    totals: {
+      users: number;
+      healthy: number;
+      excessUpstream: number;
+      deficitUpstream: number;
+      provisional: number;
+    };
+    rows: Array<{
+      feishuUserId: string;
+      userName?: string;
+      departmentId?: string;
+      tokenAccountId?: string;
+      assignedMonthlyQuota: number;
+      authorizedQuota: number;
+      authoritativeConsumedQuota: number;
+      expectedAvailableQuota: number;
+      overageQuota: number;
+      observedRemainQuota?: number;
+      delta?: number;
+      observedStable: boolean;
+      status: "healthy" | "excess_upstream" | "deficit_upstream" | "provisional" | "manual_review";
+      activeGeneration: number;
+      settledThrough?: string;
+    }>;
   };
+  operations: Array<{
+    id: string;
+    operationType: string;
+    feishuUserId: string;
+    state: string;
+    attemptCount: number;
+    operationGeneration: number;
+    targetRemainQuota?: number;
+    observedRemainBefore?: number;
+    lastErrorMessage?: string;
+    nextRetryAt?: string;
+    updatedAt: string;
+  }>;
+  ledgerEntries: Array<{
+    id: string;
+    operationId: string;
+    feishuUserId: string;
+    entryType: string;
+    signedQuota: number;
+    quotaValue: number;
+    estimated?: boolean;
+    createdAt: string;
+  }>;
+  reconciliationRecords: Array<{
+    id: string;
+    feishuUserId: string;
+    status: string;
+    delta?: number;
+    updatedAt: string;
+  }>;
+  settings: {
+    quotaFeatureFlags?: {
+      legacyAbsoluteQuotaWritesEnabled: boolean;
+      quotaLedgerShadowRead: boolean;
+      quotaSagaWritesEnabled: boolean;
+      keyRotationSagaEnabled: boolean;
+      quotaRestoreEnabled: boolean;
+      monthlyPeriodOpenEnabled: boolean;
+      reconciliationAutoDecreaseEnabled: boolean;
+      reconciliationAutoIncreaseEnabled: boolean;
+    };
+    quotaMigration?: {
+      period: string;
+      appliedAt: string;
+      planHash: string;
+      users: number;
+      estimatedUsers: number;
+    };
+  };
+  error?: string;
 };
 
 const statusLabel: Record<string, string> = {
@@ -556,6 +657,26 @@ function billingStatusVariant(status: BillingOperationRecord["status"]) {
   return "warning";
 }
 
+function quotaReconciliationLabel(status: string) {
+  if (status === "healthy") return "一致";
+  if (status === "excess_upstream") return "上游多余额";
+  if (status === "deficit_upstream") return "上游少余额";
+  if (status === "manual_review") return "人工处置";
+  return "暂定数据";
+}
+
+function quotaReconciliationVariant(status: string) {
+  if (status === "healthy") return "success";
+  if (status === "deficit_upstream" || status === "manual_review") return "danger";
+  return "warning";
+}
+
+function quotaOperationVariant(state: string) {
+  if (state === "completed") return "success";
+  if (state === "manual_review" || state === "compensated") return "danger";
+  return "warning";
+}
+
 function billingSummaryText(operation: BillingOperationRecord) {
   const summary = operation.summary ?? {};
   if (operation.kind === "usage_sync") {
@@ -607,6 +728,8 @@ export function AdminClient() {
   const [departmentStats, setDepartmentStats] = useState<DepartmentStatsRow[]>([]);
   const [departmentQuotaData, setDepartmentQuotaData] =
     useState<DepartmentQuotaResponse | null>(null);
+  const [quotaControlData, setQuotaControlData] =
+    useState<QuotaControlResponse | null>(null);
   const [departmentPolicyDrafts, setDepartmentPolicyDrafts] = useState<
     Record<string, { quotaLimit: string; defaultGrantQuota: string }>
   >({});
@@ -673,7 +796,17 @@ export function AdminClient() {
     pageSize: "100",
     maxPagesPerRun: "3",
     overlapMinutes: "120",
+    settlementLagMinutes: "5",
     matchWindowMinutes: "30",
+    retryBaseMinutes: "5",
+  });
+  const [quotaFeatureDraft, setQuotaFeatureDraft] = useState({
+    quotaLedgerShadowRead: true,
+    quotaSagaWritesEnabled: false,
+    keyRotationSagaEnabled: false,
+    quotaRestoreEnabled: false,
+    monthlyPeriodOpenEnabled: false,
+    reconciliationAutoDecreaseEnabled: false,
   });
   const [monthlyResetDraft, setMonthlyResetDraft] = useState({
     period: currentBillingPeriod(),
@@ -711,7 +844,9 @@ export function AdminClient() {
             pageSize: String(policy.pageSize ?? 100),
             maxPagesPerRun: String(policy.maxPagesPerRun ?? 3),
             overlapMinutes: String(policy.overlapMinutes ?? 120),
+            settlementLagMinutes: String(policy.settlementLagMinutes ?? 5),
             matchWindowMinutes: String(policy.matchWindowMinutes ?? 30),
+            retryBaseMinutes: String(policy.retryBaseMinutes ?? 5),
           });
           setUsageSyncDraft((current) => ({
             ...current,
@@ -720,6 +855,19 @@ export function AdminClient() {
             overlapMinutes: String(policy.overlapMinutes ?? current.overlapMinutes),
             matchWindowMinutes: String(policy.matchWindowMinutes ?? current.matchWindowMinutes),
           }));
+        }
+        const quotaFlags = body.settings.quotaFeatureFlags;
+        if (quotaFlags) {
+          setQuotaFeatureDraft({
+            quotaLedgerShadowRead: Boolean(quotaFlags.quotaLedgerShadowRead),
+            quotaSagaWritesEnabled: Boolean(quotaFlags.quotaSagaWritesEnabled),
+            keyRotationSagaEnabled: Boolean(quotaFlags.keyRotationSagaEnabled),
+            quotaRestoreEnabled: Boolean(quotaFlags.quotaRestoreEnabled),
+            monthlyPeriodOpenEnabled: Boolean(quotaFlags.monthlyPeriodOpenEnabled),
+            reconciliationAutoDecreaseEnabled: Boolean(
+              quotaFlags.reconciliationAutoDecreaseEnabled,
+            ),
+          });
         }
       }
       if (body.overview?.latestRequests) {
@@ -926,6 +1074,45 @@ export function AdminClient() {
     }
   }, [approvalPage, approvalPageSize]);
 
+  const loadQuotaControl = useCallback(async (observe = false) => {
+    setPanelLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/admin/quota-control?observe=${observe}`, {
+        cache: "no-store",
+      });
+      const body = await readJsonResponse<QuotaControlResponse>(res);
+      if (!res.ok) throw new Error(body.error ?? "读取额度一致性中心失败");
+      setQuotaControlData(body);
+      if (observe) setMessage("已完成 NewAPI 余额双读，仅生成影子对账结论。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取额度一致性中心失败");
+    } finally {
+      setPanelLoading(false);
+    }
+  }, []);
+
+  const runQuotaControlAction = useCallback(async (body: Record<string, string>) => {
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/admin/quota-control", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const response = await readJsonResponse<{ operation?: { id: string } }>(res);
+      if (!res.ok) throw new Error(response.error ?? "额度操作提交失败");
+      setMessage(`额度操作已受理${response.operation?.id ? `：${response.operation.id}` : ""}`);
+      await loadQuotaControl(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "额度操作提交失败");
+    } finally {
+      setBusy(false);
+    }
+  }, [loadQuotaControl]);
+
   useEffect(() => {
     void refresh();
   }, [refresh]);
@@ -945,6 +1132,7 @@ export function AdminClient() {
     if (panel === "departmentQuota") void loadDepartmentQuota();
     if (panel === "departmentStats" && isSystemAdmin) void loadDepartmentStats();
     if (panel === "usageRecords") void loadUsageRecords();
+    if (panel === "quotaControl") void loadQuotaControl(false);
     if (panel === "approvals") void loadApprovalRequests();
   }, [
     data?.authorized,
@@ -954,6 +1142,7 @@ export function AdminClient() {
     loadAdminUsers,
     loadDepartmentStats,
     loadDepartmentQuota,
+    loadQuotaControl,
     loadUsageRecords,
     loadUserStats,
     panel,
@@ -1047,6 +1236,16 @@ export function AdminClient() {
         min: 1,
         max: 24 * 60,
       });
+      const settlementLagMinutes = parseIntegerDraft(
+        usageSyncPolicyDraft.settlementLagMinutes,
+        "自动同步结算延迟",
+        { min: 0, max: 24 * 60 },
+      );
+      const retryBaseMinutes = parseIntegerDraft(
+        usageSyncPolicyDraft.retryBaseMinutes,
+        "自动同步重试基数",
+        { min: 1, max: 24 * 60 },
+      );
 
       setBusy(true);
       setError(null);
@@ -1061,7 +1260,9 @@ export function AdminClient() {
             pageSize,
             maxPagesPerRun,
             overlapMinutes,
+            settlementLagMinutes,
             matchWindowMinutes,
+            retryBaseMinutes,
           },
         }),
       });
@@ -1071,6 +1272,61 @@ export function AdminClient() {
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存自动同步策略失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveQuotaFeatureFlags() {
+    if (
+      !data?.settings?.quotaMigration &&
+      (quotaFeatureDraft.quotaSagaWritesEnabled ||
+        quotaFeatureDraft.keyRotationSagaEnabled ||
+        quotaFeatureDraft.quotaRestoreEnabled ||
+        quotaFeatureDraft.monthlyPeriodOpenEnabled ||
+        quotaFeatureDraft.reconciliationAutoDecreaseEnabled)
+    ) {
+      setError("历史额度账本迁移未登记，不能启用 F 阶段写功能");
+      return;
+    }
+    if (
+      !quotaFeatureDraft.quotaSagaWritesEnabled &&
+      (quotaFeatureDraft.keyRotationSagaEnabled ||
+        quotaFeatureDraft.quotaRestoreEnabled ||
+        quotaFeatureDraft.monthlyPeriodOpenEnabled ||
+        quotaFeatureDraft.reconciliationAutoDecreaseEnabled)
+    ) {
+      setError("启用具体额度动作前必须先启用统一 Saga 写入");
+      return;
+    }
+    if (
+      !window.confirm(
+        "确认保存 F 阶段功能开关？自动向上补额始终保持关闭；启用写功能前应完成影子对账。",
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/admin/settings", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          quotaFeatureFlags: {
+            legacyAbsoluteQuotaWritesEnabled: false,
+            ...quotaFeatureDraft,
+            reconciliationAutoIncreaseEnabled: false,
+          },
+        }),
+      });
+      const body = await readJsonResponse<AdminOverviewResponse>(res);
+      if (!res.ok) throw new Error(body.error ?? "保存额度功能开关失败");
+      setMessage("F 阶段功能开关已保存；自动向上补额保持关闭。");
+      await Promise.all([refresh(), loadQuotaControl(false)]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存额度功能开关失败");
     } finally {
       setBusy(false);
     }
@@ -1149,12 +1405,12 @@ export function AdminClient() {
         ? parseIntegerDraft(monthlyResetDraft.limit, "处理上限", { min: 1, max: 500 })
         : undefined;
       if (!dryRun && lastMonthlyResetDryRunSignature !== signature) {
-        throw new Error("执行月度重置前必须先用相同参数完成一次试算重置");
+        throw new Error("执行月度开账前必须先用相同参数完成一次 preflight");
       }
       if (
         !dryRun &&
         !window.confirm(
-          `确认执行 ${period} 月度账期重置？\n${lastMonthlyResetDryRunSummary ?? ""}`,
+          `确认执行 ${period} 月度开账？\n${lastMonthlyResetDryRunSummary ?? ""}`,
         )
       ) {
         return;
@@ -1174,10 +1430,15 @@ export function AdminClient() {
         }),
       });
       const body = await readJsonResponse<MonthlyResetResult>(res);
-      if (!res.ok) throw new Error(body.error ?? "月度账期重置失败");
-      const summary = `活跃 ${body.totals.activeTokens}，跳过 ${body.totals.skippedCurrentPeriod}，计划 ${body.totals.planned}，应用 ${body.totals.applied}，失败 ${body.totals.failed}`;
-      setBillingResult(`${body.period} 月度重置${dryRun ? "试算" : "执行"}完成：${summary}`);
-      setMessage(`月度账期重置${dryRun ? "试算" : "执行"}完成。`);
+      if (!res.ok) throw new Error(body.error ?? "月度开账失败");
+      const plannedUsers = body.departments.reduce((sum, item) => sum + item.users.length, 0);
+      const alreadyOpenedUsers = body.departments.reduce(
+        (sum, item) => sum + (item.alreadyOpenedUsers ?? 0),
+        0,
+      );
+      const summary = `部门 ${body.departments.length}，待开账用户 ${plannedUsers}，已开账跳过 ${alreadyOpenedUsers}，阻塞 ${body.blockers.length}，已受理操作 ${body.operations?.length ?? 0}`;
+      setBillingResult(`${body.period} 月度开账${dryRun ? " preflight" : "执行"}：${summary}`);
+      setMessage(`月度开账${dryRun ? " preflight" : "操作创建"}完成。`);
       if (dryRun) {
         setLastMonthlyResetDryRunSignature(signature);
         setLastMonthlyResetDryRunSummary(summary);
@@ -1187,7 +1448,7 @@ export function AdminClient() {
       }
       await Promise.all([refresh(), loadAdminUsers(), loadUserStats()]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "月度账期重置失败");
+      setError(err instanceof Error ? err.message : "月度开账失败");
     } finally {
       setBusy(false);
     }
@@ -1267,11 +1528,12 @@ export function AdminClient() {
         body: JSON.stringify({
           approvedMonthlyQuota,
           reason: `管理后台调额为 ${approvedMonthlyQuota}`,
+          clientRequestId: window.crypto.randomUUID(),
         }),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error ?? "调额失败");
-      setMessage(body.preallocated ? "额度已预分配，用户首次获发 key 时会沿用该额度。" : "额度已调整。");
+      setMessage("账本化调额已受理，完成上游写后校验后生效。");
       await Promise.all([refresh(), loadAdminUsers(), loadUserStats(), loadDepartmentQuota()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "调额失败");
@@ -1552,6 +1814,7 @@ export function AdminClient() {
     lastMonthlyResetDryRunSignature === monthlyResetDraftSignature(monthlyResetDraft);
   const usageSyncPolicy = data?.settings?.usageSyncPolicy;
   const usageSyncCheckpoint = data?.settings?.usageSyncCheckpoint;
+  const quotaPerUnit = quotaControlData?.quotaPerUnit ?? 500000;
 
   if (!loading && data && !data.authorized) {
     return (
@@ -1670,6 +1933,14 @@ export function AdminClient() {
               >
                 <ClipboardListIcon data-icon="inline-start" />
                 使用记录
+              </button>
+              <button
+                className={panel === "quotaControl" ? "nav-item active nav-button" : "nav-item nav-button"}
+                type="button"
+                onClick={() => selectPanel("quotaControl")}
+              >
+                <GaugeIcon data-icon="inline-start" />
+                额度一致性
               </button>
               <button
                 className={panel === "approvals" ? "nav-item active nav-button" : "nav-item nav-button"}
@@ -2801,6 +3072,273 @@ export function AdminClient() {
             </Card>
           )}
 
+          {panel === "quotaControl" && (
+            <div className="stack">
+              <Card>
+                <CardHeader>
+                  <CardTitle>额度一致性中心</CardTitle>
+                  <CardDescription>
+                    分离授权账本、NewAPI 消费事实和上游观测余额。未知负向漂移只告警，不自动补额。
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="toolbar toolbar-left">
+                    <Button
+                      variant="outline"
+                      disabled={panelLoading || busy}
+                      onClick={() => void loadQuotaControl(false)}
+                    >
+                      <RefreshCwIcon data-icon="inline-start" />
+                      重建影子快照
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={panelLoading || busy}
+                      onClick={() => void loadQuotaControl(true)}
+                    >
+                      <GaugeIcon data-icon="inline-start" />
+                      双读上游余额
+                    </Button>
+                    <Badge>
+                      账期 {quotaControlData?.report.period ?? currentBillingPeriod()}
+                    </Badge>
+                    <Badge variant={quotaControlData?.settings.quotaMigration ? "success" : "warning"}>
+                      {quotaControlData?.settings.quotaMigration ? "历史迁移已登记" : "历史迁移未登记"}
+                    </Badge>
+                  </div>
+                  <div className="metric-grid">
+                    <div className="metric-card">
+                      <span>影子用户</span>
+                      <strong>{quotaControlData?.report.totals.users ?? 0}</strong>
+                    </div>
+                    <div className="metric-card">
+                      <span>一致</span>
+                      <strong>{quotaControlData?.report.totals.healthy ?? 0}</strong>
+                    </div>
+                    <div className="metric-card">
+                      <span>上游多余额</span>
+                      <strong>{quotaControlData?.report.totals.excessUpstream ?? 0}</strong>
+                    </div>
+                    <div className="metric-card">
+                      <span>上游少余额</span>
+                      <strong>{quotaControlData?.report.totals.deficitUpstream ?? 0}</strong>
+                    </div>
+                    <div className="metric-card">
+                      <span>暂定数据</span>
+                      <strong>{quotaControlData?.report.totals.provisional ?? 0}</strong>
+                    </div>
+                  </div>
+                  <div className="toolbar toolbar-left">
+                    {Object.entries(quotaControlData?.settings.quotaFeatureFlags ?? {}).map(
+                      ([name, enabled]) => (
+                        <Badge key={name} variant={enabled ? "success" : "warning"}>
+                          {name}: {enabled ? "on" : "off"}
+                        </Badge>
+                      ),
+                    )}
+                  </div>
+                  <p className="field-description">
+                    settledThrough：
+                    {quotaControlData?.report.settledThrough
+                      ? formatDateTime(quotaControlData.report.settledThrough)
+                      : "尚无稳定水位"}
+                    {quotaControlData?.settings.quotaMigration
+                      ? `；迁移估算用户 ${quotaControlData.settings.quotaMigration.estimatedUsers}/${quotaControlData.settings.quotaMigration.users}`
+                      : ""}
+                  </p>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>用户额度勾稽</CardTitle>
+                  <CardDescription>A 授权策略、G 净授权、C 权威消费、E 预期可用、R 上游观测。</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {!quotaControlData?.report.rows.length ? (
+                    <div className="empty">暂无额度影子数据</div>
+                  ) : (
+                    <div className="table-wrap">
+                      <table className="table">
+                        <thead>
+                          <tr>
+                            <th>用户</th>
+                            <th>A</th>
+                            <th>G</th>
+                            <th>C</th>
+                            <th>E</th>
+                            <th>R</th>
+                            <th>差额</th>
+                            <th>generation</th>
+                            <th>结论</th>
+                            <th>操作</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {quotaControlData.report.rows.map((row) => (
+                            <tr key={row.feishuUserId}>
+                              <td>{row.userName ?? maskSecret(row.feishuUserId)}</td>
+                              <td>{formatQuotaAmount(row.assignedMonthlyQuota / quotaPerUnit, "0")}</td>
+                              <td>{formatQuotaAmount(row.authorizedQuota / quotaPerUnit, "0")}</td>
+                              <td>{formatQuotaAmount(row.authoritativeConsumedQuota / quotaPerUnit, "0")}</td>
+                              <td>{formatQuotaAmount(row.expectedAvailableQuota / quotaPerUnit, "0")}</td>
+                              <td>
+                                {row.observedRemainQuota === undefined
+                                  ? "-"
+                                  : formatQuotaAmount(row.observedRemainQuota / quotaPerUnit, "0")}
+                              </td>
+                              <td>
+                                {row.delta === undefined
+                                  ? "-"
+                                  : formatQuotaAmount(row.delta / quotaPerUnit, "0")}
+                              </td>
+                              <td>{row.activeGeneration}</td>
+                              <td>
+                                <Badge variant={quotaReconciliationVariant(row.status)}>
+                                  {quotaReconciliationLabel(row.status)}
+                                </Badge>
+                              </td>
+                              <td>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={
+                                    busy ||
+                                    row.status !== "excess_upstream" ||
+                                    !row.observedStable ||
+                                    !row.tokenAccountId
+                                  }
+                                  onClick={() =>
+                                    void runQuotaControlAction({
+                                      action: "reconcile_decrease",
+                                      feishuUserId: row.feishuUserId,
+                                    })
+                                  }
+                                >
+                                  安全向下校准
+                                </Button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>Saga 操作中心</CardTitle>
+                  <CardDescription>统一查看调额、Key 轮换、余额恢复、月度开账和对账状态。</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {!quotaControlData?.operations.length ? (
+                    <div className="empty">暂无额度操作</div>
+                  ) : (
+                    <div className="table-wrap">
+                      <table className="table">
+                        <thead>
+                          <tr>
+                            <th>操作</th>
+                            <th>类型</th>
+                            <th>用户</th>
+                            <th>状态</th>
+                            <th>代际</th>
+                            <th>尝试</th>
+                            <th>错误</th>
+                            <th>更新时间</th>
+                            <th>操作</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {quotaControlData.operations.map((operation) => (
+                            <tr key={operation.id}>
+                              <td>{maskSecret(operation.id)}</td>
+                              <td>{operation.operationType}</td>
+                              <td>{maskSecret(operation.feishuUserId)}</td>
+                              <td>
+                                <Badge variant={quotaOperationVariant(operation.state)}>
+                                  {operation.state}
+                                </Badge>
+                              </td>
+                              <td>{operation.operationGeneration}</td>
+                              <td>{operation.attemptCount}</td>
+                              <td>{operation.lastErrorMessage ? maskSecret(operation.lastErrorMessage) : "-"}</td>
+                              <td>{formatDateTime(operation.updatedAt)}</td>
+                              <td>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={
+                                    busy ||
+                                    (operation.state !== "retryable_failed" &&
+                                      operation.state !== "draining")
+                                  }
+                                  onClick={() =>
+                                    void runQuotaControlAction({
+                                      action: "retry",
+                                      operationId: operation.id,
+                                    })
+                                  }
+                                >
+                                  重试
+                                </Button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>不可变授权账本</CardTitle>
+                  <CardDescription>纠错通过反向分录完成；普通更新或删除会被数据库拒绝。</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {!quotaControlData?.ledgerEntries.length ? (
+                    <div className="empty">当前账期暂无账本分录</div>
+                  ) : (
+                    <div className="table-wrap">
+                      <table className="table">
+                        <thead>
+                          <tr>
+                            <th>用户</th>
+                            <th>分录类型</th>
+                            <th>额度</th>
+                            <th>估算</th>
+                            <th>operation</th>
+                            <th>时间</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {quotaControlData.ledgerEntries.map((entry) => (
+                            <tr key={entry.id}>
+                              <td>{maskSecret(entry.feishuUserId)}</td>
+                              <td>{entry.entryType}</td>
+                              <td>{formatQuotaAmount(entry.quotaValue, "0")}</td>
+                              <td>
+                                <Badge variant={entry.estimated ? "warning" : "success"}>
+                                  {entry.estimated ? "估算" : "已确认"}
+                                </Badge>
+                              </td>
+                              <td>{maskSecret(entry.operationId)}</td>
+                              <td>{formatDateTime(entry.createdAt)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            </div>
+          )}
+
           {panel === "settings" && isSystemAdmin && (
             <Card>
               <CardHeader>
@@ -2847,6 +3385,12 @@ export function AdminClient() {
                       下次同步：{usageSyncCheckpoint?.nextRunAfter ? formatDateTime(usageSyncCheckpoint.nextRunAfter) : "-"}
                       {" · "}
                       最近日志：{usageSyncCheckpoint?.lastSeenNewapiLogId ? maskSecret(usageSyncCheckpoint.lastSeenNewapiLogId) : "-"}
+                      {" · "}
+                      稳定水位：{usageSyncCheckpoint?.settledThrough ? formatDateTime(usageSyncCheckpoint.settledThrough) : "-"}
+                      {" · "}
+                      固定窗口：{usageSyncCheckpoint?.scanStart ? formatDateTime(usageSyncCheckpoint.scanStart) : "-"}
+                      {" → "}
+                      {usageSyncCheckpoint?.scanEnd ? formatDateTime(usageSyncCheckpoint.scanEnd) : "-"}
                     </span>
                   </div>
                   <div className="billing-control-grid">
@@ -2950,6 +3494,42 @@ export function AdminClient() {
                           setUsageSyncPolicyDraft((current) => ({
                             ...current,
                             matchWindowMinutes: event.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="usageSyncPolicySettlementLag">结算延迟(分钟)</label>
+                      <Input
+                        id="usageSyncPolicySettlementLag"
+                        min={0}
+                        max={1440}
+                        step={1}
+                        type="number"
+                        value={usageSyncPolicyDraft.settlementLagMinutes}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setUsageSyncPolicyDraft((current) => ({
+                            ...current,
+                            settlementLagMinutes: event.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="usageSyncPolicyRetryBase">失败重试基数(分钟)</label>
+                      <Input
+                        id="usageSyncPolicyRetryBase"
+                        min={1}
+                        max={1440}
+                        step={1}
+                        type="number"
+                        value={usageSyncPolicyDraft.retryBaseMinutes}
+                        disabled={!data?.authorized || busy}
+                        onChange={(event) =>
+                          setUsageSyncPolicyDraft((current) => ({
+                            ...current,
+                            retryBaseMinutes: event.target.value,
                           }))
                         }
                       />
@@ -3072,8 +3652,8 @@ export function AdminClient() {
 
                 <section className="settings-section">
                   <div>
-                    <h3>月度账期重置</h3>
-                    <p>按当前默认额度重置活跃 key 的 NewAPI 剩余额度和本地账期。</p>
+                    <h3>Asia/Hong_Kong 月度开账</h3>
+                    <p>先校验用户策略、部门预算、同步水位和未结操作；任何部门不足时整批阻塞。</p>
                   </div>
                   <div className="billing-control-grid">
                     <div className="field">
@@ -3107,18 +3687,77 @@ export function AdminClient() {
                   <div className="toolbar toolbar-left">
                     <Button variant="outline" size="sm" disabled={!data?.authorized || busy} onClick={() => void runMonthlyReset(true)}>
                       <RefreshCwIcon data-icon="inline-start" />
-                      试算重置
+                      开账 preflight
                     </Button>
                     <Button
                       variant="outline"
                       size="sm"
                       disabled={!data?.authorized || busy || !monthlyResetReadyToExecute}
-                      title={monthlyResetReadyToExecute ? "执行重置" : "请先用相同参数试算重置"}
+                      title={monthlyResetReadyToExecute ? "执行开账" : "请先用相同参数完成开账 preflight"}
                       onClick={() => void runMonthlyReset(false)}
                     >
                       <ShieldCheckIcon data-icon="inline-start" />
-                      执行重置
+                      执行开账
                     </Button>
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <div>
+                    <h3>F 阶段功能开关</h3>
+                    <p>写能力依赖历史账本迁移和统一 Saga；自动向上补额固定关闭且不可在界面开启。</p>
+                    <span className="field-description">
+                      迁移状态：
+                      {data?.settings?.quotaMigration
+                        ? `${data.settings.quotaMigration.period}，${data.settings.quotaMigration.estimatedUsers}/${data.settings.quotaMigration.users} 个用户为估算 opening`
+                        : "未登记"}
+                    </span>
+                  </div>
+                  <div className="billing-control-grid">
+                    {(
+                      [
+                        ["quotaLedgerShadowRead", "影子账本读取"],
+                        ["quotaSagaWritesEnabled", "统一 Saga 写入"],
+                        ["keyRotationSagaEnabled", "Key 安全轮换"],
+                        ["quotaRestoreEnabled", "恢复可用额度"],
+                        ["monthlyPeriodOpenEnabled", "月度开账"],
+                        ["reconciliationAutoDecreaseEnabled", "自动向下校准"],
+                      ] as const
+                    ).map(([key, label]) => (
+                      <label className="field" key={key}>
+                        <span>{label}</span>
+                        <input
+                          type="checkbox"
+                          checked={quotaFeatureDraft[key]}
+                          disabled={!data?.authorized || busy}
+                          onChange={(event) =>
+                            setQuotaFeatureDraft((current) => ({
+                              ...current,
+                              [key]: event.target.checked,
+                            }))
+                          }
+                        />
+                      </label>
+                    ))}
+                    <div className="field" data-disabled>
+                      <span>自动向上补额</span>
+                      <input type="checkbox" checked={false} disabled />
+                      <span className="field-description">长期固定关闭；未知负向漂移进入人工处置。</span>
+                    </div>
+                  </div>
+                  <div className="toolbar toolbar-left">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={!data?.authorized || busy}
+                      onClick={() => void saveQuotaFeatureFlags()}
+                    >
+                      <SaveIcon data-icon="inline-start" />
+                      保存 F 开关
+                    </Button>
+                    <Badge variant={data?.settings?.quotaMigration ? "success" : "warning"}>
+                      {data?.settings?.quotaMigration ? "迁移门禁满足" : "迁移门禁未满足"}
+                    </Badge>
                   </div>
                 </section>
 

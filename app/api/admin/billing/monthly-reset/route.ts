@@ -1,8 +1,16 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { z } from "zod";
 import { requireAdminScope } from "@/lib/admin";
-import { runMonthlyBillingReset } from "@/lib/billing";
+import {
+  buildMonthlyPeriodOpenPlan,
+  enqueueMonthlyPeriodOpenPlan,
+} from "@/lib/billing";
 import { getConfig } from "@/lib/config";
+import {
+  assertQuotaWriteActionEnabled,
+  quotaFeatureErrorStatus,
+} from "@/lib/quota-guard";
+import { runQuotaOperation } from "@/lib/quota-saga";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -42,12 +50,43 @@ export async function POST(request: Request) {
     );
   }
 
-  const result = await runMonthlyBillingReset({
-    period: parsed.data.period,
-    dryRun: parsed.data.dryRun,
-    limit: parsed.data.limit,
-    operatedByFeishuUserId: auth.user.id,
-    operatedByOpenId: auth.user.openId,
-  });
-  return NextResponse.json(result);
+  if (!parsed.data.dryRun) {
+    try {
+      await assertQuotaWriteActionEnabled("monthly_open");
+    } catch (err) {
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : "月度开账当前未启用" },
+        { status: quotaFeatureErrorStatus(err) ?? 503 },
+      );
+    }
+  }
+
+  const plan = await buildMonthlyPeriodOpenPlan({ period: parsed.data.period });
+  if (parsed.data.dryRun) return NextResponse.json(plan);
+  if (plan.blocked) {
+    return NextResponse.json(
+      { error: "月度开账 preflight 存在阻塞项", plan },
+      { status: 409 },
+    );
+  }
+  let operations;
+  try {
+    operations = await enqueueMonthlyPeriodOpenPlan({
+      plan,
+      createdByOpenId: auth.user.openId,
+      limit: parsed.data.limit,
+    });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error: error instanceof Error ? error.message : "月度开账批量创建失败",
+        plan,
+      },
+      { status: 409 },
+    );
+  }
+  for (const operation of operations) {
+    after(() => runQuotaOperation(operation.id).catch(() => undefined));
+  }
+  return NextResponse.json({ ...plan, dryRun: false, operations }, { status: 202 });
 }

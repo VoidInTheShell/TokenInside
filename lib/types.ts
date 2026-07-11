@@ -24,7 +24,15 @@ export type ApprovalRouteReason =
   | "directory_lookup_failed"
   | "manual_fallback";
 
-export type TokenStatus = "active" | "disabled" | "revoked" | "replaced";
+export type TokenStatus =
+  | "pending_activation"
+  | "active"
+  | "draining"
+  | "settling"
+  | "replaced"
+  | "disabled"
+  | "orphaned"
+  | "revoked";
 
 export type ProxyRequestStatus =
   | "pending"
@@ -55,7 +63,13 @@ export type FeishuUser = {
 export type TokenRequest = {
   id: string;
   feishuUserId: string;
-  requestType: "first_apply" | "quota_reset" | "key_reset" | "quota_adjust" | "monthly_reset";
+  requestType:
+    | "first_apply"
+    | "quota_reset"
+    | "quota_restore"
+    | "key_reset"
+    | "quota_adjust"
+    | "monthly_reset";
   status: RequestStatus;
   reason: string;
   requestedMonthlyQuota: number;
@@ -91,6 +105,10 @@ export type TokenAccount = {
   keyHash: string;
   status: TokenStatus;
   billingPeriod: string;
+  operationGeneration?: number;
+  drainStartedAt?: string;
+  settledThrough?: string;
+  activatedAt?: string;
   createdAt: string;
   disabledAt?: string;
   replacedByTokenAccountId?: string;
@@ -160,6 +178,11 @@ export type ProxyRequestLog = {
   clientFamily?: string;
   clientIp?: string;
   userAgent?: string;
+  billingPeriod?: string;
+  operationGeneration?: number;
+  leaseExpiresAt?: string;
+  heartbeatAt?: string;
+  terminalStatus?: "completed" | "failed" | "cancelled";
   createdAt: string;
   updatedAt?: string;
 };
@@ -180,6 +203,7 @@ export type NewApiUsageRecord = {
   departmentId?: string;
   departmentName?: string;
   matchedProxyLogId?: string;
+  billingPeriod?: string;
   matchStatus: NewApiUsageMatchStatus;
   model?: string;
   promptTokens?: number;
@@ -221,6 +245,14 @@ export type UsageSyncCheckpoint = {
   lastRunBy?: "manual" | "auto";
   lastRunSummary?: Record<string, string | number | boolean | undefined>;
   nextRunAfter?: string;
+  runId?: string;
+  runStartedAt?: string;
+  scanStart?: string;
+  scanEnd?: string;
+  settledThrough?: string;
+  cursorPage?: number;
+  failureCount?: number;
+  nextRetryAt?: string;
   updatedAt: string;
 };
 
@@ -265,6 +297,14 @@ export type UserBillingPeriod = {
   tokenAccountIds: string[];
   assignedQuotaUpdatedAt?: string;
   assignedQuotaUpdatedByFeishuUserId?: string;
+  assignedMonthlyQuotaSnapshot?: number;
+  authorizedQuota?: number;
+  authoritativeConsumedQuota?: number;
+  expectedAvailableQuota?: number;
+  overageQuota?: number;
+  settledThrough?: string;
+  sourceVersion?: string;
+  materializedAt?: string;
   updatedAt: string;
 };
 
@@ -275,6 +315,12 @@ export type DepartmentQuotaPeriod = {
   period: string;
   quotaLimit: number;
   defaultGrantQuota: number;
+  budgetQuota?: number;
+  committedAuthorizedQuota?: number;
+  pendingReservedQuota?: number;
+  availableQuota?: number;
+  overcommittedQuota?: number;
+  materializedAt?: string;
   createdAt: string;
   updatedAt: string;
   updatedByFeishuUserId?: string;
@@ -345,6 +391,142 @@ export type AdminScope = {
   updatedAt: string;
 };
 
+export type QuotaOperationType =
+  | "first_provision"
+  | "quota_adjust"
+  | "key_rotation"
+  | "quota_restore"
+  | "monthly_open"
+  | "reconcile"
+  | "migration";
+
+export type QuotaOperationState =
+  | "planned"
+  | "budget_reserved"
+  | "local_prepared"
+  | "admission_closed"
+  | "upstream_frozen"
+  | "draining"
+  | "snapshot_stable"
+  | "upstream_applying"
+  | "upstream_applied"
+  | "upstream_activated"
+  | "local_finalized"
+  | "reconciling"
+  | "completed"
+  | "retryable_failed"
+  | "compensating"
+  | "compensated"
+  | "manual_review";
+
+export type UserQuotaPolicy = {
+  id: string;
+  feishuUserId: string;
+  assignedMonthlyQuota: number;
+  departmentId?: string;
+  effectiveFromPeriod: string;
+  effectiveToPeriod?: string;
+  sourceType: "first_apply" | "quota_adjust" | "department_allocate" | "migration" | "admin_correction";
+  sourceId: string;
+  version: number;
+  quotaPerUnitSnapshot: number;
+  createdAt: string;
+  updatedAt: string;
+  updatedByOpenId?: string;
+};
+
+export type QuotaOperation = {
+  id: string;
+  operationType: QuotaOperationType;
+  idempotencyKey: string;
+  feishuUserId: string;
+  departmentId?: string;
+  billingPeriod: string;
+  requestedAssignedQuota?: number;
+  assignedQuotaBefore?: number;
+  observedRemainBefore?: number;
+  targetRemainQuota?: number;
+  observedRemainAfter?: number;
+  reservedDepartmentQuota: number;
+  operationGeneration: number;
+  state: QuotaOperationState;
+  attemptCount: number;
+  nextRetryAt?: string;
+  workerLeaseId?: string;
+  workerLeaseExpiresAt?: string;
+  upstreamTokenIdBefore?: string;
+  upstreamTokenIdAfter?: string;
+  tokenAccountIdBefore?: string;
+  tokenAccountIdAfter?: string;
+  requestId?: string;
+  evidence?: Record<string, string | number | boolean | undefined>;
+  credentialCiphertext?: string;
+  credentialDeliveredAt?: string;
+  lastErrorCode?: string;
+  lastErrorMessage?: string;
+  createdByOpenId?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+};
+
+export type QuotaLedgerEntryType =
+  | "period_open_authorization"
+  | "quota_adjust_grant"
+  | "quota_adjust_release"
+  | "quota_restore_grant"
+  | "admin_correction_debit"
+  | "admin_correction_credit"
+  | "migration_opening"
+  | "operation_compensation";
+
+export type QuotaLedgerEntry = {
+  id: string;
+  operationId: string;
+  feishuUserId: string;
+  departmentId?: string;
+  period: string;
+  signedQuota: number;
+  entryType: QuotaLedgerEntryType;
+  quotaPerUnitSnapshot: number;
+  sourceType: string;
+  sourceId: string;
+  estimated?: boolean;
+  createdAt: string;
+};
+
+export type UserQuotaState = {
+  feishuUserId: string;
+  admission: "open" | "closed";
+  activeGeneration: number;
+  operationId?: string;
+  closedReason?: string;
+  updatedAt: string;
+};
+
+export type QuotaReconciliationStatus =
+  | "healthy"
+  | "excess_upstream"
+  | "deficit_upstream"
+  | "provisional"
+  | "manual_review";
+
+export type QuotaReconciliationRecord = {
+  id: string;
+  feishuUserId: string;
+  tokenAccountId?: string;
+  period: string;
+  expectedAvailableQuota: number;
+  observedRemainQuota?: number;
+  delta?: number;
+  status: QuotaReconciliationStatus;
+  settledThrough?: string;
+  operationId?: string;
+  evidence?: Record<string, string | number | boolean | undefined>;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type BillingOperationKind = "usage_sync" | "monthly_reset" | "settings_update";
 
 export type BillingOperationStatus = "dry_run" | "applied" | "partial_failed" | "failed";
@@ -369,7 +551,9 @@ export type UsageSyncPolicy = {
   pageSize: number;
   maxPagesPerRun: number;
   overlapMinutes: number;
+  settlementLagMinutes?: number;
   matchWindowMinutes: number;
+  retryBaseMinutes?: number;
   updatedAt?: string;
   updatedByFeishuUserId?: string;
   lastRunAt?: string;
@@ -379,9 +563,28 @@ export type UsageSyncPolicy = {
   nextRunAfter?: string;
 };
 
+export type QuotaFeatureFlags = {
+  legacyAbsoluteQuotaWritesEnabled: boolean;
+  quotaLedgerShadowRead: boolean;
+  quotaSagaWritesEnabled: boolean;
+  keyRotationSagaEnabled: boolean;
+  quotaRestoreEnabled: boolean;
+  monthlyPeriodOpenEnabled: boolean;
+  reconciliationAutoDecreaseEnabled: boolean;
+  reconciliationAutoIncreaseEnabled: boolean;
+};
+
 export type AppSettings = {
   defaultMonthlyQuota: number;
   usageSyncPolicy?: UsageSyncPolicy;
+  quotaFeatureFlags?: QuotaFeatureFlags;
+  quotaMigration?: {
+    period: string;
+    appliedAt: string;
+    planHash: string;
+    users: number;
+    estimatedUsers: number;
+  };
   billingOperations?: BillingOperationRecord[];
   updatedAt?: string;
   updatedByFeishuUserId?: string;
@@ -397,6 +600,11 @@ export type StoreShape = {
   departmentQuotaPeriods: DepartmentQuotaPeriod[];
   departmentQuotaRequests: DepartmentQuotaRequest[];
   quotaChangeEvents: QuotaChangeEvent[];
+  userQuotaPolicies: UserQuotaPolicy[];
+  quotaOperations: QuotaOperation[];
+  quotaLedgerEntries: QuotaLedgerEntry[];
+  userQuotaStates: UserQuotaState[];
+  quotaReconciliationRecords: QuotaReconciliationRecord[];
   feishuEvents: FeishuEvent[];
   proxyRequestLogs: ProxyRequestLog[];
   newapiUsageRecords: NewApiUsageRecord[];

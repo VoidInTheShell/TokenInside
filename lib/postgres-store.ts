@@ -12,6 +12,9 @@ import type {
   NewApiUsageRecord,
   ProxyRequestLog,
   QuotaChangeEvent,
+  QuotaLedgerEntry,
+  QuotaOperation,
+  QuotaReconciliationRecord,
   RequestStatus,
   StoreShape,
   TokenAccount,
@@ -19,6 +22,8 @@ import type {
   TokenRequest,
   UsageSyncCheckpoint,
   UsageSyncIssue,
+  UserQuotaPolicy,
+  UserQuotaState,
   UserBillingPeriod,
 } from "@/lib/types";
 
@@ -34,6 +39,11 @@ export const REQUIRED_POSTGRES_TABLES = [
   "department_quota_periods",
   "department_quota_requests",
   "quota_change_events",
+  "user_quota_policies",
+  "quota_operations",
+  "quota_ledger_entries",
+  "user_quota_states",
+  "quota_reconciliation_records",
   "feishu_events",
   "proxy_request_logs",
   "newapi_usage_records",
@@ -210,8 +220,9 @@ async function saveTokenAccountRow(client: PoolClient, account: TokenAccount) {
   const result = await client.query<{ data: TokenAccount }>(
     `insert into token_accounts
       (id, feishu_user_id, token_request_id, newapi_token_id, key_hash,
-       status, billing_period, data, created_at, disabled_at)
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       status, billing_period, operation_generation, drain_started_at,
+       settled_through, activated_at, data, created_at, disabled_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
      on conflict (id) do update set
        feishu_user_id = excluded.feishu_user_id,
        token_request_id = excluded.token_request_id,
@@ -219,6 +230,10 @@ async function saveTokenAccountRow(client: PoolClient, account: TokenAccount) {
        key_hash = excluded.key_hash,
        status = excluded.status,
        billing_period = excluded.billing_period,
+       operation_generation = excluded.operation_generation,
+       drain_started_at = excluded.drain_started_at,
+       settled_through = excluded.settled_through,
+       activated_at = excluded.activated_at,
        data = excluded.data,
        disabled_at = excluded.disabled_at
      returning data`,
@@ -230,9 +245,158 @@ async function saveTokenAccountRow(client: PoolClient, account: TokenAccount) {
       account.keyHash,
       account.status,
       account.billingPeriod,
+      account.operationGeneration ?? 0,
+      account.drainStartedAt ?? null,
+      account.settledThrough ?? null,
+      account.activatedAt ?? null,
       account,
       account.createdAt,
       account.disabledAt ?? null,
+    ],
+  );
+  return result.rows[0].data;
+}
+
+async function saveUserQuotaPolicyRow(client: PoolClient, policy: UserQuotaPolicy) {
+  const result = await client.query<{ data: UserQuotaPolicy }>(
+    `insert into user_quota_policies
+      (id, feishu_user_id, department_id, effective_from_period, effective_to_period,
+       version, data, created_at, updated_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     on conflict (id) do update set
+       department_id = excluded.department_id,
+       effective_from_period = excluded.effective_from_period,
+       effective_to_period = excluded.effective_to_period,
+       version = excluded.version,
+       data = excluded.data,
+       updated_at = excluded.updated_at
+     returning data`,
+    [
+      policy.id,
+      policy.feishuUserId,
+      policy.departmentId ?? null,
+      policy.effectiveFromPeriod,
+      policy.effectiveToPeriod ?? null,
+      policy.version,
+      policy,
+      policy.createdAt,
+      policy.updatedAt,
+    ],
+  );
+  return result.rows[0].data;
+}
+
+async function saveQuotaOperationRow(client: PoolClient, operation: QuotaOperation) {
+  const result = await client.query<{ data: QuotaOperation }>(
+    `insert into quota_operations
+      (id, operation_type, idempotency_key, feishu_user_id, department_id,
+       billing_period, state, operation_generation, next_retry_at, data,
+       created_at, updated_at, completed_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+     on conflict (id) do update set
+       state = excluded.state,
+       next_retry_at = excluded.next_retry_at,
+       data = excluded.data,
+       updated_at = excluded.updated_at,
+       completed_at = excluded.completed_at
+     returning data`,
+    [
+      operation.id,
+      operation.operationType,
+      operation.idempotencyKey,
+      operation.feishuUserId,
+      operation.departmentId ?? null,
+      operation.billingPeriod,
+      operation.state,
+      operation.operationGeneration,
+      operation.nextRetryAt ?? null,
+      operation,
+      operation.createdAt,
+      operation.updatedAt,
+      operation.completedAt ?? null,
+    ],
+  );
+  return result.rows[0].data;
+}
+
+async function insertQuotaLedgerEntryRow(client: PoolClient, entry: QuotaLedgerEntry) {
+  const inserted = await client.query<{ data: QuotaLedgerEntry }>(
+    `insert into quota_ledger_entries
+      (id, operation_id, feishu_user_id, department_id, period, entry_type,
+       signed_quota, data, created_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     on conflict (operation_id, entry_type) do nothing
+     returning data`,
+    [
+      entry.id,
+      entry.operationId,
+      entry.feishuUserId,
+      entry.departmentId ?? null,
+      entry.period,
+      entry.entryType,
+      entry.signedQuota,
+      entry,
+      entry.createdAt,
+    ],
+  );
+  if (inserted.rows[0]) return inserted.rows[0].data;
+  const existing = await client.query<{ data: QuotaLedgerEntry }>(
+    `select data from quota_ledger_entries
+     where operation_id = $1 and entry_type = $2`,
+    [entry.operationId, entry.entryType],
+  );
+  return existing.rows[0].data;
+}
+
+async function saveUserQuotaStateRow(client: PoolClient, state: UserQuotaState) {
+  const result = await client.query<{ data: UserQuotaState }>(
+    `insert into user_quota_states
+      (feishu_user_id, admission, active_generation, operation_id, data, updated_at)
+     values ($1, $2, $3, $4, $5, $6)
+     on conflict (feishu_user_id) do update set
+       admission = excluded.admission,
+       active_generation = excluded.active_generation,
+       operation_id = excluded.operation_id,
+       data = excluded.data,
+       updated_at = excluded.updated_at
+     returning data`,
+    [
+      state.feishuUserId,
+      state.admission,
+      state.activeGeneration,
+      state.operationId ?? null,
+      state,
+      state.updatedAt,
+    ],
+  );
+  return result.rows[0].data;
+}
+
+async function saveQuotaReconciliationRow(
+  client: PoolClient,
+  record: QuotaReconciliationRecord,
+) {
+  const result = await client.query<{ data: QuotaReconciliationRecord }>(
+    `insert into quota_reconciliation_records
+      (id, feishu_user_id, token_account_id, period, status, operation_id,
+       data, created_at, updated_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     on conflict (id) do update set
+       status = excluded.status,
+       operation_id = excluded.operation_id,
+       data = excluded.data,
+       updated_at = excluded.updated_at
+     returning data`,
+    [
+      record.id,
+      record.feishuUserId,
+      record.tokenAccountId ?? null,
+      record.period,
+      record.status,
+      record.operationId ?? null,
+      record,
+      record.createdAt,
+      record.updatedAt,
     ],
   );
   return result.rows[0].data;
@@ -372,14 +536,19 @@ async function saveProxyLogRow(client: PoolClient, log: ProxyRequestLog) {
   const result = await client.query<{ data: ProxyRequestLog }>(
     `insert into proxy_request_logs
       (id, feishu_user_id, token_account_id, request_path, method, status_code,
+       billing_period, operation_generation, lease_expires_at, heartbeat_at,
        data, created_at)
-     values ($1, $2, $3, $4, $5, $6, $7, $8)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      on conflict (id) do update set
        feishu_user_id = excluded.feishu_user_id,
        token_account_id = excluded.token_account_id,
        request_path = excluded.request_path,
        method = excluded.method,
        status_code = excluded.status_code,
+       billing_period = excluded.billing_period,
+       operation_generation = excluded.operation_generation,
+       lease_expires_at = excluded.lease_expires_at,
+       heartbeat_at = excluded.heartbeat_at,
        data = excluded.data
      returning data`,
     [
@@ -389,6 +558,10 @@ async function saveProxyLogRow(client: PoolClient, log: ProxyRequestLog) {
       log.requestPath,
       log.method,
       log.statusCode,
+      log.billingPeriod ?? null,
+      log.operationGeneration ?? 0,
+      log.leaseExpiresAt ?? null,
+      log.heartbeatAt ?? null,
       log,
       log.createdAt,
     ],
@@ -651,6 +824,10 @@ async function syncPostgresBillingPeriodForUser(
   const requestById = new Map(requests.map((request) => [request.id, request]));
   const accountById = new Map(accounts.map((account) => [account.id, account]));
   const summary: UserBillingPeriod & { quotaUpdatedAt?: string; sourceUpdatedAt?: string } = {
+    // Legacy request/proxy aggregation and the F-stage ledger materialization share
+    // this row. Keep the ledger-authoritative fields until the F materializer
+    // refreshes them; otherwise an unrelated legacy sync silently erases them.
+    ...(existing ?? {}),
     id: existing?.id ?? randomId("bp"),
     feishuUserId,
     period,
@@ -692,7 +869,12 @@ async function syncPostgresBillingPeriodForUser(
     );
 
     const request = requestById.get(account.tokenRequestId);
-    if (request) {
+    if (
+      request &&
+      request.requestType !== "key_reset" &&
+      request.requestType !== "quota_reset" &&
+      request.requestType !== "quota_restore"
+    ) {
       setQuota(request.approvedMonthlyQuota ?? request.requestedMonthlyQuota, request.updatedAt);
       summary.sourceUpdatedAt = latestIso(summary.sourceUpdatedAt, request.updatedAt);
     }
@@ -701,8 +883,7 @@ async function syncPostgresBillingPeriodForUser(
   for (const request of requests) {
     if (
       request.status !== "provisioned" ||
-      (request.requestType !== "quota_reset" &&
-        request.requestType !== "quota_adjust" &&
+      (request.requestType !== "quota_adjust" &&
         request.requestType !== "monthly_reset") ||
       !request.tokenAccountId
     ) {
@@ -853,6 +1034,31 @@ export async function readPostgresStore(): Promise<StoreShape> {
         "quota_change_events",
         "created_at, id",
       ),
+      userQuotaPolicies: await readDataRows<UserQuotaPolicy>(
+        client,
+        "user_quota_policies",
+        "feishu_user_id, version, id",
+      ),
+      quotaOperations: await readDataRows<QuotaOperation>(
+        client,
+        "quota_operations",
+        "created_at, id",
+      ),
+      quotaLedgerEntries: await readDataRows<QuotaLedgerEntry>(
+        client,
+        "quota_ledger_entries",
+        "created_at, id",
+      ),
+      userQuotaStates: await readDataRows<UserQuotaState>(
+        client,
+        "user_quota_states",
+        "feishu_user_id",
+      ),
+      quotaReconciliationRecords: await readDataRows<QuotaReconciliationRecord>(
+        client,
+        "quota_reconciliation_records",
+        "created_at, id",
+      ),
       feishuEvents: await readDataRows<FeishuEvent>(client, "feishu_events", "created_at, id"),
       proxyRequestLogs: await readDataRows<ProxyRequestLog>(
         client,
@@ -910,6 +1116,291 @@ export async function mutatePostgresAppSettings<T>(
     await saveSettingsRow(client, settings);
     return result;
   });
+}
+
+export async function upsertPostgresUserQuotaPolicy(policy: UserQuotaPolicy) {
+  return withTransaction(async (client) => {
+    await client.query("select pg_advisory_xact_lock(hashtext($1))", [
+      `user-quota:${policy.feishuUserId}`,
+    ]);
+    return saveUserQuotaPolicyRow(client, policy);
+  });
+}
+
+export async function createPostgresQuotaOperation(operation: QuotaOperation) {
+  return withTransaction(async (client) => {
+    if (operation.departmentId) {
+      await client.query("select pg_advisory_xact_lock(hashtext($1))", [
+        `department-quota:${operation.departmentId}:${operation.billingPeriod}`,
+      ]);
+    }
+    await client.query("select pg_advisory_xact_lock(hashtext($1))", [
+      `user-quota:${operation.feishuUserId}`,
+    ]);
+    const idempotent = await client.query<{ data: QuotaOperation }>(
+      "select data from quota_operations where idempotency_key = $1",
+      [operation.idempotencyKey],
+    );
+    if (idempotent.rows[0]) return idempotent.rows[0].data;
+    const open = await client.query<{ data: QuotaOperation }>(
+      `select data from quota_operations
+       where feishu_user_id = $1
+         and state not in ('completed', 'compensated')
+       order by created_at desc
+       limit 1`,
+      [operation.feishuUserId],
+    );
+    if (open.rows[0]) {
+      throw new Error(`用户已有未完成额度操作: ${open.rows[0].data.id}`);
+    }
+    return saveQuotaOperationRow(client, operation);
+  });
+}
+
+export async function createPostgresMonthlyOpenOperations(
+  inputs: Array<{
+    feishuUserId: string;
+    departmentId: string;
+    billingPeriod: string;
+    assignedMonthlyQuota: number;
+    createdByOpenId?: string;
+  }>,
+) {
+  if (!inputs.length) return [];
+  return withTransaction(async (client) => {
+    const departments = [
+      ...new Set(inputs.map((item) => `${item.departmentId}:${item.billingPeriod}`)),
+    ].sort();
+    for (const department of departments) {
+      await client.query("select pg_advisory_xact_lock(hashtext($1))", [
+        `department-quota:${department}`,
+      ]);
+    }
+    for (const feishuUserId of [...new Set(inputs.map((item) => item.feishuUserId))].sort()) {
+      await client.query("select pg_advisory_xact_lock(hashtext($1))", [
+        `user-quota:${feishuUserId}`,
+      ]);
+    }
+
+    const operations: QuotaOperation[] = [];
+    const newInputs: typeof inputs = [];
+    for (const input of inputs) {
+      const idempotencyKey = `monthly-open:${input.billingPeriod}:${input.feishuUserId}`;
+      const idempotent = await client.query<{ data: QuotaOperation }>(
+        "select data from quota_operations where idempotency_key = $1",
+        [idempotencyKey],
+      );
+      if (idempotent.rows[0]) {
+        if (
+          idempotent.rows[0].data.requestedAssignedQuota !== input.assignedMonthlyQuota ||
+          idempotent.rows[0].data.departmentId !== input.departmentId
+        ) {
+          throw new Error(
+            `月度开账幂等记录与当前策略不一致: ${idempotent.rows[0].data.id}`,
+          );
+        }
+        operations.push(idempotent.rows[0].data);
+        continue;
+      }
+      const open = await client.query<{ data: QuotaOperation }>(
+        `select data from quota_operations
+         where feishu_user_id = $1 and state not in ('completed', 'compensated')
+         limit 1`,
+        [input.feishuUserId],
+      );
+      if (open.rows[0]) {
+        throw new Error(`用户已有未完成额度操作: ${open.rows[0].data.id}`);
+      }
+      newInputs.push(input);
+    }
+
+    for (const departmentKey of departments) {
+      const separator = departmentKey.lastIndexOf(":");
+      const departmentId = departmentKey.slice(0, separator);
+      const period = departmentKey.slice(separator + 1);
+      const requested = newInputs
+        .filter(
+          (item) => item.departmentId === departmentId && item.billingPeriod === period,
+        )
+        .reduce((sum, item) => sum + item.assignedMonthlyQuota, 0);
+      if (requested === 0) continue;
+      const policy = await client.query<{ data: DepartmentQuotaPeriod }>(
+        `select data from department_quota_periods
+         where department_id = $1 and period = $2
+         for update`,
+        [departmentId, period],
+      );
+      if (!policy.rows[0]) throw new Error(`部门 ${departmentId} 缺少 ${period} 账期预算`);
+      const budgetQuota = Math.max(
+        Math.round(policy.rows[0].data.quotaLimit * getConfig().newapi.quotaPerUnit),
+        0,
+      );
+      const committed = await client.query<{ quota: string }>(
+        `select coalesce(sum(signed_quota), 0)::text as quota
+         from quota_ledger_entries
+         where department_id = $1 and period = $2`,
+        [departmentId, period],
+      );
+      const pending = await client.query<{ quota: string }>(
+        `select coalesce(sum(greatest(coalesce((data->>'reservedDepartmentQuota')::bigint, 0), 0)), 0)::text as quota
+         from quota_operations
+         where department_id = $1 and billing_period = $2
+           and state not in ('completed', 'compensated')`,
+        [departmentId, period],
+      );
+      const available = Math.max(
+        budgetQuota -
+          Math.max(Number(committed.rows[0]?.quota ?? 0), 0) -
+          Math.max(Number(pending.rows[0]?.quota ?? 0), 0),
+        0,
+      );
+      if (requested > available) {
+        throw new Error(`部门 ${departmentId} 可用额度不足，月度开账整批未创建`);
+      }
+    }
+
+    for (const input of newInputs) {
+      const stateResult = await client.query<{ data: UserQuotaState }>(
+        "select data from user_quota_states where feishu_user_id = $1",
+        [input.feishuUserId],
+      );
+      const generationResult = await client.query<{ generation: number }>(
+        `select coalesce(max(operation_generation), 0)::integer as generation
+         from token_accounts where feishu_user_id = $1`,
+        [input.feishuUserId],
+      );
+      const now = nowIso();
+      const operation: QuotaOperation = {
+        id: randomId("qo"),
+        operationType: "monthly_open",
+        idempotencyKey: `monthly-open:${input.billingPeriod}:${input.feishuUserId}`,
+        feishuUserId: input.feishuUserId,
+        departmentId: input.departmentId,
+        billingPeriod: input.billingPeriod,
+        requestedAssignedQuota: input.assignedMonthlyQuota,
+        reservedDepartmentQuota: input.assignedMonthlyQuota,
+        operationGeneration:
+          (stateResult.rows[0]?.data.activeGeneration ??
+            generationResult.rows[0]?.generation ??
+            0) + 1,
+        state: "budget_reserved",
+        attemptCount: 0,
+        createdByOpenId: input.createdByOpenId,
+        createdAt: now,
+        updatedAt: now,
+      };
+      operations.push(await saveQuotaOperationRow(client, operation));
+    }
+    return operations;
+  });
+}
+
+export async function updatePostgresQuotaOperation(
+  operationId: string,
+  patch: Partial<QuotaOperation>,
+  allowedStates?: QuotaOperation["state"][],
+) {
+  return withTransaction(async (client) => {
+    const current = await client.query<{ data: QuotaOperation }>(
+      "select data from quota_operations where id = $1 for update",
+      [operationId],
+    );
+    const operation = current.rows[0]?.data;
+    if (!operation || (allowedStates && !allowedStates.includes(operation.state))) return null;
+    const updated: QuotaOperation = {
+      ...operation,
+      ...patch,
+      id: operation.id,
+      idempotencyKey: operation.idempotencyKey,
+      updatedAt: patch.updatedAt ?? nowIso(),
+    };
+    return saveQuotaOperationRow(client, updated);
+  });
+}
+
+export async function claimPostgresQuotaOperationExecution(input: {
+  operationId: string;
+  leaseId: string;
+  leaseExpiresAt: string;
+}) {
+  return withTransaction(async (client) => {
+    const current = await client.query<{ data: QuotaOperation }>(
+      "select data from quota_operations where id = $1 for update",
+      [input.operationId],
+    );
+    const operation = current.rows[0]?.data;
+    if (!operation) return null;
+    if (
+      operation.workerLeaseId &&
+      operation.workerLeaseId !== input.leaseId &&
+      operation.workerLeaseExpiresAt &&
+      operation.workerLeaseExpiresAt > nowIso()
+    ) {
+      return null;
+    }
+    return saveQuotaOperationRow(client, {
+      ...operation,
+      workerLeaseId: input.leaseId,
+      workerLeaseExpiresAt: input.leaseExpiresAt,
+    });
+  });
+}
+
+export async function renewPostgresQuotaOperationExecution(input: {
+  operationId: string;
+  leaseId: string;
+  leaseExpiresAt: string;
+}) {
+  return withTransaction(async (client) => {
+    const current = await client.query<{ data: QuotaOperation }>(
+      "select data from quota_operations where id = $1 for update",
+      [input.operationId],
+    );
+    const operation = current.rows[0]?.data;
+    if (!operation || operation.workerLeaseId !== input.leaseId) return null;
+    return saveQuotaOperationRow(client, {
+      ...operation,
+      workerLeaseExpiresAt: input.leaseExpiresAt,
+    });
+  });
+}
+
+export async function releasePostgresQuotaOperationExecution(input: {
+  operationId: string;
+  leaseId: string;
+}) {
+  return withTransaction(async (client) => {
+    const current = await client.query<{ data: QuotaOperation }>(
+      "select data from quota_operations where id = $1 for update",
+      [input.operationId],
+    );
+    const operation = current.rows[0]?.data;
+    if (!operation || operation.workerLeaseId !== input.leaseId) return operation ?? null;
+    return saveQuotaOperationRow(client, {
+      ...operation,
+      workerLeaseId: undefined,
+      workerLeaseExpiresAt: undefined,
+    });
+  });
+}
+
+export async function insertPostgresQuotaLedgerEntry(entry: QuotaLedgerEntry) {
+  return withTransaction((client) => insertQuotaLedgerEntryRow(client, entry));
+}
+
+export async function upsertPostgresUserQuotaState(state: UserQuotaState) {
+  return withTransaction(async (client) => {
+    await client.query("select pg_advisory_xact_lock(hashtext($1))", [
+      `user-quota:${state.feishuUserId}`,
+    ]);
+    return saveUserQuotaStateRow(client, state);
+  });
+}
+
+export async function upsertPostgresQuotaReconciliationRecord(
+  record: QuotaReconciliationRecord,
+) {
+  return withTransaction((client) => saveQuotaReconciliationRow(client, record));
 }
 
 export async function upsertPostgresFeishuUser(input: {
@@ -1140,7 +1631,7 @@ export async function findPostgresActiveTokenByHash(keyHash: string) {
   return withClient(async (client) => {
     const result = await client.query<{ data: TokenAccount }>(
       `select data from token_accounts
-       where key_hash = $1 and status = 'active'
+       where key_hash = $1 and status in ('active', 'draining', 'settling')
        limit 1`,
       [keyHash],
     );
@@ -1157,6 +1648,28 @@ export async function insertPostgresTokenAccount(account: TokenAccount) {
       stored.billingPeriod || periodFromIso(stored.createdAt),
     );
     return stored;
+  });
+}
+
+export async function updatePostgresTokenAccount(
+  accountId: string,
+  patch: Partial<TokenAccount>,
+  allowedStatuses?: TokenStatus[],
+) {
+  return withTransaction(async (client) => {
+    const result = await client.query<{ data: TokenAccount }>(
+      "select data from token_accounts where id = $1 for update",
+      [accountId],
+    );
+    const account = result.rows[0]?.data;
+    if (!account || (allowedStatuses && !allowedStatuses.includes(account.status))) return null;
+    return saveTokenAccountRow(client, {
+      ...account,
+      ...patch,
+      id: account.id,
+      feishuUserId: account.feishuUserId,
+      keyHash: account.keyHash,
+    });
   });
 }
 
@@ -1194,6 +1707,95 @@ export async function replacePostgresActiveTokenAccount(input: {
       stored.billingPeriod || periodFromIso(stored.createdAt),
     );
     return stored;
+  });
+}
+
+export async function finalizePostgresTokenRotation(input: {
+  feishuUserId: string;
+  oldTokenAccountId: string;
+  newTokenAccountId: string;
+  operationGeneration: number;
+  operationId: string;
+  now: string;
+}) {
+  return withTransaction(async (client) => {
+    await client.query("select pg_advisory_xact_lock(hashtext($1))", [
+      `user-quota:${input.feishuUserId}`,
+    ]);
+    const result = await client.query<{ data: TokenAccount }>(
+      `select data from token_accounts
+       where id = any($1::text[])
+       order by id
+       for update`,
+      [[input.oldTokenAccountId, input.newTokenAccountId]],
+    );
+    const accounts = new Map(result.rows.map((row) => [row.data.id, row.data]));
+    const oldAccount = accounts.get(input.oldTokenAccountId);
+    const newAccount = accounts.get(input.newTokenAccountId);
+    if (!oldAccount || !newAccount) throw new Error("Key 轮换本地账号记录不完整");
+    const storedOld = await saveTokenAccountRow(client, {
+      ...oldAccount,
+      status: "replaced",
+      disabledAt: input.now,
+      replacedByTokenAccountId: newAccount.id,
+    });
+    const storedNew = await saveTokenAccountRow(client, {
+      ...newAccount,
+      status: "active",
+      operationGeneration: input.operationGeneration,
+      activatedAt: input.now,
+    });
+    const state = await saveUserQuotaStateRow(client, {
+      feishuUserId: input.feishuUserId,
+      admission: "open",
+      activeGeneration: input.operationGeneration,
+      operationId: undefined,
+      closedReason: undefined,
+      updatedAt: input.now,
+    });
+    return { oldAccount: storedOld, newAccount: storedNew, state };
+  });
+}
+
+export async function finalizePostgresTokenProvision(input: {
+  feishuUserId: string;
+  tokenAccountId: string;
+  operationGeneration: number;
+  now: string;
+}) {
+  return withTransaction(async (client) => {
+    await client.query("select pg_advisory_xact_lock(hashtext($1))", [
+      `user-quota:${input.feishuUserId}`,
+    ]);
+    const accountResult = await client.query<{ data: TokenAccount }>(
+      `select data from token_accounts
+       where id = $1 and feishu_user_id = $2
+       for update`,
+      [input.tokenAccountId, input.feishuUserId],
+    );
+    const account = accountResult.rows[0]?.data;
+    if (!account) throw new Error("首次发放本地 TokenAccount 不存在");
+    const otherActive = await client.query<{ id: string }>(
+      `select id from token_accounts
+       where feishu_user_id = $1 and status = 'active' and id <> $2
+       limit 1
+       for update`,
+      [input.feishuUserId, input.tokenAccountId],
+    );
+    if (otherActive.rows[0]) throw new Error("首次发放期间用户已出现其他 active Key");
+    const storedAccount = await saveTokenAccountRow(client, {
+      ...account,
+      status: "active",
+      operationGeneration: input.operationGeneration,
+      activatedAt: account.activatedAt ?? input.now,
+    });
+    const state = await saveUserQuotaStateRow(client, {
+      feishuUserId: input.feishuUserId,
+      admission: "open",
+      activeGeneration: input.operationGeneration,
+      updatedAt: input.now,
+    });
+    return { account: storedAccount, state };
   });
 }
 

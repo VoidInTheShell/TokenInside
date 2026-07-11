@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   BarChart3Icon,
@@ -154,6 +155,15 @@ type AdminTokenRequestsResponse = {
   error?: string;
 };
 
+type SelfQuotaOperation = {
+  id: string;
+  operationType: string;
+  state: string;
+  lastErrorMessage?: string;
+  credentialPendingDelivery?: boolean;
+  updatedAt: string;
+};
+
 type WorkspacePanel = "account" | "usage" | "models" | "requests";
 
 const DEFAULT_REASON_PLACEHOLDER = "请说明使用场景、接入工具和预计调用方式。";
@@ -179,10 +189,11 @@ const statusLabel: Record<string, string> = {
 
 const requestTypeLabel: Record<string, string> = {
   first_apply: "首次申请",
-  quota_reset: "额度重置",
-  key_reset: "key 重置",
+  quota_reset: "恢复可用额度",
+  quota_restore: "恢复可用额度",
+  key_reset: "Key 轮换",
   quota_adjust: "额度调整",
-  monthly_reset: "月度重置",
+  monthly_reset: "月度开账",
 };
 
 function badgeVariant(status?: string) {
@@ -305,6 +316,7 @@ export function ExperienceClient() {
   const [quickApprovalBusy, setQuickApprovalBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [key, setKey] = useState<string | null>(null);
+  const [quotaOperation, setQuotaOperation] = useState<SelfQuotaOperation | null>(null);
   const [reason, setReason] = useState("");
   const [quotaResetReason, setQuotaResetReason] = useState("");
   const [quickApprovalQuotaDrafts, setQuickApprovalQuotaDrafts] = useState<Record<string, string>>({});
@@ -427,6 +439,7 @@ export function ExperienceClient() {
         params.set("limit", String(RECENT_APPROVAL_LIMIT));
         params.set("offset", String(offset));
         params.set("createdAfter", createdAfter);
+        params.set("decisionRequired", "true");
         const res = await fetch(`/api/admin/token-requests?${params.toString()}`, { cache: "no-store" });
         const data = (await res.json()) as AdminTokenRequestsResponse;
         if (!res.ok) throw new Error(data.error ?? "读取最近24小时审批请求失败");
@@ -464,6 +477,94 @@ export function ExperienceClient() {
   useEffect(() => {
     void loadQuickApprovals();
   }, [loadQuickApprovals]);
+
+  useEffect(() => {
+    if (!session?.authenticated) return;
+    let cancelled = false;
+    void fetch("/api/quota-operations", { cache: "no-store" })
+      .then(async (res) => {
+        const body = (await res.json().catch(() => ({}))) as {
+          operations?: SelfQuotaOperation[];
+        };
+        if (!res.ok || cancelled) return;
+        const resumable = body.operations?.find(
+          (operation) =>
+            (operation.operationType === "key_rotation" ||
+              operation.operationType === "first_provision") &&
+            (operation.credentialPendingDelivery ||
+              !["completed", "compensated", "manual_review"].includes(operation.state)),
+        );
+        if (resumable) setQuotaOperation(resumable);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.authenticated]);
+
+  useEffect(() => {
+    if (!quotaOperation) return;
+    if (["compensated", "manual_review"].includes(quotaOperation.state)) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const res = await fetch(`/api/quota-operations/${encodeURIComponent(quotaOperation.id)}`, {
+          cache: "no-store",
+        });
+        const body = (await res.json().catch(() => ({}))) as {
+          operation?: SelfQuotaOperation;
+          key?: string;
+          error?: string;
+        };
+        if (!res.ok) throw new Error(body.error ?? "读取额度操作失败");
+        if (cancelled || !body.operation) return;
+        setQuotaOperation(body.operation);
+        if (body.key) {
+          setKey(body.key);
+          setModels([]);
+          setModelsLoaded(false);
+          try {
+            await navigator.clipboard.writeText(body.key);
+            setMessage(
+              body.operation.operationType === "first_provision"
+                ? "首次发放已完成，Key 已展示并复制。"
+                : "Key 安全轮换已完成，新 Key 已展示并复制。旧 Key 已失效。",
+            );
+          } catch {
+            setMessage(
+              body.operation.operationType === "first_provision"
+                ? "首次发放已完成，Key 已展示。"
+                : "Key 安全轮换已完成，新 Key 已展示。旧 Key 已失效。",
+            );
+          }
+          await refresh();
+          return;
+        }
+        if (body.operation.state === "completed") {
+          setMessage(
+            body.operation.operationType === "first_provision"
+              ? "首次发放已完成。Key 凭据已在此前受控交付。"
+              : "Key 安全轮换已完成。新 Key 凭据已在此前受控交付。",
+          );
+          await refresh();
+          return;
+        }
+        if (body.operation.state === "manual_review") {
+          setError(body.operation.lastErrorMessage ?? "Key 轮换需要管理员人工处置");
+          return;
+        }
+        timer = window.setTimeout(poll, 1500);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : "读取额度操作失败");
+      }
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [quotaOperation?.id, quotaOperation?.state, refresh]);
 
   useEffect(() => {
     if (panel === "models" && session?.activeToken && !modelsLoaded && !modelsLoading) {
@@ -589,7 +690,7 @@ export function ExperienceClient() {
   }
 
   async function resetKey() {
-    if (!window.confirm("重置后旧 key 将失效，并生成新的 active key。")) return;
+    if (!window.confirm("安全轮换会先排空在途请求，再停用旧 Key 并交付新 Key。是否继续？")) return;
     setBusy(true);
     setError(null);
     setMessage(null);
@@ -597,17 +698,21 @@ export function ExperienceClient() {
       const res = await fetch("/api/token/reset", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ reason: "用户在 TokenInside 用户后台发起 key reset" }),
+        body: JSON.stringify({
+          reason: "用户在 TokenInside 用户后台发起 Key 安全轮换",
+          clientRequestId: window.crypto.randomUUID(),
+        }),
       });
-      const body = await res.json().catch(() => ({}));
+      const body = (await res.json().catch(() => ({}))) as {
+        operation?: SelfQuotaOperation;
+        error?: string;
+      };
       if (!res.ok) throw new Error(body.error ?? "重置 key 失败");
-      setKey(body.key ?? null);
-      setModels([]);
-      setModelsLoaded(false);
-      setMessage("key 已重置。");
-      await refresh();
+      if (!body.operation) throw new Error("服务端未返回 Key 轮换操作");
+      setQuotaOperation(body.operation);
+      setMessage("Key 安全轮换已受理，系统正在排空在途请求并执行写后校验。");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "重置 key 失败");
+      setError(err instanceof Error ? err.message : "Key 安全轮换失败");
     } finally {
       setBusy(false);
     }
@@ -624,12 +729,12 @@ export function ExperienceClient() {
         body: JSON.stringify({ reason: quotaResetReason.trim() }),
       });
       const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.error ?? "提交额度重置申请失败");
+      if (!res.ok) throw new Error(body.error ?? "提交额度恢复申请失败");
       setQuotaResetReason("");
-      setMessage(body.notice ?? "额度重置申请已提交。");
+      setMessage(body.notice ?? "恢复可用额度申请已提交。");
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "提交额度重置申请失败");
+      setError(err instanceof Error ? err.message : "提交额度恢复申请失败");
     } finally {
       setBusy(false);
     }
@@ -710,7 +815,15 @@ export function ExperienceClient() {
         <aside className={mobileNavOpen ? "sidebar sidebar-open" : "sidebar"}>
           <div className="sidebar-head">
             <div className="brand">
-              <div className="brand-mark">TI</div>
+              <Image
+                className="brand-mark"
+                src="/icon.svg"
+                alt=""
+                aria-hidden="true"
+                width={36}
+                height={36}
+                priority
+              />
               <div>
                 <h1 className="brand-title">TokenInside</h1>
                 <p className="brand-subtitle">共绩科技</p>
@@ -1066,10 +1179,24 @@ export function ExperienceClient() {
                               onClick={() => void resetKey()}
                             >
                               <RefreshCwIcon data-icon="inline-start" />
-                              重置
+                              安全轮换
                             </Button>
                           </div>
                         </div>
+                        {quotaOperation && (
+                          <div className="toolbar toolbar-left">
+                            <Badge variant={badgeVariant(quotaOperation.state)}>
+                              {quotaOperation.operationType === "first_provision"
+                                ? "首次发放"
+                                : "Key 轮换"}
+                              ：{quotaOperation.state}
+                            </Badge>
+                            <span className="field-description">
+                              {quotaOperation.lastErrorMessage ??
+                                "新 Key 只会在 completed 后受控展示一次。"}
+                            </span>
+                          </div>
+                        )}
                       </div>
                     </CardContent>
                   </Card>
@@ -1138,23 +1265,23 @@ export function ExperienceClient() {
 
                     <Card>
                       <CardHeader>
-                        <CardTitle>额度重置</CardTitle>
+                        <CardTitle>恢复可用额度</CardTitle>
                         <CardDescription>
                           {session?.adminScope?.type === "department"
-                            ? "部门管理员的个人额度请求会发送给系统管理员；通过后重置当前 active key 额度。"
-                            : "提交后按组织审批链路发送；通过后重置当前 active key 额度。"}
+                            ? "部门管理员的个人恢复请求会发送给系统管理员；通过后仅补足低于授权线的差额。"
+                            : "提交后按组织审批链路发送；通过后仅补足低于授权线的差额，不返还已消费额度。"}
                         </CardDescription>
                       </CardHeader>
                       <CardContent>
                         <div className="field-group">
                           <div className="field">
-                            <label htmlFor="quotaResetAmount">重置目标额度</label>
+                            <label htmlFor="quotaResetAmount">授权恢复线</label>
                             <Input
                               id="quotaResetAmount"
                               value={String(defaultMonthlyQuota)}
                               disabled
                             />
-                            <span className="field-description">以管理后台当前默认额度为准。</span>
+                            <span className="field-description">实际新增额度会受部门剩余预算约束。</span>
                           </div>
                           <div className="field">
                             <label htmlFor="quotaResetReason">申请理由</label>
@@ -1172,7 +1299,7 @@ export function ExperienceClient() {
                             onClick={() => void requestQuotaReset()}
                           >
                             <RefreshCwIcon data-icon="inline-start" />
-                            申请额度重置
+                            申请恢复可用额度
                           </Button>
                         </div>
                       </CardContent>

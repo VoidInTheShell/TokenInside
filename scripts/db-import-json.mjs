@@ -38,6 +38,11 @@ const summary = {
   departmentQuotaPeriods: count("departmentQuotaPeriods"),
   departmentQuotaRequests: count("departmentQuotaRequests"),
   quotaChangeEvents: count("quotaChangeEvents"),
+  userQuotaPolicies: count("userQuotaPolicies"),
+  quotaOperations: count("quotaOperations"),
+  quotaLedgerEntries: count("quotaLedgerEntries"),
+  userQuotaStates: count("userQuotaStates"),
+  quotaReconciliationRecords: count("quotaReconciliationRecords"),
   feishuEvents: count("feishuEvents"),
   proxyRequestLogs: count("proxyRequestLogs"),
   newapiUsageRecords: count("newapiUsageRecords"),
@@ -62,6 +67,7 @@ if (!confirmReplace) {
 const client = await pool.connect();
 try {
   await client.query("begin");
+  await client.query("set local tokeninside.allow_ledger_rewrite = 'on'");
   await client.query("delete from app_settings");
   await client.query("delete from admin_scopes");
   await client.query("delete from usage_sync_issues");
@@ -70,6 +76,11 @@ try {
   await client.query("delete from proxy_request_logs");
   await client.query("delete from feishu_events");
   await client.query("delete from quota_change_events");
+  await client.query("delete from quota_reconciliation_records");
+  await client.query("delete from quota_ledger_entries");
+  await client.query("delete from quota_operations");
+  await client.query("delete from user_quota_states");
+  await client.query("delete from user_quota_policies");
   await client.query("delete from department_quota_requests");
   await client.query("delete from department_quota_periods");
   await client.query("delete from user_billing_periods");
@@ -120,8 +131,9 @@ try {
   await insertRows(client, store.tokenAccounts, (account) => ({
     sql: `insert into token_accounts
       (id, feishu_user_id, token_request_id, newapi_token_id, key_hash,
-       status, billing_period, data, created_at, disabled_at)
-      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+       status, billing_period, operation_generation, drain_started_at,
+       settled_through, activated_at, data, created_at, disabled_at)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
     values: [
       account.id,
       account.feishuUserId,
@@ -130,6 +142,10 @@ try {
       account.keyHash,
       account.status,
       account.billingPeriod,
+      account.operationGeneration ?? 0,
+      account.drainStartedAt ?? null,
+      account.settledThrough ?? null,
+      account.activatedAt ?? null,
       account,
       account.createdAt,
       account.disabledAt ?? null,
@@ -194,6 +210,55 @@ try {
     ],
   }));
 
+  await insertRows(client, store.userQuotaPolicies, (policy) => ({
+    sql: `insert into user_quota_policies
+      (id, feishu_user_id, department_id, effective_from_period, effective_to_period,
+       version, data, created_at, updated_at)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    values: [policy.id, policy.feishuUserId, policy.departmentId ?? null,
+      policy.effectiveFromPeriod, policy.effectiveToPeriod ?? null, policy.version,
+      policy, policy.createdAt, policy.updatedAt],
+  }));
+
+  await insertRows(client, store.quotaOperations, (operation) => ({
+    sql: `insert into quota_operations
+      (id, operation_type, idempotency_key, feishu_user_id, department_id,
+       billing_period, state, operation_generation, next_retry_at, data,
+       created_at, updated_at, completed_at)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+    values: [operation.id, operation.operationType, operation.idempotencyKey,
+      operation.feishuUserId, operation.departmentId ?? null, operation.billingPeriod,
+      operation.state, operation.operationGeneration, operation.nextRetryAt ?? null,
+      operation, operation.createdAt, operation.updatedAt, operation.completedAt ?? null],
+  }));
+
+  await insertRows(client, store.quotaLedgerEntries, (entry) => ({
+    sql: `insert into quota_ledger_entries
+      (id, operation_id, feishu_user_id, department_id, period, entry_type,
+       signed_quota, data, created_at)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    values: [entry.id, entry.operationId, entry.feishuUserId, entry.departmentId ?? null,
+      entry.period, entry.entryType, entry.signedQuota, entry, entry.createdAt],
+  }));
+
+  await insertRows(client, store.userQuotaStates, (state) => ({
+    sql: `insert into user_quota_states
+      (feishu_user_id, admission, active_generation, operation_id, data, updated_at)
+      values ($1,$2,$3,$4,$5,$6)`,
+    values: [state.feishuUserId, state.admission, state.activeGeneration,
+      state.operationId ?? null, state, state.updatedAt],
+  }));
+
+  await insertRows(client, store.quotaReconciliationRecords, (record) => ({
+    sql: `insert into quota_reconciliation_records
+      (id, feishu_user_id, token_account_id, period, status, operation_id,
+       data, created_at, updated_at)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    values: [record.id, record.feishuUserId, record.tokenAccountId ?? null,
+      record.period, record.status, record.operationId ?? null,
+      record, record.createdAt, record.updatedAt],
+  }));
+
   await insertRows(client, store.feishuEvents, (event) => ({
     sql: `insert into feishu_events
       (id, event_uuid, event_type, instance_code, card_request_id, card_action,
@@ -217,8 +282,9 @@ try {
   await insertRows(client, store.proxyRequestLogs, (log) => ({
     sql: `insert into proxy_request_logs
       (id, feishu_user_id, token_account_id, request_path, method, status_code,
+       billing_period, operation_generation, lease_expires_at, heartbeat_at,
        data, created_at)
-      values ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
     values: [
       log.id,
       log.feishuUserId ?? null,
@@ -226,6 +292,10 @@ try {
       log.requestPath,
       log.method,
       log.statusCode,
+      log.billingPeriod ?? null,
+      log.operationGeneration ?? 0,
+      log.leaseExpiresAt ?? null,
+      log.heartbeatAt ?? null,
       log,
       log.createdAt,
     ],
