@@ -92,6 +92,36 @@ test("global administrators retain access to every request", () => {
   assert.equal(tokenRequestInAdminScope(request({ feishuUserId: "missing-user" }), scope, users), true);
 });
 
+test("department administrators cannot approve requests explicitly routed to system administrators", () => {
+  const systemAdminRequest = request({
+    feishuUserId: "requester-a",
+    approvalDepartmentId: "department-a",
+    approvalTargetSource: "system_admin_fallback",
+    approvalRouteReason: "applicant_is_department_admin",
+  });
+
+  assert.equal(
+    tokenRequestInAdminScope(systemAdminRequest, departmentScope("department-a"), users),
+    false,
+  );
+  assert.equal(
+    tokenRequestInAdminScope(
+      systemAdminRequest,
+      {
+        id: "global",
+        feishuUserId: "global-admin",
+        scopeType: "global",
+        source: "manual",
+        status: "active",
+        createdAt: now,
+        updatedAt: now,
+      },
+      users,
+    ),
+    true,
+  );
+});
+
 test("department administrators cannot read a system administrator request from their own department", () => {
   const systemAdminRequest = request({
     feishuUserId: "requester-a",

@@ -86,6 +86,51 @@ const statements = [
     updated_at timestamptz not null,
     unique (feishu_user_id, period)
   )`,
+  `create table if not exists department_quota_periods (
+    id text primary key,
+    department_id text not null,
+    period text not null,
+    data jsonb not null,
+    created_at timestamptz not null,
+    updated_at timestamptz not null,
+    unique (department_id, period)
+  )`,
+  `create index if not exists department_quota_periods_period_idx
+    on department_quota_periods (period, department_id)`,
+  `create table if not exists department_quota_requests (
+    id text primary key,
+    department_id text not null,
+    requester_feishu_user_id text not null,
+    period text not null,
+    status text not null,
+    approval_target_open_id text not null,
+    approval_action_nonce_hash text not null,
+    data jsonb not null,
+    created_at timestamptz not null,
+    updated_at timestamptz not null
+  )`,
+  `create unique index if not exists department_quota_requests_nonce_unique
+    on department_quota_requests (approval_action_nonce_hash)`,
+  `create index if not exists department_quota_requests_target_status_idx
+    on department_quota_requests (approval_target_open_id, status)`,
+  `create index if not exists department_quota_requests_department_created_idx
+    on department_quota_requests (department_id, created_at)`,
+  `create table if not exists quota_change_events (
+    id text primary key,
+    department_id text not null,
+    feishu_user_id text,
+    period text not null,
+    status text not null,
+    related_token_request_id text,
+    data jsonb not null,
+    created_at timestamptz not null,
+    updated_at timestamptz not null
+  )`,
+  `create unique index if not exists quota_change_events_token_request_unique
+    on quota_change_events (related_token_request_id)
+    where related_token_request_id is not null`,
+  `create index if not exists quota_change_events_department_period_status_idx
+    on quota_change_events (department_id, period, status)`,
   `create table if not exists feishu_events (
     id text primary key,
     event_uuid text not null unique,
@@ -226,6 +271,35 @@ const statements = [
   `insert into app_settings (id, data)
     values ('default', '{"defaultMonthlyQuota":200}'::jsonb)
     on conflict (id) do nothing`,
+  `insert into department_quota_periods
+    (id, department_id, period, data, created_at, updated_at)
+   select
+     'dqp_' || md5(user_row.department_id || ':' || to_char(current_date, 'YYYY-MM')),
+     user_row.department_id,
+     to_char(current_date, 'YYYY-MM'),
+     jsonb_build_object(
+       'id', 'dqp_' || md5(user_row.department_id || ':' || to_char(current_date, 'YYYY-MM')),
+       'departmentId', user_row.department_id,
+       'departmentName', max(user_row.data->>'departmentName'),
+       'period', to_char(current_date, 'YYYY-MM'),
+       'quotaLimit', coalesce(sum((billing.data->>'monthlyQuota')::numeric), 0)::int,
+       'defaultGrantQuota', coalesce(
+         (select (settings.data->>'defaultMonthlyQuota')::int
+            from app_settings settings where settings.id = 'default'),
+         200
+       ),
+       'createdAt', now(),
+       'updatedAt', now()
+     ),
+     now(),
+     now()
+   from feishu_users user_row
+   left join user_billing_periods billing
+     on billing.feishu_user_id = user_row.id
+    and billing.period = to_char(current_date, 'YYYY-MM')
+   where user_row.department_id is not null
+   group by user_row.department_id
+   on conflict (department_id, period) do nothing`,
 ];
 
 const client = await pool.connect();

@@ -10,7 +10,7 @@ import { getCurrentUser } from "@/lib/session";
 import {
   createTokenRequest,
   getActiveTokenForUser,
-  getAppSettings,
+  getEffectiveUserGrantQuota,
   listUserTokenRequests,
   updateTokenRequest,
 } from "@/lib/store";
@@ -61,8 +61,7 @@ export async function POST(request: Request) {
     }
 
     const input = quotaResetSchema.parse(await request.json());
-    const settings = await getAppSettings();
-    const requestedMonthlyQuota = settings.defaultMonthlyQuota;
+    const requestedMonthlyQuota = await getEffectiveUserGrantQuota(user.id);
     const nonce = randomId("card");
     const tokenRequest = await createTokenRequest({
       feishuUserId: user.id,
@@ -76,12 +75,18 @@ export async function POST(request: Request) {
 
     let routeResolved = false;
     try {
-      const target = await resolveApprovalTargetForUser(user.openId, user.departmentId);
+      const target = await resolveApprovalTargetForUser(
+        user.openId,
+        user.departmentId,
+        "quota_reset",
+      );
       routeResolved = true;
       await updateTokenRequest(tokenRequest.id, {
         approvalDepartmentId: target.departmentId,
         approvalTargetOpenId: target.leaderOpenId,
         approvalTargetSource: target.source,
+        approvalRouteReason: target.reason,
+        approvalRouteNotice: target.notice,
       });
 
       const message = await sendTokenApprovalCard({

@@ -10,8 +10,11 @@ import { sha256Hex } from "@/lib/crypto";
 import { provisionTokenForRequest } from "@/lib/provisioning";
 import {
   addFeishuEvent,
+  decideDepartmentQuotaRequest,
+  findDepartmentQuotaRequestById,
   findTokenRequestById,
   findTokenRequestByInstance,
+  getUserByOpenId,
   getFeishuEventByUuid,
   transitionTokenRequestStatus,
 } from "@/lib/store";
@@ -304,6 +307,79 @@ function scheduleTokenProvisionAfterResponse(input: {
   });
 }
 
+async function handleDepartmentQuotaCardAction(input: {
+  encrypted: boolean;
+  payload: FeishuEventPayload;
+  eventUuid: string;
+  eventType?: string;
+  operatorOpenId: string;
+  messageId?: string;
+  cardRequestId: string;
+  cardAction: string;
+  nonce: string;
+}) {
+  const quotaRequest = await findDepartmentQuotaRequestById(input.cardRequestId);
+  if (!quotaRequest) return null;
+  if (sha256Hex(input.nonce) !== quotaRequest.approvalActionNonceHash) {
+    await addFeishuEvent({
+      eventUuid: input.eventUuid,
+      eventType: input.eventType,
+      cardRequestId: input.cardRequestId,
+      cardAction: input.cardAction,
+      operatorOpenId: input.operatorOpenId,
+      messageId: input.messageId,
+      processingStatus: "failed",
+      payloadJson: { encrypted: input.encrypted, payload: input.payload },
+      errorMessage: "Invalid department quota card action nonce",
+    });
+    return cardToast("审批卡片校验失败", "error");
+  }
+  if (input.operatorOpenId !== quotaRequest.approvalTargetOpenId) {
+    await addFeishuEvent({
+      eventUuid: input.eventUuid,
+      eventType: input.eventType,
+      cardRequestId: input.cardRequestId,
+      cardAction: input.cardAction,
+      operatorOpenId: input.operatorOpenId,
+      messageId: input.messageId,
+      processingStatus: "ignored",
+      payloadJson: { encrypted: input.encrypted, payload: input.payload },
+      errorMessage: "Department quota card operator is not the approval target",
+    });
+    return cardToast("当前用户无权审批此申请", "error");
+  }
+  if (quotaRequest.status !== "pending_card_approval") {
+    return cardToast("该申请已处理", "success");
+  }
+  const normalizedAction = input.cardAction.toLowerCase();
+  const action =
+    normalizedAction === "approve" || normalizedAction === "approved"
+      ? "approve"
+      : normalizedAction === "reject" || normalizedAction === "rejected"
+        ? "reject"
+        : null;
+  if (!action) return cardToast("不支持的审批动作", "error");
+  const operator = await getUserByOpenId(input.operatorOpenId);
+  const decided = await decideDepartmentQuotaRequest({
+    requestId: quotaRequest.id,
+    action,
+    operatedByFeishuUserId: operator?.id ?? `open_id:${input.operatorOpenId}`,
+    approvalOperatorOpenId: input.operatorOpenId,
+  });
+  if (!decided) return cardToast("该申请已处理", "success");
+  await addFeishuEvent({
+    eventUuid: input.eventUuid,
+    eventType: input.eventType,
+    cardRequestId: input.cardRequestId,
+    cardAction: input.cardAction,
+    operatorOpenId: input.operatorOpenId,
+    messageId: input.messageId,
+    processingStatus: "processed",
+    payloadJson: { encrypted: input.encrypted, payload: input.payload },
+  });
+  return cardToast(action === "approve" ? "部门额度申请已通过" : "部门额度申请已拒绝");
+}
+
 async function handleCardActionEvent(input: {
   encrypted: boolean;
   payload: FeishuEventPayload;
@@ -344,6 +420,18 @@ async function handleCardActionEvent(input: {
 
   const tokenRequest = await findTokenRequestById(cardRequestId);
   if (!tokenRequest) {
+    const departmentQuotaResult = await handleDepartmentQuotaCardAction({
+      encrypted,
+      payload,
+      eventUuid,
+      eventType,
+      operatorOpenId,
+      messageId,
+      cardRequestId,
+      cardAction,
+      nonce,
+    });
+    if (departmentQuotaResult) return departmentQuotaResult;
     await addFeishuEvent({
       eventUuid,
       eventType,

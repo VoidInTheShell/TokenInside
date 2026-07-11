@@ -5,10 +5,13 @@ import { newApiUsageIdentityLockKeys } from "@/lib/newapi-usage-identity";
 import type {
   AdminScope,
   AppSettings,
+  DepartmentQuotaPeriod,
+  DepartmentQuotaRequest,
   FeishuEvent,
   FeishuUser,
   NewApiUsageRecord,
   ProxyRequestLog,
+  QuotaChangeEvent,
   RequestStatus,
   StoreShape,
   TokenAccount,
@@ -27,6 +30,9 @@ export const REQUIRED_POSTGRES_TABLES = [
   "token_requests",
   "token_accounts",
   "user_billing_periods",
+  "department_quota_periods",
+  "department_quota_requests",
+  "quota_change_events",
   "feishu_events",
   "proxy_request_logs",
   "newapi_usage_records",
@@ -241,6 +247,89 @@ async function saveUserBillingPeriodRow(client: PoolClient, period: UserBillingP
        updated_at = excluded.updated_at
      returning data`,
     [period.id, period.feishuUserId, period.period, period, period.updatedAt],
+  );
+  return result.rows[0].data;
+}
+
+async function saveDepartmentQuotaPeriodRow(
+  client: PoolClient,
+  period: DepartmentQuotaPeriod,
+) {
+  const result = await client.query<{ data: DepartmentQuotaPeriod }>(
+    `insert into department_quota_periods
+      (id, department_id, period, data, created_at, updated_at)
+     values ($1, $2, $3, $4, $5, $6)
+     on conflict (department_id, period) do update set
+       data = excluded.data,
+       updated_at = excluded.updated_at
+     returning data`,
+    [
+      period.id,
+      period.departmentId,
+      period.period,
+      period,
+      period.createdAt,
+      period.updatedAt,
+    ],
+  );
+  return result.rows[0].data;
+}
+
+async function saveDepartmentQuotaRequestRow(
+  client: PoolClient,
+  request: DepartmentQuotaRequest,
+) {
+  const result = await client.query<{ data: DepartmentQuotaRequest }>(
+    `insert into department_quota_requests
+      (id, department_id, requester_feishu_user_id, period, status,
+       approval_target_open_id, approval_action_nonce_hash, data, created_at, updated_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     on conflict (id) do update set
+       status = excluded.status,
+       approval_target_open_id = excluded.approval_target_open_id,
+       approval_action_nonce_hash = excluded.approval_action_nonce_hash,
+       data = excluded.data,
+       updated_at = excluded.updated_at
+     returning data`,
+    [
+      request.id,
+      request.departmentId,
+      request.requesterFeishuUserId,
+      request.period,
+      request.status,
+      request.approvalTargetOpenId,
+      request.approvalActionNonceHash,
+      request,
+      request.createdAt,
+      request.updatedAt,
+    ],
+  );
+  return result.rows[0].data;
+}
+
+async function saveQuotaChangeEventRow(client: PoolClient, event: QuotaChangeEvent) {
+  const result = await client.query<{ data: QuotaChangeEvent }>(
+    `insert into quota_change_events
+      (id, department_id, feishu_user_id, period, status,
+       related_token_request_id, data, created_at, updated_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     on conflict (id) do update set
+       status = excluded.status,
+       related_token_request_id = excluded.related_token_request_id,
+       data = excluded.data,
+       updated_at = excluded.updated_at
+     returning data`,
+    [
+      event.id,
+      event.departmentId,
+      event.feishuUserId ?? null,
+      event.period,
+      event.status,
+      event.relatedTokenRequestId ?? null,
+      event,
+      event.createdAt,
+      event.updatedAt,
+    ],
   );
   return result.rows[0].data;
 }
@@ -575,8 +664,10 @@ async function syncPostgresBillingPeriodForUser(
     usageRecordCount: 0,
     activeTokenAccountId: undefined,
     tokenAccountIds: [],
+    assignedQuotaUpdatedAt: existing?.assignedQuotaUpdatedAt,
+    assignedQuotaUpdatedByFeishuUserId: existing?.assignedQuotaUpdatedByFeishuUserId,
     updatedAt: existing?.updatedAt ?? nowIso(),
-    quotaUpdatedAt: undefined,
+    quotaUpdatedAt: existing?.assignedQuotaUpdatedAt,
     sourceUpdatedAt: existing?.updatedAt,
   };
 
@@ -679,6 +770,9 @@ async function syncPostgresBillingPeriodForUser(
     existing.usageRecordCount !== summary.usageRecordCount ||
     existing.activeTokenAccountId !== summary.activeTokenAccountId ||
     !sameStringArray(existing.tokenAccountIds, summary.tokenAccountIds) ||
+    existing.assignedQuotaUpdatedAt !== summary.assignedQuotaUpdatedAt ||
+    existing.assignedQuotaUpdatedByFeishuUserId !==
+      summary.assignedQuotaUpdatedByFeishuUserId ||
     existing.updatedAt !== summary.updatedAt
   ) {
     return saveUserBillingPeriodRow(client, summary);
@@ -742,6 +836,21 @@ export async function readPostgresStore(): Promise<StoreShape> {
         client,
         "user_billing_periods",
         "period, id",
+      ),
+      departmentQuotaPeriods: await readDataRows<DepartmentQuotaPeriod>(
+        client,
+        "department_quota_periods",
+        "period, department_id, id",
+      ),
+      departmentQuotaRequests: await readDataRows<DepartmentQuotaRequest>(
+        client,
+        "department_quota_requests",
+        "created_at, id",
+      ),
+      quotaChangeEvents: await readDataRows<QuotaChangeEvent>(
+        client,
+        "quota_change_events",
+        "created_at, id",
       ),
       feishuEvents: await readDataRows<FeishuEvent>(client, "feishu_events", "created_at, id"),
       proxyRequestLogs: await readDataRows<ProxyRequestLog>(
@@ -924,6 +1033,45 @@ export async function transitionPostgresTokenRequest(
     }
     return stored;
   });
+}
+
+export async function upsertPostgresUserBillingPeriod(period: UserBillingPeriod) {
+  return withTransaction((client) => saveUserBillingPeriodRow(client, period));
+}
+
+export async function upsertPostgresDepartmentQuotaPeriod(period: DepartmentQuotaPeriod) {
+  return withTransaction((client) => saveDepartmentQuotaPeriodRow(client, period));
+}
+
+export async function insertPostgresDepartmentQuotaRequest(
+  request: DepartmentQuotaRequest,
+) {
+  return withTransaction((client) => saveDepartmentQuotaRequestRow(client, request));
+}
+
+export async function updatePostgresDepartmentQuotaRequest(
+  id: string,
+  patch: Partial<Omit<DepartmentQuotaRequest, "id" | "createdAt">>,
+  allowedStatuses?: DepartmentQuotaRequest["status"][],
+) {
+  return withTransaction(async (client) => {
+    const result = await client.query<{ data: DepartmentQuotaRequest }>(
+      "select data from department_quota_requests where id = $1 for update",
+      [id],
+    );
+    const existing = result.rows[0]?.data;
+    if (!existing) return null;
+    if (allowedStatuses && !allowedStatuses.includes(existing.status)) return null;
+    return saveDepartmentQuotaRequestRow(client, {
+      ...existing,
+      ...patch,
+      updatedAt: nowIso(),
+    });
+  });
+}
+
+export async function upsertPostgresQuotaChangeEvent(event: QuotaChangeEvent) {
+  return withTransaction((client) => saveQuotaChangeEventRow(client, event));
 }
 
 export async function invalidatePostgresOpenFirstApplyRequests(input: {
@@ -1602,19 +1750,27 @@ export async function upsertPostgresUsageSyncCheckpoint(checkpoint: UsageSyncChe
   return withTransaction(async (client) => saveUsageSyncCheckpointRow(client, checkpoint));
 }
 
-export async function withPostgresAdvisoryLock<T>(key: string, fn: () => Promise<T>) {
+export async function withPostgresAdvisoryLock<T>(
+  key: string,
+  fn: () => Promise<T>,
+  options: { wait?: boolean } = {},
+) {
   if (getConfig().postgres.poolMax < 2) {
     throw new Error(
       "DATABASE_POOL_MAX must be at least 2 when running PostgreSQL advisory locked operations",
     );
   }
   return withClient(async (client) => {
-    const lockResult = await client.query<{ locked: boolean }>(
-      "select pg_try_advisory_lock(hashtext($1)::bigint) as locked",
-      [key],
-    );
-    if (!lockResult.rows[0]?.locked) {
-      throw new Error(`${key} is already running`);
+    if (options.wait) {
+      await client.query("select pg_advisory_lock(hashtext($1)::bigint)", [key]);
+    } else {
+      const lockResult = await client.query<{ locked: boolean }>(
+        "select pg_try_advisory_lock(hashtext($1)::bigint) as locked",
+        [key],
+      );
+      if (!lockResult.rows[0]?.locked) {
+        throw new Error(`${key} is already running`);
+      }
     }
     try {
       return await fn();
@@ -1635,6 +1791,9 @@ export async function writePostgresStore(store: StoreShape) {
     await client.query("delete from newapi_usage_records");
     await client.query("delete from proxy_request_logs");
     await client.query("delete from feishu_events");
+    await client.query("delete from quota_change_events");
+    await client.query("delete from department_quota_requests");
+    await client.query("delete from department_quota_periods");
     await client.query("delete from user_billing_periods");
     await client.query("delete from token_accounts");
     await client.query("delete from token_requests");
@@ -1710,6 +1869,67 @@ export async function writePostgresStore(store: StoreShape) {
         values: [period.id, period.feishuUserId, period.period, period, period.updatedAt],
       }),
     );
+
+    await insertJsonRows(
+      client,
+      "department_quota_periods",
+      store.departmentQuotaPeriods,
+      (period) => ({
+        sql: `insert into department_quota_periods
+          (id, department_id, period, data, created_at, updated_at)
+          values ($1, $2, $3, $4, $5, $6)`,
+        values: [
+          period.id,
+          period.departmentId,
+          period.period,
+          period,
+          period.createdAt,
+          period.updatedAt,
+        ],
+      }),
+    );
+
+    await insertJsonRows(
+      client,
+      "department_quota_requests",
+      store.departmentQuotaRequests,
+      (request) => ({
+        sql: `insert into department_quota_requests
+          (id, department_id, requester_feishu_user_id, period, status,
+           approval_target_open_id, approval_action_nonce_hash, data, created_at, updated_at)
+          values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        values: [
+          request.id,
+          request.departmentId,
+          request.requesterFeishuUserId,
+          request.period,
+          request.status,
+          request.approvalTargetOpenId,
+          request.approvalActionNonceHash,
+          request,
+          request.createdAt,
+          request.updatedAt,
+        ],
+      }),
+    );
+
+    await insertJsonRows(client, "quota_change_events", store.quotaChangeEvents, (event) => ({
+      sql: `insert into quota_change_events
+        (id, department_id, feishu_user_id, period, status,
+         related_token_request_id, data, created_at, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      values: [
+        event.id,
+        event.departmentId,
+        event.feishuUserId ?? null,
+        event.period,
+        event.status,
+        event.relatedTokenRequestId ?? null,
+        event,
+        event.createdAt,
+        event.updatedAt,
+      ],
+    }));
 
     await insertJsonRows(client, "feishu_events", store.feishuEvents, (event) => ({
       sql: `insert into feishu_events

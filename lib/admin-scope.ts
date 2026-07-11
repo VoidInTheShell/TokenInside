@@ -8,6 +8,7 @@ export function tokenRequestInAdminScope(
 ) {
   if (scope.scopeType === "global") return true;
   if (!scope.departmentId) return false;
+  if (request.approvalTargetSource === "system_admin_fallback") return false;
 
   const requester = usersById.get(request.feishuUserId);
   if (requester && globalAdminOpenIds.has(requester.openId)) return false;

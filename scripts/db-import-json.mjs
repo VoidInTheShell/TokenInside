@@ -35,6 +35,9 @@ const summary = {
   tokenRequests: count("tokenRequests"),
   tokenAccounts: count("tokenAccounts"),
   userBillingPeriods: count("userBillingPeriods"),
+  departmentQuotaPeriods: count("departmentQuotaPeriods"),
+  departmentQuotaRequests: count("departmentQuotaRequests"),
+  quotaChangeEvents: count("quotaChangeEvents"),
   feishuEvents: count("feishuEvents"),
   proxyRequestLogs: count("proxyRequestLogs"),
   newapiUsageRecords: count("newapiUsageRecords"),
@@ -66,6 +69,9 @@ try {
   await client.query("delete from newapi_usage_records");
   await client.query("delete from proxy_request_logs");
   await client.query("delete from feishu_events");
+  await client.query("delete from quota_change_events");
+  await client.query("delete from department_quota_requests");
+  await client.query("delete from department_quota_periods");
   await client.query("delete from user_billing_periods");
   await client.query("delete from token_accounts");
   await client.query("delete from token_requests");
@@ -135,6 +141,57 @@ try {
       (id, feishu_user_id, period, data, updated_at)
       values ($1, $2, $3, $4, $5)`,
     values: [period.id, period.feishuUserId, period.period, period, period.updatedAt],
+  }));
+
+  await insertRows(client, store.departmentQuotaPeriods, (period) => ({
+    sql: `insert into department_quota_periods
+      (id, department_id, period, data, created_at, updated_at)
+      values ($1, $2, $3, $4, $5, $6)`,
+    values: [
+      period.id,
+      period.departmentId,
+      period.period,
+      period,
+      period.createdAt,
+      period.updatedAt,
+    ],
+  }));
+
+  await insertRows(client, store.departmentQuotaRequests, (request) => ({
+    sql: `insert into department_quota_requests
+      (id, department_id, requester_feishu_user_id, period, status,
+       approval_target_open_id, approval_action_nonce_hash, data, created_at, updated_at)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    values: [
+      request.id,
+      request.departmentId,
+      request.requesterFeishuUserId,
+      request.period,
+      request.status,
+      request.approvalTargetOpenId,
+      request.approvalActionNonceHash,
+      request,
+      request.createdAt,
+      request.updatedAt,
+    ],
+  }));
+
+  await insertRows(client, store.quotaChangeEvents, (event) => ({
+    sql: `insert into quota_change_events
+      (id, department_id, feishu_user_id, period, status,
+       related_token_request_id, data, created_at, updated_at)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    values: [
+      event.id,
+      event.departmentId,
+      event.feishuUserId ?? null,
+      event.period,
+      event.status,
+      event.relatedTokenRequestId ?? null,
+      event,
+      event.createdAt,
+      event.updatedAt,
+    ],
   }));
 
   await insertRows(client, store.feishuEvents, (event) => ({

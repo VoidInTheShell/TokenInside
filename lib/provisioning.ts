@@ -11,8 +11,11 @@ import {
   addTokenAccount,
   createTokenRequest,
   getActiveTokenForUser,
+  completeDepartmentQuotaReservation,
+  failDepartmentQuotaReservation,
   invalidateOtherOpenFirstApplyRequests,
   replaceActiveTokenAccount,
+  reserveDepartmentQuotaForTokenRequest,
   transitionTokenRequestStatus,
   updateTokenRequest,
 } from "@/lib/store";
@@ -69,7 +72,7 @@ async function updateActiveTokenQuotaForRequest(request: TokenRequest) {
   }
 }
 
-export async function provisionTokenForRequest(request: TokenRequest) {
+async function provisionTokenForRequestWithoutDepartmentReservation(request: TokenRequest) {
   if (
     request.requestType === "quota_reset" ||
     request.requestType === "quota_adjust" ||
@@ -162,6 +165,37 @@ export async function provisionTokenForRequest(request: TokenRequest) {
     });
     throw err;
   }
+}
+
+export async function provisionTokenForRequest(request: TokenRequest) {
+  const existingBeforeProvision = await getActiveTokenForUser(request.feishuUserId);
+  const shouldReserve = !(request.requestType === "first_apply" && existingBeforeProvision);
+  let reservation: Awaited<ReturnType<typeof reserveDepartmentQuotaForTokenRequest>> = null;
+  try {
+    reservation = shouldReserve ? await reserveDepartmentQuotaForTokenRequest(request) : null;
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : "部门可用额度校验失败";
+    await updateTokenRequest(request.id, {
+      status: "approved_provision_failed",
+      errorMessage,
+    });
+    throw err;
+  }
+
+  let account: Awaited<ReturnType<typeof provisionTokenForRequestWithoutDepartmentReservation>>;
+  try {
+    account = await provisionTokenForRequestWithoutDepartmentReservation(request);
+  } catch (err) {
+    if (reservation) {
+      await failDepartmentQuotaReservation(
+        reservation.id,
+        err instanceof Error ? err.message : "NewAPI token provisioning failed",
+      ).catch(() => undefined);
+    }
+    throw err;
+  }
+  if (reservation) await completeDepartmentQuotaReservation(reservation.id);
+  return account;
 }
 
 export async function resetActiveTokenForUser(user: FeishuUser, reason = "用户发起 key reset") {

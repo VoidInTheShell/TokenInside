@@ -4,6 +4,7 @@ import { requireAdminScope } from "@/lib/admin";
 import { nowIso } from "@/lib/crypto";
 import { provisionTokenForRequest } from "@/lib/provisioning";
 import {
+  assignDepartmentUserQuota,
   createTokenRequest,
   getActiveTokenForUser,
   getScopedUser,
@@ -30,10 +31,8 @@ export async function POST(
   if (!targetUser) {
     return NextResponse.json({ error: "用户不存在或不在当前管理范围内" }, { status: 404 });
   }
-
-  const activeToken = await getActiveTokenForUser(targetUser.id);
-  if (!activeToken) {
-    return NextResponse.json({ error: "目标用户没有 active NewAPI key" }, { status: 409 });
+  if (targetUser.status && targetUser.status !== "active") {
+    return NextResponse.json({ error: "目标用户当前不是启用状态" }, { status: 409 });
   }
 
   const parsed = quotaAdjustSchema.safeParse(await request.json());
@@ -42,6 +41,31 @@ export async function POST(
   }
 
   const approvedMonthlyQuota = parsed.data.approvedMonthlyQuota;
+  const activeToken = await getActiveTokenForUser(targetUser.id);
+  if (!activeToken) {
+    if (!targetUser.departmentId) {
+      return NextResponse.json(
+        { error: "无 active key 的用户必须先归属部门，才能预分配额度" },
+        { status: 409 },
+      );
+    }
+    try {
+      const assignment = await assignDepartmentUserQuota({
+        departmentId: targetUser.departmentId,
+        departmentName: targetUser.departmentName,
+        feishuUserId: targetUser.id,
+        nextQuota: approvedMonthlyQuota,
+        operatedByFeishuUserId: auth.user.id,
+      });
+      return NextResponse.json({ assignment, preallocated: true });
+    } catch (err) {
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : "预分配额度失败" },
+        { status: 409 },
+      );
+    }
+  }
+
   const operatedAt = nowIso();
   const quotaRequest = await createTokenRequest({
     feishuUserId: targetUser.id,

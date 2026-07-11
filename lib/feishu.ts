@@ -1,6 +1,7 @@
 import { getConfig } from "@/lib/config";
 import { decryptAes256CbcBase64, sha256Hex, safeEqual } from "@/lib/crypto";
 import { selectInitialApprovalDepartmentId } from "@/lib/approval-routing";
+import type { ApprovalRouteReason } from "@/lib/types";
 
 const feishuBaseUrl = "https://open.feishu.cn";
 const feishuAccountsBaseUrl = "https://accounts.feishu.cn";
@@ -27,10 +28,17 @@ type FeishuOAuthTokenResponse = {
   message?: string;
 };
 
-type FeishuContactUser = {
+export type FeishuContactUser = {
   open_id?: string;
   user_id?: string;
+  union_id?: string;
   name?: string;
+  avatar?: {
+    avatar_origin?: string;
+    avatar_640?: string;
+    avatar_240?: string;
+    avatar_72?: string;
+  };
   department_ids?: string[];
   leader_user_id?: string;
 };
@@ -49,9 +57,10 @@ type FeishuDepartment = {
 };
 
 type ApprovalTarget = {
-  departmentId: string;
+  departmentId?: string;
   leaderOpenId: string;
   source: "department_leader" | "parent_department_leader" | "system_admin_fallback";
+  reason: ApprovalRouteReason;
   notice?: string;
   fallbackReason?: string;
 };
@@ -211,7 +220,78 @@ export async function getFeishuDepartmentNameById(departmentId?: string) {
   return feishuDepartmentDisplayName(department);
 }
 
-function resolveSystemAdminFallback(error: unknown): ApprovalTarget {
+class ApprovalRoutingError extends Error {
+  constructor(
+    readonly reason: ApprovalRouteReason,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+export async function listFeishuDepartmentUsers(
+  departmentId: string,
+  options: { fetchChild?: boolean } = {},
+) {
+  const tenantAccessToken = await getTenantAccessToken();
+  const users: FeishuContactUser[] = [];
+  let pageToken: string | undefined;
+  for (let page = 0; page < 100; page += 1) {
+    const params = new URLSearchParams({
+      department_id: departmentId,
+      department_id_type: "open_department_id",
+      fetch_child: options.fetchChild ? "true" : "false",
+      page_size: "50",
+      user_id_type: "open_id",
+    });
+    if (pageToken) params.set("page_token", pageToken);
+    const data = await feishuFetch<{
+      items?: FeishuContactUser[];
+      has_more?: boolean;
+      page_token?: string;
+    }>(`/open-apis/contact/v3/users/find_by_department?${params.toString()}`, {
+      method: "GET",
+      tenantAccessToken,
+    });
+    users.push(...(data.items ?? []));
+    if (!data.has_more || !data.page_token) break;
+    pageToken = data.page_token;
+  }
+  return users;
+}
+
+export function getPrimarySystemAdminOpenId() {
+  const openId = getConfig().admin.systemAdminOpenIds[0];
+  if (!openId) {
+    throw new Error("TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS is required");
+  }
+  return openId;
+}
+
+function systemAdminFallbackNotice(
+  reason: ApprovalRouteReason,
+  purpose: "token_apply" | "quota_reset",
+) {
+  if (reason === "no_department") return SYSTEM_ADMIN_FALLBACK_NOTICE;
+  if (reason === "applicant_is_department_admin") {
+    return purpose === "quota_reset"
+      ? "您的个人提额请求将发送给系统管理员审批。"
+      : "您的 Token 申请将发送给系统管理员审批。";
+  }
+  if (reason === "no_leader") {
+    return "未找到可用的部门审批负责人，您的请求将发送给系统管理员审批。";
+  }
+  if (reason === "directory_lookup_failed") {
+    return "组织信息暂时无法读取，您的请求将发送给系统管理员审批。";
+  }
+  return "您的请求将发送给系统管理员审批。";
+}
+
+function resolveSystemAdminFallback(
+  error: unknown,
+  knownDepartmentId: string | undefined,
+  purpose: "token_apply" | "quota_reset",
+): ApprovalTarget {
   const systemAdminOpenId = getConfig().admin.systemAdminOpenIds[0];
   const fallbackReason =
     error instanceof Error ? error.message : "Unable to resolve Feishu department leader";
@@ -221,11 +301,15 @@ function resolveSystemAdminFallback(error: unknown): ApprovalTarget {
     );
   }
 
+  const reason =
+    error instanceof ApprovalRoutingError ? error.reason : "directory_lookup_failed";
+
   return {
-    departmentId: "system-admin-fallback",
+    departmentId: selectInitialApprovalDepartmentId(knownDepartmentId),
     leaderOpenId: systemAdminOpenId,
     source: "system_admin_fallback",
-    notice: SYSTEM_ADMIN_FALLBACK_NOTICE,
+    reason,
+    notice: systemAdminFallbackNotice(reason, purpose),
     fallbackReason,
   };
 }
@@ -241,9 +325,13 @@ async function resolveDepartmentApprovalTargetForUser(
     currentDepartmentId = selectInitialApprovalDepartmentId(undefined, user.department_ids);
   }
   if (!currentDepartmentId) {
-    throw new Error("Feishu contact user has no department_ids; cannot route approval card");
+    throw new ApprovalRoutingError(
+      "no_department",
+      "Feishu contact user has no department_ids; cannot route approval card",
+    );
   }
   let initialDepartmentId = currentDepartmentId;
+  let applicantIsDepartmentLeader = false;
 
   while (currentDepartmentId && !visited.has(currentDepartmentId)) {
     visited.add(currentDepartmentId);
@@ -253,30 +341,45 @@ async function resolveDepartmentApprovalTargetForUser(
     if (!initialDepartmentId) initialDepartmentId = departmentId;
 
     if (department.leader_user_id && department.leader_user_id !== openId) {
+      const source =
+        departmentId === initialDepartmentId
+          ? "department_leader"
+          : "parent_department_leader";
       return {
         departmentId,
         leaderOpenId: department.leader_user_id,
-        source:
-          departmentId === initialDepartmentId
-            ? "department_leader"
-            : "parent_department_leader",
+        source,
+        reason: source,
       };
+    }
+    if (department.leader_user_id === openId) {
+      applicantIsDepartmentLeader = true;
+      if (departmentId === initialDepartmentId) {
+        throw new ApprovalRoutingError(
+          "applicant_is_department_admin",
+          "Current user is the leader of the applicant department",
+        );
+      }
     }
 
     currentDepartmentId = department.parent_department_id;
   }
 
-  throw new Error("No valid Feishu department leader found for current user");
+  throw new ApprovalRoutingError(
+    applicantIsDepartmentLeader ? "applicant_is_department_admin" : "no_leader",
+    "No valid Feishu department leader found for current user",
+  );
 }
 
 export async function resolveApprovalTargetForUser(
   openId: string,
   knownDepartmentId?: string,
+  purpose: "token_apply" | "quota_reset" = "token_apply",
 ): Promise<ApprovalTarget> {
   try {
     return await resolveDepartmentApprovalTargetForUser(openId, knownDepartmentId);
   } catch (err) {
-    return resolveSystemAdminFallback(err);
+    return resolveSystemAdminFallback(err, knownDepartmentId, purpose);
   }
 }
 
@@ -347,6 +450,78 @@ export async function sendTokenApprovalCard(input: {
     ],
   };
 
+  const params = new URLSearchParams({ receive_id_type: "open_id" });
+  return feishuFetch<{ message_id?: string }>(
+    `/open-apis/im/v1/messages?${params.toString()}`,
+    {
+      method: "POST",
+      tenantAccessToken,
+      body: JSON.stringify({
+        receive_id: input.receiveOpenId,
+        msg_type: "interactive",
+        content: JSON.stringify(card),
+      }),
+    },
+  );
+}
+
+export async function sendDepartmentQuotaApprovalCard(input: {
+  receiveOpenId: string;
+  requestId: string;
+  nonce: string;
+  applicantName?: string;
+  applicantOpenId: string;
+  departmentName?: string;
+  departmentId: string;
+  action: "increase" | "reset";
+  currentQuotaLimit: number;
+  requestedQuotaLimit: number;
+  reason: string;
+}) {
+  const tenantAccessToken = await getTenantAccessToken();
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      template: "blue",
+      title: {
+        tag: "plain_text",
+        content: "TokenInside 部门总额度申请",
+      },
+    },
+    elements: [
+      {
+        tag: "div",
+        text: {
+          tag: "lark_md",
+          content: [
+            `**申请人**：${input.applicantName ?? input.applicantOpenId}`,
+            `**部门**：${input.departmentName ?? input.departmentId}`,
+            `**动作**：${input.action === "increase" ? "提高部门总额度" : "重置部门总额度"}`,
+            `**当前上限**：${input.currentQuotaLimit}`,
+            `**申请上限**：${input.requestedQuotaLimit}`,
+            `**申请说明**：${input.reason}`,
+          ].join("\n"),
+        },
+      },
+      {
+        tag: "action",
+        actions: [
+          {
+            tag: "button",
+            type: "primary",
+            text: { tag: "plain_text", content: "通过" },
+            value: { requestId: input.requestId, action: "approve", nonce: input.nonce },
+          },
+          {
+            tag: "button",
+            type: "danger",
+            text: { tag: "plain_text", content: "拒绝" },
+            value: { requestId: input.requestId, action: "reject", nonce: input.nonce },
+          },
+        ],
+      },
+    ],
+  };
   const params = new URLSearchParams({ receive_id_type: "open_id" });
   return feishuFetch<{ message_id?: string }>(
     `/open-apis/im/v1/messages?${params.toString()}`,

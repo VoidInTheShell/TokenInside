@@ -13,6 +13,12 @@ import { findProxyLogForNewApiUsage } from "@/lib/usage-matching";
 import { isUsageRecordRequest } from "@/lib/usage-record-visibility";
 import { normalizedInputTokensTotal } from "@/lib/usage-metrics";
 import {
+  currentQuotaPeriod,
+  summarizeDepartmentQuota,
+  validateDepartmentAllocation,
+  validateDepartmentQuotaLimit,
+} from "@/lib/department-quota";
+import {
   enablePostgresUserAccess,
   findPostgresActiveTokenByHash,
   getPostgresDisabledTokenForUser,
@@ -22,6 +28,7 @@ import {
   insertPostgresProxyLog,
   insertPostgresTokenAccount,
   insertPostgresTokenRequest,
+  insertPostgresDepartmentQuotaRequest,
   invalidatePostgresOpenFirstApplyRequests,
   mutatePostgresAppSettings,
   recordPostgresMonthlyResetApplied,
@@ -33,24 +40,32 @@ import {
   updatePostgresManualAdminScope,
   updatePostgresProxyLog,
   updatePostgresTokenRequest,
+  updatePostgresDepartmentQuotaRequest,
   updatePostgresUserAccessStatus,
   upsertPostgresFeishuEvent,
   upsertPostgresFeishuUser,
+  upsertPostgresDepartmentQuotaPeriod,
+  upsertPostgresQuotaChangeEvent,
+  upsertPostgresUserBillingPeriod,
   upsertPostgresNewApiUsageRecord,
   upsertPostgresUsageSyncCheckpoint,
   upsertPostgresUsageSyncIssue,
   upsertPostgresManualAdminScope,
+  withPostgresAdvisoryLock,
 } from "@/lib/postgres-store";
 import type {
   AdminScope,
   BillingOperationKind,
   BillingOperationRecord,
   BillingOperationStatus,
+  DepartmentQuotaPeriod,
+  DepartmentQuotaRequest,
   FeishuEvent,
   FeishuUser,
   NewApiUsageMatchStatus,
   NewApiUsageRecord,
   ProxyRequestLog,
+  QuotaChangeEvent,
   RequestStatus,
   StoreShape,
   TokenAccount,
@@ -85,6 +100,9 @@ const initialStore: StoreShape = {
   tokenRequests: [],
   tokenAccounts: [],
   userBillingPeriods: [],
+  departmentQuotaPeriods: [],
+  departmentQuotaRequests: [],
+  quotaChangeEvents: [],
   feishuEvents: [],
   proxyRequestLogs: [],
   newapiUsageRecords: [],
@@ -247,6 +265,18 @@ function normalizeStore(store: StoreShape) {
     store.usageSyncIssues = [];
     changed = true;
   }
+  if (!Array.isArray(store.departmentQuotaPeriods)) {
+    store.departmentQuotaPeriods = [];
+    changed = true;
+  }
+  if (!Array.isArray(store.departmentQuotaRequests)) {
+    store.departmentQuotaRequests = [];
+    changed = true;
+  }
+  if (!Array.isArray(store.quotaChangeEvents)) {
+    store.quotaChangeEvents = [];
+    changed = true;
+  }
   const accountsByRequestId = new Map(
     store.tokenAccounts.map((account) => [account.tokenRequestId, account]),
   );
@@ -371,8 +401,10 @@ function syncBillingPeriods(store: StoreShape) {
         usageRecordCount: 0,
         activeTokenAccountId: undefined,
         tokenAccountIds: [],
+        assignedQuotaUpdatedAt: existing?.assignedQuotaUpdatedAt,
+        assignedQuotaUpdatedByFeishuUserId: existing?.assignedQuotaUpdatedByFeishuUserId,
         updatedAt: existing?.updatedAt ?? nowIso(),
-        quotaUpdatedAt: undefined,
+        quotaUpdatedAt: existing?.assignedQuotaUpdatedAt,
         sourceUpdatedAt: existing?.updatedAt,
       };
       computed.set(key, summary);
@@ -506,6 +538,15 @@ function syncBillingPeriods(store: StoreShape) {
     }
     if (!sameStringArray(existing.tokenAccountIds, summary.tokenAccountIds)) {
       patch.tokenAccountIds = summary.tokenAccountIds;
+    }
+    if (existing.assignedQuotaUpdatedAt !== summary.assignedQuotaUpdatedAt) {
+      patch.assignedQuotaUpdatedAt = summary.assignedQuotaUpdatedAt;
+    }
+    if (
+      existing.assignedQuotaUpdatedByFeishuUserId !==
+      summary.assignedQuotaUpdatedByFeishuUserId
+    ) {
+      patch.assignedQuotaUpdatedByFeishuUserId = summary.assignedQuotaUpdatedByFeishuUserId;
     }
     if (existing.updatedAt !== summary.updatedAt) patch.updatedAt = summary.updatedAt;
     if (Object.keys(patch).length) {
@@ -1019,6 +1060,703 @@ export async function getUserBillingPeriod(feishuUserId: string, period: string)
       (item) => item.feishuUserId === feishuUserId && item.period === period,
     ) ?? null
   );
+}
+
+const jsonDepartmentQuotaLocks = new Map<string, Promise<void>>();
+
+async function withJsonDepartmentQuotaLock<T>(key: string, fn: () => Promise<T>) {
+  const previous = jsonDepartmentQuotaLocks.get(key) ?? Promise.resolve();
+  const result = previous.catch(() => undefined).then(fn);
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  jsonDepartmentQuotaLocks.set(key, tail);
+  try {
+    return await result;
+  } finally {
+    if (jsonDepartmentQuotaLocks.get(key) === tail) jsonDepartmentQuotaLocks.delete(key);
+  }
+}
+
+function withDepartmentQuotaLock<T>(
+  departmentId: string,
+  period: string,
+  fn: () => Promise<T>,
+) {
+  const key = `department-quota:${departmentId}:${period}`;
+  if (isPostgresBackend()) {
+    return withJsonDepartmentQuotaLock("postgres-department-quota", () =>
+      withPostgresAdvisoryLock(key, fn, { wait: true }),
+    );
+  }
+  return withJsonDepartmentQuotaLock(key, fn);
+}
+
+async function persistDepartmentQuotaPeriod(period: DepartmentQuotaPeriod) {
+  if (isPostgresBackend()) return upsertPostgresDepartmentQuotaPeriod(period);
+  return mutate((store) => {
+    const index = store.departmentQuotaPeriods.findIndex(
+      (item) => item.departmentId === period.departmentId && item.period === period.period,
+    );
+    if (index === -1) store.departmentQuotaPeriods.push(period);
+    else store.departmentQuotaPeriods[index] = period;
+    return period;
+  });
+}
+
+async function persistDepartmentQuotaRequest(request: DepartmentQuotaRequest) {
+  if (isPostgresBackend()) return insertPostgresDepartmentQuotaRequest(request);
+  return mutate((store) => {
+    const index = store.departmentQuotaRequests.findIndex((item) => item.id === request.id);
+    if (index === -1) store.departmentQuotaRequests.push(request);
+    else store.departmentQuotaRequests[index] = request;
+    return request;
+  });
+}
+
+async function persistQuotaChangeEvent(event: QuotaChangeEvent) {
+  if (isPostgresBackend()) return upsertPostgresQuotaChangeEvent(event);
+  return mutate((store) => {
+    const index = store.quotaChangeEvents.findIndex((item) => item.id === event.id);
+    if (index === -1) store.quotaChangeEvents.push(event);
+    else store.quotaChangeEvents[index] = event;
+    return event;
+  });
+}
+
+async function persistUserBillingPeriod(period: UserBillingPeriod) {
+  if (isPostgresBackend()) return upsertPostgresUserBillingPeriod(period);
+  return mutate((store) => {
+    const index = store.userBillingPeriods.findIndex(
+      (item) => item.feishuUserId === period.feishuUserId && item.period === period.period,
+    );
+    if (index === -1) store.userBillingPeriods.push(period);
+    else store.userBillingPeriods[index] = period;
+    return period;
+  });
+}
+
+function departmentUsersForPeriod(store: StoreShape, departmentId: string) {
+  return store.users.filter(
+    (user) => user.departmentId === departmentId && user.status !== "deleted",
+  );
+}
+
+function allocatedDepartmentQuota(store: StoreShape, departmentId: string, period: string) {
+  const userIds = new Set(
+    departmentUsersForPeriod(store, departmentId).map((user) => user.id),
+  );
+  return store.userBillingPeriods
+    .filter((item) => item.period === period && userIds.has(item.feishuUserId))
+    .reduce((sum, item) => sum + Math.max(item.monthlyQuota, 0), 0);
+}
+
+async function ensureDepartmentQuotaPeriodUnlocked(
+  departmentId: string,
+  period: string,
+  departmentName?: string,
+) {
+  const store = await readStore();
+  const existing = store.departmentQuotaPeriods.find(
+    (item) => item.departmentId === departmentId && item.period === period,
+  );
+  if (existing) return existing;
+
+  const now = nowIso();
+  const inferredDepartmentName =
+    departmentName ??
+    store.users.find((user) => user.departmentId === departmentId)?.departmentName;
+  const quotaPeriod: DepartmentQuotaPeriod = {
+    id: randomId("dqp"),
+    departmentId,
+    departmentName: inferredDepartmentName,
+    period,
+    quotaLimit: allocatedDepartmentQuota(store, departmentId, period),
+    defaultGrantQuota: store.settings.defaultMonthlyQuota,
+    createdAt: now,
+    updatedAt: now,
+  };
+  return persistDepartmentQuotaPeriod(quotaPeriod);
+}
+
+export async function ensureDepartmentQuotaPeriod(input: {
+  departmentId: string;
+  departmentName?: string;
+  period?: string;
+}) {
+  const period = input.period ?? currentQuotaPeriod();
+  return withDepartmentQuotaLock(input.departmentId, period, () =>
+    ensureDepartmentQuotaPeriodUnlocked(input.departmentId, period, input.departmentName),
+  );
+}
+
+function mapDepartmentQuotaSummary(store: StoreShape, policy: DepartmentQuotaPeriod) {
+  const users = departmentUsersForPeriod(store, policy.departmentId);
+  const userIds = new Set(users.map((user) => user.id));
+  const billingPeriods = store.userBillingPeriods.filter(
+    (item) => item.period === policy.period && userIds.has(item.feishuUserId),
+  );
+  const events = store.quotaChangeEvents.filter(
+    (event) => event.departmentId === policy.departmentId && event.period === policy.period,
+  );
+  const allocatedQuota = billingPeriods.reduce(
+    (sum, item) => sum + Math.max(item.monthlyQuota, 0),
+    0,
+  );
+  const usage = summarizeDepartmentQuota({ policy, allocatedQuota, events });
+  const keyedUsers = new Set(
+    store.tokenAccounts
+      .filter((account) => account.status === "active" && userIds.has(account.feishuUserId))
+      .map((account) => account.feishuUserId),
+  ).size;
+  return {
+    id: policy.id,
+    departmentId: policy.departmentId,
+    departmentName:
+      policy.departmentName ?? users.find((user) => user.departmentName)?.departmentName,
+    period: policy.period,
+    quotaLimit: usage.quotaLimit,
+    defaultGrantQuota: policy.defaultGrantQuota,
+    allocatedQuota: usage.allocatedQuota,
+    pendingReservedQuota: usage.pendingReservedQuota,
+    availableQuota: usage.availableQuota,
+    quotaConsumed: billingPeriods.reduce((sum, item) => sum + (item.quotaConsumed ?? 0), 0),
+    remainingQuota: billingPeriods.reduce((sum, item) => sum + (item.remainingQuota ?? 0), 0),
+    memberCount: users.length,
+    keyedUsers,
+    updatedAt: policy.updatedAt,
+    updatedByFeishuUserId: policy.updatedByFeishuUserId,
+  };
+}
+
+export async function listDepartmentQuotaOverview(scope: AdminScope, period = currentQuotaPeriod()) {
+  const firstStore = await readStore();
+  const departmentIds =
+    scope.scopeType === "global"
+      ? [
+          ...new Set(
+            [
+              ...firstStore.users.map((user) => user.departmentId),
+              ...firstStore.departmentQuotaPeriods
+                .filter((item) => item.period === period)
+                .map((item) => item.departmentId),
+            ].filter((item): item is string => Boolean(item)),
+          ),
+        ]
+      : scope.departmentId
+        ? [scope.departmentId]
+        : [];
+
+  for (const departmentId of departmentIds) {
+    await ensureDepartmentQuotaPeriod({ departmentId, period });
+  }
+  const store = await readStore();
+  const departments = store.departmentQuotaPeriods
+    .filter((item) => item.period === period && departmentIds.includes(item.departmentId))
+    .map((item) => mapDepartmentQuotaSummary(store, item))
+    .sort((a, b) =>
+      (a.departmentName ?? a.departmentId).localeCompare(
+        b.departmentName ?? b.departmentId,
+        "zh-CN",
+      ),
+    );
+  const usersById = new Map(store.users.map((user) => [user.id, user]));
+  const requests = store.departmentQuotaRequests
+    .filter(
+      (request) =>
+        request.period === period &&
+        (scope.scopeType === "global" || request.departmentId === scope.departmentId),
+    )
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .map((request) => ({
+      ...request,
+      requesterName: usersById.get(request.requesterFeishuUserId)?.name,
+      requesterOpenId: usersById.get(request.requesterFeishuUserId)?.openId,
+    }));
+  const recentEvents = store.quotaChangeEvents
+    .filter(
+      (event) =>
+        event.period === period &&
+        (scope.scopeType === "global" || event.departmentId === scope.departmentId),
+    )
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, 100);
+  return { period, departments, requests, recentEvents };
+}
+
+export async function updateDepartmentQuotaPolicy(input: {
+  departmentId: string;
+  departmentName?: string;
+  period?: string;
+  quotaLimit?: number;
+  defaultGrantQuota?: number;
+  operatedByFeishuUserId: string;
+}) {
+  const period = input.period ?? currentQuotaPeriod();
+  return withDepartmentQuotaLock(input.departmentId, period, async () => {
+    const policy = await ensureDepartmentQuotaPeriodUnlocked(
+      input.departmentId,
+      period,
+      input.departmentName,
+    );
+    const store = await readStore();
+    const allocatedQuota = allocatedDepartmentQuota(store, input.departmentId, period);
+    const pendingReservedQuota = summarizeDepartmentQuota({
+      policy,
+      allocatedQuota,
+      events: store.quotaChangeEvents.filter(
+        (event) => event.departmentId === input.departmentId && event.period === period,
+      ),
+    }).pendingReservedQuota;
+    if (input.quotaLimit !== undefined) {
+      const error = validateDepartmentQuotaLimit(
+        input.quotaLimit,
+        allocatedQuota + pendingReservedQuota,
+      );
+      if (error) throw new Error(error);
+    }
+    if (
+      input.defaultGrantQuota !== undefined &&
+      (!Number.isInteger(input.defaultGrantQuota) ||
+        input.defaultGrantQuota <= 0 ||
+        input.defaultGrantQuota > 1_000_000)
+    ) {
+      throw new Error("部门默认发放额度必须是 1 到 1000000 之间的整数");
+    }
+    const now = nowIso();
+    const updated: DepartmentQuotaPeriod = {
+      ...policy,
+      departmentName: input.departmentName ?? policy.departmentName,
+      quotaLimit: input.quotaLimit ?? policy.quotaLimit,
+      defaultGrantQuota: input.defaultGrantQuota ?? policy.defaultGrantQuota,
+      updatedAt: now,
+      updatedByFeishuUserId: input.operatedByFeishuUserId,
+    };
+    await persistDepartmentQuotaPeriod(updated);
+    const changes: QuotaChangeEvent[] = [];
+    if (input.quotaLimit !== undefined && input.quotaLimit !== policy.quotaLimit) {
+      changes.push({
+        id: randomId("qce"),
+        departmentId: input.departmentId,
+        departmentName: updated.departmentName,
+        period,
+        operatedByFeishuUserId: input.operatedByFeishuUserId,
+        kind: "department_limit_set",
+        status: "applied",
+        previousValue: policy.quotaLimit,
+        nextValue: input.quotaLimit,
+        delta: input.quotaLimit - policy.quotaLimit,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    if (
+      input.defaultGrantQuota !== undefined &&
+      input.defaultGrantQuota !== policy.defaultGrantQuota
+    ) {
+      changes.push({
+        id: randomId("qce"),
+        departmentId: input.departmentId,
+        departmentName: updated.departmentName,
+        period,
+        operatedByFeishuUserId: input.operatedByFeishuUserId,
+        kind: "department_default_set",
+        status: "applied",
+        previousValue: policy.defaultGrantQuota,
+        nextValue: input.defaultGrantQuota,
+        delta: input.defaultGrantQuota - policy.defaultGrantQuota,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    await Promise.all(changes.map((event) => persistQuotaChangeEvent(event)));
+    return mapDepartmentQuotaSummary(await readStore(), updated);
+  });
+}
+
+const pendingDepartmentQuotaRequestStatuses = new Set<DepartmentQuotaRequest["status"]>([
+  "pending_card_send",
+  "pending_card_approval",
+  "approval_card_send_failed",
+]);
+
+export async function createDepartmentQuotaRequest(input: {
+  departmentId: string;
+  departmentName?: string;
+  period?: string;
+  requesterFeishuUserId: string;
+  action: DepartmentQuotaRequest["action"];
+  reason: string;
+  requestedQuotaLimit: number;
+  approvalTargetOpenId: string;
+  approvalActionNonceHash: string;
+}) {
+  const period = input.period ?? currentQuotaPeriod();
+  return withDepartmentQuotaLock(input.departmentId, period, async () => {
+    const policy = await ensureDepartmentQuotaPeriodUnlocked(
+      input.departmentId,
+      period,
+      input.departmentName,
+    );
+    const store = await readStore();
+    const duplicate = store.departmentQuotaRequests.find(
+      (request) =>
+        request.departmentId === input.departmentId &&
+        request.period === period &&
+        pendingDepartmentQuotaRequestStatuses.has(request.status),
+    );
+    if (duplicate) throw new Error("当前部门已有总额度申请正在处理");
+    const allocatedQuota = allocatedDepartmentQuota(store, input.departmentId, period);
+    const limitError = validateDepartmentQuotaLimit(input.requestedQuotaLimit, allocatedQuota);
+    if (limitError) throw new Error(limitError);
+    if (input.action === "increase" && input.requestedQuotaLimit <= policy.quotaLimit) {
+      throw new Error("提高额度申请必须大于当前部门额度上限");
+    }
+    const now = nowIso();
+    return persistDepartmentQuotaRequest({
+      id: randomId("dqr"),
+      departmentId: input.departmentId,
+      departmentName: input.departmentName ?? policy.departmentName,
+      period,
+      requesterFeishuUserId: input.requesterFeishuUserId,
+      action: input.action,
+      status: "pending_card_send",
+      reason: input.reason,
+      currentQuotaLimit: policy.quotaLimit,
+      requestedQuotaLimit: input.requestedQuotaLimit,
+      approvalTargetOpenId: input.approvalTargetOpenId,
+      approvalActionNonceHash: input.approvalActionNonceHash,
+      createdAt: now,
+      updatedAt: now,
+    });
+  });
+}
+
+export async function findDepartmentQuotaRequestById(id: string) {
+  const store = await readStore();
+  return store.departmentQuotaRequests.find((request) => request.id === id) ?? null;
+}
+
+export async function updateDepartmentQuotaRequest(
+  id: string,
+  patch: Partial<Omit<DepartmentQuotaRequest, "id" | "createdAt">>,
+  allowedStatuses?: DepartmentQuotaRequest["status"][],
+) {
+  if (isPostgresBackend()) {
+    return updatePostgresDepartmentQuotaRequest(id, patch, allowedStatuses);
+  }
+  return mutate((store) => {
+    const request = store.departmentQuotaRequests.find((item) => item.id === id);
+    if (!request || (allowedStatuses && !allowedStatuses.includes(request.status))) return null;
+    Object.assign(request, patch, { updatedAt: nowIso() });
+    return request;
+  });
+}
+
+export async function decideDepartmentQuotaRequest(input: {
+  requestId: string;
+  action: "approve" | "reject";
+  approvedQuotaLimit?: number;
+  operatedByFeishuUserId: string;
+  approvalOperatorOpenId: string;
+}) {
+  const initial = await findDepartmentQuotaRequestById(input.requestId);
+  if (!initial) return null;
+  return withDepartmentQuotaLock(initial.departmentId, initial.period, async () => {
+    const request = await findDepartmentQuotaRequestById(input.requestId);
+    if (!request || !pendingDepartmentQuotaRequestStatuses.has(request.status)) return null;
+    const operatedAt = nowIso();
+    if (input.action === "reject") {
+      return updateDepartmentQuotaRequest(
+        request.id,
+        {
+          status: "rejected",
+          approvalOperatorOpenId: input.approvalOperatorOpenId,
+          approvalOperatedAt: operatedAt,
+          errorMessage: undefined,
+        },
+        [...pendingDepartmentQuotaRequestStatuses],
+      );
+    }
+
+    const policy = await ensureDepartmentQuotaPeriodUnlocked(
+      request.departmentId,
+      request.period,
+      request.departmentName,
+    );
+    const store = await readStore();
+    const allocatedQuota = allocatedDepartmentQuota(store, request.departmentId, request.period);
+    const pendingReservedQuota = summarizeDepartmentQuota({
+      policy,
+      allocatedQuota,
+      events: store.quotaChangeEvents.filter(
+        (event) =>
+          event.departmentId === request.departmentId && event.period === request.period,
+      ),
+    }).pendingReservedQuota;
+    const approvedQuotaLimit = input.approvedQuotaLimit ?? request.requestedQuotaLimit;
+    const limitError = validateDepartmentQuotaLimit(
+      approvedQuotaLimit,
+      allocatedQuota + pendingReservedQuota,
+    );
+    if (limitError) throw new Error(limitError);
+    if (request.action === "increase" && approvedQuotaLimit <= policy.quotaLimit) {
+      throw new Error("提高额度审批值必须大于当前部门额度上限");
+    }
+    const updatedPolicy: DepartmentQuotaPeriod = {
+      ...policy,
+      quotaLimit: approvedQuotaLimit,
+      updatedAt: operatedAt,
+      updatedByFeishuUserId: input.operatedByFeishuUserId,
+    };
+    await persistDepartmentQuotaPeriod(updatedPolicy);
+    await persistQuotaChangeEvent({
+      id: randomId("qce"),
+      departmentId: request.departmentId,
+      departmentName: request.departmentName,
+      period: request.period,
+      operatedByFeishuUserId: input.operatedByFeishuUserId,
+      kind: "department_limit_set",
+      status: "applied",
+      previousValue: policy.quotaLimit,
+      nextValue: approvedQuotaLimit,
+      delta: approvedQuotaLimit - policy.quotaLimit,
+      relatedDepartmentQuotaRequestId: request.id,
+      createdAt: operatedAt,
+      updatedAt: operatedAt,
+    });
+    return updateDepartmentQuotaRequest(
+      request.id,
+      {
+        status: "approved",
+        approvedQuotaLimit,
+        approvalOperatorOpenId: input.approvalOperatorOpenId,
+        approvalOperatedAt: operatedAt,
+        errorMessage: undefined,
+      },
+      [...pendingDepartmentQuotaRequestStatuses],
+    );
+  });
+}
+
+export async function getEffectiveUserGrantQuota(feishuUserId: string) {
+  const period = currentQuotaPeriod();
+  const store = await readStore();
+  const user = store.users.find((item) => item.id === feishuUserId);
+  const billing = store.userBillingPeriods.find(
+    (item) => item.feishuUserId === feishuUserId && item.period === period,
+  );
+  if (billing) return billing.monthlyQuota;
+  if (!user?.departmentId) return store.settings.defaultMonthlyQuota;
+  const policy = await ensureDepartmentQuotaPeriod({
+    departmentId: user.departmentId,
+    departmentName: user.departmentName,
+    period,
+  });
+  return policy.defaultGrantQuota;
+}
+
+export async function reserveDepartmentQuotaForTokenRequest(request: TokenRequest) {
+  if (request.requestType === "key_reset") return null;
+  const initialStore = await readStore();
+  const user = initialStore.users.find((item) => item.id === request.feishuUserId);
+  if (!user?.departmentId) return null;
+  const period = currentQuotaPeriod();
+  return withDepartmentQuotaLock(user.departmentId, period, async () => {
+    const policy = await ensureDepartmentQuotaPeriodUnlocked(
+      user.departmentId!,
+      period,
+      user.departmentName,
+    );
+    const store = await readStore();
+    const existing = store.quotaChangeEvents.find(
+      (event) => event.relatedTokenRequestId === request.id,
+    );
+    if (existing?.status === "applied") return existing;
+    const billing = store.userBillingPeriods.find(
+      (item) => item.feishuUserId === user.id && item.period === period,
+    );
+    const previousValue = billing?.monthlyQuota ?? 0;
+    const nextValue = request.approvedMonthlyQuota ?? request.requestedMonthlyQuota;
+    const usage = summarizeDepartmentQuota({
+      policy,
+      allocatedQuota: allocatedDepartmentQuota(store, user.departmentId!, period),
+      events: store.quotaChangeEvents.filter(
+        (event) =>
+          event.departmentId === user.departmentId &&
+          event.period === period &&
+          event.id !== existing?.id,
+      ),
+    });
+    const allocationError = validateDepartmentAllocation({
+      nextQuota: nextValue,
+      previousQuota: previousValue,
+      availableQuota: usage.availableQuota,
+    });
+    if (allocationError) throw new Error(allocationError);
+    const now = nowIso();
+    const operator = request.approvalOperatorOpenId
+      ? store.users.find((item) => item.openId === request.approvalOperatorOpenId)
+      : undefined;
+    const event: QuotaChangeEvent = {
+      id: existing?.id ?? randomId("qce"),
+      departmentId: user.departmentId!,
+      departmentName: user.departmentName,
+      period,
+      feishuUserId: user.id,
+      operatedByFeishuUserId: operator?.id ?? request.feishuUserId,
+      kind: "user_quota_allocate",
+      status: "pending",
+      previousValue,
+      nextValue,
+      delta: nextValue - previousValue,
+      relatedTokenRequestId: request.id,
+      expiresAt: new Date(Date.now() + 20 * 60 * 1000).toISOString(),
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    return persistQuotaChangeEvent(event);
+  });
+}
+
+export async function completeDepartmentQuotaReservation(eventId: string) {
+  const firstStore = await readStore();
+  const first = firstStore.quotaChangeEvents.find((event) => event.id === eventId);
+  if (!first) return null;
+  return withDepartmentQuotaLock(first.departmentId, first.period, async () => {
+    const store = await readStore();
+    const event = store.quotaChangeEvents.find((item) => item.id === eventId);
+    if (!event) return null;
+    if (event.status === "applied") return event;
+    if (!event.feishuUserId) throw new Error("额度预留缺少目标用户");
+    const existing = store.userBillingPeriods.find(
+      (item) => item.feishuUserId === event.feishuUserId && item.period === event.period,
+    );
+    const now = nowIso();
+    const billing: UserBillingPeriod = {
+      id: existing?.id ?? randomId("bp"),
+      feishuUserId: event.feishuUserId,
+      period: event.period,
+      monthlyQuota: event.nextValue,
+      quotaConsumed: existing?.quotaConsumed ?? 0,
+      cost: existing?.cost ?? 0,
+      remainingQuota: Math.max(event.nextValue - (existing?.quotaConsumed ?? 0), 0),
+      promptTokens: existing?.promptTokens ?? 0,
+      completionTokens: existing?.completionTokens ?? 0,
+      totalTokens: existing?.totalTokens ?? 0,
+      proxyLogCount: existing?.proxyLogCount ?? 0,
+      usageRecordCount: existing?.usageRecordCount ?? 0,
+      activeTokenAccountId: existing?.activeTokenAccountId,
+      tokenAccountIds: existing?.tokenAccountIds ?? [],
+      assignedQuotaUpdatedAt: now,
+      assignedQuotaUpdatedByFeishuUserId: event.operatedByFeishuUserId,
+      updatedAt: now,
+    };
+    await persistUserBillingPeriod(billing);
+    return persistQuotaChangeEvent({
+      ...event,
+      status: "applied",
+      expiresAt: undefined,
+      errorMessage: undefined,
+      updatedAt: now,
+    });
+  });
+}
+
+export async function failDepartmentQuotaReservation(eventId: string, errorMessage: string) {
+  const firstStore = await readStore();
+  const first = firstStore.quotaChangeEvents.find((event) => event.id === eventId);
+  if (!first) return null;
+  return withDepartmentQuotaLock(first.departmentId, first.period, async () => {
+    const store = await readStore();
+    const event = store.quotaChangeEvents.find((item) => item.id === eventId);
+    if (!event || event.status === "applied") return event ?? null;
+    return persistQuotaChangeEvent({
+      ...event,
+      status: "failed",
+      expiresAt: undefined,
+      errorMessage,
+      updatedAt: nowIso(),
+    });
+  });
+}
+
+export async function assignDepartmentUserQuota(input: {
+  departmentId: string;
+  departmentName?: string;
+  feishuUserId: string;
+  nextQuota: number;
+  operatedByFeishuUserId: string;
+  period?: string;
+}) {
+  const period = input.period ?? currentQuotaPeriod();
+  return withDepartmentQuotaLock(input.departmentId, period, async () => {
+    const policy = await ensureDepartmentQuotaPeriodUnlocked(
+      input.departmentId,
+      period,
+      input.departmentName,
+    );
+    const store = await readStore();
+    const user = store.users.find((item) => item.id === input.feishuUserId);
+    if (!user || user.departmentId !== input.departmentId || user.status === "deleted") {
+      throw new Error("用户不存在、不属于当前部门或已删除");
+    }
+    const existing = store.userBillingPeriods.find(
+      (item) => item.feishuUserId === user.id && item.period === period,
+    );
+    const previousValue = existing?.monthlyQuota ?? 0;
+    const usage = summarizeDepartmentQuota({
+      policy,
+      allocatedQuota: allocatedDepartmentQuota(store, input.departmentId, period),
+      events: store.quotaChangeEvents.filter(
+        (event) => event.departmentId === input.departmentId && event.period === period,
+      ),
+    });
+    const allocationError = validateDepartmentAllocation({
+      nextQuota: input.nextQuota,
+      previousQuota: previousValue,
+      availableQuota: usage.availableQuota,
+    });
+    if (allocationError) throw new Error(allocationError);
+    const now = nowIso();
+    const billing: UserBillingPeriod = {
+      id: existing?.id ?? randomId("bp"),
+      feishuUserId: user.id,
+      period,
+      monthlyQuota: input.nextQuota,
+      quotaConsumed: existing?.quotaConsumed ?? 0,
+      cost: existing?.cost ?? 0,
+      remainingQuota: Math.max(input.nextQuota - (existing?.quotaConsumed ?? 0), 0),
+      promptTokens: existing?.promptTokens ?? 0,
+      completionTokens: existing?.completionTokens ?? 0,
+      totalTokens: existing?.totalTokens ?? 0,
+      proxyLogCount: existing?.proxyLogCount ?? 0,
+      usageRecordCount: existing?.usageRecordCount ?? 0,
+      activeTokenAccountId: existing?.activeTokenAccountId,
+      tokenAccountIds: existing?.tokenAccountIds ?? [],
+      assignedQuotaUpdatedAt: now,
+      assignedQuotaUpdatedByFeishuUserId: input.operatedByFeishuUserId,
+      updatedAt: now,
+    };
+    await persistUserBillingPeriod(billing);
+    const event = await persistQuotaChangeEvent({
+      id: randomId("qce"),
+      departmentId: input.departmentId,
+      departmentName: input.departmentName ?? policy.departmentName,
+      period,
+      feishuUserId: user.id,
+      operatedByFeishuUserId: input.operatedByFeishuUserId,
+      kind: "user_quota_allocate",
+      status: "applied",
+      previousValue,
+      nextValue: input.nextQuota,
+      delta: input.nextQuota - previousValue,
+      createdAt: now,
+      updatedAt: now,
+    });
+    return { billing, event };
+  });
 }
 
 export async function findActiveTokenByHash(keyHash: string) {

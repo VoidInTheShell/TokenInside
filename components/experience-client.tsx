@@ -40,6 +40,7 @@ import {
   type UsageAggregateRow,
 } from "@/components/usage-analysis-tables";
 import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
+import { pendingApprovalRouteNotice } from "@/lib/department-quota";
 
 type SessionResponse = {
   authenticated: boolean;
@@ -90,6 +91,15 @@ type SessionResponse = {
     status: string;
     reason: string;
     approvalTargetSource?: string;
+    approvalRouteReason?:
+      | "department_leader"
+      | "parent_department_leader"
+      | "applicant_is_department_admin"
+      | "no_department"
+      | "no_leader"
+      | "directory_lookup_failed"
+      | "manual_fallback";
+    approvalRouteNotice?: string;
     createdAt: string;
     updatedAt: string;
   }>;
@@ -276,6 +286,19 @@ export function ExperienceClient() {
       const res = await fetch("/api/session", { cache: "no-store" });
       const data = (await res.json()) as SessionResponse;
       setSession(data);
+      const activeRouteNotice = pendingApprovalRouteNotice(
+        data.requests?.[0],
+        data.adminScope?.type === "department",
+      );
+      setMessage((current) => {
+        if (
+          !current ||
+          (!current.includes("发送给系统管理员") && !current.includes("不属于任何组织"))
+        ) {
+          return current;
+        }
+        return activeRouteNotice;
+      });
       if (!data.activeToken) {
         setPanel("account");
         setKey(null);
@@ -442,10 +465,10 @@ export function ExperienceClient() {
     currentBillingPeriod?.remainingQuota ?? session?.activeToken?.remainingQuota;
   const upstreamRemainingQuota =
     currentBillingPeriod?.upstreamRemainingQuota ?? session?.activeToken?.remainingQuota;
-  const fallbackNotice =
-    latestRequest?.approvalTargetSource === "system_admin_fallback"
-      ? "您当前不属于任何组织，请求将发送给系统管理员，请联系系统管理员审批"
-      : null;
+  const fallbackNotice = pendingApprovalRouteNotice(
+    latestRequest,
+    session?.adminScope?.type === "department",
+  );
 
   function selectPanel(nextPanel: WorkspacePanel) {
     setPanel(nextPanel);
@@ -1069,7 +1092,9 @@ export function ExperienceClient() {
                       <CardHeader>
                         <CardTitle>额度重置</CardTitle>
                         <CardDescription>
-                          提交后由部门负责人审批，审批通过后重置当前 active key 额度。
+                          {session?.adminScope?.type === "department"
+                            ? "部门管理员的个人额度请求会发送给系统管理员；通过后重置当前 active key 额度。"
+                            : "提交后按组织审批链路发送；通过后重置当前 active key 额度。"}
                         </CardDescription>
                       </CardHeader>
                       <CardContent>

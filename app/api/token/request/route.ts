@@ -10,7 +10,7 @@ import { getCurrentUser } from "@/lib/session";
 import {
   createTokenRequest,
   getActiveTokenForUser,
-  getAppSettings,
+  getEffectiveUserGrantQuota,
   updateTokenRequest,
 } from "@/lib/store";
 
@@ -36,8 +36,7 @@ export async function POST(request: Request) {
     }
 
     const input = requestSchema.parse(await request.json());
-    const settings = await getAppSettings();
-    const requestedMonthlyQuota = settings.defaultMonthlyQuota;
+    const requestedMonthlyQuota = await getEffectiveUserGrantQuota(user.id);
     const nonce = randomId("card");
     const tokenRequest = await createTokenRequest({
       feishuUserId: user.id,
@@ -56,6 +55,8 @@ export async function POST(request: Request) {
         approvalDepartmentId: target.departmentId,
         approvalTargetOpenId: target.leaderOpenId,
         approvalTargetSource: target.source,
+        approvalRouteReason: target.reason,
+        approvalRouteNotice: target.notice,
       });
 
       const message = await sendTokenApprovalCard({

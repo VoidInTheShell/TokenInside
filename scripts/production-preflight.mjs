@@ -56,6 +56,45 @@ async function canConnectPostgres() {
   }
 }
 
+const requiredPostgresTables = [
+  "app_settings",
+  "feishu_users",
+  "token_requests",
+  "token_accounts",
+  "user_billing_periods",
+  "department_quota_periods",
+  "department_quota_requests",
+  "quota_change_events",
+  "feishu_events",
+  "proxy_request_logs",
+  "newapi_usage_records",
+  "usage_sync_checkpoints",
+  "usage_sync_issues",
+  "admin_scopes",
+];
+
+async function hasPostgresSchema() {
+  if (!present("DATABASE_URL")) return false;
+  const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: 1,
+    connectionTimeoutMillis: 5000,
+  });
+  try {
+    const result = await pool.query(
+      `select table_name
+       from information_schema.tables
+       where table_schema = 'public' and table_name = any($1::text[])`,
+      [requiredPostgresTables],
+    );
+    return new Set(result.rows.map((row) => row.table_name)).size === requiredPostgresTables.length;
+  } catch {
+    return false;
+  } finally {
+    await pool.end();
+  }
+}
+
 const storeBackend = process.env.TOKENINSIDE_STORE_BACKEND ?? "json";
 const checks = [
   result("NODE_ENV", process.env.NODE_ENV === "production", "must be production"),
@@ -97,12 +136,13 @@ if (storeBackend === "json") {
 if (storeBackend === "postgres") {
   checks.push(result("DATABASE_URL", safe("DATABASE_URL"), "required when store backend is postgres"));
   checks.push(result("POSTGRES_CONNECTION", await canConnectPostgres(), "PostgreSQL must accept connections"));
+  checks.push(result("POSTGRES_SCHEMA", await hasPostgresSchema(), "all required tables must exist"));
   checks.push(
     result(
       "DATABASE_POOL_MAX",
       Number.isInteger(Number(process.env.DATABASE_POOL_MAX ?? "10")) &&
-        Number(process.env.DATABASE_POOL_MAX ?? "10") > 0,
-      "pool max must be a positive integer",
+        Number(process.env.DATABASE_POOL_MAX ?? "10") >= 2,
+      "pool max must be an integer of at least 2 for quota advisory locks",
     ),
   );
 }

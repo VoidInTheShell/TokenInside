@@ -12,6 +12,7 @@ import { getCurrentUser } from "@/lib/session";
 import {
   createTokenRequest,
   getActiveTokenForUser,
+  getEffectiveUserGrantQuota,
   getStoreSnapshot,
   getUserBillingPeriod,
   listUserTokenRequests,
@@ -78,6 +79,9 @@ export async function GET() {
     getEffectiveAdminScopeForUser(user),
     getStoreSnapshot(),
   ]);
+  let effectiveGrantQuota = await getEffectiveUserGrantQuota(user.id).catch(
+    () => store.settings.defaultMonthlyQuota,
+  );
   if (adminScope && !activeToken) {
     try {
       activeToken = await ensureAdminActiveToken({
@@ -85,10 +89,13 @@ export async function GET() {
         activeToken,
         adminScope,
         requests,
-        defaultMonthlyQuota: store.settings.defaultMonthlyQuota,
+        defaultMonthlyQuota: effectiveGrantQuota,
       });
       requests = await listUserTokenRequests(user.id);
       store = await getStoreSnapshot();
+      effectiveGrantQuota = await getEffectiveUserGrantQuota(user.id).catch(
+        () => store.settings.defaultMonthlyQuota,
+      );
     } catch {
       requests = await listUserTokenRequests(user.id);
       store = await getStoreSnapshot();
@@ -129,7 +136,10 @@ export async function GET() {
   return NextResponse.json({
     authenticated: true,
     baseUrl: config.publicBaseUrl,
-    settings: store.settings,
+    settings: {
+      ...store.settings,
+      defaultMonthlyQuota: effectiveGrantQuota,
+    },
     user: {
       id: user.id,
       name: user.name,

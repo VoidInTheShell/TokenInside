@@ -15,6 +15,15 @@ export type RequestStatus =
   | "invalidated"
   | "draft_pending_approval_config";
 
+export type ApprovalRouteReason =
+  | "department_leader"
+  | "parent_department_leader"
+  | "applicant_is_department_admin"
+  | "no_department"
+  | "no_leader"
+  | "directory_lookup_failed"
+  | "manual_fallback";
+
 export type TokenStatus = "active" | "disabled" | "revoked" | "replaced";
 
 export type ProxyRequestStatus =
@@ -62,6 +71,8 @@ export type TokenRequest = {
     | "parent_department_leader"
     | "manual_fallback"
     | "system_admin_fallback";
+  approvalRouteReason?: ApprovalRouteReason;
+  approvalRouteNotice?: string;
   approvalCardMessageId?: string;
   approvalActionNonceHash?: string;
   approvalOperatorOpenId?: string;
@@ -252,6 +263,70 @@ export type UserBillingPeriod = {
   usageRecordCount: number;
   activeTokenAccountId?: string;
   tokenAccountIds: string[];
+  assignedQuotaUpdatedAt?: string;
+  assignedQuotaUpdatedByFeishuUserId?: string;
+  updatedAt: string;
+};
+
+export type DepartmentQuotaPeriod = {
+  id: string;
+  departmentId: string;
+  departmentName?: string;
+  period: string;
+  quotaLimit: number;
+  defaultGrantQuota: number;
+  createdAt: string;
+  updatedAt: string;
+  updatedByFeishuUserId?: string;
+};
+
+export type DepartmentQuotaRequestStatus =
+  | "pending_card_send"
+  | "pending_card_approval"
+  | "approval_card_send_failed"
+  | "approved"
+  | "rejected"
+  | "cancelled";
+
+export type DepartmentQuotaRequest = {
+  id: string;
+  departmentId: string;
+  departmentName?: string;
+  period: string;
+  requesterFeishuUserId: string;
+  action: "increase" | "reset";
+  status: DepartmentQuotaRequestStatus;
+  reason: string;
+  currentQuotaLimit: number;
+  requestedQuotaLimit: number;
+  approvedQuotaLimit?: number;
+  approvalTargetOpenId: string;
+  approvalCardMessageId?: string;
+  approvalActionNonceHash: string;
+  approvalOperatorOpenId?: string;
+  approvalOperatedAt?: string;
+  errorMessage?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type QuotaChangeEvent = {
+  id: string;
+  departmentId: string;
+  departmentName?: string;
+  period: string;
+  feishuUserId?: string;
+  operatedByFeishuUserId: string;
+  kind: "department_limit_set" | "department_default_set" | "user_quota_allocate";
+  status: "pending" | "applied" | "failed" | "expired";
+  previousValue: number;
+  nextValue: number;
+  delta: number;
+  relatedTokenRequestId?: string;
+  relatedDepartmentQuotaRequestId?: string;
+  expiresAt?: string;
+  errorMessage?: string;
+  createdAt: string;
   updatedAt: string;
 };
 
@@ -319,6 +394,9 @@ export type StoreShape = {
   tokenRequests: TokenRequest[];
   tokenAccounts: TokenAccount[];
   userBillingPeriods: UserBillingPeriod[];
+  departmentQuotaPeriods: DepartmentQuotaPeriod[];
+  departmentQuotaRequests: DepartmentQuotaRequest[];
+  quotaChangeEvents: QuotaChangeEvent[];
   feishuEvents: FeishuEvent[];
   proxyRequestLogs: ProxyRequestLog[];
   newapiUsageRecords: NewApiUsageRecord[];
