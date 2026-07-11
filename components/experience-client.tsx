@@ -228,6 +228,42 @@ function appendUsageParam(params: URLSearchParams, key: string, value?: string) 
   params.set(key, value);
 }
 
+type RequestHistoryItem = SessionResponse["requests"][number];
+
+function RequestHistoryList({
+  requests,
+  emptyText = "暂无申请记录",
+}: {
+  requests: RequestHistoryItem[];
+  emptyText?: string;
+}) {
+  if (!requests.length) return <div className="empty">{emptyText}</div>;
+
+  return (
+    <div className="request-history-list">
+      {requests.map((request) => (
+        <article className="request-history-item" key={request.id}>
+          <div className="request-history-main">
+            <div className="request-history-heading">
+              <strong>{requestTypeLabel[request.requestType] ?? request.requestType}</strong>
+              <Badge variant={badgeVariant(request.status)}>
+                {statusLabel[request.status] ?? request.status}
+              </Badge>
+            </div>
+            <p>{request.reason || "未填写申请理由"}</p>
+          </div>
+          <div className="request-history-meta">
+            <span>提交时间</span>
+            <strong>{formatDateTime(request.createdAt)}</strong>
+            <span>更新时间</span>
+            <strong>{formatDateTime(request.updatedAt)}</strong>
+          </div>
+        </article>
+      ))}
+    </div>
+  );
+}
+
 export function ExperienceClient() {
   const [session, setSession] = useState<SessionResponse | null>(null);
   const [models, setModels] = useState<ModelsResponse["models"]>([]);
@@ -932,52 +968,64 @@ export function ExperienceClient() {
           )}
 
           {!hasActiveToken ? (
-            <Card>
-              <CardHeader>
-                <CardTitle>申请 Token</CardTitle>
-                <CardDescription>
-                  {latestRequest
-                    ? `最近状态：${statusLabel[latestRequest.status] ?? latestRequest.status}`
-                    : "填写申请理由后提交。"}
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="field-group">
-                  <div className="field">
-                    <label htmlFor="requestedMonthlyQuota">默认申请额度</label>
-                    <Input
-                      id="requestedMonthlyQuota"
-                      value={String(defaultMonthlyQuota)}
-                      disabled
-                    />
-                    <span className="field-description">当前 MVP 固定额度，用户不可修改。</span>
-                  </div>
-                  <div className="field">
-                    <label htmlFor="requestReason">申请理由</label>
-                    <Textarea
-                      id="requestReason"
-                      placeholder={DEFAULT_REASON_PLACEHOLDER}
-                      value={reason}
-                      onChange={(event) => setReason(event.target.value)}
-                      disabled={!session?.authenticated || busy}
-                    />
-                  </div>
-                  <div className="apply-panel">
-                    <div className="apply-status">
-                      <SparklesIcon data-icon="inline-start" />
-                      <span>{latestRequest ? formatDateTime(latestRequest.updatedAt) : "首次申请"}</span>
+            <>
+              <Card>
+                <CardHeader>
+                  <CardTitle>申请 Token</CardTitle>
+                  <CardDescription>
+                    {latestRequest
+                      ? `最近状态：${statusLabel[latestRequest.status] ?? latestRequest.status}`
+                      : "填写申请理由后提交。"}
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="field-group">
+                    <div className="field">
+                      <label htmlFor="requestedMonthlyQuota">默认申请额度</label>
+                      <Input
+                        id="requestedMonthlyQuota"
+                        value={String(defaultMonthlyQuota)}
+                        disabled
+                      />
+                      <span className="field-description">当前 MVP 固定额度，用户不可修改。</span>
                     </div>
-                    <Button
-                      onClick={() => void requestToken()}
-                      disabled={!session?.authenticated || busy || reason.trim().length < 4}
-                    >
-                      <SendIcon data-icon="inline-start" />
-                      申请 Token
-                    </Button>
+                    <div className="field">
+                      <label htmlFor="requestReason">申请理由</label>
+                      <Textarea
+                        id="requestReason"
+                        placeholder={DEFAULT_REASON_PLACEHOLDER}
+                        value={reason}
+                        onChange={(event) => setReason(event.target.value)}
+                        disabled={!session?.authenticated || busy}
+                      />
+                    </div>
+                    <div className="apply-panel">
+                      <div className="apply-status">
+                        <SparklesIcon data-icon="inline-start" />
+                        <span>{latestRequest ? formatDateTime(latestRequest.updatedAt) : "首次申请"}</span>
+                      </div>
+                      <Button
+                        onClick={() => void requestToken()}
+                        disabled={!session?.authenticated || busy || reason.trim().length < 4}
+                      >
+                        <SendIcon data-icon="inline-start" />
+                        申请 Token
+                      </Button>
+                    </div>
                   </div>
-                </div>
-              </CardContent>
-            </Card>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>申请记录</CardTitle>
+                  <CardDescription>展示当前用户提交过的全部申请及其最新状态。</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <RequestHistoryList requests={requests} />
+                </CardContent>
+              </Card>
+            </>
           ) : (
             <>
               {panel === "account" && (
@@ -1243,37 +1291,12 @@ export function ExperienceClient() {
                     <CardTitle>申请记录</CardTitle>
                     <CardDescription>
                       {latestRequest
-                        ? `状态更新时间：${formatDateTime(latestRequest.updatedAt)}`
+                        ? `共 ${requests.length} 条申请，最近更新时间：${formatDateTime(latestRequest.updatedAt)}`
                         : "当前用户暂无申请记录。"}
-                    </CardDescription>
+                  </CardDescription>
                   </CardHeader>
                   <CardContent>
-                    {!latestRequest ? (
-                      <div className="empty">暂无申请记录</div>
-                    ) : (
-                      <div className="meta-list">
-                        <div className="meta-row">
-                          <span>类型</span>
-                          <strong>
-                            {requestTypeLabel[latestRequest.requestType] ?? latestRequest.requestType}
-                          </strong>
-                        </div>
-                        <div className="meta-row">
-                          <span>状态</span>
-                          <Badge variant={badgeVariant(latestRequest.status)}>
-                            {statusLabel[latestRequest.status] ?? latestRequest.status}
-                          </Badge>
-                        </div>
-                        <div className="meta-row">
-                          <span>申请理由</span>
-                          <strong>{latestRequest.reason || "-"}</strong>
-                        </div>
-                        <div className="meta-row">
-                          <span>创建时间</span>
-                          <strong>{formatDateTime(latestRequest.createdAt)}</strong>
-                        </div>
-                      </div>
-                    )}
+                    <RequestHistoryList requests={requests} />
                   </CardContent>
                 </Card>
               )}

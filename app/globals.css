@@ -880,6 +880,65 @@ a {
   line-height: 1.45;
 }
 
+.request-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.request-history-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(190px, 240px);
+  gap: 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--muted);
+}
+
+.request-history-main,
+.request-history-heading,
+.request-history-meta {
+  min-width: 0;
+}
+
+.request-history-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.request-history-heading strong {
+  font-size: 14px;
+}
+
+.request-history-main p {
+  margin: 7px 0 0;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.request-history-meta {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-content: center;
+  gap: 5px 12px;
+  font-size: 12px;
+}
+
+.request-history-meta span {
+  color: var(--muted-foreground);
+}
+
+.request-history-meta strong {
+  min-width: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
 .alert {
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -1191,7 +1250,7 @@ a {
   }
 
   .usage-records-controls-admin .usage-records-primary-row > :nth-child(2) {
-    grid-column: span 3;
+    grid-column: span 2;
   }
 
   .usage-records-controls-admin .usage-records-primary-row > :nth-child(3) {
@@ -1199,7 +1258,7 @@ a {
   }
 
   .usage-records-controls-admin .usage-records-primary-row > :nth-child(4) {
-    grid-column: span 3;
+    grid-column: span 4;
   }
 
   .usage-records-controls-admin .usage-records-secondary-row > :nth-child(1) {
@@ -1208,7 +1267,7 @@ a {
 
   .usage-records-controls-admin .usage-records-secondary-row > :nth-child(2),
   .usage-records-controls-admin .usage-records-secondary-row > :nth-child(3) {
-    grid-column: span 1;
+    grid-column: span 2;
   }
 
   .usage-records-controls-admin .usage-records-secondary-row > :nth-child(4) {
@@ -1216,7 +1275,7 @@ a {
   }
 
   .usage-records-controls-admin .usage-records-secondary-row > :nth-child(5) {
-    grid-column: span 4;
+    grid-column: span 2;
   }
 
   .usage-records-controls-user .usage-records-primary-row > :nth-child(1) {
@@ -1936,6 +1995,19 @@ a {
   .recent-approval-viewport {
     height: clamp(300px, 50dvh, 440px);
     min-height: 300px;
+  }
+
+  .request-history-item {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .request-history-meta {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .request-history-meta strong {
+    text-align: left;
   }
 
   .table-scroll-users {
