@@ -733,12 +733,6 @@ export function ExperienceClient() {
                 <div className="user-card-main">
                   <span className="user-card-label">当前飞书用户</span>
                   <strong>{session?.authenticated ? displayName(session.user) : "等待飞书身份"}</strong>
-                  <span>{session?.user?.openId ? maskSecret(session.user.openId) : "-"}</span>
-                  {(session?.user?.departmentName || session?.user?.departmentId) && (
-                    <span>
-                      部门：{formatDepartmentName(session.user.departmentName, session.user.departmentId)}
-                    </span>
-                  )}
                 </div>
                 {session?.adminScope && (
                   <div className="user-card-action">
@@ -968,7 +962,6 @@ export function ExperienceClient() {
                   <Card>
                     <CardHeader>
                       <CardTitle>当前 key</CardTitle>
-                      <CardDescription>active key 只绑定当前飞书用户。</CardDescription>
                     </CardHeader>
                     <CardContent>
                       <div className="field">
@@ -1012,8 +1005,7 @@ export function ExperienceClient() {
 
                   <Card>
                     <CardHeader>
-                      <CardTitle>代理范围</CardTitle>
-                      <CardDescription>本期仅开放 MVP 数据面。</CardDescription>
+                      <CardTitle>可用端点</CardTitle>
                     </CardHeader>
                     <CardContent>
                       <div className="endpoint-list">
@@ -1119,7 +1111,6 @@ export function ExperienceClient() {
                       <div className="usage-section-header">
                         <div>
                           <CardTitle>用量分析</CardTitle>
-                          <CardDescription>当前飞书用户通过 TokenInside 产生的调用聚合。</CardDescription>
                         </div>
                         <Button
                           variant="ghost"

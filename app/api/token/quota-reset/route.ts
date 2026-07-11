@@ -5,6 +5,7 @@ import {
   resolveApprovalTargetForUser,
   sendTokenApprovalCard,
 } from "@/lib/feishu";
+import { hydrateUserDepartment } from "@/lib/admin-sync";
 import { getCurrentUser } from "@/lib/session";
 import {
   createTokenRequest,
@@ -34,7 +35,7 @@ const pendingQuotaResetStatuses = new Set([
 
 export async function POST(request: Request) {
   try {
-    const user = await getCurrentUser();
+    const user = await hydrateUserDepartment(await getCurrentUser());
     if (!user) {
       return NextResponse.json({ error: "Feishu OAuth session required" }, { status: 401 });
     }
@@ -75,7 +76,7 @@ export async function POST(request: Request) {
 
     let routeResolved = false;
     try {
-      const target = await resolveApprovalTargetForUser(user.openId);
+      const target = await resolveApprovalTargetForUser(user.openId, user.departmentId);
       routeResolved = true;
       await updateTokenRequest(tokenRequest.id, {
         approvalDepartmentId: target.departmentId,

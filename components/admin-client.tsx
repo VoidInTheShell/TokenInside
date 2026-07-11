@@ -1464,7 +1464,6 @@ export function AdminClient() {
                 <div className="user-card-main">
                   <span className="user-card-label">当前飞书用户</span>
                   <strong>{data?.authenticated ? displayName(data.user) : "等待飞书身份"}</strong>
-                  <span>{data?.user?.openId ? maskSecret(data.user.openId) : "-"}</span>
                 </div>
                 <div className="user-card-meta">
                   <span>管理范围</span>
@@ -1657,8 +1656,6 @@ export function AdminClient() {
                             <col className="admin-users-col-department" />
                             <col className="admin-users-col-status" />
                             <col className="admin-users-col-role" />
-                            <col className="admin-users-col-key" />
-                            <col className="admin-users-col-period" />
                             <col className="admin-users-col-quota" />
                             <col className="admin-users-col-quota" />
                             <col className="admin-users-col-quota" />
@@ -1672,8 +1669,6 @@ export function AdminClient() {
                               <th>部门</th>
                               <th>状态</th>
                               <th>角色</th>
-                              <th>active key</th>
-                              <th>账期</th>
                               <th>发放额度</th>
                               <th>剩余额度</th>
                               <th>已用额度</th>
@@ -1696,8 +1691,6 @@ export function AdminClient() {
                                   <Badge variant={badgeVariant(user.status)}>{userStatusLabel[user.status]}</Badge>
                                 </td>
                                 <td>{user.role}</td>
-                                <td>{user.activeTokenStatus ?? "-"}</td>
-                                <td>{user.billingPeriod ?? "-"}</td>
                                 <td>{formatQuotaAmount(user.billingMonthlyQuota)}</td>
                                 <td>{formatQuotaAmount(user.billingRemainingQuota)}</td>
                                 <td>{formatQuotaAmount(user.billingQuotaConsumed, "0")}</td>

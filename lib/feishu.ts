@@ -1,5 +1,6 @@
 import { getConfig } from "@/lib/config";
 import { decryptAes256CbcBase64, sha256Hex, safeEqual } from "@/lib/crypto";
+import { selectInitialApprovalDepartmentId } from "@/lib/approval-routing";
 
 const feishuBaseUrl = "https://open.feishu.cn";
 const feishuAccountsBaseUrl = "https://accounts.feishu.cn";
@@ -229,15 +230,19 @@ function resolveSystemAdminFallback(error: unknown): ApprovalTarget {
   };
 }
 
-async function resolveDepartmentApprovalTargetForUser(openId: string): Promise<ApprovalTarget> {
-  const user = await getFeishuContactUserByOpenId(openId);
-  const departmentIds = user.department_ids?.filter(Boolean) ?? [];
-  if (departmentIds.length === 0) {
+async function resolveDepartmentApprovalTargetForUser(
+  openId: string,
+  knownDepartmentId?: string,
+): Promise<ApprovalTarget> {
+  const visited = new Set<string>();
+  let currentDepartmentId = selectInitialApprovalDepartmentId(knownDepartmentId);
+  if (!currentDepartmentId) {
+    const user = await getFeishuContactUserByOpenId(openId);
+    currentDepartmentId = selectInitialApprovalDepartmentId(undefined, user.department_ids);
+  }
+  if (!currentDepartmentId) {
     throw new Error("Feishu contact user has no department_ids; cannot route approval card");
   }
-
-  const visited = new Set<string>();
-  let currentDepartmentId: string | undefined = departmentIds[0];
   let initialDepartmentId = currentDepartmentId;
 
   while (currentDepartmentId && !visited.has(currentDepartmentId)) {
@@ -264,9 +269,12 @@ async function resolveDepartmentApprovalTargetForUser(openId: string): Promise<A
   throw new Error("No valid Feishu department leader found for current user");
 }
 
-export async function resolveApprovalTargetForUser(openId: string): Promise<ApprovalTarget> {
+export async function resolveApprovalTargetForUser(
+  openId: string,
+  knownDepartmentId?: string,
+): Promise<ApprovalTarget> {
   try {
-    return await resolveDepartmentApprovalTargetForUser(openId);
+    return await resolveDepartmentApprovalTargetForUser(openId, knownDepartmentId);
   } catch (err) {
     return resolveSystemAdminFallback(err);
   }

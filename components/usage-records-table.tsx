@@ -430,7 +430,12 @@ export function UsageRecordsTable({
   return (
     <div className="usage-records">
       {showControls && filters && (
-        <div className={cn("usage-records-controls", isUserOnlyView && "usage-records-controls-user")}>
+        <div
+          className={cn(
+            "usage-records-controls",
+            isUserOnlyView ? "usage-records-controls-user" : "usage-records-controls-admin",
+          )}
+        >
           <div className="usage-records-control-row usage-records-primary-row">
             {usageSelect("时间", filters.preset, PRESET_OPTIONS, (value) => updateFilter("preset", value))}
             <label className="usage-filter usage-search-filter">
@@ -482,61 +487,61 @@ export function UsageRecordsTable({
               (value) => updateFilter("userAgent", value),
             )}
             <div className="usage-records-actions">
-            <details className="usage-columns">
-              <summary>显示列</summary>
-              <div>
-                {Object.entries(COLUMN_LABELS)
-                  .filter(([column]) => {
-                    if (column === "user" && !showUser) return false;
-                    if (column === "department" && !showDepartment) return false;
-                    return true;
-                  })
-                  .map(([column, label]) => (
-                    <label key={column}>
-                      <input
-                        type="checkbox"
-                        checked={visibleSet.has(column as UsageColumnId)}
-                        onChange={(event) => {
-                          const id = column as UsageColumnId;
-                          setVisibleColumns((current) => {
-                            if (event.target.checked) return [...current, id];
-                            const next = current.filter((item) => item !== id);
-                            return next.length ? next : current;
-                          });
-                        }}
-                      />
-                      <span>{label}</span>
-                    </label>
-                  ))}
-              </div>
-            </details>
-            <Button
-              variant="ghost"
-              size="sm"
-              className={hideUnknownRecords ? "usage-toggle-active" : undefined}
-              onClick={() => onHideUnknownRecordsChange?.(!hideUnknownRecords)}
-              title={hideUnknownRecords ? "显示 unknown 请求" : "隐藏 unknown 请求"}
-            >
-              <EyeOffIcon data-icon="inline-start" />
-              unknown
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              className={autoRefresh ? "usage-toggle-active" : undefined}
-              onClick={() => onAutoRefreshChange?.(!autoRefresh)}
-              title={autoRefresh ? "关闭自动刷新" : "开启自动刷新"}
-            >
-              <RefreshCcwIcon data-icon="inline-start" className={autoRefresh ? "spin" : undefined} />
-              自动刷新
-            </Button>
-            <Button variant="outline" size="sm" disabled={loading} onClick={onRefresh}>
-              <RefreshCcwIcon data-icon="inline-start" />
-              刷新
-            </Button>
-            <Badge variant={loading ? "warning" : "default"}>
-              {loading ? "读取中" : `${totalRecords ?? records.length} 条`}
-            </Badge>
+              <details className="usage-columns">
+                <summary>显示列</summary>
+                <div>
+                  {Object.entries(COLUMN_LABELS)
+                    .filter(([column]) => {
+                      if (column === "user" && !showUser) return false;
+                      if (column === "department" && !showDepartment) return false;
+                      return true;
+                    })
+                    .map(([column, label]) => (
+                      <label key={column}>
+                        <input
+                          type="checkbox"
+                          checked={visibleSet.has(column as UsageColumnId)}
+                          onChange={(event) => {
+                            const id = column as UsageColumnId;
+                            setVisibleColumns((current) => {
+                              if (event.target.checked) return [...current, id];
+                              const next = current.filter((item) => item !== id);
+                              return next.length ? next : current;
+                            });
+                          }}
+                        />
+                        <span>{label}</span>
+                      </label>
+                    ))}
+                </div>
+              </details>
+              <Button
+                variant="ghost"
+                size="sm"
+                className={hideUnknownRecords ? "usage-toggle-active" : undefined}
+                onClick={() => onHideUnknownRecordsChange?.(!hideUnknownRecords)}
+                title={hideUnknownRecords ? "显示 unknown 请求" : "隐藏 unknown 请求"}
+              >
+                <EyeOffIcon data-icon="inline-start" />
+                unknown
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className={autoRefresh ? "usage-toggle-active" : undefined}
+                onClick={() => onAutoRefreshChange?.(!autoRefresh)}
+                title={autoRefresh ? "关闭自动刷新" : "开启自动刷新"}
+              >
+                <RefreshCcwIcon data-icon="inline-start" className={autoRefresh ? "spin" : undefined} />
+                自动刷新
+              </Button>
+              <Button variant="outline" size="sm" disabled={loading} onClick={onRefresh}>
+                <RefreshCcwIcon data-icon="inline-start" />
+                刷新
+              </Button>
+              <Badge variant={loading ? "warning" : "default"}>
+                {loading ? "读取中" : `${totalRecords ?? records.length} 条`}
+              </Badge>
             </div>
           </div>
         </div>
@@ -584,7 +589,13 @@ export function UsageRecordsTable({
       </div>
 
       <div className="table-wrap table-scroll table-scroll-usage usage-records-desktop">
-        <table className={cn("table usage-table", isUserOnlyView ? "usage-table-user" : "usage-table-admin")}>
+        <table
+          className={cn(
+            "table usage-table",
+            isUserOnlyView ? "usage-table-user" : "usage-table-admin",
+            visibleSet.has("clientFamily") && "usage-table-with-client",
+          )}
+        >
           <colgroup>
             {visibleSet.has("time") && <col className="usage-col-time" />}
             {showUser && visibleSet.has("user") && <col className="usage-col-user" />}
@@ -692,8 +703,11 @@ export function UsageRecordsTable({
                       </td>
                     )}
                     {visibleSet.has("clientFamily") && (
-                      <td>
-                        <Badge title={record.userAgent ?? record.clientFamily ?? undefined}>
+                      <td className="usage-client-cell">
+                        <Badge
+                          className="usage-client-badge"
+                          title={record.userAgent ?? record.clientFamily ?? undefined}
+                        >
                           {formatUserAgent(record.userAgent ?? record.clientFamily)}
                         </Badge>
                       </td>
