@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+import { readdir } from "node:fs/promises";
+import { resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Pool } from "pg";
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -302,16 +306,126 @@ const statements = [
    on conflict (department_id, period) do nothing`,
 ];
 
+const baselineMigration = {
+  version: "20260711_001_baseline",
+  statements,
+};
+
+async function loadAdditionalMigrations() {
+  const directory = resolve(fileURLToPath(new URL("./migrations/", import.meta.url)));
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") return [];
+    throw error;
+  }
+
+  const files = entries
+    .filter((entry) => entry.isFile() && /^\d{8}_\d{3}_[a-z0-9_]+\.mjs$/.test(entry.name))
+    .map((entry) => entry.name)
+    .sort();
+  const loaded = [];
+  for (const file of files) {
+    const moduleUrl = pathToFileURL(resolve(directory, file)).href;
+    const module = await import(moduleUrl);
+    if (!module.migration || typeof module.migration !== "object") {
+      throw new Error(`Migration module ${file} must export a migration object`);
+    }
+    loaded.push(module.migration);
+  }
+  return loaded;
+}
+
+const migrations = [
+  baselineMigration,
+  ...(await loadAdditionalMigrations()),
+];
+
+const migrationLockName = "tokeninside_schema_migrations";
+
+function checksumFor(statementsForMigration) {
+  return createHash("sha256")
+    .update(statementsForMigration.join("\n-- tokeninside migration statement --\n"), "utf8")
+    .digest("hex");
+}
+
+function assertMigrationPlan(plan) {
+  const versions = new Set();
+  for (const migration of plan) {
+    if (!/^\d{8}_\d{3}_[a-z0-9_]+$/.test(migration.version)) {
+      throw new Error(`Invalid migration version: ${migration.version}`);
+    }
+    if (versions.has(migration.version)) {
+      throw new Error(`Duplicate migration version: ${migration.version}`);
+    }
+    if (!Array.isArray(migration.statements) || migration.statements.length === 0) {
+      throw new Error(`Migration ${migration.version} has no statements`);
+    }
+    versions.add(migration.version);
+  }
+}
+
+async function applyMigration(client, migration, checksum) {
+  await client.query("begin");
+  try {
+    for (const statement of migration.statements) {
+      await client.query(statement);
+    }
+    await client.query(
+      `insert into schema_migrations (version, checksum)
+       values ($1, $2)`,
+      [migration.version, checksum],
+    );
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  }
+}
+
+assertMigrationPlan(migrations);
+
 const client = await pool.connect();
 try {
-  await client.query("begin");
-  for (const statement of statements) {
-    await client.query(statement);
+  await client.query(
+    `create table if not exists schema_migrations (
+      version text primary key,
+      checksum text not null,
+      applied_at timestamptz not null default now()
+    )`,
+  );
+  await client.query("select pg_advisory_lock(hashtext($1))", [migrationLockName]);
+  try {
+    const appliedResult = await client.query(
+      "select version, checksum, applied_at from schema_migrations order by version",
+    );
+    const applied = new Map(appliedResult.rows.map((row) => [row.version, row]));
+    let appliedCount = 0;
+
+    for (const migration of migrations) {
+      const checksum = checksumFor(migration.statements);
+      const existing = applied.get(migration.version);
+      if (existing) {
+        if (existing.checksum !== checksum) {
+          throw new Error(
+            `Migration checksum mismatch for ${migration.version}; create a new migration instead of editing applied history`,
+          );
+        }
+        console.log(`Migration ${migration.version} already applied at ${existing.applied_at.toISOString()}`);
+        continue;
+      }
+
+      await applyMigration(client, migration, checksum);
+      appliedCount += 1;
+      console.log(`Applied migration ${migration.version} (${migration.statements.length} statements)`);
+    }
+
+    console.log(`Migration complete: ${appliedCount} applied, ${migrations.length - appliedCount} already recorded`);
+  } finally {
+    await client.query("select pg_advisory_unlock(hashtext($1))", [migrationLockName]);
   }
-  await client.query("commit");
-  console.log(`Applied ${statements.length} migration statements`);
 } catch (err) {
-  await client.query("rollback");
   console.error(err instanceof Error ? err.message : err);
   process.exitCode = 1;
 } finally {

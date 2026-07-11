@@ -57,6 +57,7 @@ async function canConnectPostgres() {
 }
 
 const requiredPostgresTables = [
+  "schema_migrations",
   "app_settings",
   "feishu_users",
   "token_requests",

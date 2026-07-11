@@ -25,6 +25,7 @@ import type {
 let pool: Pool | undefined;
 
 export const REQUIRED_POSTGRES_TABLES = [
+  "schema_migrations",
   "app_settings",
   "feishu_users",
   "token_requests",

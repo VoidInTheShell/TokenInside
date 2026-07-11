@@ -122,58 +122,43 @@ jobs:
           short_sha="${GITHUB_SHA::7}"
           echo "image=${REGISTRY}/${IMAGE_NAME}:sha-${short_sha}" >> "$GITHUB_OUTPUT"
 
+      - name: Verify migration runtime
+        env:
+          TOKENINSIDE_IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker pull "$TOKENINSIDE_IMAGE"
+          docker run --rm --entrypoint node "$TOKENINSIDE_IMAGE" --input-type=module \
+            -e "await import('pg'); await import('node:fs/promises').then(({ access }) => access('scripts/db-migrate.mjs'))"
+
   deploy-staging:
     name: Deploy Staging
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, tokeninside-la, staging]
     needs: build-and-push
-    if: github.ref == 'refs/heads/main' && vars.DEPLOY_STAGING == 'true'
+    if: github.ref == 'refs/heads/main'
     environment: staging
     concurrency:
       group: tokeninside-staging-deploy
       cancel-in-progress: false
     steps:
-      - name: Deploy over SSH
+      - name: Check out deployment files
+        uses: actions/checkout@v4
+
+      - name: Deploy on LA staging runner
         env:
           TOKENINSIDE_IMAGE: ${{ needs.build-and-push.outputs.image }}
-          SSH_HOST: ${{ vars.SSH_HOST }}
-          SSH_PORT: ${{ vars.SSH_PORT }}
-          SSH_USER: ${{ vars.SSH_USER }}
           DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
           APP_URL: ${{ vars.APP_URL }}
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
-          set -eu
-          mkdir -p ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/tokeninside_deploy
-          chmod 600 ~/.ssh/tokeninside_deploy
-          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
-          ssh -i ~/.ssh/tokeninside_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            "TOKENINSIDE_IMAGE='$TOKENINSIDE_IMAGE' DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
-          set -eu
-          cd "$DEPLOY_DIR"
-          mkdir -p .deploy
-          previous="$(cat .deploy/current-image 2>/dev/null || true)"
-          printf '%s\n' "$previous" > .deploy/previous-image
-          rollback() {
-            if [ -n "$previous" ]; then
-              export TOKENINSIDE_IMAGE="$previous"
-              docker compose --env-file .env -f docker-compose.yml pull tokeninside
-              docker compose --env-file .env -f docker-compose.yml up -d --no-deps tokeninside
-            fi
-          }
-          trap rollback ERR
-          export TOKENINSIDE_IMAGE
-          docker compose --env-file .env -f docker-compose.yml pull tokeninside
-          docker compose --env-file .env -f docker-compose.yml up -d --no-deps tokeninside
-          curl -fsS http://127.0.0.1:16878/api/health
-          printf '%s\n' "$TOKENINSIDE_IMAGE" > .deploy/current-image
-          printf '%s\n' "$TOKENINSIDE_IMAGE" > .deploy/last-successful-image
-          printf '%s %s\n' "$(date -Is)" "$TOKENINSIDE_IMAGE" >> .deploy/releases.log
-          trap - ERR
-          REMOTE
-          if [ -n "$APP_URL" ]; then
-            curl -fsS "$APP_URL/api/health"
-          fi
+          set -euo pipefail
+          : "${DEPLOY_DIR:?staging DEPLOY_DIR is required}"
+          release_dir="${DEPLOY_DIR}/.release-source/${GITHUB_SHA}"
+          install -d -m 0750 "$release_dir/scripts"
+          install -m 0644 docker-compose.yml "$release_dir/docker-compose.yml"
+          install -m 0644 scripts/postgres-tuning-entrypoint.sh "$release_dir/scripts/postgres-tuning-entrypoint.sh"
+          export RELEASE_DIR="$release_dir"
+          export RELEASE_ID="$GITHUB_SHA"
+          bash scripts/deploy-la.sh
 
   deploy-production:
     name: Deploy Production

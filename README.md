@@ -70,7 +70,7 @@ For a standalone Docker Compose deployment:
 ```bash
 cp .env.example .env
 docker compose -f docker-compose.example.yml up -d
-docker compose -f docker-compose.example.yml exec tokeninside npm run db:migrate
+docker compose -f docker-compose.example.yml run --rm --no-deps --entrypoint node tokeninside scripts/db-migrate.mjs
 ```
 
 Production-style deployments should set `TOKENINSIDE_IMAGE` to a fixed tag, for example:
@@ -83,14 +83,26 @@ Runtime secrets must be provided through the server-side environment file. Do no
 
 ## CI/CD
 
-This repository contains both GitHub Actions and GitLab CI definitions:
+GitHub Actions is the canonical deployment path:
 
 ```text
 .github/workflows/tokeninside-ci-cd.yml
-.gitlab-ci.yml
 ```
 
-Both pipelines validate the app, build the Docker image, and publish to GHCR. Staging deployment is disabled by default and only runs when `DEPLOY_STAGING=true` is configured. Production deployment is manual or tag-driven and should be protected by environment controls.
+Every push to `main` validates the application, publishes a Linux/AMD64 image to GHCR, and automatically dispatches the immutable `sha-<commit>` image to the dedicated LA self-hosted runner. The deployer creates a PostgreSQL recovery point, runs versioned migrations under a PostgreSQL advisory lock, checks the migrated schema, replaces only the application service, and verifies local plus public health endpoints.
+
+The LA runner is installed as the systemd service `actions.runner.VoidInTheShell-TokenInside.tokeninside-la-staging.service` under the `tokeninside-ci` account. It connects outward to GitHub, so staging deployment does not require GitHub to hold an SSH private key or connect inbound to the server. The staging job is restricted to its labels (`self-hosted`, `linux`, `x64`, `tokeninside-la`, `staging`).
+
+The `staging` GitHub Environment has only these deployment values:
+
+| Type | Name | Value for LA |
+| --- | --- | --- |
+| Variable | `DEPLOY_DIR` | `/opt/tokeninside` |
+| Variable | `APP_URL` | `https://ti.kumiko-love.com` |
+
+The server retains runtime `.env` locally; CI never uploads it. Every release stores its Compose source under `.release-source/<commit>`, records the image, OCI revision, backup path, prior image, and final status in `.deploy/releases.log`. If an application update fails after a successful migration, the deployer restores the preceding application image. It never restores PostgreSQL automatically: migrations must follow the backward-compatible expand/contract pattern described in [`scripts/migrations/README.md`](scripts/migrations/README.md).
+
+Production is deliberately outside this automatic staging path. Version tags and the protected `production` GitHub Environment remain the route for a later production rollout.
 
 ## Configuration
 
