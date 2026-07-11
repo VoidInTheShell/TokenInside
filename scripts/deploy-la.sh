@@ -48,14 +48,6 @@ compose() {
     "$@"
 }
 
-set -a
-# Runtime env is operator-managed and must never be emitted by this script.
-. "${DEPLOY_DIR}/.env"
-set +a
-
-require_value POSTGRES_DB
-require_value POSTGRES_USER
-
 deploy_state_dir="${DEPLOY_DIR}/.deploy"
 backup_dir="${deploy_state_dir}/backups"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -96,6 +88,10 @@ trap 'rollback_application $?' ERR
 
 compose config --quiet
 compose ps --status running postgres | grep -qx postgres
+POSTGRES_DB="$(compose exec -T postgres printenv POSTGRES_DB | tr -d '\r\n')"
+POSTGRES_USER="$(compose exec -T postgres printenv POSTGRES_USER | tr -d '\r\n')"
+require_value POSTGRES_DB
+require_value POSTGRES_USER
 
 printf 'Creating PostgreSQL recovery point: %s\n' "$backup_path"
 compose exec -T postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc > "$backup_tmp_path"
