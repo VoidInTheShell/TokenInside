@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { tokenRequestInAdminScope as tokenRequestInScope } from "@/lib/admin-scope";
+import { tokenRequestInAdminScope } from "@/lib/admin-scope";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
 import { isAtOrAfterIsoTimestamp } from "@/lib/iso-time";
@@ -2102,6 +2102,25 @@ function userRoleLabel(user: FeishuUser, store: StoreShape) {
   return "普通用户";
 }
 
+function globalAdminOpenIds(store: StoreShape, usersById: ReadonlyMap<string, FeishuUser>) {
+  const openIds = new Set(getConfig().admin.systemAdminOpenIds);
+  for (const scope of store.adminScopes) {
+    if (scope.status !== "active" || scope.scopeType !== "global") continue;
+    const user = usersById.get(scope.feishuUserId);
+    if (user) openIds.add(user.openId);
+  }
+  return openIds;
+}
+
+function tokenRequestInScope(
+  request: TokenRequest,
+  scope: AdminScope,
+  usersById: ReadonlyMap<string, FeishuUser>,
+  systemAdminOpenIds: ReadonlySet<string>,
+) {
+  return tokenRequestInAdminScope(request, scope, usersById, systemAdminOpenIds);
+}
+
 function latestByUser<T extends { feishuUserId: string; updatedAt?: string; createdAt?: string }>(
   rows: T[],
 ) {
@@ -2124,7 +2143,7 @@ export async function getScopedTokenRequest(scope: AdminScope, requestId: string
   const request = store.tokenRequests.find((item) => item.id === requestId);
   if (!request) return null;
   const usersById = new Map(store.users.map((user) => [user.id, user]));
-  return tokenRequestInScope(request, scope, usersById) ? request : null;
+  return tokenRequestInScope(request, scope, usersById, globalAdminOpenIds(store, usersById)) ? request : null;
 }
 
 export async function getScopedUser(scope: AdminScope, feishuUserId: string) {
@@ -2994,10 +3013,11 @@ export async function listAdminTokenRequests(input: {
 }) {
   const store = await readStore();
   const usersById = new Map(store.users.map((user) => [user.id, user]));
+  const systemAdminOpenIds = globalAdminOpenIds(store, usersById);
   const scopedRequests = store.tokenRequests
     .filter(
       (request) =>
-        tokenRequestInScope(request, input.scope, usersById) &&
+        tokenRequestInScope(request, input.scope, usersById, systemAdminOpenIds) &&
         isAtOrAfterIsoTimestamp(request.createdAt, input.createdAfter),
     )
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -3018,12 +3038,13 @@ export async function getAdminOverview(scope: AdminScope) {
   const store = await readStore();
   const currentPeriod = nowIso().slice(0, 7);
   const usersById = new Map(store.users.map((user) => [user.id, user]));
+  const systemAdminOpenIds = globalAdminOpenIds(store, usersById);
   const scopedUsers =
     scope.scopeType === "global"
       ? store.users
       : store.users.filter((user) => user.departmentId === scope.departmentId);
   const scopedRequests = store.tokenRequests.filter((request) =>
-    tokenRequestInScope(request, scope, usersById),
+    tokenRequestInScope(request, scope, usersById, systemAdminOpenIds),
   );
   const scopedAccounts = store.tokenAccounts.filter((account) =>
     tokenAccountInScope(account, scope, usersById),

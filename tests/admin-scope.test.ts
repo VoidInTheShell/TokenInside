@@ -91,3 +91,25 @@ test("global administrators retain access to every request", () => {
   };
   assert.equal(tokenRequestInAdminScope(request({ feishuUserId: "missing-user" }), scope, users), true);
 });
+
+test("department administrators cannot read a system administrator request from their own department", () => {
+  const systemAdminRequest = request({
+    feishuUserId: "requester-a",
+    approvalDepartmentId: "department-a",
+  });
+  const systemAdminOpenIds = new Set(["open-requester-a"]);
+
+  assert.equal(
+    tokenRequestInAdminScope(systemAdminRequest, departmentScope("department-a"), users, systemAdminOpenIds),
+    false,
+  );
+  assert.equal(
+    tokenRequestInAdminScope(
+      systemAdminRequest,
+      { ...departmentScope("department-a"), scopeType: "global", departmentId: undefined },
+      users,
+      systemAdminOpenIds,
+    ),
+    true,
+  );
+});
