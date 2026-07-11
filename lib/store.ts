@@ -1,10 +1,14 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { tokenRequestInAdminScope as tokenRequestInScope } from "@/lib/admin-scope";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
 import { isAtOrAfterIsoTimestamp } from "@/lib/iso-time";
 import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
-import { sameNewApiUsageSource } from "@/lib/newapi-usage-identity";
+import {
+  sameNewApiUsageSource,
+  stableNewApiUsageRecordId,
+} from "@/lib/newapi-usage-identity";
 import { findProxyLogForNewApiUsage } from "@/lib/usage-matching";
 import { isUsageRecordRequest } from "@/lib/usage-record-visibility";
 import { normalizedInputTokensTotal } from "@/lib/usage-metrics";
@@ -1448,16 +1452,17 @@ function stableUsageIdentity(usageLog: NormalizedNewApiUsageLog) {
     .join(":");
 }
 
-function stableRecordId(prefix: string, identity: string) {
+function stableIssueId(prefix: string, identity: string) {
   return `${prefix}_${identity.replace(/[^a-zA-Z0-9_.:-]/g, "_").slice(0, 180) || randomId(prefix)}`;
 }
 
 function usageRecordIdFromLog(usageLog: NormalizedNewApiUsageLog) {
-  return stableRecordId("nur", stableUsageIdentity(usageLog));
+  const identity = stableUsageIdentity(usageLog);
+  return identity ? stableNewApiUsageRecordId(identity) : randomId("nur");
 }
 
 function usageIssueIdFromLog(type: UsageSyncIssueType, usageLog: NormalizedNewApiUsageLog) {
-  return stableRecordId(`usi_${type}`, stableUsageIdentity(usageLog));
+  return stableIssueId(`usi_${type}`, stableUsageIdentity(usageLog));
 }
 
 function buildNewApiUsageRecord(input: {
@@ -1649,31 +1654,15 @@ export async function backfillProxyLogsFromNewApiUsage(
           ? undefined
           : accountByNewApiTokenId.get(usageLog.newapiTokenId);
       if (!account) {
-        const record = buildNewApiUsageRecord({
-          store,
-          usageLog,
-          matchStatus: "unknown_token",
-          syncedAt,
-        });
-        const issue = buildUsageSyncIssue({
-          issueType: "unknown_token",
-          usageLog,
-          syncedAt,
-          message: "NewAPI token_id is not bound to a TokenInside token account",
-        });
-        await persistRecord(record);
-        await persistSyncIssue(issue);
         result.skippedUnknownToken += 1;
         result.items.push({
           action: "skipped_unknown_token",
           newapiLogId: usageLog.newapiLogId,
           newapiRequestId: usageLog.newapiRequestId,
           newapiTokenId: usageLog.newapiTokenId,
-          usageRecordId: record.id,
-          issueId: issue.id,
           cost: usageLog.cost,
           quota: usageLog.quota,
-          reason: "NewAPI token_id is not bound to a TokenInside token account",
+          reason: "NewAPI token_id is outside the TokenInside account boundary",
         });
         continue;
       }
@@ -2057,20 +2046,6 @@ export async function syncDepartmentSupervisorAdminScope(input: {
     store.adminScopes.push(scope);
     return scope;
   });
-}
-
-function tokenRequestInScope(
-  request: TokenRequest,
-  scope: AdminScope,
-  usersById: Map<string, FeishuUser>,
-) {
-  if (scope.scopeType === "global") return true;
-  const adminUser = usersById.get(scope.feishuUserId);
-  if (request.approvalTargetOpenId) {
-    return request.approvalTargetOpenId === adminUser?.openId;
-  }
-  const user = usersById.get(request.feishuUserId);
-  return Boolean(user?.departmentId && user.departmentId === scope.departmentId);
 }
 
 function tokenAccountInScope(

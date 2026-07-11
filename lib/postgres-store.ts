@@ -1541,7 +1541,11 @@ export async function upsertPostgresNewApiUsageRecord(record: NewApiUsageRecord)
               )
             )
           )
-       order by case when id = $1 then 0 else 1 end
+       order by case
+         when id = $1 then 0
+         when $3::text is not null and newapi_request_id = $3 then 1
+         else 2
+       end
        limit 1
        for update`,
       [record.id, record.newapiTokenId ?? null, record.newapiRequestId ?? null, record.newapiLogId ?? null],

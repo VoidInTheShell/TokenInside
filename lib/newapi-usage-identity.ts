@@ -1,9 +1,15 @@
+import { sha256Hex } from "./crypto.ts";
+
 export type NewApiUsageSourceIdentity = {
   id?: string;
   newapiLogId?: string;
   newapiRequestId?: string;
   newapiTokenId?: string;
 };
+
+export function stableNewApiUsageRecordId(identity: string) {
+  return `nur_${sha256Hex(identity)}`;
+}
 
 export function sameNewApiUsageSource(
   left: NewApiUsageSourceIdentity,

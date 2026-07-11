@@ -48,6 +48,18 @@ const statements = [
     on token_requests (approval_instance_code)`,
   `create index if not exists token_requests_user_created_idx
     on token_requests (feishu_user_id, created_at)`,
+  `update token_requests request
+   set approval_department_id = user_row.department_id,
+       data = jsonb_set(
+         request.data,
+         '{approvalDepartmentId}',
+         to_jsonb(user_row.department_id),
+         true
+       )
+   from feishu_users user_row
+   where request.feishu_user_id = user_row.id
+     and request.approval_department_id is null
+     and user_row.department_id is not null`,
   `create table if not exists token_accounts (
     id text primary key,
     feishu_user_id text not null,
@@ -191,6 +203,11 @@ const statements = [
   `create index if not exists usage_sync_issues_log_idx
     on usage_sync_issues (newapi_log_id)
     where newapi_log_id is not null`,
+  `update usage_sync_issues
+   set status = 'closed',
+       data = jsonb_set(data, '{status}', to_jsonb('closed'::text), true)
+   where issue_type = 'unknown_token'
+     and status = 'open'`,
   `create table if not exists admin_scopes (
     id text primary key,
     feishu_user_id text not null,

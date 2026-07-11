@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   newApiUsageIdentityLockKeys,
   sameNewApiUsageSource,
+  stableNewApiUsageRecordId,
 } from "../lib/newapi-usage-identity.ts";
 
 test("does not treat reused NewAPI log ids from different tokens as the same source", () => {
@@ -42,4 +43,16 @@ test("locks request and log identities in a stable order before an upsert", () =
     }),
     ["newapi_usage:54:log:9", "newapi_usage:54:request:request-a"],
   );
+});
+
+test("stable record ids do not collide after sanitization or long-prefix truncation", () => {
+  assert.notEqual(
+    stableNewApiUsageRecordId("request:54:request/a"),
+    stableNewApiUsageRecordId("request:54:request?a"),
+  );
+  assert.notEqual(
+    stableNewApiUsageRecordId(`request:54:${"a".repeat(220)}-one`),
+    stableNewApiUsageRecordId(`request:54:${"a".repeat(220)}-two`),
+  );
+  assert.match(stableNewApiUsageRecordId("request:54:request-a"), /^nur_[a-f0-9]{64}$/);
 });
