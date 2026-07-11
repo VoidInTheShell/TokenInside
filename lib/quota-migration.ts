@@ -68,15 +68,15 @@ export function buildQuotaMigrationPlan(
       (item) => item.feishuUserId === user.id && item.period === input.period,
     );
     const assignedDisplayQuota =
+      billing?.monthlyQuota ??
       explicitRequest?.approvedMonthlyQuota ??
       explicitRequest?.requestedMonthlyQuota ??
-      billing?.monthlyQuota ??
       store.settings.defaultMonthlyQuota;
     const assignedMonthlyQuota = Math.max(
       Math.round(assignedDisplayQuota * input.quotaPerUnit),
       0,
     );
-    const sourceId = explicitRequest?.id ?? billing?.id ?? `default:${input.period}:${user.id}`;
+    const sourceId = billing?.id ?? explicitRequest?.id ?? `default:${input.period}:${user.id}`;
     const previousVersion = store.userQuotaPolicies
       .filter((item) => item.feishuUserId === user.id)
       .reduce((max, item) => Math.max(max, item.version), 0);
