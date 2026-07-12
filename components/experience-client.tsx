@@ -42,6 +42,10 @@ import {
 } from "@/components/usage-analysis-tables";
 import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
 import { pendingApprovalRouteNotice } from "@/lib/department-quota";
+import {
+  tokenRequestAllowsQuotaEdit,
+  tokenRequestRequiresAdminDecision,
+} from "@/lib/token-request-policy";
 
 type SessionResponse = {
   authenticated: boolean;
@@ -189,7 +193,7 @@ const requestTypeLabel: Record<string, string> = {
   first_apply: "首次申请",
   quota_reset: "恢复可用额度",
   quota_restore: "恢复可用额度",
-  key_reset: "Key 轮换",
+  key_reset: "Key 更换",
   quota_adjust: "额度调整",
   monthly_reset: "月度开账",
 };
@@ -217,19 +221,12 @@ function scopeLabel(scope?: SessionResponse["adminScope"]) {
   return "部门管理";
 }
 
-function canDecideRequest(status: string) {
-  return [
-    "pending_card_send",
-    "pending_card_approval",
-    "approval_card_send_failed",
-    "approval_route_failed",
-    "pending_feishu_approval",
-    "approved_provision_failed",
-  ].includes(status);
+function canDecideRequest(request: { requestType: string; status: string }) {
+  return tokenRequestRequiresAdminDecision(request);
 }
 
-function canEditQuota(status: string) {
-  return ["pending_card_send", "pending_card_approval", "approval_card_send_failed"].includes(status);
+function canEditQuota(request: { requestType: string; status: string }) {
+  return tokenRequestAllowsQuotaEdit(request);
 }
 
 function appendUsageParam(params: URLSearchParams, key: string, value?: string) {
@@ -527,13 +524,13 @@ export function ExperienceClient() {
             setMessage(
               body.operation.operationType === "first_provision"
                 ? "首次发放已完成，Key 已展示并复制。"
-                : "Key 安全轮换已完成，新 Key 已展示并复制。旧 Key 已失效。",
+                : "Key 更换已完成，新 Key 已展示并复制。旧 Key 已失效。",
             );
           } catch {
             setMessage(
               body.operation.operationType === "first_provision"
                 ? "首次发放已完成，Key 已展示。"
-                : "Key 安全轮换已完成，新 Key 已展示。旧 Key 已失效。",
+                : "Key 更换已完成，新 Key 已展示。旧 Key 已失效。",
             );
           }
           await refresh();
@@ -543,13 +540,13 @@ export function ExperienceClient() {
           setMessage(
             body.operation.operationType === "first_provision"
               ? "首次发放已完成。Key 凭据已在此前受控交付。"
-              : "Key 安全轮换已完成。新 Key 凭据已在此前受控交付。",
+              : "Key 更换已完成。新 Key 凭据已在此前受控交付。",
           );
           await refresh();
           return;
         }
         if (body.operation.state === "manual_review") {
-          setError(body.operation.lastErrorMessage ?? "Key 轮换需要管理员人工处置");
+          setError(body.operation.lastErrorMessage ?? "Key 更换需要管理员人工处置");
           return;
         }
         timer = window.setTimeout(poll, 1500);
@@ -685,7 +682,7 @@ export function ExperienceClient() {
   }
 
   async function resetKey() {
-    if (!window.confirm("安全轮换会先排空在途请求，再停用旧 Key 并交付新 Key。是否继续？")) return;
+    if (!window.confirm("更换会立即停止旧 Key 接收新请求，排空已在途请求后停用旧 Key 并交付新 Key。是否继续？")) return;
     setBusy(true);
     setError(null);
     setMessage(null);
@@ -694,7 +691,7 @@ export function ExperienceClient() {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          reason: "用户在 TokenInside 用户后台发起 Key 安全轮换",
+          reason: "用户在 TokenInside 用户后台发起 Key 更换",
           clientRequestId: window.crypto.randomUUID(),
         }),
       });
@@ -702,12 +699,12 @@ export function ExperienceClient() {
         operation?: SelfQuotaOperation;
         error?: string;
       };
-      if (!res.ok) throw new Error(body.error ?? "重置 key 失败");
-      if (!body.operation) throw new Error("服务端未返回 Key 轮换操作");
+      if (!res.ok) throw new Error(body.error ?? "更换 Key 失败");
+      if (!body.operation) throw new Error("服务端未返回 Key 更换操作");
       setQuotaOperation(body.operation);
-      setMessage("Key 安全轮换已受理，系统正在排空在途请求并执行写后校验。");
+      setMessage("Key 更换已受理，旧 Key 已停止接收新请求，系统正在排空在途请求并执行切换校验。");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Key 安全轮换失败");
+      setError(err instanceof Error ? err.message : "Key 更换失败");
     } finally {
       setBusy(false);
     }
@@ -1025,12 +1022,12 @@ export function ExperienceClient() {
                                       [request.id]: event.target.value,
                                     }))
                                   }
-                                  disabled={!canEditQuota(request.status) || quickApprovalBusy}
+                                  disabled={!canEditQuota(request) || quickApprovalBusy}
                                 />
                                 <Button
                                   variant="outline"
                                   size="sm"
-                                  disabled={!canEditQuota(request.status) || quickApprovalBusy}
+                                  disabled={!canEditQuota(request) || quickApprovalBusy}
                                   onClick={() => void saveQuickApprovalQuota(request.id)}
                                 >
                                   保存
@@ -1048,7 +1045,7 @@ export function ExperienceClient() {
                                 <Button
                                   variant="outline"
                                   size="sm"
-                                  disabled={!canDecideRequest(request.status) || quickApprovalBusy}
+                                  disabled={!canDecideRequest(request) || quickApprovalBusy}
                                   onClick={() => void decideQuickApproval(request.id, "approve")}
                                 >
                                   <CheckCircle2Icon data-icon="inline-start" />
@@ -1057,7 +1054,7 @@ export function ExperienceClient() {
                                 <Button
                                   variant="outline"
                                   size="sm"
-                                  disabled={!canDecideRequest(request.status) || quickApprovalBusy}
+                                  disabled={!canDecideRequest(request) || quickApprovalBusy}
                                   onClick={() => void decideQuickApproval(request.id, "reject")}
                                 >
                                   <XCircleIcon data-icon="inline-start" />
@@ -1174,7 +1171,7 @@ export function ExperienceClient() {
                               onClick={() => void resetKey()}
                             >
                               <RefreshCwIcon data-icon="inline-start" />
-                              安全轮换
+                              更换
                             </Button>
                           </div>
                         </div>
@@ -1183,7 +1180,7 @@ export function ExperienceClient() {
                             <Badge variant={badgeVariant(quotaOperation.state)}>
                               {quotaOperation.operationType === "first_provision"
                                 ? "首次发放"
-                                : "Key 轮换"}
+                                : "Key 更换"}
                               ：{quotaOperation.state}
                             </Badge>
                             <span className="field-description">

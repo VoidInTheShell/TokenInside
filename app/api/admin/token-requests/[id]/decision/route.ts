@@ -6,6 +6,7 @@ import { provisionTokenForRequest } from "@/lib/provisioning";
 import { getScopedTokenRequest, updateTokenRequest } from "@/lib/store";
 import { enqueueQuotaRestoreForRequest, runQuotaOperation } from "@/lib/quota-saga";
 import { quotaFeatureErrorStatus } from "@/lib/quota-guard";
+import { tokenRequestRequiresAdminDecision } from "@/lib/token-request-policy";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,15 +15,6 @@ const decisionSchema = z.object({
   action: z.enum(["approve", "reject"]),
   approvedMonthlyQuota: z.number().int().positive().max(1000000).optional(),
 });
-
-const decidableStatuses = new Set([
-  "pending_card_send",
-  "pending_card_approval",
-  "approval_card_send_failed",
-  "approval_route_failed",
-  "pending_feishu_approval",
-  "approved_provision_failed",
-]);
 
 export async function POST(
   request: Request,
@@ -37,9 +29,9 @@ export async function POST(
     return NextResponse.json({ error: "申请单不存在或不在当前管理范围内" }, { status: 404 });
   }
 
-  if (!decidableStatuses.has(tokenRequest.status)) {
+  if (!tokenRequestRequiresAdminDecision(tokenRequest)) {
     return NextResponse.json(
-      { error: "当前申请状态不允许管理端审批处理" },
+      { error: "当前记录不是可人工处理的审批申请" },
       { status: 409 },
     );
   }

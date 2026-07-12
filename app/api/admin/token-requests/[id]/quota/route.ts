@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireAdminScope } from "@/lib/admin";
 import { getScopedTokenRequest, updateTokenRequest } from "@/lib/store";
+import { tokenRequestAllowsQuotaEdit } from "@/lib/token-request-policy";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -23,9 +24,9 @@ export async function PATCH(
     return NextResponse.json({ error: "申请单不存在或不在当前管理范围内" }, { status: 404 });
   }
 
-  if (!["pending_card_send", "pending_card_approval", "approval_card_send_failed"].includes(tokenRequest.status)) {
+  if (!tokenRequestAllowsQuotaEdit(tokenRequest)) {
     return NextResponse.json(
-      { error: "只有待审批或发卡失败的申请可以修改最终额度" },
+      { error: "当前记录不是可修改额度的审批申请" },
       { status: 409 },
     );
   }

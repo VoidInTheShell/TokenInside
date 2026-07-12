@@ -20,6 +20,7 @@ import {
   calculateFirstProvision,
   calculateQuotaAdjustment,
   calculateQuotaRestore,
+  conservativeRemainQuotaObservation,
   hongKongBillingPeriod,
 } from "@/lib/quota-model";
 import {
@@ -55,7 +56,11 @@ import {
   updateTokenRequest,
   withUserQuotaOperationLock,
 } from "@/lib/store";
-import { quotaOperationRetryResumeState } from "@/lib/quota-saga-state";
+import {
+  canAutoResumeKeyRotationObservationFailure,
+  canCompensateKeyRotationBeforeUpstream,
+  quotaOperationRetryResumeState,
+} from "@/lib/quota-saga-state";
 import type {
   QuotaOperation,
   TokenAccount,
@@ -78,6 +83,14 @@ async function stableRemainQuota(newapiTokenId: string) {
     throw new Error("NewAPI token 余额观测不稳定");
   }
   return second;
+}
+
+async function conservativeRemainQuotaAfterDrain(newapiTokenId: string) {
+  const observations = [];
+  for (let index = 0; index < 3; index += 1) {
+    observations.push(await getNewApiTokenRemainQuota(newapiTokenId));
+  }
+  return conservativeRemainQuotaObservation(observations);
 }
 
 async function assignedQuotaForUser(feishuUserId: string, period: string) {
@@ -139,12 +152,31 @@ async function prepareAndDrain(
         ["active"],
       );
     }
+    if (
+      drainingAccount?.newapiTokenId &&
+      !current.evidence?.oldUpstreamDisabledAt
+    ) {
+      await disableNewApiToken(drainingAccount.newapiTokenId);
+      const evidence = {
+        ...current.evidence,
+        oldUpstreamDisabledAt: nowIso(),
+      };
+      if (current.state === "admission_closed") {
+        current =
+          (await transitionQuotaOperation(current.id, "upstream_frozen", {
+            evidence,
+          })) ?? current;
+      } else {
+        current =
+          (await updateQuotaOperation(current.id, { evidence }, [current.state])) ?? current;
+      }
+    }
     const inflight = await listInflightProxyRequests(
       current.feishuUserId,
       state.activeGeneration,
     );
     if (inflight.length > 0) {
-      if (current.state === "admission_closed") {
+      if (current.state === "admission_closed" || current.state === "upstream_frozen") {
         current = await transitionQuotaOperation(current.id, "draining", {
           nextRetryAt: addMilliseconds(nowIso(), retryDelayMs),
           evidence: {
@@ -663,15 +695,72 @@ async function handleFirstProvision(operation: QuotaOperation) {
 }
 
 async function accountBeforeRotation(operation: QuotaOperation) {
-  if (!operation.tokenAccountIdBefore) return getActiveTokenForUser(operation.feishuUserId);
   const store = await getStoreSnapshot();
+  if (!operation.tokenAccountIdBefore) {
+    return (
+      store.tokenAccounts.find(
+        (item) =>
+          item.feishuUserId === operation.feishuUserId && item.status === "active",
+      ) ??
+      [...store.tokenAccounts]
+        .filter(
+          (item) =>
+            item.feishuUserId === operation.feishuUserId &&
+            ["draining", "settling"].includes(item.status),
+        )
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] ??
+      null
+    );
+  }
   return store.tokenAccounts.find((item) => item.id === operation.tokenAccountIdBefore) ?? null;
+}
+
+async function quarantineUnexpectedRotationAccounts(
+  operation: QuotaOperation,
+  oldAccount: TokenAccount,
+) {
+  if (!operation.requestId) return operation;
+  const store = await getStoreSnapshot();
+  const candidates = store.tokenAccounts.filter(
+    (account) =>
+      account.feishuUserId === operation.feishuUserId &&
+      account.id !== oldAccount.id &&
+      account.id !== operation.tokenAccountIdAfter &&
+      account.tokenRequestId === operation.requestId &&
+      ["pending_activation", "active", "draining", "settling"].includes(account.status),
+  );
+  if (!candidates.length) return operation;
+  for (const account of candidates) {
+    if (account.newapiTokenId) await disableNewApiToken(account.newapiTokenId);
+    await updateTokenAccount(
+      account.id,
+      { status: "orphaned", disabledAt: nowIso() },
+      ["pending_activation", "active", "draining", "settling"],
+    );
+  }
+  return (
+    (await updateQuotaOperation(operation.id, {
+      evidence: {
+        ...operation.evidence,
+        quarantinedUnexpectedTokenAccountIds: candidates.map((account) => account.id).join(","),
+        quarantinedUnexpectedTokenAccountsAt: nowIso(),
+      },
+    })) ?? operation
+  );
 }
 
 async function handleKeyRotation(operation: QuotaOperation) {
   let current = operation;
   let oldAccount = await accountBeforeRotation(current);
   if (!oldAccount?.newapiTokenId) throw new Error("当前用户没有可轮换的 active NewAPI key");
+  if (!current.tokenAccountIdBefore || !current.upstreamTokenIdBefore) {
+    current =
+      (await updateQuotaOperation(current.id, {
+        tokenAccountIdBefore: oldAccount.id,
+        upstreamTokenIdBefore: oldAccount.newapiTokenId,
+      })) ?? current;
+  }
+  current = await quarantineUnexpectedRotationAccounts(current, oldAccount);
   if (
     current.state === "upstream_activated" ||
     current.state === "local_finalized" ||
@@ -711,25 +800,13 @@ async function handleKeyRotation(operation: QuotaOperation) {
       })) ?? current
     );
   }
-  if (current.observedRemainBefore === undefined) {
-    const observedRemainBefore = await stableRemainQuota(oldAccount.newapiTokenId);
-    current =
-      (await updateQuotaOperation(current.id, {
-        observedRemainBefore,
-        upstreamTokenIdBefore: oldAccount.newapiTokenId,
-        tokenAccountIdBefore: oldAccount.id,
-      })) ?? current;
-  }
   const prepared = await prepareAndDrain(current, oldAccount);
   if (!prepared.ready) return prepared.operation;
   current = prepared.operation;
   oldAccount = await accountBeforeRotation(current);
   if (!oldAccount?.newapiTokenId) throw new Error("轮换前旧 Key 记录丢失");
-  const stable = await stableRemainQuota(oldAccount.newapiTokenId);
-  if (stable !== current.observedRemainBefore) {
-    throw new Error("旧 Key 排空后余额变化，需要新建操作版本");
-  }
   if (current.targetRemainQuota === undefined) {
+    const observation = await conservativeRemainQuotaAfterDrain(oldAccount.newapiTokenId);
     await rebuildQuotaMaterializedSnapshots(current.billingPeriod);
     const billingPeriod = await getUserBillingPeriod(
       current.feishuUserId,
@@ -748,16 +825,20 @@ async function handleKeyRotation(operation: QuotaOperation) {
     }
     const rotationTarget = calculateKeyRotationTarget({
       expectedAvailableQuota: billingPeriod.expectedAvailableQuota,
-      observedRemainQuota: stable,
+      observedRemainQuota: observation.remainQuota,
     });
     current = await freezeSnapshot(current, {
+      observedRemainBefore: observation.remainQuota,
       targetRemainQuota: rotationTarget.targetRemainQuota,
+      upstreamTokenIdBefore: oldAccount.newapiTokenId,
+      tokenAccountIdBefore: oldAccount.id,
       evidence: {
         ...current.evidence,
         expectedAvailableQuota: rotationTarget.expectedAvailableQuota,
         authoritativeConsumedQuota: billingPeriod.authoritativeConsumedQuota,
         authorizedQuota: billingPeriod.authorizedQuota,
         observedRemainQuota: rotationTarget.observedRemainQuota,
+        observedRemainQuotaSamples: observation.observations.join(","),
         upstreamDelta: rotationTarget.upstreamDelta,
         keyRotationTargetLimitedBy: rotationTarget.limitedBy,
         quotaSourceVersion: billingPeriod.sourceVersion,
@@ -985,10 +1066,60 @@ async function handleReconciliation(operation: QuotaOperation) {
   return finalizeCommon(current, account);
 }
 
+async function compensateKeyRotationBeforeUpstream(
+  operation: QuotaOperation,
+  message: string,
+) {
+  if (!canCompensateKeyRotationBeforeUpstream(operation)) return null;
+  const oldAccount = await accountBeforeRotation(operation);
+  if (oldAccount?.newapiTokenId) {
+    await enableNewApiToken(oldAccount.newapiTokenId);
+    if (!getConfig().newapi.mock) {
+      const state = await getNewApiTokenControlState(oldAccount.newapiTokenId);
+      if (state.status !== 1) throw new Error("Key 更换补偿无法重新启用旧 Key");
+    }
+  }
+  if (oldAccount && ["draining", "settling"].includes(oldAccount.status)) {
+    await updateTokenAccount(
+      oldAccount.id,
+      { status: "active", drainStartedAt: undefined },
+      ["draining", "settling"],
+    );
+  }
+  await reopenAdmission(operation);
+  const compensating =
+    (await transitionQuotaOperation(operation.id, "compensating", {
+      lastErrorCode: "pre_switch_failure",
+      lastErrorMessage: message,
+      nextRetryAt: undefined,
+      evidence: {
+        ...operation.evidence,
+        compensatedFromState: operation.state,
+        compensatedAt: nowIso(),
+      },
+    })) ?? operation;
+  return (
+    (await transitionQuotaOperation(compensating.id, "compensated", {
+      reservedDepartmentQuota: 0,
+      nextRetryAt: undefined,
+    })) ?? compensating
+  );
+}
+
 async function markOperationFailure(operationId: string, error: unknown) {
   const current = await findQuotaOperationById(operationId);
   if (!current || current.state === "completed" || current.state === "compensated") return current;
   const message = error instanceof Error ? error.message : "quota operation failed";
+  const compensated = await compensateKeyRotationBeforeUpstream(current, message);
+  if (compensated) {
+    if (current.requestId) {
+      await updateTokenRequest(current.requestId, {
+        status: "approved_provision_failed",
+        errorMessage: message,
+      }).catch(() => undefined);
+    }
+    return compensated;
+  }
   const waitingForDepartmentBudget = message.includes("部门可用额度不足");
   const uncertain = !waitingForDepartmentBudget && current.attemptCount >= maxAttempts;
   const nextState = uncertain ? "manual_review" : "retryable_failed";
@@ -1059,13 +1190,29 @@ export async function runQuotaOperation(operationId: string) {
       return operation;
     }
     if (operation.state === "manual_review") {
-      if (!canResumeBudgetBlockedOperation(operation)) return operation;
-      operation =
-        (await transitionQuotaOperation(operation.id, "planned", {
-          nextRetryAt: undefined,
-          lastErrorCode: undefined,
-          lastErrorMessage: undefined,
-        })) ?? operation;
+      if (canAutoResumeKeyRotationObservationFailure(operation)) {
+        operation =
+          (await transitionQuotaOperation(operation.id, "planned", {
+            nextRetryAt: undefined,
+            lastErrorCode: undefined,
+            lastErrorMessage: undefined,
+            evidence: {
+              ...operation.evidence,
+              legacyObservationRetryFromState: quotaOperationRetryResumeState(
+                operation.evidence?.retryFromState,
+              ),
+            },
+          })) ?? operation;
+      } else if (canResumeBudgetBlockedOperation(operation)) {
+        operation =
+          (await transitionQuotaOperation(operation.id, "planned", {
+            nextRetryAt: undefined,
+            lastErrorCode: undefined,
+            lastErrorMessage: undefined,
+          })) ?? operation;
+      } else {
+        return operation;
+      }
     }
     if (operation.state === "retryable_failed") {
       operation =
@@ -1108,7 +1255,8 @@ export async function runDueQuotaOperations(limit = 20) {
       (item) =>
         item.state !== "completed" &&
         item.state !== "compensated" &&
-        item.state !== "manual_review" &&
+        (item.state !== "manual_review" ||
+          canAutoResumeKeyRotationObservationFailure(item)) &&
         (!item.nextRetryAt || item.nextRetryAt <= now),
     )
     .slice(0, limit);

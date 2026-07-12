@@ -150,6 +150,21 @@ export function calculateKeyRotationTarget(input: {
   };
 }
 
+export function conservativeRemainQuotaObservation(
+  observations: readonly (number | undefined)[],
+) {
+  if (!observations.length || observations.some((value) => value === undefined)) {
+    throw new Error("NewAPI token 余额观测不可用");
+  }
+  const normalized = observations.map((value, index) =>
+    normalizeQuota(value as number, `remainQuotaObservation[${index}]`),
+  );
+  return {
+    remainQuota: Math.min(...normalized),
+    observations: normalized,
+  };
+}
+
 export function materializeDepartmentQuota(input: {
   budgetQuota: number;
   committedAuthorizedQuota: number;

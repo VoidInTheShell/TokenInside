@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   assertQuotaOperationTransition,
+  canAutoResumeKeyRotationObservationFailure,
+  canCompensateKeyRotationBeforeUpstream,
   canTransitionQuotaOperation,
   quotaOperationRetryResumeState,
 } from "../lib/quota-saga-state.ts";
@@ -37,4 +39,31 @@ test("quota saga resumes the exact durable phase after a retryable failure", () 
 test("manual review can reopen only through an explicit recovery transition", () => {
   assert.equal(canTransitionQuotaOperation("manual_review", "planned"), true);
   assert.equal(canTransitionQuotaOperation("manual_review", "completed"), false);
+});
+
+test("pre-switch key rotation failures can compensate and legacy observation failures auto-resume", () => {
+  assert.equal(canTransitionQuotaOperation("draining", "compensating"), true);
+  assert.equal(
+    canCompensateKeyRotationBeforeUpstream({
+      operationType: "key_rotation",
+      state: "draining",
+    }),
+    true,
+  );
+  assert.equal(
+    canCompensateKeyRotationBeforeUpstream({
+      operationType: "key_rotation",
+      state: "upstream_applying",
+    }),
+    false,
+  );
+  assert.equal(
+    canAutoResumeKeyRotationObservationFailure({
+      operationType: "key_rotation",
+      state: "manual_review",
+      lastErrorMessage: "NewAPI token 余额观测不稳定",
+      evidence: { retryFromState: "draining" },
+    }),
+    true,
+  );
 });

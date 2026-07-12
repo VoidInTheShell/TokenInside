@@ -6,6 +6,7 @@ import {
   calculateFirstProvision,
   calculateQuotaRestore,
   classifyQuotaReconciliation,
+  conservativeRemainQuotaObservation,
   fixedUsageSyncWindow,
   hongKongBillingPeriod,
   initialUnassignedMonthlyQuota,
@@ -58,6 +59,17 @@ test("key rotation inherits the conservative user-period remainder", () => {
       upstreamDelta: -2_147_229,
       limitedBy: "upstream",
     },
+  );
+});
+
+test("key rotation accepts decreasing post-drain observations conservatively", () => {
+  assert.deepEqual(conservativeRemainQuotaObservation([100, 98, 99]), {
+    remainQuota: 98,
+    observations: [100, 98, 99],
+  });
+  assert.throws(
+    () => conservativeRemainQuotaObservation([100, undefined, 98]),
+    /余额观测不可用/,
   );
 });
 

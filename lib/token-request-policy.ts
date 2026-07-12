@@ -16,10 +16,26 @@ export const adminDecidableRequestStatuses = new Set<RequestStatus>([
 ]);
 
 export function tokenRequestRequiresAdminDecision(
-  request: Pick<TokenRequest, "requestType" | "status">,
+  request: { requestType: string; status: string },
 ) {
   return (
-    humanApprovalRequestTypes.has(request.requestType) &&
-    adminDecidableRequestStatuses.has(request.status)
+    humanApprovalRequestTypes.has(request.requestType as TokenRequest["requestType"]) &&
+    adminDecidableRequestStatuses.has(request.status as RequestStatus)
+  );
+}
+
+const quotaEditableRequestStatuses = new Set<RequestStatus>([
+  "pending_card_send",
+  "pending_card_approval",
+  "approval_card_send_failed",
+]);
+
+export function tokenRequestAllowsQuotaEdit(request: {
+  requestType: string;
+  status: string;
+}) {
+  return (
+    humanApprovalRequestTypes.has(request.requestType as TokenRequest["requestType"]) &&
+    quotaEditableRequestStatuses.has(request.status as RequestStatus)
   );
 }

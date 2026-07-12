@@ -33,13 +33,13 @@ export async function POST(request: Request) {
     const body = await request.json().catch(() => ({}));
     const parsed = resetSchema.safeParse(body);
     if (!parsed.success) {
-      return NextResponse.json({ error: "key reset 理由无效" }, { status: 400 });
+      return NextResponse.json({ error: "Key 更换理由无效" }, { status: 400 });
     }
 
     await assertQuotaWriteActionEnabled("key_rotation");
     const activeToken = await getActiveTokenForUser(user.id);
     if (!activeToken) {
-      return NextResponse.json({ error: "当前飞书用户没有可轮换的 active NewAPI key" }, { status: 409 });
+      return NextResponse.json({ error: "当前飞书用户没有可更换的 active NewAPI Key" }, { status: 409 });
     }
     const clientRequestId =
       parsed.data.clientRequestId ?? request.headers.get("idempotency-key") ?? randomId("reset");
@@ -57,7 +57,7 @@ export async function POST(request: Request) {
       feishuUserId: user.id,
       requestType: "key_reset",
       status: "approved_provisioning",
-      reason: parsed.data.reason ?? "用户发起 Key 轮换",
+      reason: parsed.data.reason ?? "用户发起 Key 更换",
       requestedMonthlyQuota: monthlyQuota,
       approvalMode: "manual",
       approvalOperatorOpenId: user.openId,
@@ -75,7 +75,7 @@ export async function POST(request: Request) {
     } catch (error) {
       await updateTokenRequest(tokenRequest.id, {
         status: "approved_provision_failed",
-        errorMessage: error instanceof Error ? error.message : "Key 轮换操作创建失败",
+        errorMessage: error instanceof Error ? error.message : "Key 更换操作创建失败",
       });
       throw error;
     }

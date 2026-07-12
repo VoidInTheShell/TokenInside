@@ -46,6 +46,10 @@ import {
 } from "@/components/usage-analysis-tables";
 import { PageSelector } from "@/components/page-selector";
 import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
+import {
+  tokenRequestAllowsQuotaEdit,
+  tokenRequestRequiresAdminDecision,
+} from "@/lib/token-request-policy";
 
 type AdminScopeSummary = {
   type: "global" | "department";
@@ -547,7 +551,7 @@ const statusLabel: Record<string, string> = {
 const requestTypeLabel: Record<string, string> = {
   first_apply: "首次申请",
   quota_reset: "额度重置",
-  key_reset: "key 重置",
+  key_reset: "Key 更换",
   quota_adjust: "额度调整",
   monthly_reset: "月度重置",
 };
@@ -604,19 +608,12 @@ function avatarInitial(user?: AdminOverviewResponse["user"]) {
   return displayName(user).trim().slice(0, 1).toUpperCase() || "T";
 }
 
-function canEditQuota(status: string) {
-  return ["pending_card_send", "pending_card_approval", "approval_card_send_failed"].includes(status);
+function canEditQuota(request: { requestType: string; status: string }) {
+  return tokenRequestAllowsQuotaEdit(request);
 }
 
-function canDecideRequest(status: string) {
-  return [
-    "pending_card_send",
-    "pending_card_approval",
-    "approval_card_send_failed",
-    "approval_route_failed",
-    "pending_feishu_approval",
-    "approved_provision_failed",
-  ].includes(status);
+function canDecideRequest(request: { requestType: string; status: string }) {
+  return tokenRequestRequiresAdminDecision(request);
 }
 
 function formatRate(value?: number) {
@@ -3073,12 +3070,12 @@ export function AdminClient() {
                                         [request.id]: event.target.value,
                                       }))
                                     }
-                                    disabled={!canEditQuota(request.status) || busy}
+                                    disabled={!canEditQuota(request) || busy}
                                   />
                                   <Button
                                     variant="outline"
                                     size="sm"
-                                    disabled={!canEditQuota(request.status) || busy}
+                                    disabled={!canEditQuota(request) || busy}
                                     onClick={() => void saveRequestQuota(request.id)}
                                   >
                                     保存
@@ -3093,7 +3090,7 @@ export function AdminClient() {
                                   <Button
                                     variant="outline"
                                     size="sm"
-                                    disabled={!canDecideRequest(request.status) || busy}
+                                    disabled={!canDecideRequest(request) || busy}
                                     onClick={() => void decideRequest(request.id, "approve")}
                                   >
                                     通过
@@ -3101,7 +3098,7 @@ export function AdminClient() {
                                   <Button
                                     variant="outline"
                                     size="sm"
-                                    disabled={!canDecideRequest(request.status) || busy}
+                                    disabled={!canDecideRequest(request) || busy}
                                     onClick={() => void decideRequest(request.id, "reject")}
                                   >
                                     拒绝
@@ -3291,7 +3288,7 @@ export function AdminClient() {
               <Card>
                 <CardHeader>
                   <CardTitle>Saga 操作中心</CardTitle>
-                  <CardDescription>统一查看调额、Key 轮换、余额恢复、月度开账和对账状态。</CardDescription>
+                  <CardDescription>统一查看调额、Key 更换、余额恢复、月度开账和对账状态。</CardDescription>
                 </CardHeader>
                 <CardContent>
                   {!quotaControlData?.operations.length ? (
@@ -3779,7 +3776,7 @@ export function AdminClient() {
                       [
                         ["quotaLedgerShadowRead", "影子账本读取"],
                         ["quotaSagaWritesEnabled", "统一 Saga 写入"],
-                        ["keyRotationSagaEnabled", "Key 安全轮换"],
+                        ["keyRotationSagaEnabled", "Key 更换"],
                         ["quotaRestoreEnabled", "恢复可用额度"],
                         ["monthlyPeriodOpenEnabled", "月度开账"],
                         ["reconciliationAutoDecreaseEnabled", "自动向下校准"],
