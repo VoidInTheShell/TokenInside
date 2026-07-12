@@ -2,11 +2,7 @@ import { NextResponse } from "next/server";
 import { getEffectiveAdminScopeForUser, hydrateUserDepartment } from "@/lib/admin-sync";
 import { getConfig } from "@/lib/config";
 import { nowIso } from "@/lib/crypto";
-import {
-  fromNewApiQuota,
-  getNewApiTokenKey,
-  getNewApiTokenRemainQuota,
-} from "@/lib/newapi";
+import { getNewApiTokenKey } from "@/lib/newapi";
 import { provisionTokenForRequest } from "@/lib/provisioning";
 import { getCurrentUser } from "@/lib/session";
 import {
@@ -107,10 +103,8 @@ export async function GET() {
   let activeTokenResponse:
     | (typeof activeToken & {
         maskedKey?: string;
-        remainingQuota?: number;
       })
     | null = activeToken;
-  let remainingQuota: number | undefined;
   if (activeToken?.newapiTokenId) {
     try {
       const key = await getNewApiTokenKey(activeToken.newapiTokenId);
@@ -120,17 +114,6 @@ export async function GET() {
       };
     } catch {
       activeTokenResponse = { ...activeToken };
-    }
-    try {
-      const remainQuota = await getNewApiTokenRemainQuota(activeToken.newapiTokenId);
-      remainingQuota =
-        remainQuota === undefined ? undefined : Math.max(0, Math.round(fromNewApiQuota(remainQuota)));
-      activeTokenResponse = {
-        ...activeTokenResponse,
-        remainingQuota,
-      };
-    } catch {
-      activeTokenResponse = { ...activeTokenResponse };
     }
   }
   return NextResponse.json({
@@ -150,12 +133,7 @@ export async function GET() {
       departmentName: user.departmentName,
     },
     activeToken: activeTokenResponse,
-    billingPeriod: billingPeriod
-      ? {
-          ...billingPeriod,
-          upstreamRemainingQuota: remainingQuota,
-        }
-      : null,
+    billingPeriod,
     adminScope: adminScope
       ? {
           type: adminScope.scopeType,

@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { useCallback, useEffect, useState } from "react";
 import {
   ArrowLeftIcon,
@@ -320,6 +321,7 @@ type DepartmentQuotaSummary = {
   remainingQuota: number;
   memberCount: number;
   keyedUsers: number;
+  prewarmedKeys: number;
   updatedAt: string;
 };
 
@@ -740,6 +742,8 @@ export function AdminClient() {
     useState<"increase" | "reset">("increase");
   const [departmentQuotaRequestLimit, setDepartmentQuotaRequestLimit] = useState("");
   const [departmentQuotaRequestReason, setDepartmentQuotaRequestReason] = useState("");
+  const [prewarmKeysOnMemberSync, setPrewarmKeysOnMemberSync] = useState(false);
+  const [prewarmingDepartmentId, setPrewarmingDepartmentId] = useState<string | null>(null);
   const [approvalRequests, setApprovalRequests] = useState<AdminTokenRequestRow[]>([]);
   const [approvalTotalRequests, setApprovalTotalRequests] = useState(0);
   const [usageRecords, setUsageRecords] = useState<UsageRecordRow[]>([]);
@@ -1647,21 +1651,44 @@ export function AdminClient() {
 
   async function syncDepartmentMembers(departmentId: string) {
     setBusy(true);
+    if (prewarmKeysOnMemberSync) setPrewarmingDepartmentId(departmentId);
     setError(null);
     setMessage(null);
     try {
       const res = await fetch("/api/admin/departments/sync-members", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ departmentId }),
+        body: JSON.stringify({ departmentId, prewarmKeys: prewarmKeysOnMemberSync }),
       });
-      const body = await readJsonResponse<{ synced?: number; skipped?: number }>(res);
+      const body = await readJsonResponse<{
+        synced?: number;
+        skipped?: number;
+        prewarm?: {
+          eligible?: number;
+          prewarmed?: number;
+          skippedAfterRace?: number;
+          failed?: number;
+          capped?: boolean;
+          error?: string;
+        };
+      }>(res);
       if (!res.ok) throw new Error(body.error ?? "同步部门成员失败");
-      setMessage(`已同步 ${body.synced ?? 0} 位部门成员${body.skipped ? `，跳过 ${body.skipped} 条无 open_id 记录` : ""}。`);
+      const syncNotice = `已同步 ${body.synced ?? 0} 位部门成员${body.skipped ? `，跳过 ${body.skipped} 条无 open_id 记录` : ""}`;
+      if (body.prewarm?.error) {
+        setMessage(`${syncNotice}。`);
+        setError(`成员同步成功，但 Key 预热失败：${body.prewarm.error}`);
+      } else if (body.prewarm) {
+        setMessage(
+          `${syncNotice}；新增预热 Key ${body.prewarm.prewarmed ?? 0} 个${body.prewarm.skippedAfterRace ? `，竞态跳过 ${body.prewarm.skippedAfterRace} 个` : ""}${body.prewarm.failed ? `，失败回收 ${body.prewarm.failed} 个` : ""}${body.prewarm.capped ? "，本批已达 100 个上限" : ""}。`,
+        );
+      } else {
+        setMessage(`${syncNotice}。`);
+      }
       await Promise.all([loadAdminUsers(), loadDepartmentQuota()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "同步部门成员失败");
     } finally {
+      setPrewarmingDepartmentId(null);
       setBusy(false);
     }
   }
@@ -1861,7 +1888,15 @@ export function AdminClient() {
         <aside className={mobileNavOpen ? "sidebar sidebar-open" : "sidebar"}>
           <div className="sidebar-head">
             <div className="brand">
-              <div className="brand-mark">TI</div>
+              <Image
+                className="brand-mark"
+                src="/icon.svg"
+                alt=""
+                aria-hidden="true"
+                width={36}
+                height={36}
+                priority
+              />
               <div>
                 <h1 className="brand-title">TokenInside</h1>
                 <p className="brand-subtitle">共绩科技</p>
@@ -2451,6 +2486,15 @@ export function AdminClient() {
                     </Button>
                     <Badge>{departmentQuotaData?.period ?? currentBillingPeriod()}</Badge>
                     <Badge>{departmentQuotaData?.departments.length ?? 0} 个部门</Badge>
+                    <label className="prewarm-option">
+                      <input
+                        type="checkbox"
+                        checked={prewarmKeysOnMemberSync}
+                        disabled={panelLoading || busy}
+                        onChange={(event) => setPrewarmKeysOnMemberSync(event.target.checked)}
+                      />
+                      <span>同步后为无 Key 成员预热</span>
+                    </label>
                   </div>
                   {!departmentQuotaData?.departments.length ? (
                     <div className="empty">{panelLoading ? "读取部门额度中" : "暂无可管理的部门额度"}</div>
@@ -2460,7 +2504,7 @@ export function AdminClient() {
                         <thead>
                           <tr>
                             <th>部门</th>
-                            <th>成员 / key</th>
+                            <th>成员 / 已发 Key / 已预热</th>
                             <th>总额度上限</th>
                             <th>已分配</th>
                             <th>预留</th>
@@ -2488,7 +2532,9 @@ export function AdminClient() {
                                     <span>{department.departmentId}</span>
                                   </div>
                                 </td>
-                                <td>{department.memberCount} / {department.keyedUsers}</td>
+                                <td>
+                                  {department.memberCount} / {department.keyedUsers} / {department.prewarmedKeys}
+                                </td>
                                 <td>
                                   {isSystemAdmin ? (
                                     <div className="quota-control">
@@ -2572,8 +2618,16 @@ export function AdminClient() {
                                     disabled={busy}
                                     onClick={() => void syncDepartmentMembers(department.departmentId)}
                                   >
-                                    <RefreshCwIcon data-icon="inline-start" />
-                                    同步成员
+                                    {prewarmingDepartmentId === department.departmentId ? (
+                                      <LoaderCircleIcon className="spin-icon" data-icon="inline-start" />
+                                    ) : (
+                                      <RefreshCwIcon data-icon="inline-start" />
+                                    )}
+                                    {prewarmingDepartmentId === department.departmentId
+                                      ? "正在预热…"
+                                      : prewarmKeysOnMemberSync
+                                        ? "同步并预热"
+                                        : "同步成员"}
                                   </Button>
                                 </td>
                               </tr>

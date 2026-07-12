@@ -63,7 +63,6 @@ type SessionResponse = {
     status: string;
     newapiTokenId?: string;
     maskedKey?: string;
-    remainingQuota?: number;
     billingPeriod: string;
     createdAt: string;
   };
@@ -78,7 +77,6 @@ type SessionResponse = {
     totalTokens: number;
     proxyLogCount: number;
     usageRecordCount: number;
-    upstreamRemainingQuota?: number;
   } | null;
   adminScope?: {
     type: "global" | "department";
@@ -598,10 +596,7 @@ export function ExperienceClient() {
   const currentBillingPeriod = session?.billingPeriod ?? null;
   const currentBillingPeriodName =
     currentBillingPeriod?.period ?? session?.activeToken?.billingPeriod ?? "-";
-  const remainingQuota =
-    currentBillingPeriod?.remainingQuota ?? session?.activeToken?.remainingQuota;
-  const upstreamRemainingQuota =
-    currentBillingPeriod?.upstreamRemainingQuota ?? session?.activeToken?.remainingQuota;
+  const remainingQuota = currentBillingPeriod?.remainingQuota;
   const fallbackNotice = pendingApprovalRouteNotice(
     latestRequest,
     session?.adminScope?.type === "department",
@@ -1238,10 +1233,6 @@ export function ExperienceClient() {
                           <div className="meta-row">
                             <span>剩余额度</span>
                             <strong>{formatQuotaAmount(remainingQuota)}</strong>
-                          </div>
-                          <div className="meta-row">
-                            <span>NewAPI 实时剩余</span>
-                            <strong>{formatQuotaAmount(upstreamRemainingQuota)}</strong>
                           </div>
                           <div className="meta-row">
                             <span>总 tokens</span>

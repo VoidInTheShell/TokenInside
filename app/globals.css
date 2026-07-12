@@ -1013,6 +1013,30 @@ a {
   justify-content: flex-start;
 }
 
+.prewarm-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--muted-foreground);
+  background: color-mix(in srgb, var(--card) 88%, transparent);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.prewarm-option input {
+  margin: 0;
+  accent-color: var(--primary);
+}
+
+.prewarm-option:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
 .apply-panel {
   min-height: 112px;
   display: flex;
@@ -1452,25 +1476,28 @@ a {
 }
 
 .usage-table-with-client.usage-table-user .usage-col-model {
-  width: 19%;
+  width: 20%;
 }
 
 .usage-table-with-client.usage-table-user .usage-col-api-format,
-.usage-table-with-client.usage-table-user .usage-col-cost,
-.usage-table-with-client.usage-table-user .usage-col-client {
+.usage-table-with-client.usage-table-user .usage-col-performance {
   width: 12%;
 }
 
 .usage-table-with-client.usage-table-user .usage-col-status {
-  width: 9%;
+  width: 6%;
 }
 
 .usage-table-with-client.usage-table-user .usage-col-tokens {
-  width: 14%;
+  width: 9%;
 }
 
-.usage-table-with-client.usage-table-user .usage-col-performance {
-  width: 13%;
+.usage-table-with-client.usage-table-user .usage-col-cost {
+  width: 9%;
+}
+
+.usage-table-with-client.usage-table-user .usage-col-client {
+  width: 22%;
 }
 
 .usage-table-with-client.usage-table-admin .usage-col-time,
@@ -1598,7 +1625,7 @@ a {
 
 .usage-table .usage-performance-heading,
 .usage-table .usage-performance-cell {
-  padding-left: 20px;
+  padding-left: 8px;
 }
 
 .usage-table th.usage-number-heading,
