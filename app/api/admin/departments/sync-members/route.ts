@@ -5,6 +5,7 @@ import {
   getFeishuDepartmentNameById,
   listFeishuDepartmentUsers,
 } from "@/lib/feishu";
+import { prewarmDepartmentMemberKeys } from "@/lib/key-prewarm";
 import { getUserByOpenId, upsertFeishuUser } from "@/lib/store";
 
 export const runtime = "nodejs";
@@ -12,6 +13,7 @@ export const dynamic = "force-dynamic";
 
 const syncSchema = z.object({
   departmentId: z.string().min(1).max(200).optional(),
+  prewarmKeys: z.boolean().optional().default(false),
 });
 
 export async function POST(request: Request) {
@@ -68,7 +70,20 @@ export async function POST(request: Request) {
       });
       synced += 1;
     }
-    return NextResponse.json({ departmentId, departmentName, synced, skipped });
+    let prewarm:
+      | Awaited<ReturnType<typeof prewarmDepartmentMemberKeys>>
+      | { error: string }
+      | undefined;
+    if (parsed.data.prewarmKeys) {
+      try {
+        prewarm = await prewarmDepartmentMemberKeys({ departmentId });
+      } catch (error) {
+        prewarm = {
+          error: error instanceof Error ? error.message : "部门成员 Key 预热失败",
+        };
+      }
+    }
+    return NextResponse.json({ departmentId, departmentName, synced, skipped, prewarm });
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "同步飞书部门成员失败" },

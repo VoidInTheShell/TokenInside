@@ -126,6 +126,24 @@ const checks = [
     storeBackend === "json" || storeBackend === "postgres",
     "must be json or postgres",
   ),
+  result(
+    "NEWAPI_REQUEST_TIMEOUT_MS",
+    Number.isInteger(Number(process.env.NEWAPI_REQUEST_TIMEOUT_MS ?? "15000")) &&
+      Number(process.env.NEWAPI_REQUEST_TIMEOUT_MS ?? "15000") >= 1000,
+    "must be an integer of at least 1000 milliseconds",
+  ),
+  result(
+    "TOKENINSIDE_PROXY_CONCURRENCY_MAX",
+    Number.isInteger(Number(process.env.TOKENINSIDE_PROXY_CONCURRENCY_MAX ?? "60")) &&
+      Number(process.env.TOKENINSIDE_PROXY_CONCURRENCY_MAX ?? "60") >= 1,
+    "must be a positive integer",
+  ),
+  result(
+    "TOKENINSIDE_PROXY_QUEUE_TIMEOUT_MS",
+    Number.isInteger(Number(process.env.TOKENINSIDE_PROXY_QUEUE_TIMEOUT_MS ?? "30000")) &&
+      Number(process.env.TOKENINSIDE_PROXY_QUEUE_TIMEOUT_MS ?? "30000") >= 1000,
+    "must be an integer of at least 1000 milliseconds",
+  ),
 ];
 
 if (storeBackend === "json") {
@@ -140,15 +158,37 @@ if (storeBackend === "json") {
 }
 
 if (storeBackend === "postgres") {
+  const businessPoolMax = Number(process.env.DATABASE_POOL_MAX ?? "10");
+  const lockPoolMax = Number(process.env.DATABASE_LOCK_POOL_MAX ?? "10");
+  const postgresMaxConnections = Number(process.env.POSTGRES_MAX_CONNECTIONS ?? "30");
+  const postgresReservedConnections = Number(
+    process.env.POSTGRES_SUPERUSER_RESERVED_CONNECTIONS ?? "3",
+  );
   checks.push(result("DATABASE_URL", safe("DATABASE_URL"), "required when store backend is postgres"));
   checks.push(result("POSTGRES_CONNECTION", await canConnectPostgres(), "PostgreSQL must accept connections"));
   checks.push(result("POSTGRES_SCHEMA", await hasPostgresSchema(), "all required tables must exist"));
   checks.push(
     result(
       "DATABASE_POOL_MAX",
-      Number.isInteger(Number(process.env.DATABASE_POOL_MAX ?? "10")) &&
-        Number(process.env.DATABASE_POOL_MAX ?? "10") >= 2,
-      "pool max must be an integer of at least 2 for quota advisory locks",
+      Number.isInteger(businessPoolMax) && businessPoolMax >= 2,
+      "business pool max must be an integer of at least 2",
+    ),
+  );
+  checks.push(
+    result(
+      "DATABASE_LOCK_POOL_MAX",
+      Number.isInteger(lockPoolMax) && lockPoolMax >= 1,
+      "advisory lock pool max must be a positive integer",
+    ),
+  );
+  checks.push(
+    result(
+      "POSTGRES_APP_CONNECTION_BUDGET",
+      Number.isInteger(postgresMaxConnections) &&
+        Number.isInteger(postgresReservedConnections) &&
+        businessPoolMax + lockPoolMax + 5 <
+          postgresMaxConnections - postgresReservedConnections,
+      "business pool + lock pool + 5 maintenance connections must stay below PostgreSQL usable connections",
     ),
   );
 }

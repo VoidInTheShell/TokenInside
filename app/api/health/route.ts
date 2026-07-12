@@ -3,6 +3,7 @@ import { access, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
 import { getConfig } from "@/lib/config";
+import { proxyConcurrencySnapshot } from "@/lib/proxy-concurrency";
 import { checkPostgresSchema } from "@/lib/postgres-store";
 import { ensureUsageSyncScheduler } from "@/lib/usage-sync";
 
@@ -76,10 +77,12 @@ export async function GET() {
           config.storeBackend === "postgres"
             ? {
                 max: config.postgres.poolMax,
+                lockMax: config.postgres.lockPoolMax,
                 idleTimeoutMs: config.postgres.poolIdleTimeoutMs,
                 connectionTimeoutMs: config.postgres.poolConnectionTimeoutMs,
               }
             : undefined,
+        proxyConcurrency: proxyConcurrencySnapshot(),
       },
       configuration: {
         sessionSecret: configured(config.sessionSecret),
@@ -94,6 +97,8 @@ export async function GET() {
         newapiControlUserId: configured(config.newapi.controlUserId),
         newapiMock: config.newapi.mock,
         newapiQuotaPerUnit: config.newapi.quotaPerUnit,
+        newapiRequestTimeoutMs: config.newapi.requestTimeoutMs,
+        proxyQueueTimeoutMs: config.proxy.queueTimeoutMs,
         systemAdmins: config.admin.systemAdminOpenIds.length,
         environmentAdmins: config.admin.systemAdminOpenIds.length > 0,
         monthlyResetEnabled: config.billing.monthlyResetEnabled,

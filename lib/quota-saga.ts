@@ -1,6 +1,10 @@
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId, sha256Hex } from "@/lib/crypto";
 import {
+  claimPrewarmedTokenForProvision,
+  clearClaimedPrewarmedCredential,
+} from "@/lib/key-prewarm";
+import {
   createNewApiToken,
   disableNewApiToken,
   enableNewApiToken,
@@ -564,6 +568,23 @@ async function handleFirstProvision(operation: QuotaOperation) {
   const tokenName = `TI provision ${current.id}`.slice(0, 50);
   let upstreamTokenIdAfter = current.upstreamTokenIdAfter;
   let key: string | undefined;
+  let account = await firstProvisionAccount(current);
+  if (!upstreamTokenIdAfter && !account) {
+    const prewarmed = await claimPrewarmedTokenForProvision({
+      feishuUserId: current.feishuUserId,
+      tokenRequestId: current.requestId ?? current.id,
+      billingPeriod: current.billingPeriod,
+      operationGeneration: current.operationGeneration,
+    });
+    if (prewarmed) {
+      account = prewarmed.account;
+      upstreamTokenIdAfter = prewarmed.account.newapiTokenId;
+      key = prewarmed.key;
+    }
+  }
+  if (!upstreamTokenIdAfter && account?.newapiTokenId) {
+    upstreamTokenIdAfter = account.newapiTokenId;
+  }
   if (!upstreamTokenIdAfter) {
     const existingUpstream = await findNewApiTokenByName(tokenName);
     if (existingUpstream?.id !== undefined) {
@@ -576,10 +597,15 @@ async function handleFirstProvision(operation: QuotaOperation) {
     }
   }
   await disableNewApiToken(upstreamTokenIdAfter);
+  if (!key && current.credentialCiphertext) {
+    key = openQuotaCredential(current.credentialCiphertext, current.id);
+  }
+  if (!key && account?.prewarmedCredentialCiphertext) {
+    key = openQuotaCredential(account.prewarmedCredentialCiphertext, account.id);
+  }
   if (!key) key = await getNewApiTokenKey(upstreamTokenIdAfter);
   if (!key) throw new Error("NewAPI 未返回首次发放 Key 明文");
 
-  let account = await firstProvisionAccount(current);
   if (!account) {
     const store = await getStoreSnapshot();
     account =
@@ -605,6 +631,9 @@ async function handleFirstProvision(operation: QuotaOperation) {
       credentialCiphertext:
         current.credentialCiphertext ?? sealQuotaCredential(key, current.id),
     })) ?? current;
+  if (account.prewarmedCredentialCiphertext) {
+    await clearClaimedPrewarmedCredential(account.id);
+  }
 
   await updateNewApiTokenQuota({
     newapiTokenId: upstreamTokenIdAfter,

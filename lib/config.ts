@@ -8,8 +8,13 @@ export type RuntimeConfig = {
   databaseUrl?: string;
   postgres: {
     poolMax: number;
+    lockPoolMax: number;
     poolIdleTimeoutMs: number;
     poolConnectionTimeoutMs: number;
+  };
+  proxy: {
+    maxConcurrency: number;
+    queueTimeoutMs: number;
   };
   feishu: {
     appId?: string;
@@ -25,6 +30,7 @@ export type RuntimeConfig = {
     adminAccessToken?: string;
     systemAk?: string;
     quotaPerUnit: number;
+    requestTimeoutMs: number;
     mock: boolean;
   };
   admin: {
@@ -77,6 +83,7 @@ export function getConfig(): RuntimeConfig {
     databaseUrl: process.env.DATABASE_URL,
     postgres: {
       poolMax: positiveIntegerFromEnv(process.env.DATABASE_POOL_MAX, 10),
+      lockPoolMax: positiveIntegerFromEnv(process.env.DATABASE_LOCK_POOL_MAX, 10),
       poolIdleTimeoutMs: positiveIntegerFromEnv(
         process.env.DATABASE_POOL_IDLE_TIMEOUT_MS,
         30000,
@@ -84,6 +91,16 @@ export function getConfig(): RuntimeConfig {
       poolConnectionTimeoutMs: positiveIntegerFromEnv(
         process.env.DATABASE_POOL_CONNECTION_TIMEOUT_MS,
         5000,
+      ),
+    },
+    proxy: {
+      maxConcurrency: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_PROXY_CONCURRENCY_MAX,
+        60,
+      ),
+      queueTimeoutMs: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_PROXY_QUEUE_TIMEOUT_MS,
+        30000,
       ),
     },
     feishu: {
@@ -100,6 +117,7 @@ export function getConfig(): RuntimeConfig {
       adminAccessToken: process.env.NEWAPI_ADMIN_ACCESS_TOKEN,
       systemAk: process.env.NEWAPI_SYSTEM_AK,
       quotaPerUnit: positiveIntegerFromEnv(process.env.NEWAPI_QUOTA_PER_UNIT, 500000),
+      requestTimeoutMs: positiveIntegerFromEnv(process.env.NEWAPI_REQUEST_TIMEOUT_MS, 15000),
       mock: process.env.TOKENINSIDE_MOCK_NEWAPI === "true",
     },
     admin: {

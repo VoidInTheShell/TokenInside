@@ -1,6 +1,10 @@
 import { after, NextResponse } from "next/server";
 import { buildNewApiProxyUrl } from "@/lib/newapi";
 import { sha256Hex } from "@/lib/crypto";
+import {
+  acquireProxyConcurrencySlot,
+  ProxyQueueTimeoutError,
+} from "@/lib/proxy-concurrency";
 import { syncNewApiUsageForProxyRequest } from "@/lib/usage-sync";
 import {
   createSseUsageCollector,
@@ -235,6 +239,7 @@ function streamWithProxyLog(input: {
   statusCode: number;
   newapiResponseRequestId?: string;
   apiFormat: string;
+  releaseUpstreamSlot: () => void;
 }) {
   const reader = input.body.getReader();
   const usageCollector = createSseUsageCollector({
@@ -259,6 +264,7 @@ function streamWithProxyLog(input: {
             ...usage,
             leaseExpiresAt: undefined,
           });
+          input.releaseUpstreamSlot();
           controller.close();
           return;
         }
@@ -266,6 +272,7 @@ function streamWithProxyLog(input: {
         controller.enqueue(result.value);
       } catch (err) {
         stopHeartbeat();
+        input.releaseUpstreamSlot();
         await updateProxyLog(input.logId, {
           status: "failed",
           terminalStatus: "failed",
@@ -280,6 +287,7 @@ function streamWithProxyLog(input: {
     },
     async cancel(reason) {
       stopHeartbeat();
+      input.releaseUpstreamSlot();
       try {
         await reader.cancel(reason);
       } finally {
@@ -505,6 +513,40 @@ async function proxy(request: Request, context: RouteContext) {
   const stopRequestHeartbeat = startProxyLeaseHeartbeat(proxyLog.id);
 
   const upstreamUrl = buildNewApiProxyUrl(path, requestUrl.search);
+  let releaseUpstreamSlot: (() => void) | undefined;
+  try {
+    releaseUpstreamSlot = await acquireProxyConcurrencySlot(request.signal);
+  } catch (error) {
+    stopRequestHeartbeat();
+    const aborted = request.signal.aborted ||
+      (error instanceof DOMException && error.name === "AbortError");
+    const queueTimedOut = error instanceof ProxyQueueTimeoutError;
+    await updateProxyLog(proxyLog.id, {
+      status: aborted ? "cancelled" : "failed",
+      terminalStatus: aborted ? "cancelled" : "failed",
+      statusCode: aborted ? 499 : 503,
+      durationMs: Date.now() - startedAt,
+      errorMessage: aborted
+        ? "Client cancelled while waiting for an upstream slot"
+        : queueTimedOut
+          ? "Upstream concurrency queue timed out"
+          : sanitizedErrorMessage(error),
+      responseTimeUpdatedAt: new Date().toISOString(),
+      leaseExpiresAt: undefined,
+    });
+    return NextResponse.json(
+      {
+        error: aborted
+          ? "Client cancelled the request"
+          : "Gateway upstream concurrency queue is full",
+        retryable: !aborted,
+      },
+      {
+        status: aborted ? 499 : 503,
+        headers: aborted ? undefined : { "Retry-After": "2" },
+      },
+    );
+  }
   try {
     const upstream = await fetch(upstreamUrl, {
       method: request.method,
@@ -544,6 +586,7 @@ async function proxy(request: Request, context: RouteContext) {
           statusCode: upstream.status,
           newapiResponseRequestId,
           apiFormat,
+          releaseUpstreamSlot,
         }),
         {
           status: upstream.status,
@@ -566,6 +609,7 @@ async function proxy(request: Request, context: RouteContext) {
       responseJson: responseBody.json,
     });
     stopRequestHeartbeat();
+    releaseUpstreamSlot();
 
     return new Response(responseBody.buffer, {
       status: upstream.status,
@@ -574,6 +618,7 @@ async function proxy(request: Request, context: RouteContext) {
     });
   } catch (err) {
     stopRequestHeartbeat();
+    releaseUpstreamSlot?.();
     const aborted =
       request.signal.aborted ||
       (err instanceof DOMException && err.name === "AbortError");

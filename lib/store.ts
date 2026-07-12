@@ -1205,9 +1205,7 @@ function withDepartmentQuotaLock<T>(
 ) {
   const key = `department-quota:${departmentId}:${period}`;
   if (isPostgresBackend()) {
-    return withJsonDepartmentQuotaLock("postgres-department-quota", () =>
-      withPostgresAdvisoryLock(key, fn, { wait: true }),
-    );
+    return withPostgresAdvisoryLock(key, fn, { wait: true });
   }
   return withJsonDepartmentQuotaLock(key, fn);
 }
@@ -1241,9 +1239,7 @@ export function withUserQuotaOperationLock<T>(
   // across two pooled connections would make the outer callback wait on itself.
   const key = `user-quota-fence:${feishuUserId}`;
   if (isPostgresBackend()) {
-    return withJsonDepartmentQuotaLock("postgres-user-quota-operation", () =>
-      withPostgresAdvisoryLock(key, fn, { wait: true }),
-    );
+    return withPostgresAdvisoryLock(key, fn, { wait: true });
   }
   return withJsonDepartmentQuotaLock(key, fn);
 }
@@ -2039,6 +2035,12 @@ function mapDepartmentQuotaSummary(store: StoreShape, policy: DepartmentQuotaPer
       .filter((account) => account.status === "active" && userIds.has(account.feishuUserId))
       .map((account) => account.feishuUserId),
   ).size;
+  const prewarmedKeys = store.tokenAccounts.filter(
+    (account) =>
+      account.status === "pending_activation" &&
+      Boolean(account.prewarmedAt) &&
+      userIds.has(account.feishuUserId),
+  ).length;
   return {
     id: policy.id,
     departmentId: policy.departmentId,
@@ -2054,6 +2056,7 @@ function mapDepartmentQuotaSummary(store: StoreShape, policy: DepartmentQuotaPer
     remainingQuota: billingPeriods.reduce((sum, item) => sum + (item.remainingQuota ?? 0), 0),
     memberCount: users.length,
     keyedUsers,
+    prewarmedKeys,
     updatedAt: policy.updatedAt,
     updatedByFeishuUserId: policy.updatedByFeishuUserId,
   };
@@ -2612,6 +2615,9 @@ export async function addTokenAccount(input: {
   status?: TokenStatus;
   operationGeneration?: number;
   activatedAt?: string;
+  prewarmedAt?: string;
+  prewarmDepartmentId?: string;
+  prewarmedCredentialCiphertext?: string;
 }) {
   if (isPostgresBackend()) {
     const now = nowIso();
@@ -2625,6 +2631,9 @@ export async function addTokenAccount(input: {
       billingPeriod: input.billingPeriod ?? now.slice(0, 7),
       operationGeneration: input.operationGeneration,
       activatedAt: input.activatedAt ?? (input.status && input.status !== "active" ? undefined : now),
+      prewarmedAt: input.prewarmedAt,
+      prewarmDepartmentId: input.prewarmDepartmentId,
+      prewarmedCredentialCiphertext: input.prewarmedCredentialCiphertext,
       createdAt: now,
     };
     return insertPostgresTokenAccount(account);
@@ -2642,6 +2651,9 @@ export async function addTokenAccount(input: {
       billingPeriod: input.billingPeriod ?? now.slice(0, 7),
       operationGeneration: input.operationGeneration,
       activatedAt: input.activatedAt ?? (input.status && input.status !== "active" ? undefined : now),
+      prewarmedAt: input.prewarmedAt,
+      prewarmDepartmentId: input.prewarmDepartmentId,
+      prewarmedCredentialCiphertext: input.prewarmedCredentialCiphertext,
       createdAt: now,
     };
     store.tokenAccounts.push(account);

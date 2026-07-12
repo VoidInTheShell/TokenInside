@@ -28,6 +28,7 @@ import type {
 } from "@/lib/types";
 
 let pool: Pool | undefined;
+let advisoryLockPool: Pool | undefined;
 
 export const REQUIRED_POSTGRES_TABLES = [
   "schema_migrations",
@@ -68,6 +69,22 @@ function getPool() {
   return pool;
 }
 
+function getAdvisoryLockPool() {
+  if (advisoryLockPool) return advisoryLockPool;
+  const config = getConfig();
+  const databaseUrl = config.databaseUrl;
+  if (!databaseUrl) {
+    throw new Error("DATABASE_URL is required when TOKENINSIDE_STORE_BACKEND=postgres");
+  }
+  advisoryLockPool = new Pool({
+    connectionString: databaseUrl,
+    max: config.postgres.lockPoolMax,
+    idleTimeoutMillis: config.postgres.poolIdleTimeoutMs,
+    connectionTimeoutMillis: config.postgres.poolConnectionTimeoutMs,
+  });
+  return advisoryLockPool;
+}
+
 async function readDataRows<T>(client: PoolClient, table: string, orderBy: string) {
   const result = await client.query<{ data: T }>(`select data from ${table} order by ${orderBy}`);
   return result.rows.map((row) => row.data);
@@ -87,6 +104,15 @@ async function insertJsonRows<T>(
 
 async function withClient<T>(fn: (client: PoolClient) => Promise<T>) {
   const client = await getPool().connect();
+  try {
+    return await fn(client);
+  } finally {
+    client.release();
+  }
+}
+
+async function withAdvisoryLockClient<T>(fn: (client: PoolClient) => Promise<T>) {
+  const client = await getAdvisoryLockPool().connect();
   try {
     return await fn(client);
   } finally {
@@ -2358,12 +2384,7 @@ export async function withPostgresAdvisoryLock<T>(
   fn: () => Promise<T>,
   options: { wait?: boolean } = {},
 ) {
-  if (getConfig().postgres.poolMax < 2) {
-    throw new Error(
-      "DATABASE_POOL_MAX must be at least 2 when running PostgreSQL advisory locked operations",
-    );
-  }
-  return withClient(async (client) => {
+  return withAdvisoryLockClient(async (client) => {
     if (options.wait) {
       await client.query("select pg_advisory_lock(hashtext($1)::bigint)", [key]);
     } else {

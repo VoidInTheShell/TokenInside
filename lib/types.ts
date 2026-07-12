@@ -109,6 +109,9 @@ export type TokenAccount = {
   drainStartedAt?: string;
   settledThrough?: string;
   activatedAt?: string;
+  prewarmedAt?: string;
+  prewarmDepartmentId?: string;
+  prewarmedCredentialCiphertext?: string;
   createdAt: string;
   disabledAt?: string;
   replacedByTokenAccountId?: string;

@@ -33,6 +33,10 @@ type NewApiKeyResponse = {
   token?: string;
 };
 
+type NewApiBatchKeyResponse = {
+  keys?: Record<string, string>;
+};
+
 export type NewApiLogRecord = {
   id?: string | number;
   created_at?: string | number;
@@ -141,10 +145,12 @@ function parseNewApiBody<T>(text: string, status: number) {
 
 async function newApiFetch<T>(path: string, init: RequestInit = {}) {
   const { newapi } = getConfig();
+  const timeoutSignal = AbortSignal.timeout(newapi.requestTimeoutMs);
   const res = await fetch(`${newapi.baseUrl}${path}`, {
     ...init,
     headers: getNewApiHeaders(init.headers),
     cache: "no-store",
+    signal: init.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal,
   });
 
   const body = parseNewApiBody<T>(await res.text(), res.status);
@@ -212,6 +218,21 @@ export async function searchNewApiTokens(keyword: string) {
   return page.items ?? [];
 }
 
+async function searchNewApiTokensPaged(keyword: string) {
+  const items: NewApiTokenRecord[] = [];
+  for (let pageNumber = 1; pageNumber <= 5; pageNumber += 1) {
+    const params = new URLSearchParams({
+      p: String(pageNumber),
+      size: "20",
+      keyword,
+    });
+    const page = await newApiFetch<NewApiTokenPage>(`/api/token/search?${params.toString()}`);
+    items.push(...(page.items ?? []));
+    if ((page.items ?? []).length === 0 || items.length >= (page.total ?? items.length)) break;
+  }
+  return items;
+}
+
 export async function findNewApiTokenByName(name: string) {
   const tokens = await searchNewApiTokens(name);
   return tokens.find((token) => token.name === name) ?? null;
@@ -251,6 +272,115 @@ export async function createNewApiToken(input: {
     newapiTokenId: id,
     key,
   };
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+) {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = await Promise.allSettled(
+    Array.from({ length: Math.min(Math.max(concurrency, 1), items.length) }, async () => {
+      while (cursor < items.length) {
+        const index = cursor;
+        cursor += 1;
+        results[index] = await fn(items[index], index);
+      }
+    }),
+  );
+  const failed = workers.find((item) => item.status === "rejected");
+  if (failed) throw failed.reason;
+  return results;
+}
+
+export async function deleteNewApiTokens(newapiTokenIds: string[]) {
+  const { newapi } = getConfig();
+  if (newapiTokenIds.length === 0 || newapi.mock) return;
+  const ids = newapiTokenIds.map(Number);
+  if (ids.some((id) => !Number.isInteger(id))) {
+    throw new Error("NewAPI batch delete requires numeric token IDs");
+  }
+  await newApiFetch<unknown>("/api/token/batch", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  });
+}
+
+export async function createPrewarmedNewApiTokens(input: {
+  count: number;
+  batchLabel?: string;
+}) {
+  const count = Math.trunc(input.count);
+  if (count < 1 || count > 100) {
+    throw new Error("一次可预热的 NewAPI Key 数量必须在 1 到 100 之间");
+  }
+  const { newapi } = getConfig();
+  const labelPrefix = (input.batchLabel ?? "department")
+    .replace(/[^a-zA-Z0-9_-]/g, "")
+    .slice(-10);
+  const batchLabel = `${labelPrefix}-${randomId("warm").replace(/[^a-zA-Z0-9]/g, "").slice(-8)}`;
+  if (newapi.mock) {
+    return Array.from({ length: count }, (_, index) => ({
+      newapiTokenId: randomId("newapi"),
+      key: `sk-ti-prewarm-${batchLabel}-${index}`,
+    }));
+  }
+
+  const names = Array.from(
+    { length: count },
+    (_, index) => `TI warm ${batchLabel} ${String(index).padStart(3, "0")}`.slice(0, 50),
+  );
+  let tokenIds: string[] = [];
+  try {
+    await mapWithConcurrency(names, 2, async (name) => {
+      await newApiFetch<unknown>("/api/token", {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          remain_quota: 0,
+          unlimited_quota: false,
+          expired_time: -1,
+        }),
+      });
+    });
+
+    const foundTokens = await searchNewApiTokensPaged(`TI warm ${batchLabel}%`);
+    const byName = new Map(foundTokens.map((item) => [item.name, item]));
+    const tokens = names.map((name) => {
+      const token = byName.get(name);
+      if (!token?.id) throw new Error(`预热 NewAPI Key 创建后未找到: ${name}`);
+      return token;
+    });
+    tokenIds = tokens.map((token) => String(token.id));
+    const numericIds = tokenIds.map(Number);
+    if (numericIds.some((id) => !Number.isInteger(id))) {
+      throw new Error("NewAPI 批量读取 Key 要求数字 Token ID");
+    }
+    const keyBody = await newApiFetch<NewApiBatchKeyResponse>("/api/token/batch/keys", {
+      method: "POST",
+      body: JSON.stringify({ ids: numericIds }),
+    });
+    const keys = keyBody.keys ?? {};
+    const warmed = tokens.map((token) => {
+      const tokenId = String(token.id);
+      const key = keys[tokenId];
+      if (!key) throw new Error(`NewAPI 批量接口未返回预热 Key: ${token.name}`);
+      return { newapiTokenId: tokenId, key };
+    });
+    return warmed;
+  } catch (error) {
+    if (tokenIds.length === 0) {
+      const foundTokens = await searchNewApiTokensPaged(`TI warm ${batchLabel}%`).catch(() => []);
+      tokenIds = foundTokens
+        .filter((item) => names.includes(item.name ?? ""))
+        .map((item) => String(item.id))
+        .filter(Boolean);
+    }
+    await deleteNewApiTokens(tokenIds).catch(() => undefined);
+    throw error;
+  }
 }
 
 export async function getNewApiTokenKey(newapiTokenId: string) {
@@ -300,6 +430,7 @@ export async function listModelsForNewApiToken(newapiTokenId: string) {
       authorization: `Bearer ${key}`,
     },
     cache: "no-store",
+    signal: AbortSignal.timeout(newapi.requestTimeoutMs),
   });
   const text = await res.text();
   const body = parseNewApiBody<NewApiModelsEnvelope>(text, res.status);
