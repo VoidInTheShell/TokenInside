@@ -1535,9 +1535,16 @@ export function AdminClient() {
           clientRequestId: window.crypto.randomUUID(),
         }),
       });
-      const body = await res.json().catch(() => ({}));
+      const body = await res.json().catch(() => ({})) as {
+        error?: string;
+        mode?: "first_provision" | "quota_adjust";
+      };
       if (!res.ok) throw new Error(body.error ?? "调额失败");
-      setMessage("账本化调额已受理，完成上游写后校验后生效。");
+      setMessage(
+        body.mode === "first_provision"
+          ? "首次 Key 与额度已完成发放。"
+          : "账本化调额已受理；仅在申请状态变为“已发放”后生效。",
+      );
       await Promise.all([refresh(), loadAdminUsers(), loadUserStats(), loadDepartmentQuota()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "调额失败");

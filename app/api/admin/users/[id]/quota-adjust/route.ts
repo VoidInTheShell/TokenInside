@@ -5,9 +5,15 @@ import { nowIso, randomId } from "@/lib/crypto";
 import {
   createTokenRequest,
   findQuotaOperationByIdempotencyKey,
+  getActiveTokenForUser,
   getScopedUser,
+  listUserTokenRequests,
   updateTokenRequest,
 } from "@/lib/store";
+import {
+  findReusableFirstApplyRequest,
+  provisionTokenForRequest,
+} from "@/lib/provisioning";
 import {
   assertQuotaWriteActionEnabled,
   quotaFeatureErrorStatus,
@@ -50,6 +56,69 @@ export async function POST(
       { error: "目标用户必须先归属部门，才能执行账本化调额" },
       { status: 409 },
     );
+  }
+
+  const activeToken = await getActiveTokenForUser(targetUser.id);
+  if (!activeToken) {
+    const requests = await listUserTokenRequests(targetUser.id);
+    const reusableRequest = await findReusableFirstApplyRequest(requests);
+    const existingFirstProvisionOperation = reusableRequest
+      ? await findQuotaOperationByIdempotencyKey(
+          `quota-operation:${reusableRequest.id}`,
+        )
+      : null;
+    const reusableQuota = reusableRequest
+      ? reusableRequest.approvedMonthlyQuota ?? reusableRequest.requestedMonthlyQuota
+      : undefined;
+    if (existingFirstProvisionOperation && reusableQuota !== approvedMonthlyQuota) {
+      return NextResponse.json(
+        {
+          error: `该用户已有 ${reusableQuota} 额度的首次发放操作，请先完成或处置该操作`,
+        },
+        { status: 409 },
+      );
+    }
+    const operatedAt = nowIso();
+    const firstApplyRequest = reusableRequest
+      ? await updateTokenRequest(reusableRequest.id, {
+          status: "approved",
+          reason: parsed.data.reason ?? `管理员首次分配额度为 ${approvedMonthlyQuota}`,
+          requestedMonthlyQuota: approvedMonthlyQuota,
+          approvedMonthlyQuota,
+          approvalOperatorOpenId: auth.user.openId,
+          approvalOperatedAt: operatedAt,
+          errorMessage: undefined,
+        })
+      : await createTokenRequest({
+          feishuUserId: targetUser.id,
+          requestType: "first_apply",
+          status: "approved",
+          reason: parsed.data.reason ?? `管理员首次分配额度为 ${approvedMonthlyQuota}`,
+          requestedMonthlyQuota: approvedMonthlyQuota,
+          approvedMonthlyQuota,
+          approvalMode: "manual",
+          approvalOperatorOpenId: auth.user.openId,
+          approvalOperatedAt: operatedAt,
+        });
+    if (!firstApplyRequest) {
+      return NextResponse.json({ error: "首次发放申请不存在" }, { status: 404 });
+    }
+    try {
+      const account = await provisionTokenForRequest(firstApplyRequest);
+      if (!account || account.status !== "active") {
+        throw new Error("首次分配未生成 active Key");
+      }
+      return NextResponse.json({
+        mode: "first_provision",
+        request: await updateTokenRequest(firstApplyRequest.id, {}),
+        account,
+      });
+    } catch (err) {
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : "首次 Key 与额度发放失败" },
+        { status: quotaFeatureErrorStatus(err) ?? 502 },
+      );
+    }
   }
 
   try {
@@ -99,7 +168,10 @@ export async function POST(
       createdByOpenId: auth.user.openId,
     });
     after(() => runQuotaOperation(operation.id).catch(() => undefined));
-    return NextResponse.json({ request: quotaRequest, operation }, { status: 202 });
+    return NextResponse.json(
+      { mode: "quota_adjust", request: quotaRequest, operation },
+      { status: 202 },
+    );
   } catch (err) {
     await updateTokenRequest(quotaRequest.id, {
       status: "approved_provision_failed",

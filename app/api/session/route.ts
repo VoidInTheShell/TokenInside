@@ -3,7 +3,10 @@ import { getEffectiveAdminScopeForUser, hydrateUserDepartment } from "@/lib/admi
 import { getConfig } from "@/lib/config";
 import { nowIso } from "@/lib/crypto";
 import { getNewApiTokenKey } from "@/lib/newapi";
-import { provisionTokenForRequest } from "@/lib/provisioning";
+import {
+  findReusableFirstApplyRequest,
+  provisionTokenForRequest,
+} from "@/lib/provisioning";
 import { getCurrentUser } from "@/lib/session";
 import {
   createTokenRequest,
@@ -27,14 +30,13 @@ async function ensureAdminActiveToken(input: {
   requests: TokenRequest[];
   defaultMonthlyQuota: number;
 }) {
-  if (input.activeToken || !input.adminScope) return input.activeToken;
+  if (input.activeToken || !input.adminScope || input.defaultMonthlyQuota <= 0) {
+    return input.activeToken;
+  }
 
-  const reusableRequest = input.requests.find(
-    (request) =>
-      request.requestType === "first_apply" &&
-      request.approvalMode === "manual" &&
-      request.reason === ADMIN_AUTO_PROVISION_REASON &&
-      (request.status === "approved" || request.status === "approved_provision_failed"),
+  const reusableRequest = await findReusableFirstApplyRequest(
+    input.requests.filter((request) => request.approvalMode === "manual"),
+    ADMIN_AUTO_PROVISION_REASON,
   );
   const operatedAt = nowIso();
   const tokenRequest =

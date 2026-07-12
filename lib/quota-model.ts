@@ -220,6 +220,13 @@ export function hongKongBillingPeriod(date = new Date()) {
   return `${datePart(date, "year")}-${datePart(date, "month")}`;
 }
 
+export function initialUnassignedMonthlyQuota(input: {
+  defaultMonthlyQuota: number;
+  quotaMigrationApplied: boolean;
+}) {
+  return input.quotaMigrationApplied ? 0 : Math.max(input.defaultMonthlyQuota, 0);
+}
+
 export function resolveUsageBillingPeriod(input: {
   billingPeriod?: string;
   occurredAt?: string;

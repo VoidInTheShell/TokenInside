@@ -30,7 +30,7 @@ const transitions: Record<QuotaOperationState, QuotaOperationState[]> = {
   ],
   compensating: ["compensated", "manual_review"],
   compensated: [],
-  manual_review: ["compensating"],
+  manual_review: ["planned", "compensating"],
   completed: [],
 };
 

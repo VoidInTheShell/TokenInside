@@ -5,6 +5,14 @@ import type {
 } from "./types.ts";
 
 export const MAX_QUOTA_AMOUNT = 1_000_000;
+export const DEFAULT_DEPARTMENT_QUOTA_LIMIT = 1_000;
+
+export function initialDepartmentQuotaLimit(allocatedQuota: number) {
+  const normalizedAllocatedQuota = Number.isFinite(allocatedQuota)
+    ? Math.max(Math.round(allocatedQuota), 0)
+    : 0;
+  return Math.max(DEFAULT_DEPARTMENT_QUOTA_LIMIT, normalizedAllocatedQuota);
+}
 
 export type DepartmentQuotaUsage = {
   quotaLimit: number;

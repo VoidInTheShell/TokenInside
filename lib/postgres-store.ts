@@ -2,6 +2,7 @@ import { Pool, type PoolClient } from "pg";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
 import { newApiUsageIdentityLockKeys } from "@/lib/newapi-usage-identity";
+import { initialUnassignedMonthlyQuota } from "@/lib/quota-model";
 import type {
   AdminScope,
   AppSettings,
@@ -789,14 +790,18 @@ async function syncPostgresBillingPeriodForUser(
 ) {
   const settings = await readSettingsRow(client);
   const seededAt = nowIso();
+  const initialMonthlyQuota = initialUnassignedMonthlyQuota({
+    defaultMonthlyQuota: settings.defaultMonthlyQuota,
+    quotaMigrationApplied: Boolean(settings.quotaMigration?.appliedAt),
+  });
   const seed: UserBillingPeriod = {
     id: randomId("bp"),
     feishuUserId,
     period,
-    monthlyQuota: settings.defaultMonthlyQuota,
+    monthlyQuota: initialMonthlyQuota,
     quotaConsumed: 0,
     cost: 0,
-    remainingQuota: settings.defaultMonthlyQuota,
+    remainingQuota: initialMonthlyQuota,
     promptTokens: 0,
     completionTokens: 0,
     totalTokens: 0,
@@ -857,10 +862,10 @@ async function syncPostgresBillingPeriodForUser(
     id: existing?.id ?? randomId("bp"),
     feishuUserId,
     period,
-    monthlyQuota: existing?.monthlyQuota ?? settings.defaultMonthlyQuota,
+    monthlyQuota: existing?.monthlyQuota ?? initialMonthlyQuota,
     quotaConsumed: 0,
     cost: 0,
-    remainingQuota: existing?.monthlyQuota ?? settings.defaultMonthlyQuota,
+    remainingQuota: existing?.monthlyQuota ?? initialMonthlyQuota,
     promptTokens: 0,
     completionTokens: 0,
     totalTokens: 0,

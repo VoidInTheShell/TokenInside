@@ -33,3 +33,8 @@ test("quota saga resumes the exact durable phase after a retryable failure", () 
   assert.equal(quotaOperationRetryResumeState("local_finalized"), "local_finalized");
   assert.equal(quotaOperationRetryResumeState("completed"), "local_prepared");
 });
+
+test("manual review can reopen only through an explicit recovery transition", () => {
+  assert.equal(canTransitionQuotaOperation("manual_review", "planned"), true);
+  assert.equal(canTransitionQuotaOperation("manual_review", "completed"), false);
+});

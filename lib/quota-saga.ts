@@ -989,12 +989,19 @@ async function markOperationFailure(operationId: string, error: unknown) {
   const current = await findQuotaOperationById(operationId);
   if (!current || current.state === "completed" || current.state === "compensated") return current;
   const message = error instanceof Error ? error.message : "quota operation failed";
-  const uncertain = current.attemptCount >= maxAttempts;
+  const waitingForDepartmentBudget = message.includes("部门可用额度不足");
+  const uncertain = !waitingForDepartmentBudget && current.attemptCount >= maxAttempts;
   const nextState = uncertain ? "manual_review" : "retryable_failed";
   const updated = await transitionQuotaOperation(current.id, nextState, {
-    lastErrorCode: uncertain ? "upstream_state_uncertain" : "retryable_failure",
+    lastErrorCode: waitingForDepartmentBudget
+      ? "department_budget_insufficient"
+      : uncertain
+        ? "upstream_state_uncertain"
+        : "retryable_failure",
     lastErrorMessage: message,
-    nextRetryAt: uncertain ? undefined : addMilliseconds(nowIso(), retryDelayMs),
+    nextRetryAt: uncertain
+      ? undefined
+      : addMilliseconds(nowIso(), waitingForDepartmentBudget ? 60_000 : retryDelayMs),
     evidence: {
       ...current.evidence,
       retryFromState: current.state,
@@ -1015,6 +1022,17 @@ async function markOperationFailure(operationId: string, error: unknown) {
     }).catch(() => undefined);
   }
   return updated;
+}
+
+export function canResumeBudgetBlockedOperation(operation: QuotaOperation) {
+  return (
+    operation.operationType === "first_provision" &&
+    operation.state === "manual_review" &&
+    !operation.upstreamTokenIdAfter &&
+    !operation.tokenAccountIdAfter &&
+    operation.lastErrorMessage?.includes("部门可用额度不足") === true &&
+    operation.evidence?.retryFromState === "planned"
+  );
 }
 
 export async function runQuotaOperation(operationId: string) {
@@ -1040,7 +1058,15 @@ export async function runQuotaOperation(operationId: string) {
     if (operation.state === "completed" || operation.state === "compensated") {
       return operation;
     }
-    if (operation.state === "manual_review") return operation;
+    if (operation.state === "manual_review") {
+      if (!canResumeBudgetBlockedOperation(operation)) return operation;
+      operation =
+        (await transitionQuotaOperation(operation.id, "planned", {
+          nextRetryAt: undefined,
+          lastErrorCode: undefined,
+          lastErrorMessage: undefined,
+        })) ?? operation;
+    }
     if (operation.state === "retryable_failed") {
       operation =
         (await transitionQuotaOperation(

@@ -15,6 +15,7 @@ import { normalizedInputTokensTotal } from "@/lib/usage-metrics";
 import { assertQuotaAdmission } from "@/lib/quota-admission";
 import {
   hongKongBillingPeriod,
+  initialUnassignedMonthlyQuota,
   materializeDepartmentQuota,
   materializeUserQuota,
   resolveUsageBillingPeriod,
@@ -23,6 +24,7 @@ import { assertQuotaOperationTransition } from "@/lib/quota-saga-state";
 import { tokenRequestRequiresAdminDecision } from "@/lib/token-request-policy";
 import {
   currentQuotaPeriod,
+  initialDepartmentQuotaLimit,
   summarizeDepartmentQuota,
   validateDepartmentAllocation,
   validateDepartmentQuotaLimit,
@@ -454,6 +456,10 @@ function usageRecordPeriod(record: NewApiUsageRecord) {
 
 function syncBillingPeriods(store: StoreShape) {
   let changed = false;
+  const initialMonthlyQuota = initialUnassignedMonthlyQuota({
+    defaultMonthlyQuota: store.settings.defaultMonthlyQuota,
+    quotaMigrationApplied: Boolean(store.settings.quotaMigration?.appliedAt),
+  });
   const existingByKey = new Map(
     store.userBillingPeriods.map((period) => [
       billingKey(period.feishuUserId, period.period),
@@ -476,10 +482,10 @@ function syncBillingPeriods(store: StoreShape) {
         id: existing?.id ?? randomId("bp"),
         feishuUserId,
         period,
-        monthlyQuota: existing?.monthlyQuota ?? initialStore.settings.defaultMonthlyQuota,
+        monthlyQuota: existing?.monthlyQuota ?? initialMonthlyQuota,
         quotaConsumed: 0,
         cost: 0,
-        remainingQuota: existing?.monthlyQuota ?? initialStore.settings.defaultMonthlyQuota,
+        remainingQuota: existing?.monthlyQuota ?? initialMonthlyQuota,
         promptTokens: 0,
         completionTokens: 0,
         totalTokens: 0,
@@ -1759,6 +1765,7 @@ export async function rebuildQuotaMaterializedSnapshots(
 ) {
   const store = await readStore();
   const quotaPerUnit = getConfig().newapi.quotaPerUnit;
+  const ledgerAuthoritative = Boolean(store.settings.quotaMigration?.appliedAt);
   const now = nowIso();
   const userRows: UserBillingPeriod[] = [];
   const shadowUsers: Array<{
@@ -1808,9 +1815,15 @@ export async function rebuildQuotaMaterializedSnapshots(
         item.matchStatus !== "unknown_token" &&
         item.matchStatus !== "malformed_log",
     );
-    const assignedMonthlyQuota =
-      policy?.assignedMonthlyQuota ??
-      Math.max(Math.round((existing?.monthlyQuota ?? store.settings.defaultMonthlyQuota) * quotaPerUnit), 0);
+    const assignedMonthlyQuota = policy?.assignedMonthlyQuota ??
+      (ledgerAuthoritative
+        ? 0
+        : Math.max(
+            Math.round(
+              (existing?.monthlyQuota ?? store.settings.defaultMonthlyQuota) * quotaPerUnit,
+            ),
+            0,
+          ));
     const authoritativeConsumedQuota = usageRecords.reduce(
       (sum, item) => sum + authoritativeQuotaFromRecord(item, quotaPerUnit),
       0,
@@ -1824,11 +1837,14 @@ export async function rebuildQuotaMaterializedSnapshots(
       id: existing?.id ?? randomId("bp"),
       feishuUserId,
       period,
-      monthlyQuota: existing?.monthlyQuota ?? assignedMonthlyQuota / quotaPerUnit,
+      monthlyQuota: ledgerAuthoritative
+        ? assignedMonthlyQuota / quotaPerUnit
+        : existing?.monthlyQuota ?? assignedMonthlyQuota / quotaPerUnit,
       quotaConsumed: existing?.quotaConsumed ?? authoritativeConsumedQuota / quotaPerUnit,
       cost: existing?.cost ?? authoritativeConsumedQuota / quotaPerUnit,
-      remainingQuota:
-        existing?.remainingQuota ?? materialized.expectedAvailableQuota / quotaPerUnit,
+      remainingQuota: ledgerAuthoritative
+        ? materialized.expectedAvailableQuota / quotaPerUnit
+        : existing?.remainingQuota ?? materialized.expectedAvailableQuota / quotaPerUnit,
       promptTokens: existing?.promptTokens ?? 0,
       completionTokens: existing?.completionTokens ?? 0,
       totalTokens: existing?.totalTokens ?? 0,
@@ -1997,7 +2013,9 @@ async function ensureDepartmentQuotaPeriodUnlocked(
     departmentId,
     departmentName: inferredDepartmentName,
     period,
-    quotaLimit: allocatedDepartmentQuota(store, departmentId, period),
+    quotaLimit: initialDepartmentQuotaLimit(
+      allocatedDepartmentQuota(store, departmentId, period),
+    ),
     defaultGrantQuota: store.settings.defaultMonthlyQuota,
     createdAt: now,
     updatedAt: now,
@@ -2379,7 +2397,9 @@ export async function getEffectiveUserGrantQuota(feishuUserId: string) {
   const billing = store.userBillingPeriods.find(
     (item) => item.feishuUserId === feishuUserId && item.period === period,
   );
-  if (billing) return billing.monthlyQuota;
+  if (billing && (billing.monthlyQuota > 0 || billing.assignedQuotaUpdatedAt)) {
+    return billing.monthlyQuota;
+  }
   if (!user?.departmentId) return store.settings.defaultMonthlyQuota;
   const policy = await ensureDepartmentQuotaPeriod({
     departmentId: user.departmentId,
@@ -2387,6 +2407,66 @@ export async function getEffectiveUserGrantQuota(feishuUserId: string) {
     period,
   });
   return policy.defaultGrantQuota;
+}
+
+export async function assertFirstProvisionDepartmentCapacity(input: {
+  feishuUserId: string;
+  requestedMonthlyQuota: number;
+  requestId?: string;
+}) {
+  const initialStore = await readStore();
+  const user = initialStore.users.find((item) => item.id === input.feishuUserId);
+  if (!user?.departmentId) return;
+  const period = currentQuotaPeriod();
+  await ensureDepartmentQuotaPeriod({
+    departmentId: user.departmentId,
+    departmentName: user.departmentName,
+    period,
+  });
+  const store = await readStore();
+  const policy = store.departmentQuotaPeriods.find(
+    (item) => item.departmentId === user.departmentId && item.period === period,
+  );
+  if (!policy) throw new Error("部门账期预算不存在");
+  const quotaPerUnit = getConfig().newapi.quotaPerUnit;
+  const requestedQuota = Math.max(Math.round(input.requestedMonthlyQuota * quotaPerUnit), 0);
+  const billing = store.userBillingPeriods.find(
+    (item) => item.feishuUserId === user.id && item.period === period,
+  );
+  const authorizedQuotaBefore = Math.max(billing?.authorizedQuota ?? 0, 0);
+  const requiredQuota = Math.max(requestedQuota - authorizedQuotaBefore, 0);
+  const existingOperation = input.requestId
+    ? store.quotaOperations.find(
+        (item) => item.idempotencyKey === `quota-operation:${input.requestId}`,
+      )
+    : undefined;
+  if ((existingOperation?.reservedDepartmentQuota ?? 0) >= requiredQuota) return;
+  const committedQuota = store.quotaLedgerEntries
+    .filter(
+      (item) => item.departmentId === user.departmentId && item.period === period,
+    )
+    .reduce((sum, item) => sum + item.signedQuota, 0);
+  const pendingQuota = store.quotaOperations
+    .filter(
+      (item) =>
+        item.id !== existingOperation?.id &&
+        item.departmentId === user.departmentId &&
+        item.billingPeriod === period &&
+        item.state !== "completed" &&
+        item.state !== "compensated",
+    )
+    .reduce((sum, item) => sum + Math.max(item.reservedDepartmentQuota, 0), 0);
+  const availableQuota = Math.max(
+    Math.round(policy.quotaLimit * quotaPerUnit) -
+      Math.max(committedQuota, 0) -
+      Math.max(pendingQuota, 0),
+    0,
+  );
+  if (requiredQuota > availableQuota) {
+    throw new Error(
+      `部门可用额度不足：首次发放需要 ${requiredQuota / quotaPerUnit}，当前可用 ${availableQuota / quotaPerUnit}`,
+    );
+  }
 }
 
 export async function reserveDepartmentQuotaForTokenRequest(request: TokenRequest) {

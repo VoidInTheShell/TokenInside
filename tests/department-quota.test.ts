@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  DEFAULT_DEPARTMENT_QUOTA_LIMIT,
+  initialDepartmentQuotaLimit,
   pendingApprovalRouteNotice,
   summarizeDepartmentQuota,
   validateDepartmentAllocation,
@@ -40,6 +42,13 @@ function reservation(input: Partial<QuotaChangeEvent> = {}): QuotaChangeEvent {
     ...input,
   };
 }
+
+test("new departments start with a 1000 quota budget without allocating members", () => {
+  assert.equal(DEFAULT_DEPARTMENT_QUOTA_LIMIT, 1_000);
+  assert.equal(initialDepartmentQuotaLimit(0), 1_000);
+  assert.equal(initialDepartmentQuotaLimit(600), 1_000);
+  assert.equal(initialDepartmentQuotaLimit(1_200), 1_200);
+});
 
 test("department availability subtracts assigned quota and live positive reservations", () => {
   assert.deepEqual(

@@ -9,7 +9,9 @@ import {
 } from "@/lib/newapi";
 import {
   addTokenAccount,
+  assertFirstProvisionDepartmentCapacity,
   createTokenRequest,
+  findQuotaOperationByIdempotencyKey,
   getActiveTokenForUser,
   getAppSettings,
   completeDepartmentQuotaReservation,
@@ -38,6 +40,31 @@ async function invalidateOtherFirstApplyRequestsAfterProvision(request: TokenReq
     approvalOperatorOpenId: request.approvalOperatorOpenId,
     approvalOperatedAt: request.approvalOperatedAt,
   });
+}
+
+const reusableFirstApplyStatuses = new Set([
+  "approved",
+  "approved_provisioning",
+  "approved_provision_failed",
+]);
+
+export async function findReusableFirstApplyRequest(
+  requests: TokenRequest[],
+  reason?: string,
+) {
+  const candidates = requests.filter(
+    (request) =>
+      request.requestType === "first_apply" &&
+      reusableFirstApplyStatuses.has(request.status) &&
+      (!reason || request.reason === reason),
+  );
+  for (const candidate of candidates) {
+    const operation = await findQuotaOperationByIdempotencyKey(
+      `quota-operation:${candidate.id}`,
+    );
+    if (operation) return candidate;
+  }
+  return candidates.at(-1) ?? null;
 }
 
 async function updateActiveTokenQuotaForRequest(request: TokenRequest) {
@@ -221,28 +248,45 @@ export async function provisionTokenForRequest(request: TokenRequest) {
     }
     const settings = await getAppSettings();
     if (settings.quotaMigration?.appliedAt) {
-      const store = await getStoreSnapshot();
-      const user = store.users.find((item) => item.id === request.feishuUserId);
-      const operation = await enqueueFirstProvision({
-        feishuUserId: request.feishuUserId,
-        departmentId: user?.departmentId,
-        approvedMonthlyQuota:
-          request.approvedMonthlyQuota ?? request.requestedMonthlyQuota,
-        requestId: request.id,
-        createdByOpenId: request.approvalOperatorOpenId,
-      });
-      await updateTokenRequest(request.id, {
-        status: "approved_provisioning",
-        errorMessage: undefined,
-      });
-      const completed = await runQuotaOperation(operation.id);
-      if (completed.state !== "completed") {
-        throw new Error(`首次发放尚未完成: ${completed.state}`);
+      try {
+        const approvedMonthlyQuota =
+          request.approvedMonthlyQuota ?? request.requestedMonthlyQuota;
+        await assertFirstProvisionDepartmentCapacity({
+          feishuUserId: request.feishuUserId,
+          requestedMonthlyQuota: approvedMonthlyQuota,
+          requestId: request.id,
+        });
+        const store = await getStoreSnapshot();
+        const user = store.users.find((item) => item.id === request.feishuUserId);
+        const operation = await enqueueFirstProvision({
+          feishuUserId: request.feishuUserId,
+          departmentId: user?.departmentId,
+          approvedMonthlyQuota,
+          requestId: request.id,
+          createdByOpenId: request.approvalOperatorOpenId,
+        });
+        await updateTokenRequest(request.id, {
+          status: "approved_provisioning",
+          errorMessage: undefined,
+        });
+        const completed = await runQuotaOperation(operation.id);
+        if (completed.state !== "completed") {
+          throw new Error(
+            completed.lastErrorMessage ?? `首次发放尚未完成: ${completed.state}`,
+          );
+        }
+        const account = await getActiveTokenForUser(request.feishuUserId);
+        if (!account) throw new Error("首次发放完成后未找到 active Key");
+        await invalidateOtherFirstApplyRequestsAfterProvision(request);
+        return account;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "首次发放失败";
+        await updateTokenRequest(request.id, {
+          status: "approved_provision_failed",
+          errorMessage: message,
+        }).catch(() => undefined);
+        throw error;
       }
-      const account = await getActiveTokenForUser(request.feishuUserId);
-      if (!account) throw new Error("首次发放完成后未找到 active Key");
-      await invalidateOtherFirstApplyRequestsAfterProvision(request);
-      return account;
     }
   }
   const existingBeforeProvision = await getActiveTokenForUser(request.feishuUserId);

@@ -27,10 +27,10 @@ if (!Number.isInteger(quotaPerUnit) || quotaPerUnit <= 0) {
 
 const runId = `fapp_${Date.now()}_${randomBytes(4).toString("hex")}`;
 const userId = `${runId}_user`;
+const ordinaryUserId = `${runId}_ordinary_user`;
 const tenantKey = `${runId}_tenant`;
 const openId = "ou_f_local_admin";
 const departmentId = `${runId}_department`;
-const firstRequestId = `${runId}_first_apply`;
 const pool = new Pool({ connectionString: databaseUrl, max: 4 });
 const checks = [];
 let sessionCookie;
@@ -213,7 +213,7 @@ async function seedLocalScenario() {
     departmentId,
     departmentName: user.departmentName,
     period,
-    quotaLimit: 1000,
+    quotaLimit: 0,
     defaultGrantQuota: 200,
     createdAt: nowIso,
     updatedAt: nowIso,
@@ -253,6 +253,26 @@ async function seedLocalScenario() {
        values ($1,$2,$3,$4,$5,$6,$7)`,
       [user.id, user.tenantKey, user.openId, user.departmentId, user, nowIso, nowIso],
     );
+    const ordinaryUser = {
+      ...user,
+      id: ordinaryUserId,
+      openId: `${runId}_ordinary_open`,
+      name: "F-stage synced ordinary user",
+    };
+    await client.query(
+      `insert into feishu_users
+        (id, tenant_key, open_id, department_id, data, created_at, updated_at)
+       values ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        ordinaryUser.id,
+        ordinaryUser.tenantKey,
+        ordinaryUser.openId,
+        ordinaryUser.departmentId,
+        ordinaryUser,
+        nowIso,
+        nowIso,
+      ],
+    );
     await client.query(
       `insert into admin_scopes
         (id, feishu_user_id, scope_type, department_id, source, status,
@@ -290,41 +310,6 @@ async function seedLocalScenario() {
     client.release();
   }
   pass("isolated_seed", { period, user: "unique", department: "unique" });
-}
-
-async function insertFirstApplyRequest() {
-  const now = new Date().toISOString();
-  const request = {
-    id: firstRequestId,
-    feishuUserId: userId,
-    requestType: "first_apply",
-    status: "pending_card_send",
-    reason: "F-stage local first provision",
-    requestedMonthlyQuota: 10,
-    approvalUuid: `${runId}_approval`,
-    approvalDepartmentId: departmentId,
-    approvalMode: "manual",
-    approvalTargetOpenId: openId,
-    createdAt: now,
-    updatedAt: now,
-  };
-  await pool.query(
-    `insert into token_requests
-      (id, feishu_user_id, request_type, status, approval_department_id,
-       approval_target_open_id, data, created_at, updated_at)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-    [
-      request.id,
-      request.feishuUserId,
-      request.requestType,
-      request.status,
-      request.approvalDepartmentId,
-      request.approvalTargetOpenId,
-      request,
-      now,
-      now,
-    ],
-  );
 }
 
 async function operationByIdempotencyKey(idempotencyKey) {
@@ -521,38 +506,74 @@ async function run() {
   assert(health.json?.configuration?.newapiMock === false, "NewAPI mock must be disabled");
   pass("docker_app_health", { store: "postgres", newapi: "real-test-gateway" });
 
-  const preallocation = await appRequest(
+  const blockedAllocation = await appRequest(
     `/api/admin/users/${encodeURIComponent(userId)}/quota-adjust`,
     {
       method: "POST",
-      expectedStatus: 202,
+      expectedStatus: 502,
       body: {
         approvedMonthlyQuota: 10,
-        reason: "F-stage local preallocation",
+        reason: "F-stage zero-budget allocation",
+        clientRequestId: `${runId}_blocked_allocate`,
+      },
+    },
+  );
+  assert(
+    String(blockedAllocation.json?.error ?? "").includes("部门可用额度不足"),
+    "zero-budget allocation did not return the department budget error",
+  );
+  const blockedRequests = await pool.query(
+    `select data from token_requests
+     where feishu_user_id = $1 and request_type = 'first_apply'
+     order by created_at`,
+    [userId],
+  );
+  assert(blockedRequests.rowCount === 1, "zero-budget allocation created duplicate requests");
+  assert(
+    blockedRequests.rows[0]?.data?.status === "approved_provision_failed",
+    "zero-budget allocation was not recorded as failed",
+  );
+  const blockedAccounts = await tokenAccounts();
+  assert(blockedAccounts.length === 0, "zero-budget allocation created a token account");
+  pass("zero_budget_fails_without_false_success", {
+    status: blockedAllocation.status,
+    requests: blockedRequests.rowCount,
+    tokenAccounts: 0,
+  });
+
+  await appRequest("/api/admin/department-quota", {
+    method: "PATCH",
+    body: { departmentId, quotaLimit: 1000 },
+  });
+
+  const firstAllocation = await appRequest(
+    `/api/admin/users/${encodeURIComponent(userId)}/quota-adjust`,
+    {
+      method: "POST",
+      expectedStatus: 200,
+      body: {
+        approvedMonthlyQuota: 10,
+        reason: "F-stage local first allocation",
         clientRequestId: `${runId}_preallocate`,
       },
     },
   );
-  const preallocationId = preallocation.json?.operation?.id;
-  assert(preallocationId, "preallocation operation id is missing");
-  const preallocationResult = await waitForOperation(preallocationId);
-  assert(!preallocationResult.key, "preallocation unexpectedly returned a credential");
-  let snapshot = await quotaSnapshot();
-  assert(snapshot.total === 10 * quotaPerUnit, "preallocation ledger total is incorrect");
+  assert(firstAllocation.json?.mode === "first_provision", "no-key allocation used the wrong mode");
+  assert(firstAllocation.json?.account?.status === "active", "no-key allocation did not return an active account");
+  const firstRequestId = firstAllocation.json?.request?.id;
+  assert(firstRequestId, "first-provision request id is missing");
   assert(
-    snapshot.policy?.assignedMonthlyQuota === 10 * quotaPerUnit,
-    "preallocation policy is incorrect",
+    firstRequestId === blockedRequests.rows[0]?.data?.id,
+    "budget recovery did not reuse the failed first-apply request",
   );
-  pass("no_key_preallocation", { ledgerQuota: snapshot.total, credential: false });
-
-  await insertFirstApplyRequest();
-  const decision = await appRequest(
-    `/api/admin/token-requests/${encodeURIComponent(firstRequestId)}/decision`,
-    {
-      method: "POST",
-      expectedStatus: [200, 502],
-      body: { action: "approve", approvedMonthlyQuota: 10 },
-    },
+  const recoveredRequestCount = await pool.query(
+    `select count(*)::integer as count from token_requests
+     where feishu_user_id = $1 and request_type = 'first_apply'`,
+    [userId],
+  );
+  assert(
+    recoveredRequestCount.rows[0]?.count === 1,
+    "budget recovery created a duplicate first-apply request",
   );
   const firstOperation = await operationByIdempotencyKey(
     `quota-operation:${firstRequestId}`,
@@ -564,26 +585,60 @@ async function run() {
   const firstCompleted = await operationByIdempotencyKey(
     `quota-operation:${firstRequestId}`,
   );
-  assert(firstCompleted?.evidence?.authorizationDelta === 0, "first provision granted twice");
-  snapshot = await quotaSnapshot();
-  assert(snapshot.total === 10 * quotaPerUnit, "first provision changed preallocated total");
+  assert(
+    firstCompleted?.evidence?.authorizationDelta === 10 * quotaPerUnit,
+    "first allocation authorization delta is incorrect",
+  );
+  let snapshot = await quotaSnapshot();
+  assert(snapshot.total === 10 * quotaPerUnit, "first allocation ledger total is incorrect");
+  assert(
+    snapshot.policy?.assignedMonthlyQuota === 10 * quotaPerUnit,
+    "first allocation policy is incorrect",
+  );
   const periodOpenMarker = await pool.query(
     `select signed_quota from quota_ledger_entries
      where operation_id = $1 and entry_type = 'period_open_authorization'`,
     [firstOperation.id],
   );
   assert(periodOpenMarker.rowCount === 1, "first provision did not write a period-open marker");
-  assert(Number(periodOpenMarker.rows[0].signed_quota) === 0, "period-open marker is not zero");
+  assert(
+    Number(periodOpenMarker.rows[0].signed_quota) === 10 * quotaPerUnit,
+    "period-open marker does not contain the first authorization",
+  );
   const firstAccounts = await tokenAccounts();
   assert(
     firstAccounts.filter((row) => row.status === "active").length === 1,
     "first provision did not create exactly one active account",
   );
-  pass("first_provision_reuses_allocation", {
-    decisionStatus: decision.status,
-    authorizationDelta: 0,
+  pass("no_key_allocation_provisions_key", {
+    allocationStatus: firstAllocation.status,
+    authorizationDelta: 10 * quotaPerUnit,
     periodOpenMarker: true,
   });
+  const ordinaryBilling = await pool.query(
+    `select data from user_billing_periods
+     where feishu_user_id = $1 and period = $2`,
+    [ordinaryUserId, period],
+  );
+  const ordinaryAccounts = await pool.query(
+    "select count(*)::integer as count from token_accounts where feishu_user_id = $1",
+    [ordinaryUserId],
+  );
+  assert(
+    ordinaryBilling.rows[0]?.data?.monthlyQuota === 0 &&
+      ordinaryBilling.rows[0]?.data?.remainingQuota === 0,
+    "synced ordinary user inherited quota without approval",
+  );
+  assert(ordinaryAccounts.rows[0]?.count === 0, "synced ordinary user received a key");
+  pass("synced_user_remains_unassigned", {
+    monthlyQuota: 0,
+    remainingQuota: 0,
+    tokenAccounts: 0,
+  });
+  await pool.query("delete from user_billing_periods where feishu_user_id = $1", [
+    ordinaryUserId,
+  ]);
+  await pool.query("delete from feishu_users where id = $1", [ordinaryUserId]);
 
   const firstModels = await modelsWithRetry(firstKey, "first key model discovery");
   pass("gateway_first_key", {

@@ -8,11 +8,29 @@ import {
   classifyQuotaReconciliation,
   fixedUsageSyncWindow,
   hongKongBillingPeriod,
+  initialUnassignedMonthlyQuota,
   isSettlementWatermarkFresh,
   materializeDepartmentQuota,
   materializeUserQuota,
   resolveUsageBillingPeriod,
 } from "../lib/quota-model.ts";
+
+test("ledger-migrated users start unassigned instead of inheriting the global grant", () => {
+  assert.equal(
+    initialUnassignedMonthlyQuota({
+      defaultMonthlyQuota: 200,
+      quotaMigrationApplied: true,
+    }),
+    0,
+  );
+  assert.equal(
+    initialUnassignedMonthlyQuota({
+      defaultMonthlyQuota: 200,
+      quotaMigrationApplied: false,
+    }),
+    200,
+  );
+});
 
 test("key rotation inherits the conservative user-period remainder", () => {
   assert.deepEqual(
