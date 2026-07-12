@@ -308,6 +308,128 @@ a {
   gap: 14px;
 }
 
+.progress {
+  position: relative;
+  width: 100%;
+  height: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--primary) 14%, var(--muted));
+}
+
+.progress-indicator {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--primary);
+  transition: transform 300ms ease;
+}
+
+.usage-overview-header {
+  flex-direction: row;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.usage-overview-heading {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.usage-overview-reset {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.usage-overview-reset svg {
+  width: 15px;
+  height: 15px;
+}
+
+.usage-overview-reset strong {
+  color: var(--foreground);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-overview-layout {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 0.46fr);
+  align-items: stretch;
+  gap: 24px;
+}
+
+.usage-overview-progress-area {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 12px;
+}
+
+.usage-overview-percentage {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+}
+
+.usage-overview-percentage strong {
+  color: var(--primary);
+  font-size: 32px;
+  font-weight: 680;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.usage-overview-percentage span,
+.usage-overview-caption,
+.usage-overview-metric span {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.usage-overview-caption {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-overview-metrics {
+  min-width: 0;
+  border-left: 1px solid var(--border);
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  padding-left: 24px;
+}
+
+.usage-overview-metric {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+}
+
+.usage-overview-metric strong {
+  font-size: 24px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  overflow-wrap: anywhere;
+}
+
 .user-card {
   display: grid;
   grid-template-columns: auto minmax(180px, 1fr) minmax(130px, auto) auto;
@@ -1879,6 +2001,10 @@ a {
   .usage-analysis-grid-user {
     grid-template-columns: 1fr;
   }
+
+  .usage-overview-layout {
+    grid-template-columns: minmax(0, 1fr) minmax(280px, 0.7fr);
+  }
 }
 
 @media (max-width: 720px) {
@@ -1946,6 +2072,34 @@ a {
   .grid-4,
   .grid-2 {
     grid-template-columns: 1fr;
+  }
+
+  .usage-overview-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .usage-overview-reset {
+    justify-content: flex-start;
+  }
+
+  .usage-overview-layout {
+    grid-template-columns: 1fr;
+    gap: 18px;
+  }
+
+  .usage-overview-metrics {
+    border-top: 1px solid var(--border);
+    border-left: 0;
+    padding-top: 18px;
+    padding-left: 0;
+  }
+
+  .usage-overview-caption {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
   }
 
   .billing-control-grid {

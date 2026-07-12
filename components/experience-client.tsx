@@ -31,6 +31,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
+import { UsageOverviewCard } from "@/components/usage-overview-card";
 import {
   UsageRecordsTable,
   type UsageRecordRow,
@@ -947,6 +948,16 @@ export function ExperienceClient() {
             </CardContent>
           </Card>
 
+          {hasActiveToken && (
+            <UsageOverviewCard
+              period={currentBillingPeriodName}
+              monthlyQuota={currentBillingPeriod?.monthlyQuota}
+              quotaConsumed={currentBillingPeriod?.quotaConsumed}
+              remainingQuota={remainingQuota}
+              totalTokens={currentBillingPeriod?.totalTokens}
+            />
+          )}
+
           {fallbackNotice && <div className="alert">{fallbackNotice}</div>}
 
           {session?.adminScope && panel === "account" && (
@@ -1211,46 +1222,7 @@ export function ExperienceClient() {
 
               {panel === "usage" && (
                 <div className="stack">
-                  <section className="grid grid-2">
-                    <Card>
-                      <CardHeader>
-                        <CardTitle>当前账期</CardTitle>
-                        <CardDescription>{currentBillingPeriodName}</CardDescription>
-                      </CardHeader>
-                      <CardContent>
-                        <div className="meta-list">
-                          <div className="meta-row">
-                            <span>账期额度</span>
-                            <strong>{formatQuotaAmount(currentBillingPeriod?.monthlyQuota)}</strong>
-                          </div>
-                          <div className="meta-row">
-                            <span>已用额度</span>
-                            <strong>{formatQuotaAmount(currentBillingPeriod?.quotaConsumed, "0")}</strong>
-                          </div>
-                          <div className="meta-row">
-                            <span>剩余额度</span>
-                            <strong>{formatQuotaAmount(remainingQuota)}</strong>
-                          </div>
-                          <div className="meta-row">
-                            <span>总 tokens</span>
-                            <strong>{formatTokenAmount(currentBillingPeriod?.totalTokens, "0")}</strong>
-                          </div>
-                          <div className="meta-row">
-                            <span>输入 tokens</span>
-                            <strong>{formatTokenAmount(currentBillingPeriod?.promptTokens, "0")}</strong>
-                          </div>
-                          <div className="meta-row">
-                            <span>输出 tokens</span>
-                            <strong>{formatTokenAmount(currentBillingPeriod?.completionTokens, "0")}</strong>
-                          </div>
-                          <div className="meta-row">
-                            <span>代理请求</span>
-                            <strong>{currentBillingPeriod?.proxyLogCount ?? 0}</strong>
-                          </div>
-                        </div>
-                      </CardContent>
-                    </Card>
-
+                  <section className="grid">
                     <Card>
                       <CardHeader>
                         <CardTitle>恢复可用额度</CardTitle>

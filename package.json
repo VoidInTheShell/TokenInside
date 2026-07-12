@@ -25,6 +25,7 @@
     "production:docker-pull": "bash scripts/production-docker-pull-with-mihomo.sh"
   },
   "dependencies": {
+    "@radix-ui/react-progress": "^1.1.12",
     "clsx": "^2.1.1",
     "lucide-react": "^0.468.0",
     "next": "^16.0.0",
