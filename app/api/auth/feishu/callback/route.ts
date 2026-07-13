@@ -6,6 +6,8 @@ import {
   getFeishuDepartmentNameById,
   getFeishuUserInfo,
 } from "@/lib/feishu";
+import { getEffectiveAdminScopeForUser } from "@/lib/admin-sync";
+import { defaultPostLoginPath } from "@/lib/auth-landing";
 import { createSessionToken, setSessionCookie } from "@/lib/session";
 import { upsertFeishuUser } from "@/lib/store";
 
@@ -51,6 +53,7 @@ export async function POST(request: Request) {
       departmentId,
       departmentName,
     });
+    const adminScope = await getEffectiveAdminScopeForUser(user);
 
     const sessionToken = createSessionToken({
       userId: user.id,
@@ -59,7 +62,11 @@ export async function POST(request: Request) {
     });
     await setSessionCookie(sessionToken);
 
-    return NextResponse.json({ ok: true, user });
+    return NextResponse.json({
+      ok: true,
+      user,
+      redirectTo: defaultPostLoginPath(adminScope),
+    });
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Feishu callback failed" },

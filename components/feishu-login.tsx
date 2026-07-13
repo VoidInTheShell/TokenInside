@@ -22,6 +22,7 @@ type FeishuAuthMethod = "requestAccess" | "requestAuthCode";
 
 type FeishuLoginResult = {
   method: FeishuAuthMethod;
+  redirectTo: "/" | "/admin";
 };
 
 declare global {
@@ -251,10 +252,14 @@ async function submitFeishuCode(code: string) {
     body: JSON.stringify({ code }),
   });
 
+  const body = (await callback.json().catch(() => ({}))) as {
+    error?: string;
+    redirectTo?: string;
+  };
   if (!callback.ok) {
-    const body = (await callback.json().catch(() => ({}))) as { error?: string };
     throw new Error(body.error ?? "飞书登录失败。");
   }
+  return body.redirectTo === "/admin" ? "/admin" : "/";
 }
 
 export async function loginWithFeishu(): Promise<FeishuLoginResult> {
@@ -265,8 +270,8 @@ export async function loginWithFeishu(): Promise<FeishuLoginResult> {
   const appId = await getFeishuAppId();
   await waitForFeishuSdkReady();
   const authCode = await requestAccess(appId);
-  await submitFeishuCode(authCode.code);
-  return { method: authCode.method };
+  const redirectTo = await submitFeishuCode(authCode.code);
+  return { method: authCode.method, redirectTo };
 }
 
 export function FeishuSdkScript({

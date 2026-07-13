@@ -1173,6 +1173,10 @@ export function AdminClient() {
           ? "已通过飞书身份自动登录（兼容模式）。"
           : "已通过飞书身份自动登录。",
       );
+      if (result.redirectTo !== window.location.pathname) {
+        window.location.replace(result.redirectTo);
+        return;
+      }
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "飞书登录失败");
@@ -1880,7 +1884,7 @@ export function AdminClient() {
                 {error && <div className="alert alert-danger">{error}</div>}
                 {message && <div className="alert">{message}</div>}
                 <div className="toolbar toolbar-left">
-                  <a className="button button-outline" href="/">
+                  <a className="button button-outline" href="/?view=user">
                     回到用户后台
                   </a>
                   {!data.authenticated && (
@@ -2024,7 +2028,7 @@ export function AdminClient() {
               <h2 className="page-title">TokenInside 管理后台</h2>
               <p className="page-description">用户、额度、管理员、统计和调用记录统一工作台。</p>
             </div>
-            <a className="button button-outline" href="/">
+            <a className="button button-outline" href="/?view=user">
               <ArrowLeftIcon data-icon="inline-start" />
               返回控制台
             </a>

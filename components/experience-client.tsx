@@ -44,6 +44,7 @@ import {
 } from "@/components/usage-analysis-tables";
 import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
 import { pendingApprovalRouteNotice } from "@/lib/department-quota";
+import { shouldRedirectToDefaultAdminPath } from "@/lib/auth-landing";
 import {
   tokenRequestAllowsQuotaEdit,
   tokenRequestRequiresAdminDecision,
@@ -330,6 +331,17 @@ export function ExperienceClient() {
     try {
       const res = await fetch("/api/session", { cache: "no-store" });
       const data = (await res.json()) as SessionResponse;
+      if (
+        data.authenticated &&
+        shouldRedirectToDefaultAdminPath({
+          scope: data.adminScope ? { scopeType: data.adminScope.type } : null,
+          currentPath: window.location.pathname,
+          search: window.location.search,
+        })
+      ) {
+        window.location.replace("/admin");
+        return;
+      }
       setSession(data);
       const activeRouteNotice = pendingApprovalRouteNotice(
         data.requests?.[0],
@@ -617,6 +629,10 @@ export function ExperienceClient() {
           ? "已通过飞书身份自动登录（兼容模式）。"
           : "已通过飞书身份自动登录。",
       );
+      if (result.redirectTo !== window.location.pathname) {
+        window.location.replace(result.redirectTo);
+        return;
+      }
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "飞书登录失败");
