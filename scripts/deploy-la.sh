@@ -73,7 +73,7 @@ rollback_application() {
     echo "Deployment failed after application replacement; restoring ${previous}" >&2
     export TOKENINSIDE_IMAGE="$previous"
     compose pull tokeninside
-    compose up -d --no-deps --wait tokeninside
+    compose up -d --no-deps --wait --force-recreate tokeninside
     curl --fail --silent --show-error http://127.0.0.1:16878/api/health >/dev/null
     printf '%s\n' "$previous" > "${deploy_state_dir}/current-image"
     record_failure "rolled_back"
@@ -117,7 +117,7 @@ compose run --rm --no-deps --entrypoint node tokeninside scripts/production-pref
 
 app_update_started=true
 echo "Replacing TokenInside application container"
-compose up -d --no-deps --wait tokeninside
+compose up -d --no-deps --wait --force-recreate tokeninside
 curl --fail --silent --show-error http://127.0.0.1:16878/api/health >/dev/null
 
 if [ -n "${APP_URL:-}" ]; then
