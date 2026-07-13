@@ -12,6 +12,8 @@ const newApiBaseUrl = (process.env.NEWAPI_BASE_URL ?? "https://new-api.550w.link
   /\/+$/,
   "",
 );
+const allowUnrelatedMonthlyBlockers =
+  process.env.F_STAGE_ALLOW_UNRELATED_MONTHLY_BLOCKERS === "true";
 const newApiControlUserId = process.env.NEWAPI_CONTROL_USER_ID;
 const newApiControlCredential = [
   process.env.NEWAPI_ACCESS_TOKEN,
@@ -1164,7 +1166,15 @@ async function run() {
   const departmentPlan = monthly.json?.departments?.find(
     (item) => item.departmentId === departmentId,
   );
-  assert(monthly.json?.blocked === false, "monthly preflight is unexpectedly blocked");
+  if (allowUnrelatedMonthlyBlockers) {
+    const targetBlockers = (monthly.json?.blockers ?? []).filter(
+      (item) => item.departmentId === departmentId || item.feishuUserId === userId || item.feishuUserId === ordinaryUserId,
+    );
+    assert(departmentPlan?.blocked === false, "target department monthly preflight is blocked");
+    assert(targetBlockers.length === 0, "target users have monthly preflight blockers");
+  } else {
+    assert(monthly.json?.blocked === false, "monthly preflight is unexpectedly blocked");
+  }
   assert(departmentPlan?.alreadyOpenedUsers === 2, "monthly preflight missed prior opening");
   assert(departmentPlan?.users?.length === 0, "monthly preflight would authorize the user twice");
   pass("monthly_open_idempotency", { alreadyOpenedUsers: 2, pendingUsers: 0 });

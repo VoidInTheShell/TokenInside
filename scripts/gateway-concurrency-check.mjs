@@ -12,9 +12,18 @@ const controlUserId = process.env.NEWAPI_CONTROL_USER_ID;
 const targetUrl = (process.env.TOKENINSIDE_LOAD_TARGET_URL ?? "http://127.0.0.1:16878")
   .replace(/\/+$/, "");
 const concurrency = Number(process.env.TOKENINSIDE_LOAD_CONCURRENCY ?? "60");
+const userCount = Number(process.env.TOKENINSIDE_LOAD_USERS ?? String(concurrency));
 const setupConcurrency = Number(process.env.TOKENINSIDE_LOAD_SETUP_CONCURRENCY ?? "3");
 const requestTimeoutMs = Number(process.env.TOKENINSIDE_LOAD_REQUEST_TIMEOUT_MS ?? "15000");
 const p95LimitMs = Number(process.env.TOKENINSIDE_LOAD_P95_LIMIT_MS ?? "5000");
+const billable = process.env.TOKENINSIDE_LOAD_BILLABLE === "true";
+const billingModel = process.env.TOKENINSIDE_LOAD_MODEL ?? "gpt-4o-mini";
+const streamMode = process.env.TOKENINSIDE_LOAD_STREAM_MODE ?? "nonstream";
+const billingSyncTimeoutMs = Number(
+  process.env.TOKENINSIDE_LOAD_BILLING_SYNC_TIMEOUT_MS ?? "60000",
+);
+const quotaPerUnit = Number(process.env.NEWAPI_QUOTA_PER_UNIT ?? "500000");
+const minSuccessRate = Number(process.env.TOKENINSIDE_LOAD_MIN_SUCCESS_RATE ?? "1");
 
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
 if (!newApiBaseUrl) throw new Error("NEWAPI_BASE_URL is required");
@@ -24,11 +33,20 @@ if (!controlCredential) {
   );
 }
 if (!controlUserId) throw new Error("NEWAPI_CONTROL_USER_ID is required");
-if (!Number.isInteger(concurrency) || concurrency < 2 || concurrency > 200) {
-  throw new Error("TOKENINSIDE_LOAD_CONCURRENCY must be an integer between 2 and 200");
+if (!Number.isInteger(concurrency) || concurrency < 2 || concurrency > 1200) {
+  throw new Error("TOKENINSIDE_LOAD_CONCURRENCY must be an integer between 2 and 1200");
+}
+if (!Number.isInteger(userCount) || userCount < 1 || userCount > Math.min(concurrency, 200)) {
+  throw new Error("TOKENINSIDE_LOAD_USERS must be between 1 and min(concurrency, 200)");
 }
 if (!Number.isInteger(setupConcurrency) || setupConcurrency < 1 || setupConcurrency > 30) {
   throw new Error("TOKENINSIDE_LOAD_SETUP_CONCURRENCY must be an integer between 1 and 30");
+}
+if (!new Set(["nonstream", "stream", "mixed"]).has(streamMode)) {
+  throw new Error("TOKENINSIDE_LOAD_STREAM_MODE must be nonstream, stream or mixed");
+}
+if (!Number.isFinite(minSuccessRate) || minSuccessRate <= 0 || minSuccessRate > 1) {
+  throw new Error("TOKENINSIDE_LOAD_MIN_SUCCESS_RATE must be greater than 0 and at most 1");
 }
 
 const pool = new Pool({
@@ -120,14 +138,14 @@ async function createUpstreamFixtures(count) {
       method: "POST",
       body: JSON.stringify({
         name,
-        remain_quota: 1,
+        remain_quota: billable ? 100_000_000 : 1,
         unlimited_quota: false,
         expired_time: -1,
       }),
     });
   });
 
-  const foundTokens = await searchUpstreamTokens(`${upstreamPrefix}%`);
+  const foundTokens = await searchUpstreamTokens(`${upstreamPrefix}%`, count);
   const byName = new Map(foundTokens.map((item) => [item.name, item]));
   const orderedTokens = names.map((name) => {
     const token = byName.get(name);
@@ -140,11 +158,14 @@ async function createUpstreamFixtures(count) {
   }
   createdTokens.push(...numericTokenIds.map(String));
 
-  const keyBody = await controlFetch("/api/token/batch/keys", {
-    method: "POST",
-    body: JSON.stringify({ ids: numericTokenIds }),
-  });
-  const keys = keyBody.keys ?? {};
+  const keys = {};
+  for (let index = 0; index < numericTokenIds.length; index += 100) {
+    const keyBody = await controlFetch("/api/token/batch/keys", {
+      method: "POST",
+      body: JSON.stringify({ ids: numericTokenIds.slice(index, index + 100) }),
+    });
+    Object.assign(keys, keyBody.keys ?? {});
+  }
   return orderedTokens.map((token, index) => {
     const tokenId = String(token.id);
     const key = keys[tokenId];
@@ -252,23 +273,73 @@ async function runLoad(items) {
   const results = await Promise.all(
     items.map(async (item) => {
       const requestStartedAt = performance.now();
+      const isStream = streamMode === "stream" || (streamMode === "mixed" && item.loadIndex % 2 === 0);
       try {
-        const response = await fetch(`${targetUrl}/v1/models`, {
+        const response = await fetch(
+          billable ? `${targetUrl}/v1/chat/completions` : `${targetUrl}/v1/models`,
+          {
+          method: billable ? "POST" : "GET",
           headers: {
             authorization: `Bearer ${item.key}`,
             "user-agent": "tokeninside-gateway-concurrency-check/1.0",
+            ...(billable ? { "content-type": "application/json; charset=utf-8" } : {}),
           },
+          body: billable
+            ? JSON.stringify({
+                model: billingModel,
+                messages: [
+                  { role: "user", content: `load request ${item.userId}:${item.loadIndex}` },
+                ],
+                max_tokens: 8,
+                stream: isStream,
+              })
+            : undefined,
           cache: "no-store",
           signal: AbortSignal.timeout(requestTimeoutMs),
         });
-        await response.arrayBuffer();
+        const firstByteMs = Math.round(performance.now() - requestStartedAt);
+        const responseBuffer = await response.arrayBuffer();
+        let errorContract;
+        if (response.status >= 400) {
+          let responseJson;
+          try {
+            responseJson = JSON.parse(new TextDecoder().decode(responseBuffer));
+          } catch {
+            responseJson = undefined;
+          }
+          const error = responseJson?.error;
+          const headerRequestId = response.headers.get("x-tokeninside-request-id");
+          const retryAfter = response.headers.get("retry-after");
+          const retryable = error?.retryable === true;
+          errorContract = {
+            code: typeof error?.code === "string" ? error.code : undefined,
+            message: typeof error?.message === "string" ? error.message : undefined,
+            requestId: typeof error?.request_id === "string" ? error.request_id : undefined,
+            retryable: typeof error?.retryable === "boolean" ? error.retryable : undefined,
+            retryAfterSeconds: error?.retry_after_seconds,
+            headerRequestId,
+            retryAfter,
+            complete:
+              typeof error?.code === "string" &&
+              typeof error?.message === "string" &&
+              typeof error?.request_id === "string" &&
+              error.request_id === headerRequestId &&
+              typeof error?.retryable === "boolean" &&
+              (!retryable || (typeof error?.retry_after_seconds === "number" && retryAfter !== null)),
+          };
+        }
         return {
           status: response.status,
+          isStream,
+          firstByteMs,
           durationMs: Math.round(performance.now() - requestStartedAt),
+          errorContract,
         };
       } catch (error) {
         return {
           status: 0,
+          isStream,
+          firstByteMs: 0,
           durationMs: Math.round(performance.now() - requestStartedAt),
           error: error instanceof Error ? error.name : "UnknownError",
         };
@@ -277,11 +348,53 @@ async function runLoad(items) {
   );
   const wallMs = Math.round(performance.now() - startedAt);
   const durations = results.map((item) => item.durationMs).sort((a, b) => a - b);
+  const firstBytes = results
+    .filter((item) => item.firstByteMs > 0)
+    .map((item) => item.firstByteMs)
+    .sort((a, b) => a - b);
+  const modeMetrics = Object.fromEntries(
+    [true, false].map((isStream) => {
+      const subset = results.filter((item) => item.isStream === isStream);
+      const subsetDurations = subset.map((item) => item.durationMs).sort((a, b) => a - b);
+      const subsetFirstBytes = subset
+        .filter((item) => item.firstByteMs > 0)
+        .map((item) => item.firstByteMs)
+        .sort((a, b) => a - b);
+      return [
+        isStream ? "stream" : "nonstream",
+        {
+          requests: subset.length,
+          succeeded: subset.filter((item) => item.status === 200).length,
+          failed: subset.filter((item) => item.status !== 200).length,
+          ttftP50Ms: percentile(subsetFirstBytes, 50),
+          ttftP95Ms: percentile(subsetFirstBytes, 95),
+          totalP50Ms: percentile(subsetDurations, 50),
+          totalP95Ms: percentile(subsetDurations, 95),
+        },
+      ];
+    }),
+  );
   const statusCounts = Object.fromEntries(
     [...new Set(results.map((item) => item.status))]
       .sort((a, b) => a - b)
       .map((status) => [String(status), results.filter((item) => item.status === status).length]),
   );
+  const failures = results.filter((item) => item.status !== 200);
+  const errorContracts = {
+    failures: failures.length,
+    complete: failures.filter((item) => item.errorContract?.complete).length,
+    retryable: failures.filter((item) => item.errorContract?.retryable === true).length,
+    codes: Object.fromEntries(
+      [...new Set(failures.map((item) => item.errorContract?.code ?? item.error ?? "missing"))]
+        .sort()
+        .map((code) => [
+          code,
+          failures.filter(
+            (item) => (item.errorContract?.code ?? item.error ?? "missing") === code,
+          ).length,
+        ]),
+    ),
+  };
   return {
     results,
     summary: {
@@ -292,8 +405,102 @@ async function runLoad(items) {
       p95Ms: percentile(durations, 95),
       p99Ms: percentile(durations, 99),
       maxMs: durations.at(-1) ?? 0,
+      ttftP50Ms: percentile(firstBytes, 50),
+      ttftP95Ms: percentile(firstBytes, 95),
+      ttftP99Ms: percentile(firstBytes, 99),
+      ttftMaxMs: firstBytes.at(-1) ?? 0,
+      modeMetrics,
       statusCounts,
+      errorContracts,
     },
+  };
+}
+
+async function billingSnapshot(items) {
+  const userIds = items.map((item) => item.userId);
+  const result = await pool.query(
+    `select data
+       from proxy_request_logs
+      where feishu_user_id = any($1::text[])
+        and request_path = '/v1/chat/completions'
+      order by created_at`,
+    [userIds],
+  );
+  const logs = result.rows.map((row) => row.data);
+  const synced = logs.filter(
+    (log) => log.usageSource === "newapi_log" && typeof log.usageSyncedAt === "string",
+  );
+  const syncDelays = synced
+    .map((log) => new Date(log.usageSyncedAt).getTime() - new Date(log.createdAt).getTime())
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  const settlementDelays = synced
+    .map(
+      (log) =>
+        new Date(log.usageSyncedAt).getTime() -
+        new Date(log.responseTimeUpdatedAt ?? log.createdAt).getTime(),
+    )
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  const sourceRecords = await pool.query(
+    `select count(*)::integer as count,
+            coalesce(sum((data->>'totalTokens')::bigint), 0)::text as total_tokens,
+            coalesce(sum((data->>'quota')::bigint), 0)::text as total_quota
+       from newapi_usage_records
+      where feishu_user_id = any($1::text[])
+        and match_status = 'matched'`,
+    [userIds],
+  );
+  const periods = await pool.query(
+    `select count(*)::integer as count,
+            coalesce(sum((data->>'totalTokens')::bigint), 0)::text as total_tokens,
+            coalesce(round(sum((data->>'quotaConsumed')::numeric) * $2), 0)::text as consumed_quota
+       from user_billing_periods
+      where feishu_user_id = any($1::text[])`,
+    [userIds, quotaPerUnit],
+  );
+  return {
+    proxyLogs: logs.length,
+    completed: logs.filter((log) => log.statusCode === 200 && log.status === "completed").length,
+    synced: synced.length,
+    failedUnbilled: logs.filter((log) => log.statusCode !== 200).length,
+    unsyncedCompleted: logs.filter((log) => log.statusCode === 200).length - synced.length,
+    sourceRecords: sourceRecords.rows[0]?.count ?? 0,
+    sourceTotalTokens: Number(sourceRecords.rows[0]?.total_tokens ?? 0),
+    sourceTotalQuota: Number(sourceRecords.rows[0]?.total_quota ?? 0),
+    billingPeriods: periods.rows[0]?.count ?? 0,
+    periodTotalTokens: Number(periods.rows[0]?.total_tokens ?? 0),
+    periodConsumedQuota: Number(periods.rows[0]?.consumed_quota ?? 0),
+    syncP50Ms: percentile(syncDelays, 50),
+    syncP95Ms: percentile(syncDelays, 95),
+    syncP99Ms: percentile(syncDelays, 99),
+    syncMaxMs: syncDelays.at(-1) ?? 0,
+    settlementP50Ms: percentile(settlementDelays, 50),
+    settlementP95Ms: percentile(settlementDelays, 95),
+    settlementP99Ms: percentile(settlementDelays, 99),
+    settlementMaxMs: settlementDelays.at(-1) ?? 0,
+  };
+}
+
+async function waitForBilling(items, expectedCompleted) {
+  const startedAt = performance.now();
+  let snapshot;
+  while (performance.now() - startedAt < billingSyncTimeoutMs) {
+    snapshot = await billingSnapshot(items);
+    if (
+      snapshot.completed === expectedCompleted &&
+      snapshot.synced === expectedCompleted &&
+      snapshot.sourceRecords === expectedCompleted &&
+      snapshot.sourceTotalTokens === snapshot.periodTotalTokens &&
+      snapshot.sourceTotalQuota === snapshot.periodConsumedQuota
+    ) {
+      return { ...snapshot, convergenceMs: Math.round(performance.now() - startedAt) };
+    }
+    await sleep(250);
+  }
+  return {
+    ...(snapshot ?? (await billingSnapshot(items))),
+    convergenceMs: Math.round(performance.now() - startedAt),
   };
 }
 
@@ -332,28 +539,33 @@ async function localCleanup(items) {
 async function upstreamCleanup(tokenIds) {
   const ids = tokenIds.map(Number).filter(Number.isInteger);
   if (ids.length === 0) return;
-  let lastError;
-  for (let attempt = 1; attempt <= 4; attempt += 1) {
-    try {
-      await controlFetch("/api/token/batch", {
-        method: "POST",
-        body: JSON.stringify({ ids }),
-      });
-      return;
-    } catch (error) {
-      lastError = error;
-      if (!(error instanceof Error) || !error.message.includes("HTTP 429") || attempt === 4) {
-        throw error;
+  for (let index = 0; index < ids.length; index += 100) {
+    const chunk = ids.slice(index, index + 100);
+    let lastError;
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      try {
+        await controlFetch("/api/token/batch", {
+          method: "POST",
+          body: JSON.stringify({ ids: chunk }),
+        });
+        lastError = undefined;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (!(error instanceof Error) || !error.message.includes("HTTP 429") || attempt === 4) {
+          throw error;
+        }
+        await sleep(60_000);
       }
-      await sleep(60_000);
     }
+    if (lastError) throw lastError;
   }
-  throw lastError;
 }
 
-async function searchUpstreamTokens(keyword) {
+async function searchUpstreamTokens(keyword, expectedCount = 0) {
   const items = [];
-  for (let pageNumber = 1; pageNumber <= 5; pageNumber += 1) {
+  const maxPages = Math.max(10, Math.ceil(expectedCount / 20) + 2);
+  for (let pageNumber = 1; pageNumber <= maxPages; pageNumber += 1) {
     const params = new URLSearchParams({
       keyword,
       p: String(pageNumber),
@@ -404,23 +616,49 @@ async function cleanupStaleFixtures() {
 }
 
 let loadSummary;
+let billingSummary;
 try {
   await cleanupStaleFixtures();
-  fixtures.push(...(await createUpstreamFixtures(concurrency)));
+  fixtures.push(...(await createUpstreamFixtures(userCount)));
   await insertLocalFixtures(fixtures);
-  const load = await runLoad(fixtures);
+  const loadItems = Array.from({ length: concurrency }, (_, index) => ({
+    ...fixtures[index % fixtures.length],
+    loadIndex: index,
+  }));
+  const load = await runLoad(loadItems);
   loadSummary = load.summary;
+  const successCount = load.results.filter((item) => item.status === 200).length;
+  const minimumSuccessCount = Math.ceil(concurrency * minSuccessRate);
+  if (billable) billingSummary = await waitForBilling(loadItems, successCount);
 
   console.log(
     JSON.stringify({
       event: "gateway-load-measurement",
       target: new URL(targetUrl).host,
       upstream: new URL(newApiBaseUrl).host,
+      billable,
+      streamMode,
+      users: userCount,
+      requestsPerUser: Number((concurrency / userCount).toFixed(2)),
+      minSuccessRate,
+      minimumSuccessCount,
       ...loadSummary,
+      billing: billingSummary,
     }),
   );
 
-  assert.equal(load.results.filter((item) => item.status === 200).length, concurrency);
+  assert.ok(
+    successCount >= minimumSuccessCount,
+    `success ${successCount}/${concurrency} is below required rate ${minSuccessRate}`,
+  );
+  if (billable) {
+    assert.equal(billingSummary.completed, successCount);
+    assert.equal(billingSummary.synced, successCount);
+    assert.equal(billingSummary.sourceRecords, successCount);
+    assert.equal(billingSummary.unsyncedCompleted, 0);
+    assert.equal(billingSummary.sourceTotalTokens, billingSummary.periodTotalTokens);
+    assert.equal(billingSummary.sourceTotalQuota, billingSummary.periodConsumedQuota);
+  }
   assert.ok(
     load.summary.p95Ms <= p95LimitMs,
     `p95 ${load.summary.p95Ms}ms exceeded ${p95LimitMs}ms`,
@@ -446,8 +684,15 @@ console.log(
     target: new URL(targetUrl).host,
     upstream: new URL(newApiBaseUrl).host,
     scenario: "distinct-users-real-upstream",
+    billable,
+    streamMode,
+    users: userCount,
+    requestsPerUser: Number((concurrency / userCount).toFixed(2)),
+    billingModel: billable ? billingModel : undefined,
     p95LimitMs,
+    minSuccessRate,
     ...loadSummary,
+    billing: billingSummary,
     fixturesCleaned: true,
   }),
 );

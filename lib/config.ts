@@ -15,6 +15,11 @@ export type RuntimeConfig = {
   proxy: {
     maxConcurrency: number;
     queueTimeoutMs: number;
+    preparationMaxConcurrency: number;
+    preparationQueueTimeoutMs: number;
+    upstreamMaxAttempts: number;
+    upstreamRetryBaseMs: number;
+    upstreamRetryMaxDelayMs: number;
   };
   feishu: {
     appId?: string;
@@ -96,11 +101,31 @@ export function getConfig(): RuntimeConfig {
     proxy: {
       maxConcurrency: positiveIntegerFromEnv(
         process.env.TOKENINSIDE_PROXY_CONCURRENCY_MAX,
-        60,
+        480,
       ),
       queueTimeoutMs: positiveIntegerFromEnv(
         process.env.TOKENINSIDE_PROXY_QUEUE_TIMEOUT_MS,
         30000,
+      ),
+      preparationMaxConcurrency: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_PROXY_PREPARATION_CONCURRENCY_MAX,
+        8,
+      ),
+      preparationQueueTimeoutMs: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_PROXY_PREPARATION_QUEUE_TIMEOUT_MS,
+        30000,
+      ),
+      upstreamMaxAttempts: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_PROXY_UPSTREAM_MAX_ATTEMPTS,
+        2,
+      ),
+      upstreamRetryBaseMs: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_PROXY_UPSTREAM_RETRY_BASE_MS,
+        250,
+      ),
+      upstreamRetryMaxDelayMs: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_PROXY_UPSTREAM_RETRY_MAX_DELAY_MS,
+        2000,
       ),
     },
     feishu: {

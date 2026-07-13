@@ -1,10 +1,20 @@
-import { after, NextResponse } from "next/server";
+import { after } from "next/server";
 import { buildNewApiProxyUrl } from "@/lib/newapi";
-import { sha256Hex } from "@/lib/crypto";
+import { getConfig } from "@/lib/config";
+import { finalizeBillingPeriodAfterSettlements } from "@/lib/billing-period-finalizer";
+import { randomId, sha256Hex } from "@/lib/crypto";
 import {
   acquireProxyConcurrencySlot,
-  ProxyQueueTimeoutError,
+  acquireProxyPreparationSlot,
+  ProxyPreparationQueueTimeoutError,
 } from "@/lib/proxy-concurrency";
+import {
+  buildProxyErrorResponse,
+  buildProxyStreamErrorChunk,
+  retryableUpstreamStatus,
+  upstreamRetryAfterSeconds,
+} from "@/lib/proxy-error";
+import { fetchUpstreamWithRetry } from "@/lib/proxy-retry";
 import { syncNewApiUsageForProxyRequest } from "@/lib/usage-sync";
 import {
   createSseUsageCollector,
@@ -43,13 +53,14 @@ function extractBearerKey(request: Request) {
   return match?.[1]?.trim();
 }
 
-function filteredProxyHeaders(request: Request, key: string) {
+function filteredProxyHeaders(request: Request, key: string, requestId: string) {
   const headers = new Headers(request.headers);
   headers.delete("host");
   headers.delete("content-length");
   headers.delete("cookie");
   headers.set("authorization", `Bearer ${key}`);
   headers.set("x-tokeninside-proxy", "1");
+  headers.set("x-tokeninside-request-id", requestId);
   return headers;
 }
 
@@ -160,6 +171,8 @@ function newApiResponseRequestIdPatch(newapiResponseRequestId?: string) {
 
 type ProxyUsageSettlementContext = {
   proxyLogId: string;
+  feishuUserId: string;
+  billingPeriod: string;
   newapiTokenId?: string;
   model?: string;
   isStream: boolean;
@@ -171,7 +184,7 @@ function settleNewApiUsageAfterResponse(
   newapiRequestId?: string,
 ) {
   after(async () => {
-    await syncNewApiUsageForProxyRequest({
+    const result = await syncNewApiUsageForProxyRequest({
       newapiRequestId,
       proxyLogId: context.proxyLogId,
       newapiTokenId: context.newapiTokenId,
@@ -179,6 +192,12 @@ function settleNewApiUsageAfterResponse(
       isStream: context.isStream,
       requestStartedAt: context.requestStartedAt,
     }).catch(() => undefined);
+    if (result?.backfill) {
+      await finalizeBillingPeriodAfterSettlements(
+        context.feishuUserId,
+        context.billingPeriod,
+      ).catch(() => undefined);
+    }
   });
 }
 
@@ -239,6 +258,7 @@ function streamWithProxyLog(input: {
   statusCode: number;
   newapiResponseRequestId?: string;
   apiFormat: string;
+  requestId: string;
   releaseUpstreamSlot: () => void;
 }) {
   const reader = input.body.getReader();
@@ -282,7 +302,20 @@ function streamWithProxyLog(input: {
           responseTimeUpdatedAt: new Date().toISOString(),
           leaseExpiresAt: undefined,
         });
-        controller.error(err);
+        try {
+          controller.enqueue(buildProxyStreamErrorChunk({
+            status: 502,
+            message: `流式上游连接中断（${sanitizedErrorMessage(err)}），请在 2 秒后重试`,
+            code: "upstream_stream_interrupted",
+            type: "upstream_error",
+            requestId: input.requestId,
+            retryable: true,
+            retryAfterSeconds: 2,
+          }));
+          controller.close();
+        } catch {
+          controller.error(err);
+        }
       }
     },
     async cancel(reason) {
@@ -387,15 +420,17 @@ async function recordFailedProxyLog(input: {
   });
 }
 
-function responseHeadersFrom(upstream: Response) {
+function responseHeadersFrom(upstream: Response, requestId: string) {
   const responseHeaders = new Headers(upstream.headers);
   responseHeaders.delete("content-encoding");
   responseHeaders.delete("content-length");
+  responseHeaders.set("x-tokeninside-request-id", requestId);
   return responseHeaders;
 }
 
 async function proxy(request: Request, context: RouteContext) {
   const startedAt = Date.now();
+  const requestId = randomId("req");
   const params = await context.params;
   const rawPath = params.path ?? [];
   const path = normalizeProxyPath(rawPath);
@@ -406,52 +441,49 @@ async function proxy(request: Request, context: RouteContext) {
   const unsupported = getSupportedProxyError(request.method, path);
 
   if (unsupported) {
-    await addProxyLog({
-      requestPath: rawRequestPath,
-      method: request.method,
-      statusCode: unsupported.status,
-      durationMs: Date.now() - startedAt,
-      userAgent: request.headers.get("user-agent") ?? undefined,
-      clientIp: request.headers.get("x-forwarded-for") ?? undefined,
+    after(async () => {
+      await addProxyLog({
+        requestPath: rawRequestPath,
+        method: request.method,
+        statusCode: unsupported.status,
+        durationMs: Date.now() - startedAt,
+        userAgent: request.headers.get("user-agent") ?? undefined,
+        clientIp: request.headers.get("x-forwarded-for") ?? undefined,
+      }).catch(() => undefined);
     });
-    return NextResponse.json({ error: unsupported.error }, { status: unsupported.status });
+    return buildProxyErrorResponse({
+      status: unsupported.status,
+      message: unsupported.error,
+      code: unsupported.status === 405 ? "unsupported_method" : "unsupported_endpoint",
+      requestId,
+    });
   }
 
   if (!key) {
-    return NextResponse.json({ error: "Bearer NewAPI key is required" }, { status: 401 });
+    return buildProxyErrorResponse({
+      status: 401,
+      message: "缺少 Bearer NewAPI Key，请在 Authorization header 中提供",
+      code: "missing_bearer_key",
+      requestId,
+    });
   }
 
-  const tokenAccount = await findActiveTokenByHash(sha256Hex(key));
-  if (!tokenAccount) {
-    await addProxyLog({
-      requestPath,
-      method: request.method,
-      statusCode: 403,
-      durationMs: Date.now() - startedAt,
-      userAgent: request.headers.get("user-agent") ?? undefined,
-      clientIp: request.headers.get("x-forwarded-for") ?? undefined,
+  let releaseUpstreamSlot: (() => void) | undefined;
+  try {
+    releaseUpstreamSlot = await acquireProxyConcurrencySlot(request.signal);
+  } catch (error) {
+    const aborted = request.signal.aborted ||
+      (error instanceof DOMException && error.name === "AbortError");
+    return buildProxyErrorResponse({
+      status: aborted ? 499 : 503,
+      message: aborted
+        ? "客户端已取消请求"
+        : "TokenInside 当前长请求并发已满，请在 2 秒后重试",
+      code: aborted ? "client_cancelled" : "gateway_upstream_capacity_exhausted",
+      requestId,
+      retryable: !aborted,
+      retryAfterSeconds: 2,
     });
-    return NextResponse.json({ error: "NewAPI key is not bound to an active Feishu user" }, { status: 403 });
-  }
-
-  const user = await getUserById(tokenAccount.feishuUserId);
-  if (!user) {
-    return NextResponse.json({ error: "Bound Feishu user no longer exists" }, { status: 403 });
-  }
-  if (user.status === "disabled" || user.status === "deleted") {
-    await addProxyLog({
-      feishuUserId: user.id,
-      tokenAccountId: tokenAccount.id,
-      departmentId: user.departmentId,
-      departmentName: user.departmentName,
-      requestPath,
-      method: request.method,
-      statusCode: 403,
-      durationMs: Date.now() - startedAt,
-      userAgent: request.headers.get("user-agent") ?? undefined,
-      clientIp: request.headers.get("x-forwarded-for") ?? undefined,
-    });
-    return NextResponse.json({ error: "Bound Feishu user is not active" }, { status: 403 });
   }
 
   const body =
@@ -469,8 +501,87 @@ async function proxy(request: Request, context: RouteContext) {
   });
   const userAgent = request.headers.get("user-agent");
   const clientIp = request.headers.get("x-forwarded-for") ?? undefined;
+  let releasePreparationSlot: (() => void) | undefined;
+  try {
+    releasePreparationSlot = await acquireProxyPreparationSlot(request.signal);
+  } catch (error) {
+    releaseUpstreamSlot?.();
+    releaseUpstreamSlot = undefined;
+    const aborted = request.signal.aborted ||
+      (error instanceof DOMException && error.name === "AbortError");
+    const queueTimedOut = error instanceof ProxyPreparationQueueTimeoutError;
+    return buildProxyErrorResponse({
+      status: aborted ? 499 : 503,
+      message: aborted
+        ? "客户端已取消请求"
+        : queueTimedOut
+          ? "TokenInside 数据库准备队列繁忙，请在 2 秒后重试"
+          : "TokenInside 请求准备失败，请在 2 秒后重试",
+      code: aborted ? "client_cancelled" : "gateway_preparation_queue_full",
+      requestId,
+      retryable: !aborted,
+      retryAfterSeconds: 2,
+    });
+  }
+
+  let tokenAccount: NonNullable<Awaited<ReturnType<typeof findActiveTokenByHash>>>;
+  let user: NonNullable<Awaited<ReturnType<typeof getUserById>>>;
   let proxyLog: Awaited<ReturnType<typeof beginQuotaAwareProxyLog>>;
   try {
+    const foundTokenAccount = await findActiveTokenByHash(sha256Hex(key));
+    if (!foundTokenAccount) {
+      void addProxyLog({
+        requestPath,
+        method: request.method,
+        statusCode: 403,
+        durationMs: Date.now() - startedAt,
+        userAgent: userAgent ?? undefined,
+        clientIp,
+      }).catch(() => undefined);
+      releaseUpstreamSlot();
+      releaseUpstreamSlot = undefined;
+      return buildProxyErrorResponse({
+        status: 403,
+        message: "当前 NewAPI Key 未绑定到有效的飞书用户或已经失效",
+        code: "inactive_key",
+        requestId,
+      });
+    }
+    tokenAccount = foundTokenAccount;
+    const foundUser = await getUserById(tokenAccount.feishuUserId);
+    if (!foundUser) {
+      releaseUpstreamSlot();
+      releaseUpstreamSlot = undefined;
+      return buildProxyErrorResponse({
+        status: 403,
+        message: "当前 Key 绑定的飞书用户已不存在",
+        code: "bound_user_missing",
+        requestId,
+      });
+    }
+    user = foundUser;
+    if (user.status === "disabled" || user.status === "deleted") {
+      void addProxyLog({
+        feishuUserId: user.id,
+        tokenAccountId: tokenAccount.id,
+        departmentId: user.departmentId,
+        departmentName: user.departmentName,
+        requestPath,
+        method: request.method,
+        statusCode: 403,
+        durationMs: Date.now() - startedAt,
+        userAgent: userAgent ?? undefined,
+        clientIp,
+      }).catch(() => undefined);
+      releaseUpstreamSlot();
+      releaseUpstreamSlot = undefined;
+      return buildProxyErrorResponse({
+        status: 403,
+        message: "当前 Key 绑定的飞书用户已被禁用",
+        code: "bound_user_inactive",
+        requestId,
+      });
+    }
     proxyLog = await beginQuotaAwareProxyLog(tokenAccount, {
       feishuUserId: user.id,
       tokenAccountId: tokenAccount.id,
@@ -492,19 +603,48 @@ async function proxy(request: Request, context: RouteContext) {
       clientFamily: detectClientFamily(userAgent),
     });
   } catch (error) {
+    releaseUpstreamSlot?.();
+    releaseUpstreamSlot = undefined;
     if (error instanceof QuotaAdmissionClosedError) {
-      return NextResponse.json(
-        { error: error.message, operationId: error.operationId, retryable: true },
-        { status: 409, headers: { "Retry-After": "2" } },
-      );
+      return buildProxyErrorResponse({
+        status: 409,
+        message: `${error.message}，请在 2 秒后重试`,
+        code: error.code,
+        requestId,
+        retryable: true,
+        retryAfterSeconds: 2,
+        details: error.operationId ? { operation_id: error.operationId } : undefined,
+      });
     }
     if (error instanceof StaleTokenGenerationError) {
-      return NextResponse.json({ error: error.message }, { status: 403 });
+      return buildProxyErrorResponse({
+        status: 403,
+        message: error.message,
+        code: error.code,
+        requestId,
+      });
     }
-    throw error;
+    console.error(JSON.stringify({
+      event: "tokeninside.proxy.preparation_failed",
+      requestId,
+      errorMessage: sanitizedErrorMessage(error),
+    }));
+    return buildProxyErrorResponse({
+      status: 503,
+      message: "TokenInside 数据库暂时繁忙，请在 2 秒后重试",
+      code: "gateway_storage_unavailable",
+      requestId,
+      retryable: true,
+      retryAfterSeconds: 2,
+    });
+  } finally {
+    releasePreparationSlot?.();
+    releasePreparationSlot = undefined;
   }
   const settlementContext: ProxyUsageSettlementContext = {
     proxyLogId: proxyLog.id,
+    feishuUserId: user.id,
+    billingPeriod: tokenAccount.billingPeriod,
     newapiTokenId: tokenAccount.newapiTokenId,
     model: metadata.model,
     isStream: metadata.clientRequestedStream,
@@ -513,53 +653,69 @@ async function proxy(request: Request, context: RouteContext) {
   const stopRequestHeartbeat = startProxyLeaseHeartbeat(proxyLog.id);
 
   const upstreamUrl = buildNewApiProxyUrl(path, requestUrl.search);
-  let releaseUpstreamSlot: (() => void) | undefined;
   try {
-    releaseUpstreamSlot = await acquireProxyConcurrencySlot(request.signal);
-  } catch (error) {
-    stopRequestHeartbeat();
-    const aborted = request.signal.aborted ||
-      (error instanceof DOMException && error.name === "AbortError");
-    const queueTimedOut = error instanceof ProxyQueueTimeoutError;
-    await updateProxyLog(proxyLog.id, {
-      status: aborted ? "cancelled" : "failed",
-      terminalStatus: aborted ? "cancelled" : "failed",
-      statusCode: aborted ? 499 : 503,
-      durationMs: Date.now() - startedAt,
-      errorMessage: aborted
-        ? "Client cancelled while waiting for an upstream slot"
-        : queueTimedOut
-          ? "Upstream concurrency queue timed out"
-          : sanitizedErrorMessage(error),
-      responseTimeUpdatedAt: new Date().toISOString(),
-      leaseExpiresAt: undefined,
-    });
-    return NextResponse.json(
+    const retryConfig = getConfig().proxy;
+    const upstreamResult = await fetchUpstreamWithRetry(
+      () => fetch(upstreamUrl, {
+        method: request.method,
+        headers: filteredProxyHeaders(request, key, requestId),
+        body: upstreamBody,
+        cache: "no-store",
+        signal: request.signal,
+      }),
       {
-        error: aborted
-          ? "Client cancelled the request"
-          : "Gateway upstream concurrency queue is full",
-        retryable: !aborted,
-      },
-      {
-        status: aborted ? 499 : 503,
-        headers: aborted ? undefined : { "Retry-After": "2" },
+        maxAttempts: retryConfig.upstreamMaxAttempts,
+        baseDelayMs: retryConfig.upstreamRetryBaseMs,
+        maxDelayMs: retryConfig.upstreamRetryMaxDelayMs,
+        signal: request.signal,
       },
     );
-  }
-  try {
-    const upstream = await fetch(upstreamUrl, {
-      method: request.method,
-      headers: filteredProxyHeaders(request, key),
-      body: upstreamBody,
-      cache: "no-store",
-      signal: request.signal,
-    });
+    const upstream = upstreamResult.response;
     const firstByteMs = Date.now() - startedAt;
     const contentType = upstream.headers.get("content-type") ?? "";
     const upstreamIsStream = contentType.includes("text/event-stream");
     const newapiResponseRequestId = newApiResponseRequestIdFrom(upstream);
-    const responseHeaders = responseHeadersFrom(upstream);
+    const responseHeaders = responseHeadersFrom(upstream, requestId);
+    responseHeaders.set("x-tokeninside-upstream-attempts", String(upstreamResult.attempts));
+
+    if (upstream.status >= 400) {
+      const responseBody = await readResponseBody(upstream);
+      await recordFinishedProxyLog({
+        logId: proxyLog.id,
+        startedAt,
+        firstByteMs,
+        upstream,
+        requestPath,
+        settlementContext,
+        apiFormat,
+        responseBuffer: responseBody.buffer,
+        responseJson: responseBody.json,
+      });
+      stopRequestHeartbeat();
+      releaseUpstreamSlot();
+      releaseUpstreamSlot = undefined;
+      const retryable = retryableUpstreamStatus(upstream.status);
+      const retryAfterSeconds = upstreamRetryAfterSeconds(upstream);
+      return buildProxyErrorResponse({
+        status: upstream.status,
+        message: `${upstreamErrorMessage({
+          statusCode: upstream.status,
+          responseJson: responseBody.json,
+          responseBuffer: responseBody.buffer,
+        })}${retryable ? `，请在 ${retryAfterSeconds} 秒后重试` : ""}`,
+        code: `upstream_http_${upstream.status}`,
+        type: "upstream_error",
+        requestId,
+        retryable,
+        retryAfterSeconds,
+        details: {
+          upstream_attempts: upstreamResult.attempts,
+          ...(newapiResponseRequestId
+            ? { newapi_request_id: newapiResponseRequestId }
+            : {}),
+        },
+      });
+    }
 
     if (upstreamIsStream && upstream.body) {
       await updateProxyLog(proxyLog.id, {
@@ -586,6 +742,7 @@ async function proxy(request: Request, context: RouteContext) {
           statusCode: upstream.status,
           newapiResponseRequestId,
           apiFormat,
+          requestId,
           releaseUpstreamSlot,
         }),
         {
@@ -610,6 +767,7 @@ async function proxy(request: Request, context: RouteContext) {
     });
     stopRequestHeartbeat();
     releaseUpstreamSlot();
+    releaseUpstreamSlot = undefined;
 
     return new Response(responseBody.buffer, {
       status: upstream.status,
@@ -627,11 +785,23 @@ async function proxy(request: Request, context: RouteContext) {
       startedAt,
       err,
       aborted,
+    }).catch(() => undefined);
+    const reason = sanitizedErrorMessage(err);
+    const attempts = typeof (err as { attempts?: unknown })?.attempts === "number"
+      ? (err as { attempts: number }).attempts
+      : getConfig().proxy.upstreamMaxAttempts;
+    return buildProxyErrorResponse({
+      status: aborted ? 499 : 502,
+      message: aborted
+        ? "客户端已取消请求"
+        : `NewAPI 上游请求失败（${reason}），请在 2 秒后重试`,
+      code: aborted ? "client_cancelled" : "upstream_request_failed",
+      type: aborted ? "tokeninside_error" : "upstream_error",
+      requestId,
+      retryable: !aborted,
+      retryAfterSeconds: 2,
+      details: aborted ? undefined : { upstream_attempts: attempts },
     });
-    return NextResponse.json(
-      { error: aborted ? "Client cancelled the request" : "Upstream request failed" },
-      { status: aborted ? 499 : 502 },
-    );
   }
 }
 

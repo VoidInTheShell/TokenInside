@@ -1,7 +1,10 @@
 import { Pool, type PoolClient } from "pg";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
-import { newApiUsageIdentityLockKeys } from "@/lib/newapi-usage-identity";
+import {
+  hasConflictingProxyMatch,
+  newApiUsageIdentityLockKeys,
+} from "@/lib/newapi-usage-identity";
 import { initialUnassignedMonthlyQuota } from "@/lib/quota-model";
 import type {
   AdminScope,
@@ -993,6 +996,19 @@ async function syncPostgresBillingPeriodForUser(
   return existing;
 }
 
+export async function reconcilePostgresBillingPeriodForUser(
+  feishuUserId: string,
+  period: string,
+) {
+  return withTransaction(async (client) => {
+    await client.query(
+      "select pg_advisory_xact_lock(hashtext($1)::bigint)",
+      [`billing-period-finalize:${feishuUserId}:${period}`],
+    );
+    return syncPostgresBillingPeriodForUser(client, feishuUserId, period);
+  });
+}
+
 export async function checkPostgresConnection() {
   const client = await getPool().connect();
   try {
@@ -1120,6 +1136,75 @@ export async function readPostgresStore(): Promise<StoreShape> {
 
 export async function getPostgresAppSettings() {
   return withClient((client) => readSettingsRow(client));
+}
+
+export async function readPostgresUsageMatchingSnapshot(input: {
+  newapiTokenIds: string[];
+  proxyLogIds: string[];
+}) {
+  const newapiTokenIds = [...new Set(input.newapiTokenIds.filter(Boolean))];
+  const proxyLogIds = [...new Set(input.proxyLogIds.filter(Boolean))];
+  return withClient(async (client) => {
+    const accounts = newapiTokenIds.length
+      ? await client.query<{ data: TokenAccount }>(
+          "select data from token_accounts where newapi_token_id = any($1::text[])",
+          [newapiTokenIds],
+        )
+      : { rows: [] as Array<{ data: TokenAccount }> };
+    const userIds = [...new Set(accounts.rows.map((row) => row.data.feishuUserId))];
+    const users = userIds.length
+      ? await client.query<{ data: FeishuUser }>(
+          "select data from feishu_users where id = any($1::text[])",
+          [userIds],
+        )
+      : { rows: [] as Array<{ data: FeishuUser }> };
+    const proxyLogs = proxyLogIds.length
+      ? await client.query<{ data: ProxyRequestLog }>(
+          "select data from proxy_request_logs where id = any($1::text[])",
+          [proxyLogIds],
+        )
+      : { rows: [] as Array<{ data: ProxyRequestLog }> };
+    const usageRecords = newapiTokenIds.length
+      ? await client.query<{ data: NewApiUsageRecord }>(
+          "select data from newapi_usage_records where newapi_token_id = any($1::text[])",
+          [newapiTokenIds],
+        )
+      : { rows: [] as Array<{ data: NewApiUsageRecord }> };
+    return {
+      users: users.rows.map((row) => row.data),
+      tokenAccounts: accounts.rows.map((row) => row.data),
+      proxyRequestLogs: proxyLogs.rows.map((row) => row.data),
+      newapiUsageRecords: usageRecords.rows.map((row) => row.data),
+    };
+  });
+}
+
+export async function getPostgresUserById(feishuUserId: string) {
+  return withClient(async (client) => {
+    const result = await client.query<{ data: FeishuUser }>(
+      "select data from feishu_users where id = $1 limit 1",
+      [feishuUserId],
+    );
+    return result.rows[0]?.data ?? null;
+  });
+}
+
+export async function getPostgresUserQuotaState(feishuUserId: string) {
+  return withClient(async (client) => {
+    const result = await client.query<{ data: UserQuotaState | null; generation: number }>(
+      `select
+         (select data from user_quota_states where feishu_user_id = $1) as data,
+         coalesce((select max(operation_generation) from token_accounts where feishu_user_id = $1), 0)::integer as generation`,
+      [feishuUserId],
+    );
+    const row = result.rows[0];
+    return row?.data ?? {
+      feishuUserId,
+      admission: "open" as const,
+      activeGeneration: row?.generation ?? 0,
+      updatedAt: nowIso(),
+    };
+  });
 }
 
 export async function savePostgresAppSettings(settings: AppSettings) {
@@ -2333,6 +2418,9 @@ export async function upsertPostgresNewApiUsageRecord(record: NewApiUsageRecord)
       [record.id, record.newapiTokenId ?? null, record.newapiRequestId ?? null, record.newapiLogId ?? null],
     );
     const existing = existingResult.rows[0]?.data;
+    if (hasConflictingProxyMatch(existing, record)) {
+      return existing;
+    }
     const stored = await saveNewApiUsageRecordRow(client, {
       ...existing,
       ...record,

@@ -7,6 +7,17 @@ export type NewApiUsageSourceIdentity = {
   newapiTokenId?: string;
 };
 
+export function hasConflictingProxyMatch(
+  existing: { matchedProxyLogId?: string } | undefined,
+  incoming: { matchedProxyLogId?: string },
+) {
+  return Boolean(
+    existing?.matchedProxyLogId &&
+      incoming.matchedProxyLogId &&
+      existing.matchedProxyLogId !== incoming.matchedProxyLogId,
+  );
+}
+
 export function stableNewApiUsageRecordId(identity: string) {
   return `nur_${sha256Hex(identity)}`;
 }

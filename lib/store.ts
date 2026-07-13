@@ -41,6 +41,8 @@ import {
   getPostgresActiveTokenForUser,
   getPostgresAppSettings,
   getPostgresFeishuEventByUuid,
+  getPostgresUserById,
+  getPostgresUserQuotaState,
   insertPostgresProxyLog,
   insertPostgresQuotaLedgerEntry,
   insertPostgresTokenAccount,
@@ -51,6 +53,7 @@ import {
   recordPostgresMonthlyResetApplied,
   replacePostgresActiveTokenAccount,
   readPostgresStore,
+  readPostgresUsageMatchingSnapshot,
   releasePostgresQuotaOperationExecution,
   renewPostgresQuotaOperationExecution,
   revokePostgresAdminScopesForUser,
@@ -966,6 +969,7 @@ export async function upsertFeishuUser(input: {
 }
 
 export async function getUserById(id: string) {
+  if (isPostgresBackend()) return getPostgresUserById(id);
   const store = await readStore();
   return store.users.find((user) => user.id === id) ?? null;
 }
@@ -1312,6 +1316,7 @@ export async function createUserQuotaPolicyVersion(input: {
 }
 
 export async function getUserQuotaState(feishuUserId: string) {
+  if (isPostgresBackend()) return getPostgresUserQuotaState(feishuUserId);
   const store = await readStore();
   return (
     store.userQuotaStates.find((item) => item.feishuUserId === feishuUserId) ?? {
@@ -3525,7 +3530,24 @@ export async function backfillProxyLogsFromNewApiUsage(
         account,
         proxyLog,
       });
-      await persistRecord(record);
+      const storedRecord = await persistRecord(record);
+      if (
+        storedRecord.matchedProxyLogId &&
+        storedRecord.matchedProxyLogId !== proxyLog.id
+      ) {
+        result.skippedNoMatch += 1;
+        result.items.push({
+          action: "skipped_no_match",
+          newapiLogId: usageLog.newapiLogId,
+          newapiRequestId: usageLog.newapiRequestId,
+          newapiTokenId: usageLog.newapiTokenId,
+          feishuUserId: account.feishuUserId,
+          tokenAccountId: account.id,
+          usageRecordId: storedRecord.id,
+          reason: "NewAPI source is already bound to another proxy request",
+        });
+        continue;
+      }
       if (usageLog.cost === undefined && usageLog.quota === undefined) {
         const issue = buildUsageSyncIssue({
           issueType: "missing_cost",
@@ -3573,7 +3595,17 @@ export async function backfillProxyLogsFromNewApiUsage(
   };
 
   if (isPostgresBackend()) {
-    const store = await readPostgresStore();
+    const store = input.targetProxyLogIds?.length
+      ? {
+          ...structuredClone(initialStore),
+          ...(await readPostgresUsageMatchingSnapshot({
+            newapiTokenIds: usageLogs
+              .map((item) => item.newapiTokenId)
+              .filter((item): item is string => Boolean(item)),
+            proxyLogIds: input.targetProxyLogIds,
+          })),
+        }
+      : await readPostgresStore();
     return runBackfill(
       store,
       async (proxyLog, patch, syncedAt) => {

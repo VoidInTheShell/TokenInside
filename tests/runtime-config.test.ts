@@ -30,13 +30,19 @@ test("uses bounded defaults for the advisory lock pool and NewAPI control reques
       NEWAPI_REQUEST_TIMEOUT_MS: undefined,
       TOKENINSIDE_PROXY_CONCURRENCY_MAX: undefined,
       TOKENINSIDE_PROXY_QUEUE_TIMEOUT_MS: undefined,
+      TOKENINSIDE_PROXY_PREPARATION_CONCURRENCY_MAX: undefined,
+      TOKENINSIDE_PROXY_PREPARATION_QUEUE_TIMEOUT_MS: undefined,
+      TOKENINSIDE_PROXY_UPSTREAM_MAX_ATTEMPTS: undefined,
     },
     () => {
       const config = getConfig();
       assert.equal(config.postgres.lockPoolMax, 10);
       assert.equal(config.newapi.requestTimeoutMs, 15_000);
-      assert.equal(config.proxy.maxConcurrency, 60);
+      assert.equal(config.proxy.maxConcurrency, 480);
       assert.equal(config.proxy.queueTimeoutMs, 30_000);
+      assert.equal(config.proxy.preparationMaxConcurrency, 8);
+      assert.equal(config.proxy.preparationQueueTimeoutMs, 30_000);
+      assert.equal(config.proxy.upstreamMaxAttempts, 2);
     },
   );
 });
@@ -48,6 +54,9 @@ test("reads explicit advisory lock pool and NewAPI timeout limits", () => {
       NEWAPI_REQUEST_TIMEOUT_MS: "23000",
       TOKENINSIDE_PROXY_CONCURRENCY_MAX: "12",
       TOKENINSIDE_PROXY_QUEUE_TIMEOUT_MS: "45000",
+      TOKENINSIDE_PROXY_PREPARATION_CONCURRENCY_MAX: "6",
+      TOKENINSIDE_PROXY_PREPARATION_QUEUE_TIMEOUT_MS: "12000",
+      TOKENINSIDE_PROXY_UPSTREAM_MAX_ATTEMPTS: "3",
     },
     () => {
       const config = getConfig();
@@ -55,6 +64,9 @@ test("reads explicit advisory lock pool and NewAPI timeout limits", () => {
       assert.equal(config.newapi.requestTimeoutMs, 23_000);
       assert.equal(config.proxy.maxConcurrency, 12);
       assert.equal(config.proxy.queueTimeoutMs, 45_000);
+      assert.equal(config.proxy.preparationMaxConcurrency, 6);
+      assert.equal(config.proxy.preparationQueueTimeoutMs, 12_000);
+      assert.equal(config.proxy.upstreamMaxAttempts, 3);
     },
   );
 });

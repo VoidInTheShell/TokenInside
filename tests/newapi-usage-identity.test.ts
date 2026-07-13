@@ -1,10 +1,28 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  hasConflictingProxyMatch,
   newApiUsageIdentityLockKeys,
   sameNewApiUsageSource,
   stableNewApiUsageRecordId,
 } from "../lib/newapi-usage-identity.ts";
+
+test("an authoritative source match cannot move to a competing proxy request", () => {
+  assert.equal(
+    hasConflictingProxyMatch(
+      { matchedProxyLogId: "proxy-a" },
+      { matchedProxyLogId: "proxy-b" },
+    ),
+    true,
+  );
+  assert.equal(
+    hasConflictingProxyMatch(
+      { matchedProxyLogId: "proxy-a" },
+      { matchedProxyLogId: "proxy-a" },
+    ),
+    false,
+  );
+});
 
 test("does not treat reused NewAPI log ids from different tokens as the same source", () => {
   assert.equal(
