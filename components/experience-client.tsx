@@ -9,9 +9,9 @@ import {
   HistoryIcon,
   KeyRoundIcon,
   ListFilterIcon,
-  LoaderCircleIcon,
   MenuIcon,
   RefreshCwIcon,
+  SaveIcon,
   SendIcon,
   ShieldCheckIcon,
   SlidersHorizontalIcon,
@@ -31,6 +31,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
+import { LoginWaitingScreen } from "@/components/login-waiting-screen";
 import { UsageOverviewCard } from "@/components/usage-overview-card";
 import {
   UsageRecordsTable,
@@ -798,6 +799,20 @@ export function ExperienceClient() {
     }
   }
 
+  const loginInProgress = loading || (!session?.authenticated && busy);
+
+  if (loginInProgress) {
+    return (
+      <>
+        <FeishuSdkScript
+          onReady={() => setFeishuSdkReady(true)}
+          onError={(sdkError) => setError(sdkError)}
+        />
+        <LoginWaitingScreen />
+      </>
+    );
+  }
+
   return (
     <>
       <FeishuSdkScript
@@ -913,32 +928,6 @@ export function ExperienceClient() {
                       当前用户已有 active key
                     </Badge>
                   )}
-                  <Badge
-                    className="identity-status"
-                    aria-label={
-                      loading || busy
-                        ? "自动识别中"
-                        : session?.authenticated
-                          ? "飞书身份已识别"
-                          : "等待飞书身份"
-                    }
-                    title={
-                      loading || busy
-                        ? "自动识别中"
-                        : session?.authenticated
-                          ? "飞书身份已识别"
-                          : "等待飞书身份"
-                    }
-                    variant={session?.authenticated ? "success" : "warning"}
-                  >
-                    {loading || busy ? (
-                      <LoaderCircleIcon className="spin-icon" data-icon="inline-start" />
-                    ) : session?.authenticated ? (
-                      <CheckCircle2Icon data-icon="inline-start" />
-                    ) : (
-                      <XCircleIcon data-icon="inline-start" />
-                    )}
-                  </Badge>
                   <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={busy}>
                     <RefreshCwIcon data-icon="inline-start" />
                     刷新
@@ -1017,7 +1006,7 @@ export function ExperienceClient() {
                             </td>
                             <td>{formatQuotaAmount(request.requestedMonthlyQuota)}</td>
                             <td>
-                              <div className="quota-control recent-approval-quota">
+                              <div className="quota-control quota-control-icon-action recent-approval-quota">
                                 <Input
                                   aria-label={`最终额度-${request.id}`}
                                   min={1}
@@ -1038,10 +1027,12 @@ export function ExperienceClient() {
                                 <Button
                                   variant="outline"
                                   size="sm"
+                                  aria-label="保存最终额度"
+                                  title="保存最终额度"
                                   disabled={!canEditQuota(request) || quickApprovalBusy}
                                   onClick={() => void saveQuickApprovalQuota(request.id)}
                                 >
-                                  保存
+                                  <SaveIcon data-icon="inline-start" />
                                 </Button>
                               </div>
                             </td>
@@ -1091,7 +1082,7 @@ export function ExperienceClient() {
                   <CardDescription>
                     {latestRequest
                       ? `最近状态：${statusLabel[latestRequest.status] ?? latestRequest.status}`
-                      : "填写申请理由后提交。"}
+                      : "确认默认申请额度后即可提交，申请理由可选。"}
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
@@ -1106,11 +1097,14 @@ export function ExperienceClient() {
                       <span className="field-description">当前 MVP 固定额度，用户不可修改。</span>
                     </div>
                     <div className="field">
-                      <label htmlFor="requestReason">申请理由</label>
+                      <label htmlFor="requestReason">申请理由（选填）</label>
                       <Textarea
                         id="requestReason"
+                        className="request-reason-textarea"
                         placeholder={DEFAULT_REASON_PLACEHOLDER}
                         value={reason}
+                        maxLength={500}
+                        rows={2}
                         onChange={(event) => setReason(event.target.value)}
                         disabled={!session?.authenticated || busy}
                       />
@@ -1122,7 +1116,7 @@ export function ExperienceClient() {
                       </div>
                       <Button
                         onClick={() => void requestToken()}
-                        disabled={!session?.authenticated || busy || reason.trim().length < 4}
+                        disabled={!session?.authenticated || busy}
                       >
                         <SendIcon data-icon="inline-start" />
                         申请 Token

@@ -325,6 +325,66 @@ a {
   transition: transform 300ms ease;
 }
 
+.login-waiting-screen {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: grid;
+  place-content: center;
+  gap: 24px;
+  padding: 24px;
+  background:
+    radial-gradient(circle at 50% 34%, color-mix(in srgb, var(--primary) 9%, transparent), transparent 34%),
+    var(--background);
+}
+
+.login-waiting-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+
+.login-waiting-brand > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.login-waiting-brand strong {
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+.login-waiting-brand span,
+.login-waiting-meta {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.login-waiting-card {
+  width: min(440px, calc(100vw - 48px));
+  box-shadow: 0 20px 48px rgba(15, 23, 42, 0.08);
+}
+
+.login-waiting-card .card-header {
+  text-align: center;
+}
+
+.login-waiting-card .card-title {
+  font-size: 20px;
+}
+
+.login-waiting-card .progress {
+  height: 8px;
+}
+
+.login-waiting-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
 .usage-overview-header {
   flex-direction: row;
   align-items: flex-end;
@@ -628,13 +688,6 @@ a {
   color: var(--danger);
 }
 
-.identity-status {
-  width: 32px;
-  height: 32px;
-  justify-content: center;
-  padding: 0;
-}
-
 .active-key-status {
   min-height: 32px;
 }
@@ -693,6 +746,11 @@ a {
   min-height: 86px;
   padding: 10px 11px;
   resize: vertical;
+}
+
+.request-reason-textarea {
+  min-height: 64px;
+  height: 64px;
 }
 
 .input:focus,
@@ -803,6 +861,43 @@ a {
 
 .quota-control .input {
   min-width: 0;
+}
+
+.quota-control-icon-action {
+  width: 100%;
+  max-width: 164px;
+  grid-template-columns: minmax(0, 1fr) 36px;
+}
+
+.quota-control-icon-action .button {
+  width: 36px;
+  min-width: 36px;
+  padding-inline: 0;
+}
+
+.department-quota-table {
+  min-width: 1090px;
+  table-layout: fixed;
+}
+
+.department-quota-col-name {
+  width: 190px;
+}
+
+.department-quota-col-members {
+  width: 170px;
+}
+
+.department-quota-col-control {
+  width: 168px;
+}
+
+.department-quota-col-number {
+  width: 90px;
+}
+
+.department-quota-col-action {
+  width: 134px;
 }
 
 .user-management-actions {
@@ -2008,6 +2103,25 @@ a {
 }
 
 @media (max-width: 720px) {
+  .login-waiting-screen {
+    place-content: center stretch;
+    padding: 20px;
+  }
+
+  .login-waiting-card {
+    width: 100%;
+  }
+
+  .quota-control-icon-action {
+    grid-template-columns: minmax(0, 1fr) 44px;
+  }
+
+  .quota-control-icon-action .button {
+    width: 44px;
+    min-width: 44px;
+    min-height: 44px;
+  }
+
   .main {
     padding: 84px 18px 18px;
     gap: 16px;
@@ -2203,5 +2317,13 @@ a {
 
   .page-title {
     font-size: 23px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-indicator,
+  .spin-icon {
+    animation: none;
+    transition: none;
   }
 }

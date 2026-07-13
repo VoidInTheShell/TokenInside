@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { z } from "zod";
 import { randomId, sha256Hex } from "@/lib/crypto";
 import {
   resolveApprovalTargetForUser,
@@ -13,12 +12,9 @@ import {
   getEffectiveUserGrantQuota,
   updateTokenRequest,
 } from "@/lib/store";
+import { tokenRequestSchema } from "@/lib/token-request-input";
 
 export const runtime = "nodejs";
-
-const requestSchema = z.object({
-  reason: z.string().min(4).max(500),
-});
 
 export async function POST(request: Request) {
   try {
@@ -35,12 +31,12 @@ export async function POST(request: Request) {
       );
     }
 
-    const input = requestSchema.parse(await request.json());
+    const input = tokenRequestSchema.parse(await request.json());
     const requestedMonthlyQuota = await getEffectiveUserGrantQuota(user.id);
     const nonce = randomId("card");
     const tokenRequest = await createTokenRequest({
       feishuUserId: user.id,
-      reason: input.reason,
+      reason: input.reason ?? "",
       requestedMonthlyQuota,
       approvalMode: "feishu_card",
       approvalActionNonceHash: sha256Hex(nonce),
@@ -66,7 +62,7 @@ export async function POST(request: Request) {
         applicantName: user.name,
         applicantOpenId: user.openId,
         requestedMonthlyQuota,
-        reason: input.reason,
+        reason: input.reason || "未填写",
       });
       const updated = await updateTokenRequest(tokenRequest.id, {
         approvalCardMessageId: message.message_id,

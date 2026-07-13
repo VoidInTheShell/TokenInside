@@ -34,6 +34,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
+import { LoginWaitingScreen } from "@/components/login-waiting-screen";
 import {
   UsageRecordsTable,
   type UsageOption,
@@ -1847,6 +1848,20 @@ export function AdminClient() {
   const usageSyncCheckpoint = data?.settings?.usageSyncCheckpoint;
   const quotaPerUnit = quotaControlData?.quotaPerUnit ?? 500000;
 
+  const loginInProgress = loading || (!data?.authenticated && busy);
+
+  if (loginInProgress) {
+    return (
+      <>
+        <FeishuSdkScript
+          onReady={() => setFeishuSdkReady(true)}
+          onError={(sdkError) => setError(sdkError)}
+        />
+        <LoginWaitingScreen />
+      </>
+    );
+  }
+
   if (!loading && data && !data.authorized) {
     return (
       <>
@@ -2034,20 +2049,6 @@ export function AdminClient() {
                   <strong>{scopeLabel(overview?.scope)}</strong>
                 </div>
                 <div className="user-card-controls">
-                  <Badge
-                    className="identity-status"
-                    aria-label={loading || busy ? "自动识别中" : data?.authenticated ? "飞书身份已识别" : "等待飞书身份"}
-                    title={loading || busy ? "自动识别中" : data?.authenticated ? "飞书身份已识别" : "等待飞书身份"}
-                    variant={data?.authenticated ? "success" : "warning"}
-                  >
-                    {loading || busy ? (
-                      <LoaderCircleIcon className="spin-icon" data-icon="inline-start" />
-                    ) : data?.authenticated ? (
-                      <CheckCircle2Icon data-icon="inline-start" />
-                    ) : (
-                      <XCircleIcon data-icon="inline-start" />
-                    )}
-                  </Badge>
                   <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={busy}>
                     <RefreshCwIcon data-icon="inline-start" />
                     刷新
@@ -2504,7 +2505,17 @@ export function AdminClient() {
                     <div className="empty">{panelLoading ? "读取部门额度中" : "暂无可管理的部门额度"}</div>
                   ) : (
                     <div className="table-wrap">
-                      <table className="table">
+                      <table className="table department-quota-table">
+                        <colgroup>
+                          <col className="department-quota-col-name" />
+                          <col className="department-quota-col-members" />
+                          <col className="department-quota-col-control" />
+                          <col className="department-quota-col-number" />
+                          <col className="department-quota-col-number" />
+                          <col className="department-quota-col-number" />
+                          <col className="department-quota-col-control" />
+                          <col className="department-quota-col-action" />
+                        </colgroup>
                         <thead>
                           <tr>
                             <th>部门</th>
@@ -2541,7 +2552,7 @@ export function AdminClient() {
                                 </td>
                                 <td>
                                   {isSystemAdmin ? (
-                                    <div className="quota-control">
+                                    <div className="quota-control quota-control-icon-action">
                                       <Input
                                         aria-label={`${department.departmentName ?? department.departmentId} 总额度上限`}
                                         min={0}
@@ -2563,13 +2574,14 @@ export function AdminClient() {
                                       <Button
                                         variant="outline"
                                         size="sm"
+                                        aria-label="保存部门总额度上限"
+                                        title="保存部门总额度上限"
                                         disabled={busy}
                                         onClick={() =>
                                           void saveDepartmentPolicy(department.departmentId, "quotaLimit")
                                         }
                                       >
                                         <SaveIcon data-icon="inline-start" />
-                                        保存
                                       </Button>
                                     </div>
                                   ) : (
@@ -2580,7 +2592,7 @@ export function AdminClient() {
                                 <td>{formatQuotaAmount(department.pendingReservedQuota, "0")}</td>
                                 <td>{formatQuotaAmount(department.availableQuota, "0")}</td>
                                 <td>
-                                  <div className="quota-control">
+                                  <div className="quota-control quota-control-icon-action">
                                     <Input
                                       aria-label={`${department.departmentName ?? department.departmentId} 默认发放额度`}
                                       min={1}
@@ -2602,6 +2614,8 @@ export function AdminClient() {
                                     <Button
                                       variant="outline"
                                       size="sm"
+                                      aria-label="保存部门默认发放额度"
+                                      title="保存部门默认发放额度"
                                       disabled={busy}
                                       onClick={() =>
                                         void saveDepartmentPolicy(
@@ -2611,7 +2625,6 @@ export function AdminClient() {
                                       }
                                     >
                                       <SaveIcon data-icon="inline-start" />
-                                      保存
                                     </Button>
                                   </div>
                                 </td>
@@ -3057,7 +3070,7 @@ export function AdminClient() {
                               </td>
                               <td>{formatQuotaAmount(request.requestedMonthlyQuota)}</td>
                               <td>
-                                <div className="quota-control">
+                                <div className="quota-control quota-control-icon-action">
                                   <Input
                                     aria-label="最终额度"
                                     min={1}
@@ -3075,10 +3088,12 @@ export function AdminClient() {
                                   <Button
                                     variant="outline"
                                     size="sm"
+                                    aria-label="保存最终额度"
+                                    title="保存最终额度"
                                     disabled={!canEditQuota(request) || busy}
                                     onClick={() => void saveRequestQuota(request.id)}
                                   >
-                                    保存
+                                    <SaveIcon data-icon="inline-start" />
                                   </Button>
                                 </div>
                               </td>
@@ -3412,7 +3427,7 @@ export function AdminClient() {
                   </div>
                   <div className="field">
                     <label htmlFor="defaultMonthlyQuota">默认申请额度</label>
-                    <div className="quota-control">
+                    <div className="quota-control quota-control-icon-action">
                       <Input
                         id="defaultMonthlyQuota"
                         min={1}
@@ -3422,9 +3437,15 @@ export function AdminClient() {
                         onChange={(event) => setDefaultQuotaDraft(event.target.value)}
                         disabled={!data?.authorized || busy}
                       />
-                      <Button variant="outline" size="sm" disabled={!data?.authorized || busy} onClick={() => void saveDefaultQuota()}>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        aria-label="保存默认申请额度"
+                        title="保存默认申请额度"
+                        disabled={!data?.authorized || busy}
+                        onClick={() => void saveDefaultQuota()}
+                      >
                         <SaveIcon data-icon="inline-start" />
-                        保存
                       </Button>
                     </div>
                     <span className="field-description">
