@@ -87,6 +87,10 @@ rollback_application() {
 trap 'exit_code=$?; echo "Deployment command failed at line ${LINENO}: ${BASH_COMMAND}" >&2; rollback_application "$exit_code"' ERR
 
 compose config --quiet
+if ! compose ps --status running --services postgres | grep -qx postgres; then
+  echo "PostgreSQL is not running; starting the existing service before creating a recovery point"
+  compose up -d --wait postgres
+fi
 compose ps --status running --services postgres | grep -qx postgres
 POSTGRES_DB="$(compose exec -T postgres printenv POSTGRES_DB | tr -d '\r\n')"
 POSTGRES_USER="$(compose exec -T postgres printenv POSTGRES_USER | tr -d '\r\n')"
