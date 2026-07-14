@@ -1,60 +1,33 @@
 import { after, NextResponse } from "next/server";
-import { nowIso } from "@/lib/crypto";
+import { getEffectiveAdminScopeForUser } from "@/lib/admin-sync";
+import { sha256Hex } from "@/lib/crypto";
 import {
   decryptFeishuEventPayload,
   hasFeishuEventVerificationToken,
   verifyFeishuEventSignature,
   verifyFeishuEventVerificationToken,
 } from "@/lib/feishu";
-import { sha256Hex } from "@/lib/crypto";
-import { provisionTokenForRequest } from "@/lib/provisioning";
-import {
-  addFeishuEvent,
-  decideDepartmentQuotaRequest,
-  findDepartmentQuotaRequestById,
-  findTokenRequestById,
-  findTokenRequestByInstance,
-  getUserByOpenId,
-  getFeishuEventByUuid,
-  transitionTokenRequestStatus,
-} from "@/lib/store";
-import type { TokenRequest } from "@/lib/types";
+import { decidePackageRequest, findPackageRequestById } from "@/lib/package-repository";
+import { provisionApprovedPackageRequest } from "@/lib/package-saga";
+import { addFeishuEvent, getFeishuEventByUuid, getUserByOpenId } from "@/lib/store";
 
 export const runtime = "nodejs";
 
 type JsonRecord = Record<string, unknown>;
-
-type FeishuEventPayload = {
+type FeishuPayload = {
   challenge?: string;
   encrypt?: string;
-  schema?: string;
-  header?: {
-    event_id?: string;
-    event_type?: string;
-  };
-  event?: JsonRecord;
   type?: string;
   token?: string;
+  header?: { event_id?: string; event_type?: string; token?: string };
+  event?: JsonRecord;
 };
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function stringValue(value: unknown) {
-  return typeof value === "string" ? value : undefined;
-}
-
-function nestedValue(source: unknown, path: string[]) {
-  let cursor = source;
-  for (const part of path) {
-    if (!isRecord(cursor)) return undefined;
-    cursor = cursor[part];
-  }
-  return stringValue(cursor);
-}
-
-function nestedUnknown(source: unknown, path: string[]) {
+function nested(source: unknown, path: string[]) {
   let cursor = source;
   for (const part of path) {
     if (!isRecord(cursor)) return undefined;
@@ -65,535 +38,102 @@ function nestedUnknown(source: unknown, path: string[]) {
 
 function firstString(source: unknown, paths: string[][]) {
   for (const path of paths) {
-    const value = nestedValue(source, path);
-    if (value) return value;
+    const value = nested(source, path);
+    if (typeof value === "string" && value) return value;
   }
   return undefined;
 }
 
 function normalizedActionValue(value: unknown) {
   if (typeof value !== "string") return value;
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    return parsed;
-  } catch {
-    return value;
-  }
+  try { return JSON.parse(value) as unknown; } catch { return value; }
 }
 
-function parseRawFeishuPayload(rawBody: string, contentType?: string | null) {
-  try {
-    return JSON.parse(rawBody) as FeishuEventPayload;
-  } catch (jsonError) {
-    const canTryForm =
-      contentType?.includes("application/x-www-form-urlencoded") ||
-      rawBody.includes("=");
-    if (!canTryForm) throw jsonError;
-
+function parseRawPayload(rawBody: string, contentType?: string | null) {
+  try { return JSON.parse(rawBody) as FeishuPayload; } catch (jsonError) {
+    if (!contentType?.includes("application/x-www-form-urlencoded") && !rawBody.includes("=")) throw jsonError;
     const params = new URLSearchParams(rawBody);
-    const jsonCandidate =
-      params.get("payload") ??
-      params.get("event") ??
-      params.get("data") ??
-      params.get("body");
-    if (jsonCandidate) {
-      try {
-        return JSON.parse(jsonCandidate) as FeishuEventPayload;
-      } catch {
-        // Fall back to key/value extraction below.
-      }
-    }
-
-    const entries = Object.fromEntries(params.entries()) as FeishuEventPayload;
-    if (Object.keys(entries).length > 0) return entries;
+    const candidate = params.get("payload") ?? params.get("event") ?? params.get("data") ?? params.get("body");
+    if (candidate) return JSON.parse(candidate) as FeishuPayload;
+    const entries = Object.fromEntries(params.entries()) as FeishuPayload;
+    if (Object.keys(entries).length) return entries;
     throw jsonError;
   }
 }
 
-function parseFeishuPayloadWrapper(wrapper: FeishuEventPayload) {
-  if (!wrapper.encrypt) {
-    return { payload: wrapper, encrypted: false };
-  }
-
-  const decrypted = decryptFeishuEventPayload(wrapper.encrypt);
-  return {
-    payload: JSON.parse(decrypted) as FeishuEventPayload,
-    encrypted: true,
-  };
+function parseWrapper(wrapper: FeishuPayload) {
+  if (!wrapper.encrypt) return { payload: wrapper, encrypted: false };
+  return { payload: JSON.parse(decryptFeishuEventPayload(wrapper.encrypt)) as FeishuPayload, encrypted: true };
 }
 
-function extractApprovalEvent(payload: FeishuEventPayload) {
-  const instanceCode = firstString(payload, [
-    ["event", "instance_code"],
-    ["event", "instanceCode"],
-    ["event", "approval_instance_code"],
-    ["event", "approval_instance", "instance_code"],
-    ["event", "object", "instance_code"],
-    ["event", "data", "instance_code"],
-  ]);
-  const approvalStatus = firstString(payload, [
-    ["event", "status"],
-    ["event", "approval_status"],
-    ["event", "approvalStatus"],
-    ["event", "approval_instance", "status"],
-    ["event", "object", "status"],
-    ["event", "data", "status"],
-  ]);
-  const eventUuid =
-    firstString(payload, [
-      ["header", "event_id"],
-      ["event", "event_id"],
-      ["event", "uuid"],
-      ["uuid"],
-    ]) ?? sha256Hex(JSON.stringify(payload));
-  const eventType = firstString(payload, [
-    ["header", "event_type"],
-    ["event", "type"],
-    ["type"],
-  ]);
-
-  return { eventUuid, eventType, instanceCode, approvalStatus };
-}
-
-function extractCardActionEvent(payload: FeishuEventPayload) {
+function extractCardAction(payload: FeishuPayload) {
   const actionValue = normalizedActionValue(
-    nestedUnknown(payload, ["event", "action", "value"]) ??
-    nestedUnknown(payload, ["event", "action", "values"]) ??
-    nestedUnknown(payload, ["event", "action"]) ??
-    nestedUnknown(payload, ["action", "value"]) ??
-    nestedUnknown(payload, ["action", "values"]) ??
-    nestedUnknown(payload, ["action_value"]) ??
-    nestedUnknown(payload, ["action"]),
+    nested(payload, ["event", "action", "value"]) ??
+    nested(payload, ["event", "action", "values"]) ??
+    nested(payload, ["event", "action"]) ??
+    nested(payload, ["action", "value"]) ??
+    nested(payload, ["action"]),
   );
-  const eventUuid =
-    firstString(payload, [
-      ["header", "event_id"],
-      ["event", "event_id"],
-      ["event", "uuid"],
-      ["uuid"],
-    ]) ?? sha256Hex(JSON.stringify(payload));
-  const eventType = firstString(payload, [
-    ["header", "event_type"],
-    ["event", "type"],
-    ["type"],
-  ]);
-  const operatorOpenId = firstString(payload, [
-    ["event", "operator", "open_id"],
-    ["event", "operator", "operator_id", "open_id"],
-    ["event", "operator_id", "open_id"],
-    ["event", "open_id"],
-    ["operator", "open_id"],
-    ["operator", "operator_id", "open_id"],
-    ["operator_id", "open_id"],
-    ["open_id"],
-  ]);
-  const messageId = firstString(payload, [
-    ["event", "message_id"],
-    ["event", "context", "open_message_id"],
-    ["event", "open_message_id"],
-    ["context", "open_message_id"],
-    ["message_id"],
-    ["open_message_id"],
-  ]);
-  const cardRequestId = firstString(actionValue, [
-    ["requestId"],
-    ["request_id"],
-    ["card_request_id"],
-  ]);
-  const cardAction = firstString(actionValue, [["action"], ["cardAction"], ["card_action"]]);
-  const nonce = firstString(actionValue, [["nonce"], ["approvalNonce"], ["approval_nonce"]]);
-
   return {
-    eventUuid,
-    eventType,
-    operatorOpenId,
-    messageId,
-    cardRequestId,
-    cardAction,
-    nonce,
+    eventUuid: firstString(payload, [["header", "event_id"], ["event", "event_id"], ["event", "uuid"], ["uuid"]]) ?? sha256Hex(JSON.stringify(payload)),
+    eventType: firstString(payload, [["header", "event_type"], ["event", "type"], ["type"]]),
+    operatorOpenId: firstString(payload, [["event", "operator", "open_id"], ["event", "operator", "operator_id", "open_id"], ["event", "operator_id", "open_id"], ["event", "open_id"], ["operator", "open_id"], ["open_id"]]),
+    messageId: firstString(payload, [["event", "message_id"], ["event", "context", "open_message_id"], ["event", "open_message_id"], ["message_id"]]),
+    requestId: firstString(actionValue, [["requestId"], ["request_id"], ["card_request_id"]]),
+    action: firstString(actionValue, [["action"], ["cardAction"], ["card_action"]]),
+    nonce: firstString(actionValue, [["nonce"], ["approvalNonce"], ["approval_nonce"]]),
   };
+}
+
+function verificationToken(payload: FeishuPayload) {
+  return payload.token ?? firstString(payload, [["event", "token"], ["header", "token"]]);
 }
 
 function cardToast(content: string, type: "success" | "error" = "success") {
   return NextResponse.json({ toast: { type, content } });
 }
 
-function rawPreview(rawBody: string) {
-  return rawBody
-    .slice(0, 1000)
-    .replace(/("token"\s*:\s*")[^"]+(")/gi, "$1[redacted]$2")
-    .replace(/("app_secret"\s*:\s*")[^"]+(")/gi, "$1[redacted]$2")
-    .replace(/([?&]token=)[^&]+/gi, "$1[redacted]")
-    .replace(/(^|&)token=[^&]+/gi, "$1token=[redacted]");
+async function record(event: Parameters<typeof addFeishuEvent>[0]) {
+  try { await addFeishuEvent(event); } catch (error) { console.error("Failed to record Feishu event", error); }
 }
 
-async function recordInvalidFeishuPayload(input: {
-  rawBody: string;
-  request: Request;
-  stage: "raw_parse" | "payload_parse";
-  wrapper?: FeishuEventPayload;
-}) {
-  await addFeishuEventBestEffort({
-    eventUuid: `invalid-${sha256Hex(`${input.stage}:${input.rawBody}`).slice(0, 32)}`,
+function redactedPreview(rawBody: string) {
+  return rawBody.slice(0, 1000)
+    .replace(/("token"\s*:\s*")[^"]+(")/gi, "$1[redacted]$2")
+    .replace(/("app_secret"\s*:\s*")[^"]+(")/gi, "$1[redacted]$2");
+}
+
+async function invalidPayload(rawBody: string, request: Request, stage: string) {
+  await record({
+    eventUuid: `invalid-${sha256Hex(`${stage}:${rawBody}`).slice(0, 32)}`,
     eventType: "invalid_payload",
     processingStatus: "failed",
-    payloadJson: {
-      stage: input.stage,
-      rawLength: input.rawBody.length,
-      rawPreview: rawPreview(input.rawBody),
-      contentType: input.request.headers.get("content-type"),
-      userAgent: input.request.headers.get("user-agent"),
-      wrapperKeys: input.wrapper ? Object.keys(input.wrapper) : undefined,
-      hasEncrypt: Boolean(input.wrapper?.encrypt),
-      encryptLength:
-        typeof input.wrapper?.encrypt === "string" ? input.wrapper.encrypt.length : undefined,
-    },
+    payloadJson: { stage, rawLength: rawBody.length, rawPreview: redactedPreview(rawBody), contentType: request.headers.get("content-type") },
     errorMessage: "Invalid Feishu event payload",
   });
   return cardToast("审批回调格式无法识别，已记录", "error");
 }
 
-async function addFeishuEventBestEffort(event: Parameters<typeof addFeishuEvent>[0]) {
-  try {
-    await addFeishuEvent(event);
-  } catch (err) {
-    console.error("Failed to record Feishu event", err);
-  }
-}
-
-function payloadVerificationToken(payload: FeishuEventPayload) {
-  return (
-    payload.token ??
-    firstString(payload, [
-      ["event", "token"],
-      ["header", "token"],
-    ])
-  );
-}
-
-function isCardActionEventType(eventType?: string) {
-  return eventType === "card.action.trigger" || eventType === "card.action.trigger_v1";
-}
-
-function scheduleTokenProvisionAfterResponse(input: {
-  request: TokenRequest;
-  eventUuid: string;
-  eventType?: string;
-  cardRequestId: string;
-  cardAction: string;
-  operatorOpenId: string;
-  messageId?: string;
-}) {
-  after(async () => {
-    try {
-      await provisionTokenForRequest(input.request);
-    } catch (err) {
-      await addFeishuEventBestEffort({
-        eventUuid: `${input.eventUuid}:provision`,
-        eventType: input.eventType,
-        cardRequestId: input.cardRequestId,
-        cardAction: input.cardAction,
-        operatorOpenId: input.operatorOpenId,
-        messageId: input.messageId,
-        processingStatus: "failed",
-        payloadJson: {
-          sourceEventUuid: input.eventUuid,
-          tokenRequestId: input.request.id,
-          source: "card_action_after_response_provisioning",
-        },
-        errorMessage: err instanceof Error ? err.message : "NewAPI token provisioning failed",
-      });
-    }
-  });
-}
-
-async function handleDepartmentQuotaCardAction(input: {
-  encrypted: boolean;
-  payload: FeishuEventPayload;
-  eventUuid: string;
-  eventType?: string;
-  operatorOpenId: string;
-  messageId?: string;
-  cardRequestId: string;
-  cardAction: string;
-  nonce: string;
-}) {
-  const quotaRequest = await findDepartmentQuotaRequestById(input.cardRequestId);
-  if (!quotaRequest) return null;
-  if (sha256Hex(input.nonce) !== quotaRequest.approvalActionNonceHash) {
-    await addFeishuEvent({
-      eventUuid: input.eventUuid,
-      eventType: input.eventType,
-      cardRequestId: input.cardRequestId,
-      cardAction: input.cardAction,
-      operatorOpenId: input.operatorOpenId,
-      messageId: input.messageId,
-      processingStatus: "failed",
-      payloadJson: { encrypted: input.encrypted, payload: input.payload },
-      errorMessage: "Invalid department quota card action nonce",
-    });
-    return cardToast("审批卡片校验失败", "error");
-  }
-  if (input.operatorOpenId !== quotaRequest.approvalTargetOpenId) {
-    await addFeishuEvent({
-      eventUuid: input.eventUuid,
-      eventType: input.eventType,
-      cardRequestId: input.cardRequestId,
-      cardAction: input.cardAction,
-      operatorOpenId: input.operatorOpenId,
-      messageId: input.messageId,
-      processingStatus: "ignored",
-      payloadJson: { encrypted: input.encrypted, payload: input.payload },
-      errorMessage: "Department quota card operator is not the approval target",
-    });
-    return cardToast("当前用户无权审批此申请", "error");
-  }
-  if (quotaRequest.status !== "pending_card_approval") {
-    return cardToast("该申请已处理", "success");
-  }
-  const normalizedAction = input.cardAction.toLowerCase();
-  const action =
-    normalizedAction === "approve" || normalizedAction === "approved"
-      ? "approve"
-      : normalizedAction === "reject" || normalizedAction === "rejected"
-        ? "reject"
-        : null;
-  if (!action) return cardToast("不支持的审批动作", "error");
-  const operator = await getUserByOpenId(input.operatorOpenId);
-  const decided = await decideDepartmentQuotaRequest({
-    requestId: quotaRequest.id,
-    action,
-    operatedByFeishuUserId: operator?.id ?? `open_id:${input.operatorOpenId}`,
-    approvalOperatorOpenId: input.operatorOpenId,
-  });
-  if (!decided) return cardToast("该申请已处理", "success");
-  await addFeishuEvent({
-    eventUuid: input.eventUuid,
-    eventType: input.eventType,
-    cardRequestId: input.cardRequestId,
-    cardAction: input.cardAction,
-    operatorOpenId: input.operatorOpenId,
-    messageId: input.messageId,
-    processingStatus: "processed",
-    payloadJson: { encrypted: input.encrypted, payload: input.payload },
-  });
-  return cardToast(action === "approve" ? "部门额度申请已通过" : "部门额度申请已拒绝");
-}
-
-async function handleCardActionEvent(input: {
-  encrypted: boolean;
-  payload: FeishuEventPayload;
-  eventUuid: string;
-  eventType?: string;
-  operatorOpenId?: string;
-  messageId?: string;
-  cardRequestId?: string;
-  cardAction?: string;
-  nonce?: string;
-}) {
-  const {
-    encrypted,
-    payload,
-    eventUuid,
-    eventType,
-    operatorOpenId,
-    messageId,
-    cardRequestId,
-    cardAction,
-    nonce,
-  } = input;
-
-  if (!cardRequestId || !cardAction || !operatorOpenId || !nonce) {
-    await addFeishuEvent({
-      eventUuid,
-      eventType,
-      cardRequestId,
-      cardAction,
-      operatorOpenId,
-      messageId,
-      processingStatus: "ignored",
-      payloadJson: { encrypted, payload },
-      errorMessage: "Missing card action requestId, action, operator open_id or nonce",
-    });
-    return cardToast("审批卡片参数不完整", "error");
-  }
-
-  const tokenRequest = await findTokenRequestById(cardRequestId);
-  if (!tokenRequest) {
-    const departmentQuotaResult = await handleDepartmentQuotaCardAction({
-      encrypted,
-      payload,
-      eventUuid,
-      eventType,
-      operatorOpenId,
-      messageId,
-      cardRequestId,
-      cardAction,
-      nonce,
-    });
-    if (departmentQuotaResult) return departmentQuotaResult;
-    await addFeishuEvent({
-      eventUuid,
-      eventType,
-      cardRequestId,
-      cardAction,
-      operatorOpenId,
-      messageId,
-      processingStatus: "ignored",
-      payloadJson: { encrypted, payload },
-      errorMessage: "Token request not found for card action",
-    });
-    return cardToast("申请单不存在或已失效", "error");
-  }
-
-  const expectedNonceHash = tokenRequest.approvalActionNonceHash;
-  if (!expectedNonceHash || sha256Hex(nonce) !== expectedNonceHash) {
-    await addFeishuEvent({
-      eventUuid,
-      eventType,
-      cardRequestId,
-      cardAction,
-      operatorOpenId,
-      messageId,
-      processingStatus: "failed",
-      payloadJson: { encrypted, payload },
-      errorMessage: "Invalid card action nonce",
-    });
-    return cardToast("审批卡片校验失败", "error");
-  }
-
-  if (operatorOpenId !== tokenRequest.approvalTargetOpenId) {
-    await addFeishuEvent({
-      eventUuid,
-      eventType,
-      cardRequestId,
-      cardAction,
-      operatorOpenId,
-      messageId,
-      processingStatus: "ignored",
-      payloadJson: { encrypted, payload },
-      errorMessage: "Card action operator is not the approval target",
-    });
-    return cardToast("当前用户无权审批此申请", "error");
-  }
-
-  const normalizedAction = cardAction.toLowerCase();
-  const isApproveAction = normalizedAction === "approve" || normalizedAction === "approved";
-  const canRetryProvisioningFailure =
-    isApproveAction && tokenRequest.status === "approved_provision_failed";
-  if (tokenRequest.status !== "pending_card_approval" && !canRetryProvisioningFailure) {
-    await addFeishuEvent({
-      eventUuid,
-      eventType,
-      cardRequestId,
-      cardAction,
-      operatorOpenId,
-      messageId,
-      processingStatus: "ignored",
-      payloadJson: { encrypted, payload },
-      errorMessage: `Token request status is ${tokenRequest.status}`,
-    });
-    return cardToast("该申请已处理", "success");
-  }
-
-  const operatedAt = nowIso();
-  if (isApproveAction) {
-    const approved = await transitionTokenRequestStatus(
-      tokenRequest.id,
-      {
-        status: "approved",
-        approvalOperatorOpenId: operatorOpenId,
-        approvalOperatedAt: operatedAt,
-      },
-      ["pending_card_approval", "approved_provision_failed"],
-    );
-    if (!approved) {
-      await addFeishuEvent({
-        eventUuid,
-        eventType,
-        cardRequestId,
-        cardAction,
-        operatorOpenId,
-        messageId,
-        processingStatus: "ignored",
-        payloadJson: { encrypted, payload },
-        errorMessage: "Token request was already handled before approve transition",
-      });
-      return cardToast("该申请已处理", "success");
-    }
-    scheduleTokenProvisionAfterResponse({
-      request: approved,
-      eventUuid,
-      eventType,
-      cardRequestId,
-      cardAction,
-      operatorOpenId,
-      messageId,
-    });
-  } else if (normalizedAction === "reject" || normalizedAction === "rejected") {
-    const rejected = await transitionTokenRequestStatus(
-      tokenRequest.id,
-      {
-        status: "rejected",
-        approvalOperatorOpenId: operatorOpenId,
-        approvalOperatedAt: operatedAt,
-      },
-      ["pending_card_approval"],
-    );
-    if (!rejected) {
-      await addFeishuEvent({
-        eventUuid,
-        eventType,
-        cardRequestId,
-        cardAction,
-        operatorOpenId,
-        messageId,
-        processingStatus: "ignored",
-        payloadJson: { encrypted, payload },
-        errorMessage: "Token request was already handled before reject transition",
-      });
-      return cardToast("该申请已处理", "success");
-    }
-  } else {
-    await addFeishuEvent({
-      eventUuid,
-      eventType,
-      cardRequestId,
-      cardAction,
-      operatorOpenId,
-      messageId,
-      processingStatus: "ignored",
-      payloadJson: { encrypted, payload },
-      errorMessage: `Unsupported card action ${cardAction}`,
-    });
-    return cardToast("不支持的审批动作", "error");
-  }
-
-  await addFeishuEvent({
-    eventUuid,
-    eventType,
-    cardRequestId,
-    cardAction,
-    operatorOpenId,
-    messageId,
-    processingStatus: "processed",
-    payloadJson: { encrypted, payload },
-  });
-
-  return cardToast(normalizedAction.startsWith("approve") ? "已通过" : "已拒绝");
+function normalizedDecision(action: string) {
+  const value = action.toLowerCase();
+  if (value === "approve" || value === "approved") return "approve" as const;
+  if (value === "reject" || value === "rejected") return "reject" as const;
+  return null;
 }
 
 export async function POST(request: Request) {
   const rawBody = await request.text();
+  let wrapper: FeishuPayload;
+  try { wrapper = parseRawPayload(rawBody, request.headers.get("content-type")); }
+  catch { return invalidPayload(rawBody, request, "raw_parse"); }
 
-  let payload: FeishuEventPayload;
+  let payload: FeishuPayload;
   let encrypted = false;
-  let wrapper: FeishuEventPayload;
   try {
-    wrapper = parseRawFeishuPayload(rawBody, request.headers.get("content-type"));
-  } catch {
-    return recordInvalidFeishuPayload({ rawBody, request, stage: "raw_parse" });
-  }
+    const parsed = parseWrapper(wrapper);
+    payload = parsed.payload;
+    encrypted = parsed.encrypted;
+  } catch { return invalidPayload(rawBody, request, "payload_parse"); }
 
   const signatureOk = verifyFeishuEventSignature({
     timestamp: request.headers.get("x-lark-request-timestamp"),
@@ -601,159 +141,98 @@ export async function POST(request: Request) {
     signature: request.headers.get("x-lark-signature"),
     rawBody,
   });
-  try {
-    const parsed = parseFeishuPayloadWrapper(wrapper);
-    payload = parsed.payload;
-    encrypted = parsed.encrypted;
-  } catch {
-    return recordInvalidFeishuPayload({
-      rawBody,
-      request,
-      stage: "payload_parse",
-      wrapper,
-    });
-  }
-
-  const wrapperTokenOk =
-    !wrapper.encrypt &&
-    hasFeishuEventVerificationToken() &&
-    verifyFeishuEventVerificationToken(payloadVerificationToken(wrapper));
-  const payloadTokenOk = verifyFeishuEventVerificationToken(payloadVerificationToken(payload));
-  const { eventUuid, eventType, instanceCode, approvalStatus } =
-    extractApprovalEvent(payload);
-  const cardActionEvent = extractCardActionEvent(payload);
-  const isCardAction =
-    isCardActionEventType(eventType) ||
-    isCardActionEventType(cardActionEvent.eventType) ||
-    Boolean(cardActionEvent.cardRequestId);
-
+  const wrapperTokenOk = !wrapper.encrypt && hasFeishuEventVerificationToken() && verifyFeishuEventVerificationToken(verificationToken(wrapper));
+  const payloadTokenOk = verifyFeishuEventVerificationToken(verificationToken(payload));
   if (!signatureOk && !wrapperTokenOk && !payloadTokenOk) {
-    if (isCardAction) {
-      await addFeishuEventBestEffort({
-        eventUuid,
-        eventType: eventType ?? cardActionEvent.eventType,
-        cardRequestId: cardActionEvent.cardRequestId,
-        cardAction: cardActionEvent.cardAction,
-        operatorOpenId: cardActionEvent.operatorOpenId,
-        messageId: cardActionEvent.messageId,
-        processingStatus: "failed",
-        payloadJson: { encrypted, payload },
-        errorMessage: "Invalid Feishu card callback signature or verification token",
-      });
-      return cardToast("审批回调校验失败", "error");
-    }
     return NextResponse.json({ error: "Invalid Feishu event signature" }, { status: 401 });
   }
+  if (payload.challenge) return NextResponse.json({ challenge: payload.challenge });
 
-  if (payload.challenge) {
-    return NextResponse.json({ challenge: payload.challenge });
+  const card = extractCardAction(payload);
+  const existing = await getFeishuEventByUuid(card.eventUuid);
+  if (existing && ["processed", "ignored"].includes(existing.processingStatus)) {
+    return cardToast("该申请已处理");
   }
-
-  const existingEvent = await getFeishuEventByUuid(eventUuid);
-  if (
-    existingEvent &&
-    ["processed", "ignored"].includes(existingEvent.processingStatus)
-  ) {
-    if (isCardAction) {
-      return cardToast("该申请已处理", "success");
-    }
-    return NextResponse.json({ ok: true, duplicate: true });
+  if (!card.requestId || !card.action || !card.operatorOpenId || !card.nonce) {
+    await record({
+      eventUuid: card.eventUuid,
+      eventType: card.eventType,
+      cardRequestId: card.requestId,
+      cardAction: card.action,
+      operatorOpenId: card.operatorOpenId,
+      messageId: card.messageId,
+      processingStatus: "ignored",
+      payloadJson: { encrypted, payload },
+      errorMessage: "Missing package card requestId, action, operator open_id or nonce",
+    });
+    return cardToast("审批卡片参数不完整", "error");
   }
 
   try {
-    if (
-      isCardActionEventType(eventType) ||
-      isCardActionEventType(cardActionEvent.eventType) ||
-      cardActionEvent.cardRequestId
-    ) {
-      try {
-        return await handleCardActionEvent({
-          encrypted,
-          payload,
-          ...cardActionEvent,
-        });
-      } catch (err) {
-        await addFeishuEventBestEffort({
-          eventUuid,
-          eventType: eventType ?? cardActionEvent.eventType,
-          cardRequestId: cardActionEvent.cardRequestId,
-          cardAction: cardActionEvent.cardAction,
-          operatorOpenId: cardActionEvent.operatorOpenId,
-          messageId: cardActionEvent.messageId,
-          processingStatus: "failed",
-          payloadJson: { encrypted, payload },
-          errorMessage: err instanceof Error ? err.message : "Card action processing failed",
-        });
-        return cardToast("审批处理失败，请到管理后台处理", "error");
-      }
-    }
-
-    if (!instanceCode || !approvalStatus) {
-      await addFeishuEvent({
-        eventUuid,
-        eventType,
-        processingStatus: "ignored",
-        payloadJson: { encrypted, payload },
+    const packageRequest = await findPackageRequestById(card.requestId);
+    if (!packageRequest) {
+      await record({
+        eventUuid: card.eventUuid, eventType: card.eventType, cardRequestId: card.requestId,
+        cardAction: card.action, operatorOpenId: card.operatorOpenId, messageId: card.messageId,
+        processingStatus: "ignored", payloadJson: { encrypted, payload }, errorMessage: "Package request not found",
       });
-      return NextResponse.json({ ok: true, ignored: true });
+      return cardToast("套餐申请不存在或已失效", "error");
     }
-
-    const tokenRequest = await findTokenRequestByInstance(instanceCode);
-    if (!tokenRequest) {
-      await addFeishuEvent({
-        eventUuid,
-        eventType,
-        instanceCode,
-        approvalStatus,
-        processingStatus: "ignored",
-        payloadJson: { encrypted, payload },
+    if (!packageRequest.approvalActionNonceHash || sha256Hex(card.nonce) !== packageRequest.approvalActionNonceHash) {
+      await record({
+        eventUuid: card.eventUuid, eventType: card.eventType, cardRequestId: card.requestId,
+        cardAction: card.action, operatorOpenId: card.operatorOpenId, messageId: card.messageId,
+        processingStatus: "failed", payloadJson: { encrypted, payload }, errorMessage: "Invalid package card action nonce",
       });
-      return NextResponse.json({ ok: true, ignored: true });
+      return cardToast("审批卡片校验失败", "error");
     }
-
-    const normalizedStatus = approvalStatus.toUpperCase();
-    if (normalizedStatus === "APPROVED") {
-      const approved = await transitionTokenRequestStatus(
-        tokenRequest.id,
-        { status: "approved" },
-        ["pending_feishu_approval", "approved_provision_failed"],
-      );
-      if (approved) {
-        await provisionTokenForRequest(approved);
-      }
-    } else if (["REJECTED", "CANCELED", "CANCELLED"].includes(normalizedStatus)) {
-      await transitionTokenRequestStatus(
-        tokenRequest.id,
-        {
-          status: normalizedStatus === "REJECTED" ? "rejected" : "cancelled",
-        },
-        ["pending_feishu_approval"],
-      );
+    if (card.operatorOpenId !== packageRequest.approvalTargetOpenId) {
+      await record({
+        eventUuid: card.eventUuid, eventType: card.eventType, cardRequestId: card.requestId,
+        cardAction: card.action, operatorOpenId: card.operatorOpenId, messageId: card.messageId,
+        processingStatus: "ignored", payloadJson: { encrypted, payload }, errorMessage: "Package card operator is not the approval target",
+      });
+      return cardToast("当前用户无权审批此申请", "error");
     }
-
-    await addFeishuEvent({
-      eventUuid,
-      eventType,
-      instanceCode,
-      approvalStatus,
-      processingStatus: "processed",
-      payloadJson: { encrypted, payload },
+    const decision = normalizedDecision(card.action);
+    if (!decision) return cardToast("不支持的审批动作", "error");
+    const operator = await getUserByOpenId(card.operatorOpenId);
+    const scope = operator ? await getEffectiveAdminScopeForUser(operator) : null;
+    if (!operator || !scope) return cardToast("当前审批人没有启用的 TokenInside 管理范围", "error");
+    const decided = await decidePackageRequest({
+      scope,
+      operatedByUserId: operator.id,
+      operatedByOpenId: card.operatorOpenId,
+      requestId: packageRequest.id,
+      action: decision,
     });
-
-    return NextResponse.json({ ok: true });
-  } catch (err) {
-    await addFeishuEvent({
-      eventUuid,
-      eventType,
-      instanceCode,
-      approvalStatus,
-      processingStatus: "failed",
-      payloadJson: { encrypted, payload },
-      errorMessage: err instanceof Error ? err.message : "Event processing failed",
+    if (decision === "approve" && decided.operation) {
+      after(async () => {
+        try { await provisionApprovedPackageRequest(packageRequest.id); }
+        catch (error) {
+          await record({
+            eventUuid: `${card.eventUuid}:package-provision`, eventType: card.eventType,
+            cardRequestId: packageRequest.id, cardAction: card.action,
+            operatorOpenId: card.operatorOpenId, messageId: card.messageId,
+            processingStatus: "failed", payloadJson: { sourceEventUuid: card.eventUuid, packageRequestId: packageRequest.id },
+            errorMessage: error instanceof Error ? error.message : "Package provisioning failed",
+          });
+        }
+      });
+    }
+    await record({
+      eventUuid: card.eventUuid, eventType: card.eventType, cardRequestId: card.requestId,
+      cardAction: card.action, operatorOpenId: card.operatorOpenId, messageId: card.messageId,
+      processingStatus: "processed", payloadJson: { encrypted, payload },
     });
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Event processing failed" },
-      { status: 500 },
-    );
+    return cardToast(decision === "approve" ? "套餐申请已通过" : "套餐申请已拒绝");
+  } catch (error) {
+    await record({
+      eventUuid: card.eventUuid, eventType: card.eventType, cardRequestId: card.requestId,
+      cardAction: card.action, operatorOpenId: card.operatorOpenId, messageId: card.messageId,
+      processingStatus: "failed", payloadJson: { encrypted, payload },
+      errorMessage: error instanceof Error ? error.message : "Package card processing failed",
+    });
+    return cardToast("审批处理失败，请到管理后台处理", "error");
   }
 }

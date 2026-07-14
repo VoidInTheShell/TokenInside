@@ -270,13 +270,13 @@ export function getPrimarySystemAdminOpenId() {
 
 function systemAdminFallbackNotice(
   reason: ApprovalRouteReason,
-  purpose: "token_apply" | "quota_reset",
+  requestKind: "first" | "regrant",
 ) {
   if (reason === "no_department") return SYSTEM_ADMIN_FALLBACK_NOTICE;
   if (reason === "applicant_is_department_admin") {
-    return purpose === "quota_reset"
-      ? "您的个人提额请求将发送给系统管理员审批。"
-      : "您的 Token 申请将发送给系统管理员审批。";
+    return requestKind === "regrant"
+      ? "您的套餐重发申请将发送给系统管理员审批。"
+      : "您的套餐申请将发送给系统管理员审批。";
   }
   if (reason === "no_leader") {
     return "未找到可用的部门审批负责人，您的请求将发送给系统管理员审批。";
@@ -290,7 +290,7 @@ function systemAdminFallbackNotice(
 function resolveSystemAdminFallback(
   error: unknown,
   knownDepartmentId: string | undefined,
-  purpose: "token_apply" | "quota_reset",
+  requestKind: "first" | "regrant",
 ): ApprovalTarget {
   const systemAdminOpenId = getConfig().admin.systemAdminOpenIds[0];
   const fallbackReason =
@@ -309,7 +309,7 @@ function resolveSystemAdminFallback(
     leaderOpenId: systemAdminOpenId,
     source: "system_admin_fallback",
     reason,
-    notice: systemAdminFallbackNotice(reason, purpose),
+    notice: systemAdminFallbackNotice(reason, requestKind),
     fallbackReason,
   };
 }
@@ -374,108 +374,26 @@ async function resolveDepartmentApprovalTargetForUser(
 export async function resolveApprovalTargetForUser(
   openId: string,
   knownDepartmentId?: string,
-  purpose: "token_apply" | "quota_reset" = "token_apply",
+  requestKind: "first" | "regrant" = "first",
 ): Promise<ApprovalTarget> {
   try {
     return await resolveDepartmentApprovalTargetForUser(openId, knownDepartmentId);
   } catch (err) {
-    return resolveSystemAdminFallback(err, knownDepartmentId, purpose);
+    return resolveSystemAdminFallback(err, knownDepartmentId, requestKind);
   }
 }
 
-export async function sendTokenApprovalCard(input: {
+export async function sendPackageApprovalCard(input: {
   receiveOpenId: string;
   requestId: string;
   nonce: string;
   applicantName?: string;
   applicantOpenId: string;
-  requestedMonthlyQuota: number;
-  reason: string;
-}) {
-  const tenantAccessToken = await getTenantAccessToken();
-  const card = {
-    config: {
-      wide_screen_mode: true,
-    },
-    header: {
-      template: "blue",
-      title: {
-        tag: "plain_text",
-        content: "TokenInside Token 申请",
-      },
-    },
-    elements: [
-      {
-        tag: "div",
-        text: {
-          tag: "lark_md",
-          content: [
-            `**申请人**：${input.applicantName ?? input.applicantOpenId}`,
-            `**月额度**：${input.requestedMonthlyQuota}`,
-            `**申请说明**：${input.reason}`,
-          ].join("\n"),
-        },
-      },
-      {
-        tag: "action",
-        actions: [
-          {
-            tag: "button",
-            type: "primary",
-            text: {
-              tag: "plain_text",
-              content: "通过",
-            },
-            value: {
-              requestId: input.requestId,
-              action: "approve",
-              nonce: input.nonce,
-            },
-          },
-          {
-            tag: "button",
-            type: "danger",
-            text: {
-              tag: "plain_text",
-              content: "拒绝",
-            },
-            value: {
-              requestId: input.requestId,
-              action: "reject",
-              nonce: input.nonce,
-            },
-          },
-        ],
-      },
-    ],
-  };
-
-  const params = new URLSearchParams({ receive_id_type: "open_id" });
-  return feishuFetch<{ message_id?: string }>(
-    `/open-apis/im/v1/messages?${params.toString()}`,
-    {
-      method: "POST",
-      tenantAccessToken,
-      body: JSON.stringify({
-        receive_id: input.receiveOpenId,
-        msg_type: "interactive",
-        content: JSON.stringify(card),
-      }),
-    },
-  );
-}
-
-export async function sendDepartmentQuotaApprovalCard(input: {
-  receiveOpenId: string;
-  requestId: string;
-  nonce: string;
-  applicantName?: string;
-  applicantOpenId: string;
-  departmentName?: string;
-  departmentId: string;
-  action: "increase" | "reset";
-  currentQuotaLimit: number;
-  requestedQuotaLimit: number;
+  requestKind: "first" | "regrant";
+  packageName: string;
+  packageVersion: number;
+  quotaLabel: string;
+  cycleLabel: string;
   reason: string;
 }) {
   const tenantAccessToken = await getTenantAccessToken();
@@ -485,7 +403,7 @@ export async function sendDepartmentQuotaApprovalCard(input: {
       template: "blue",
       title: {
         tag: "plain_text",
-        content: "TokenInside 部门总额度申请",
+        content: input.requestKind === "first" ? "TokenInside 套餐申请" : "TokenInside 套餐重发申请",
       },
     },
     elements: [
@@ -495,11 +413,10 @@ export async function sendDepartmentQuotaApprovalCard(input: {
           tag: "lark_md",
           content: [
             `**申请人**：${input.applicantName ?? input.applicantOpenId}`,
-            `**部门**：${input.departmentName ?? input.departmentId}`,
-            `**动作**：${input.action === "increase" ? "提高部门总额度" : "重置部门总额度"}`,
-            `**当前上限**：${input.currentQuotaLimit}`,
-            `**申请上限**：${input.requestedQuotaLimit}`,
-            `**申请说明**：${input.reason}`,
+            `**套餐**：${input.packageName} v${input.packageVersion}`,
+            `**套餐额度**：${input.quotaLabel}`,
+            `**有效周期**：${input.cycleLabel}`,
+            `**申请说明**：${input.reason || "未填写"}`,
           ].join("\n"),
         },
       },
@@ -535,41 +452,6 @@ export async function sendDepartmentQuotaApprovalCard(input: {
       }),
     },
   );
-}
-
-export async function createApprovalInstance(input: {
-  approvalCode: string;
-  openId: string;
-  departmentId?: string;
-  uuid: string;
-  reason: string;
-  requestedMonthlyQuota: number;
-}) {
-  const tenantAccessToken = await getTenantAccessToken();
-  const form = JSON.stringify([
-    {
-      id: "requested_monthly_quota",
-      type: "number",
-      value: String(input.requestedMonthlyQuota),
-    },
-    {
-      id: "reason",
-      type: "textarea",
-      value: input.reason,
-    },
-  ]);
-
-  return feishuFetch<{ instance_code: string }>("/open-apis/approval/v4/instances", {
-    method: "POST",
-    tenantAccessToken,
-    body: JSON.stringify({
-      approval_code: input.approvalCode,
-      open_id: input.openId,
-      department_id: input.departmentId,
-      form,
-      uuid: input.uuid,
-    }),
-  });
 }
 
 export function verifyFeishuEventSignature(input: {

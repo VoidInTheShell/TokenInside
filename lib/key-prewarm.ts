@@ -3,19 +3,18 @@ import {
   createPrewarmedNewApiTokens,
   deleteNewApiTokens,
 } from "@/lib/newapi";
-import { hongKongBillingPeriod } from "@/lib/quota-model";
 import { openQuotaCredential, sealQuotaCredential } from "@/lib/secret-box";
 import {
   addTokenAccount,
   getStoreSnapshot,
   updateTokenAccount,
-  withUserQuotaOperationLock,
+  withUserKeyLifecycleLock,
 } from "@/lib/store";
-import type { StoreShape, TokenAccount } from "@/lib/types";
+import type { TokenAccount } from "@/lib/types";
 
-const terminalOperationStates = new Set(["completed", "compensated"]);
+type KeyStoreSnapshot = Awaited<ReturnType<typeof getStoreSnapshot>>;
 
-function userHasTokenReservation(store: StoreShape, feishuUserId: string) {
+function userHasTokenReservation(store: KeyStoreSnapshot, feishuUserId: string) {
   return store.tokenAccounts.some(
     (account) =>
       account.feishuUserId === feishuUserId &&
@@ -23,22 +22,13 @@ function userHasTokenReservation(store: StoreShape, feishuUserId: string) {
   );
 }
 
-function userHasOpenQuotaOperation(store: StoreShape, feishuUserId: string) {
-  return store.quotaOperations.some(
-    (operation) =>
-      operation.feishuUserId === feishuUserId &&
-      !terminalOperationStates.has(operation.state),
-  );
-}
-
-function eligibleDepartmentUsers(store: StoreShape, departmentId: string) {
+function eligibleDepartmentUsers(store: KeyStoreSnapshot, departmentId: string) {
   return store.users
     .filter(
       (user) =>
         user.departmentId === departmentId &&
         (!user.status || user.status === "active") &&
-        !userHasTokenReservation(store, user.id) &&
-        !userHasOpenQuotaOperation(store, user.id),
+        !userHasTokenReservation(store, user.id),
     )
     .sort((left, right) => left.id.localeCompare(right.id));
 }
@@ -73,21 +63,24 @@ export async function prewarmDepartmentMemberKeys(input: {
   for (const [index, user] of candidates.entries()) {
     const upstream = warmed[index];
     try {
-      const stored = await withUserQuotaOperationLock(user.id, async () => {
+      const stored = await withUserKeyLifecycleLock(user.id, async () => {
         const currentStore = await getStoreSnapshot();
         if (
-          userHasTokenReservation(currentStore, user.id) ||
-          userHasOpenQuotaOperation(currentStore, user.id)
+          userHasTokenReservation(currentStore, user.id)
         ) {
           return null;
         }
         const account = await addTokenAccount({
           feishuUserId: user.id,
-          tokenRequestId: `prewarm:${upstream.newapiTokenId}`,
+          sourceRequestId: `prewarm:${upstream.newapiTokenId}`,
           newapiTokenId: upstream.newapiTokenId,
           keyHash: sha256Hex(upstream.key),
           status: "pending_activation",
-          billingPeriod: hongKongBillingPeriod(),
+          billingPeriod: new Intl.DateTimeFormat("en-CA", {
+            timeZone: "Asia/Hong_Kong",
+            year: "numeric",
+            month: "2-digit",
+          }).format(new Date()),
           operationGeneration: 0,
           prewarmedAt: new Date().toISOString(),
           prewarmDepartmentId: input.departmentId,
@@ -124,11 +117,11 @@ export async function prewarmDepartmentMemberKeys(input: {
 
 export async function claimPrewarmedTokenForProvision(input: {
   feishuUserId: string;
-  tokenRequestId: string;
+  sourceRequestId: string;
   billingPeriod: string;
   operationGeneration?: number;
 }) {
-  return withUserQuotaOperationLock(input.feishuUserId, async () => {
+  return withUserKeyLifecycleLock(input.feishuUserId, async () => {
     const store = await getStoreSnapshot();
     const account = store.tokenAccounts.find(
       (item) =>
@@ -140,7 +133,7 @@ export async function claimPrewarmedTokenForProvision(input: {
     if (!account?.newapiTokenId || !account.prewarmedCredentialCiphertext) return null;
     const key = openQuotaCredential(account.prewarmedCredentialCiphertext, account.id);
     const updated = await updateTokenAccount(account.id, {
-      tokenRequestId: input.tokenRequestId,
+      sourceRequestId: input.sourceRequestId,
       billingPeriod: input.billingPeriod,
       operationGeneration: input.operationGeneration ?? account.operationGeneration,
     });

@@ -1,5 +1,5 @@
-import { getConfig } from "@/lib/config";
-import { randomId } from "@/lib/crypto";
+import { getConfig } from "./config.ts";
+import { randomId } from "./crypto.ts";
 import {
   extractUsageFromNewApiOther,
   mergeUsageMetrics,
@@ -22,6 +22,13 @@ type NewApiTokenRecord = {
   expired_time?: number;
   status?: number;
 };
+
+const mockTokens = new Map<string, {
+  key: string;
+  name: string;
+  remainQuota: number;
+  status: 1 | 2;
+}>();
 
 type NewApiTokenPage = {
   items?: NewApiTokenRecord[];
@@ -244,9 +251,16 @@ export async function createNewApiToken(input: {
 }) {
   const { newapi } = getConfig();
   if (newapi.mock) {
+    const newapiTokenId = randomId("newapi");
     const key = `sk-ti-${randomId("mock").replaceAll("_", "")}`;
+    mockTokens.set(newapiTokenId, {
+      key,
+      name: input.name,
+      remainQuota: input.remainQuota,
+      status: 1,
+    });
     return {
-      newapiTokenId: randomId("newapi"),
+      newapiTokenId,
       key,
     };
   }
@@ -385,7 +399,7 @@ export async function createPrewarmedNewApiTokens(input: {
 
 export async function getNewApiTokenKey(newapiTokenId: string) {
   const { newapi } = getConfig();
-  if (newapi.mock) return `sk-ti-${newapiTokenId}`;
+  if (newapi.mock) return mockTokens.get(newapiTokenId)?.key;
   const data = await newApiFetch<NewApiKeyResponse>(`/api/token/${newapiTokenId}/key`, {
     method: "POST",
   });
@@ -394,14 +408,17 @@ export async function getNewApiTokenKey(newapiTokenId: string) {
 
 export async function getNewApiTokenRemainQuota(newapiTokenId: string) {
   const { newapi } = getConfig();
-  if (newapi.mock) return toNewApiQuota(200);
+  if (newapi.mock) return mockTokens.get(newapiTokenId)?.remainQuota;
   const record = await getNewApiToken(newapiTokenId);
   return typeof record.remain_quota === "number" ? record.remain_quota : undefined;
 }
 
 export async function getNewApiTokenControlState(newapiTokenId: string) {
   const { newapi } = getConfig();
-  if (newapi.mock) return { status: 1, remainQuota: toNewApiQuota(200) };
+  if (newapi.mock) {
+    const token = mockTokens.get(newapiTokenId);
+    return token ? { status: token.status, remainQuota: token.remainQuota } : { status: undefined, remainQuota: undefined };
+  }
   const record = await getNewApiToken(newapiTokenId);
   return {
     status: record.status,
@@ -547,7 +564,12 @@ export async function listNewApiUsageLogs(input: {
 
 async function setNewApiTokenStatus(newapiTokenId: string, status: 1 | 2) {
   const { newapi } = getConfig();
-  if (newapi.mock) return;
+  if (newapi.mock) {
+    const token = mockTokens.get(newapiTokenId);
+    if (!token) throw new Error("Mock NewAPI token was not found before status update");
+    token.status = status;
+    return;
+  }
   await newApiFetch<unknown>("/api/token/?status_only=true", {
     method: "PUT",
     body: JSON.stringify({
@@ -570,7 +592,12 @@ export async function updateNewApiTokenQuota(input: {
   remainQuota: number;
 }) {
   const { newapi } = getConfig();
-  if (newapi.mock) return;
+  if (newapi.mock) {
+    const token = mockTokens.get(input.newapiTokenId);
+    if (!token) throw new Error("Mock NewAPI token was not found before quota update");
+    token.remainQuota = input.remainQuota;
+    return;
+  }
   const existing = await getNewApiToken(input.newapiTokenId);
   if (!existing.id) {
     throw new Error("NewAPI token was not found before quota update");

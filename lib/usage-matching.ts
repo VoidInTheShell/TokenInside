@@ -1,5 +1,5 @@
-import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
-import type { ProxyRequestLog, TokenAccount } from "@/lib/types";
+import type { NormalizedNewApiUsageLog } from "./newapi.ts";
+import type { ProxyRequestLog, TokenAccount } from "./types.ts";
 
 const MAX_SAFE_TIME_DELTA_MS = 30_000;
 const BILLABLE_PROXY_PATHS = new Set([

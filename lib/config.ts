@@ -12,10 +12,19 @@ export type RuntimeConfig = {
     poolIdleTimeoutMs: number;
     poolConnectionTimeoutMs: number;
   };
+  redis: {
+    url?: string;
+    required: boolean;
+    keyPrefix: string;
+    principalTtlSeconds: number;
+    connectTimeoutMs: number;
+  };
   proxy: {
     maxConcurrency: number;
+    queueMax: number;
     queueTimeoutMs: number;
     preparationMaxConcurrency: number;
+    preparationQueueMax: number;
     preparationQueueTimeoutMs: number;
     upstreamMaxAttempts: number;
     upstreamRetryBaseMs: number;
@@ -24,7 +33,6 @@ export type RuntimeConfig = {
   feishu: {
     appId?: string;
     appSecret?: string;
-    approvalCodeTokenRequest?: string;
     eventEncryptKey?: string;
     eventVerificationToken?: string;
   };
@@ -42,9 +50,6 @@ export type RuntimeConfig = {
     systemAdminOpenIds: string[];
     globalOpenIds: string[];
   };
-  billing: {
-    monthlyResetEnabled: boolean;
-  };
 };
 
 function trimSlash(value: string) {
@@ -55,6 +60,13 @@ function positiveIntegerFromEnv(value: string | undefined, fallback: number) {
   if (!value) return fallback;
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+function nonNegativeIntegerFromEnv(value: string | undefined, fallback: number) {
+  if (value === undefined || value === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) return fallback;
   return parsed;
 }
 
@@ -98,10 +110,27 @@ export function getConfig(): RuntimeConfig {
         5000,
       ),
     },
+    redis: {
+      url: process.env.TOKENINSIDE_REDIS_URL,
+      required: process.env.TOKENINSIDE_REDIS_REQUIRED === "true",
+      keyPrefix: process.env.TOKENINSIDE_REDIS_KEY_PREFIX?.trim() || "tokeninside",
+      principalTtlSeconds: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_REDIS_PRINCIPAL_TTL_SECONDS,
+        300,
+      ),
+      connectTimeoutMs: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_REDIS_CONNECT_TIMEOUT_MS,
+        1000,
+      ),
+    },
     proxy: {
       maxConcurrency: positiveIntegerFromEnv(
         process.env.TOKENINSIDE_PROXY_CONCURRENCY_MAX,
         480,
+      ),
+      queueMax: nonNegativeIntegerFromEnv(
+        process.env.TOKENINSIDE_PROXY_QUEUE_MAX,
+        0,
       ),
       queueTimeoutMs: positiveIntegerFromEnv(
         process.env.TOKENINSIDE_PROXY_QUEUE_TIMEOUT_MS,
@@ -110,6 +139,10 @@ export function getConfig(): RuntimeConfig {
       preparationMaxConcurrency: positiveIntegerFromEnv(
         process.env.TOKENINSIDE_PROXY_PREPARATION_CONCURRENCY_MAX,
         8,
+      ),
+      preparationQueueMax: nonNegativeIntegerFromEnv(
+        process.env.TOKENINSIDE_PROXY_PREPARATION_QUEUE_MAX,
+        0,
       ),
       preparationQueueTimeoutMs: positiveIntegerFromEnv(
         process.env.TOKENINSIDE_PROXY_PREPARATION_QUEUE_TIMEOUT_MS,
@@ -131,7 +164,6 @@ export function getConfig(): RuntimeConfig {
     feishu: {
       appId: process.env.FEISHU_APP_ID,
       appSecret: process.env.FEISHU_APP_SECRET,
-      approvalCodeTokenRequest: process.env.FEISHU_APPROVAL_CODE_TOKEN_REQUEST,
       eventEncryptKey: process.env.FEISHU_APPROVAL_EVENT_ENCRYPT_KEY,
       eventVerificationToken: process.env.FEISHU_APPROVAL_EVENT_VERIFICATION_TOKEN,
     },
@@ -142,7 +174,7 @@ export function getConfig(): RuntimeConfig {
       adminAccessToken: process.env.NEWAPI_ADMIN_ACCESS_TOKEN,
       systemAk: process.env.NEWAPI_SYSTEM_AK,
       quotaPerUnit: positiveIntegerFromEnv(process.env.NEWAPI_QUOTA_PER_UNIT, 500000),
-      requestTimeoutMs: positiveIntegerFromEnv(process.env.NEWAPI_REQUEST_TIMEOUT_MS, 15000),
+      requestTimeoutMs: positiveIntegerFromEnv(process.env.NEWAPI_REQUEST_TIMEOUT_MS, 90000),
       mock: process.env.TOKENINSIDE_MOCK_NEWAPI === "true",
     },
     admin: {
@@ -154,9 +186,6 @@ export function getConfig(): RuntimeConfig {
         process.env.TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS,
         process.env.TOKENINSIDE_ADMIN_OPEN_IDS,
       ),
-    },
-    billing: {
-      monthlyResetEnabled: process.env.TOKENINSIDE_MONTHLY_RESET_ENABLED === "true",
     },
   };
 }

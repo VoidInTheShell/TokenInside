@@ -1,6 +1,7 @@
 import { access, constants } from "node:fs/promises";
 import path from "node:path";
 import { Pool } from "pg";
+import { createClient } from "redis";
 
 const placeholderPatterns = [
   /^$/,
@@ -60,8 +61,28 @@ const requiredPostgresTables = [
   "schema_migrations",
   "app_settings",
   "feishu_users",
-  "token_requests",
   "token_accounts",
+  "feishu_events",
+  "proxy_request_logs",
+  "newapi_usage_records",
+  "usage_sync_checkpoints",
+  "usage_sync_issues",
+  "admin_scopes",
+  "billing_package_definitions",
+  "billing_package_versions",
+  "department_package_assignments",
+  "billing_package_requests",
+  "user_package_grants",
+  "department_budget_periods",
+  "department_budget_commitments",
+  "request_billing_contexts",
+  "usage_charge_allocations",
+  "billing_operations",
+  "newapi_quota_display_snapshots",
+];
+
+const forbiddenLegacyTables = [
+  "token_requests",
   "user_billing_periods",
   "department_quota_periods",
   "department_quota_requests",
@@ -71,12 +92,6 @@ const requiredPostgresTables = [
   "quota_ledger_entries",
   "user_quota_states",
   "quota_reconciliation_records",
-  "feishu_events",
-  "proxy_request_logs",
-  "newapi_usage_records",
-  "usage_sync_checkpoints",
-  "usage_sync_issues",
-  "admin_scopes",
 ];
 
 async function hasPostgresSchema() {
@@ -101,7 +116,45 @@ async function hasPostgresSchema() {
   }
 }
 
+async function canConnectRedis() {
+  if (!present("TOKENINSIDE_REDIS_URL")) return false;
+  const client = createClient({
+    url: process.env.TOKENINSIDE_REDIS_URL,
+    socket: {
+      connectTimeout: Number(process.env.TOKENINSIDE_REDIS_CONNECT_TIMEOUT_MS ?? "1000"),
+      reconnectStrategy: false,
+    },
+  });
+  client.on("error", () => undefined);
+  try {
+    await client.connect();
+    return (await client.ping()) === "PONG";
+  } catch {
+    return false;
+  } finally {
+    if (client.isOpen) await client.close().catch(() => client.destroy());
+  }
+}
+
+async function legacyQuotaSchemaAbsent() {
+  if (!present("DATABASE_URL")) return false;
+  const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 1, connectionTimeoutMillis: 5000 });
+  try {
+    const result = await pool.query(
+      `select table_name from information_schema.tables
+       where table_schema = 'public' and table_name = any($1::text[])`,
+      [forbiddenLegacyTables],
+    );
+    return result.rowCount === 0;
+  } catch {
+    return false;
+  } finally {
+    await pool.end();
+  }
+}
+
 const storeBackend = process.env.TOKENINSIDE_STORE_BACKEND ?? "json";
+const redisRequired = process.env.TOKENINSIDE_REDIS_REQUIRED === "true";
 const checks = [
   result("NODE_ENV", process.env.NODE_ENV === "production", "must be production"),
   result("PORT", process.env.PORT === "16878", "must listen on 16878"),
@@ -123,9 +176,16 @@ const checks = [
   ),
   result(
     "TOKENINSIDE_STORE_BACKEND",
-    storeBackend === "json" || storeBackend === "postgres",
-    "must be json or postgres",
+    storeBackend === "postgres",
+    "G package runtime requires postgres",
   ),
+  result(
+    "TOKENINSIDE_REDIS_REQUIRED",
+    redisRequired,
+    "Redis hot-path cache is required for the Redis plus PostgreSQL runtime",
+  ),
+  result("TOKENINSIDE_REDIS_URL", safe("TOKENINSIDE_REDIS_URL"), "Redis URL must be configured"),
+  result("REDIS_CONNECTION", await canConnectRedis(), "Redis must accept connections"),
   result(
     "NEWAPI_REQUEST_TIMEOUT_MS",
     Number.isInteger(Number(process.env.NEWAPI_REQUEST_TIMEOUT_MS ?? "15000")) &&
@@ -146,17 +206,6 @@ const checks = [
   ),
 ];
 
-if (storeBackend === "json") {
-  const storePath = process.env.TOKENINSIDE_STORE_PATH ?? ".local-data/tokeninside.json";
-  checks.push(
-    result(
-      "TOKENINSIDE_STORE_PATH",
-      await canWriteDirectory(storePath),
-      "JSON store directory must be writable",
-    ),
-  );
-}
-
 if (storeBackend === "postgres") {
   const businessPoolMax = Number(process.env.DATABASE_POOL_MAX ?? "10");
   const lockPoolMax = Number(process.env.DATABASE_LOCK_POOL_MAX ?? "10");
@@ -167,6 +216,7 @@ if (storeBackend === "postgres") {
   checks.push(result("DATABASE_URL", safe("DATABASE_URL"), "required when store backend is postgres"));
   checks.push(result("POSTGRES_CONNECTION", await canConnectPostgres(), "PostgreSQL must accept connections"));
   checks.push(result("POSTGRES_SCHEMA", await hasPostgresSchema(), "all required tables must exist"));
+  checks.push(result("LEGACY_QUOTA_SCHEMA", await legacyQuotaSchemaAbsent(), "legacy quota tables must be absent"));
   checks.push(
     result(
       "DATABASE_POOL_MAX",
