@@ -4,7 +4,7 @@ import {
   formatRawQuota,
   normalizeNewApiQuotaDisplayStatus,
   parseDisplayQuota,
-} from "../lib/quota-display-model.ts";
+} from "../lib/billing/quota-display-model.ts";
 
 function status(type: "USD" | "CNY" | "CUSTOM" | "TOKENS") {
   return normalizeNewApiQuotaDisplayStatus(

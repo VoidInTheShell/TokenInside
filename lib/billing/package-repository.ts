@@ -1,5 +1,5 @@
 import type { PoolClient, QueryResultRow } from "pg";
-import { nowIso, randomId, sha256Hex } from "./crypto.ts";
+import { nowIso, randomId, sha256Hex } from "../crypto.ts";
 import { PackageBillingError } from "./package-errors.ts";
 import {
   assertPositiveRawQuota,
@@ -32,9 +32,9 @@ import type {
   UsageChargeAllocation,
   UserPackageGrant,
 } from "./package-types.ts";
-import { withPostgresClient, withPostgresTransaction } from "./postgres-store.ts";
-import type { AdminScope } from "./types.ts";
-import type { NewApiUsageRecord, TokenAccount } from "./types.ts";
+import { withPostgresClient, withPostgresTransaction } from "../postgres-store.ts";
+import type { AdminScope } from "../types.ts";
+import type { NewApiUsageRecord, TokenAccount } from "../types.ts";
 
 function quotaNumber(value: unknown, field: string) {
   const number = typeof value === "number" ? value : Number(value);

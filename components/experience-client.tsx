@@ -14,13 +14,13 @@ import {
   ShieldCheckIcon,
   XIcon,
 } from "lucide-react";
-import { PackageBalanceCard } from "@/components/package-balance-card";
+import { PackageBalanceCard } from "@/components/package/package-balance-card";
 import type {
   ClientAvailablePackage,
   ClientPackageMe,
-} from "@/components/package-client-types";
-import { PackageGrantList } from "@/components/package-grant-list";
-import { PackageRequestForm } from "@/components/package-request-form";
+} from "@/components/package/package-client-types";
+import { PackageGrantList } from "@/components/package/package-grant-list";
+import { PackageRequestForm } from "@/components/package/package-request-form";
 import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
 import { LoginWaitingScreen } from "@/components/login-waiting-screen";
 import { UsageRecordsTable, type UsageRecordFiltersState, type UsageRecordRow } from "@/components/usage-records-table";

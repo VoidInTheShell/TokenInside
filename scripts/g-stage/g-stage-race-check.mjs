@@ -107,8 +107,8 @@ async function cleanup() {
 
 try {
   await seed();
-  repository = await import("../lib/package-repository.ts");
-  postgresStore = await import("../lib/postgres-store.ts");
+  repository = await import("../../lib/billing/package-repository.ts");
+  postgresStore = await import("../../lib/postgres-store.ts");
   const inputs = userIds.map((userId, index) => ({
     userId,
     departmentId,

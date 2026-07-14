@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHmac, randomUUID } from "node:crypto";
 import { Pool } from "pg";
-import { formatRawQuota, parseDisplayQuota } from "../lib/quota-display-model.ts";
+import { formatRawQuota, parseDisplayQuota } from "../../lib/billing/quota-display-model.ts";
 
 const databaseUrl = process.env.DATABASE_URL;
 const baseUrl = process.env.G_STAGE_BASE_URL ?? "http://127.0.0.1:16879";

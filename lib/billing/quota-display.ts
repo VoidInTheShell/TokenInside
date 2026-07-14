@@ -1,7 +1,7 @@
-import { getConfig } from "./config.ts";
+import { getConfig } from "../config.ts";
 import { PackageBillingError } from "./package-errors.ts";
 import type { NewApiQuotaDisplaySnapshot } from "./package-types.ts";
-import { withPostgresClient, withPostgresTransaction } from "./postgres-store.ts";
+import { withPostgresClient, withPostgresTransaction } from "../postgres-store.ts";
 import { normalizeNewApiQuotaDisplayStatus } from "./quota-display-model.ts";
 
 let cached: NewApiQuotaDisplaySnapshot | null = null;

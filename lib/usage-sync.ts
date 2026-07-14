@@ -11,7 +11,7 @@ import {
   saveUsageSyncCheckpoint,
   type NewApiUsageBackfillResult,
 } from "@/lib/store";
-import { allocateAuthoritativeUsageRecord } from "@/lib/package-repository";
+import { allocateAuthoritativeUsageRecord } from "@/lib/billing/package-repository";
 
 type UsageSyncTrigger = "manual" | "auto";
 

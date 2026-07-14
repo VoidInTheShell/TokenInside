@@ -7,8 +7,8 @@ import {
   packageGrantWindow,
   planGrantAllocations,
   sortAllocatableGrants,
-} from "../lib/package-model.ts";
-import type { UserPackageGrant } from "../lib/package-types.ts";
+} from "../lib/billing/package-model.ts";
+import type { UserPackageGrant } from "../lib/billing/package-types.ts";
 
 function grant(input: Partial<UserPackageGrant> & Pick<UserPackageGrant, "id">): UserPackageGrant {
   return {

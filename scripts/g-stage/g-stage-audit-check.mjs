@@ -207,9 +207,9 @@ async function cleanup() {
 
 try {
   await seed();
-  repository = await import("../lib/package-repository.ts");
-  postgresStore = await import("../lib/postgres-store.ts");
-  store = await import("../lib/store.ts");
+  repository = await import("../../lib/billing/package-repository.ts");
+  postgresStore = await import("../../lib/postgres-store.ts");
+  store = await import("../../lib/store.ts");
   const tokenAccount = {
     id: ids.token,
     feishuUserId: ids.user,

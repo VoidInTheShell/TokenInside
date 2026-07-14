@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { SendIcon } from "lucide-react";
-import type { ClientAvailablePackage } from "@/components/package-client-types";
+import type { ClientAvailablePackage } from "@/components/package/package-client-types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";

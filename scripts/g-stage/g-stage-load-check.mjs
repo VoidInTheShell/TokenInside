@@ -364,8 +364,8 @@ async function prewarmTokenInsidePrincipals() {
   if (!process.env.TOKENINSIDE_REDIS_URL) {
     return { configured: false, warmed: 0 };
   }
-  const { primeProxyPrincipalCache } = await import("../lib/proxy-principal-cache.ts");
-  const { closeRedisClient } = await import("../lib/redis-runtime.ts");
+  const { primeProxyPrincipalCache } = await import("../../lib/proxy-principal-cache.ts");
+  const { closeRedisClient } = await import("../../lib/redis-runtime.ts");
   try {
     const results = await mapLimit(fixtures, prewarmConcurrency, (fixture) => {
       if (!fixture.principal) throw new Error(`TokenInside principal missing for fixture ${fixture.index}`);
@@ -381,8 +381,8 @@ async function prewarmTokenInsidePrincipals() {
 
 async function cleanupTokenInsidePrincipals() {
   if (!process.env.TOKENINSIDE_REDIS_URL) return;
-  const { invalidateProxyPrincipalCache } = await import("../lib/proxy-principal-cache.ts");
-  const { closeRedisClient } = await import("../lib/redis-runtime.ts");
+  const { invalidateProxyPrincipalCache } = await import("../../lib/proxy-principal-cache.ts");
+  const { closeRedisClient } = await import("../../lib/redis-runtime.ts");
   try {
     await mapLimit(fixtures, prewarmConcurrency, (fixture) => (
       fixture.principal

@@ -5,7 +5,7 @@ import {
   assertCanCreatePackageDefinition,
   assertPackageDefinitionInScope,
   packageScopeDepartment,
-} from "../lib/package-permissions.ts";
+} from "../lib/billing/package-permissions.ts";
 import type { AdminScope } from "../lib/types.ts";
 
 const globalScope: AdminScope = {

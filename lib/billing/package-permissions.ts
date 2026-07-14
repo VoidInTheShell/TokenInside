@@ -1,6 +1,6 @@
 import { PackageBillingError } from "./package-errors.ts";
 import type { BillingPackageDefinition, PackageOwnerScopeType } from "./package-types";
-import type { AdminScope } from "./types";
+import type { AdminScope } from "../types";
 
 export function packageScopeDepartment(scope: AdminScope, requestedDepartmentId?: string) {
   if (scope.scopeType === "global") {

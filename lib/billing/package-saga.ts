@@ -1,8 +1,8 @@
-import { sha256Hex } from "./crypto.ts";
+import { sha256Hex } from "../crypto.ts";
 import {
   clearClaimedPrewarmedCredential,
   claimPrewarmedTokenForProvision,
-} from "./key-prewarm.ts";
+} from "../key-prewarm.ts";
 import {
   createNewApiToken,
   disableNewApiToken,
@@ -10,7 +10,7 @@ import {
   getNewApiTokenKey,
   getNewApiTokenRemainQuota,
   updateNewApiTokenQuota,
-} from "./newapi.ts";
+} from "../newapi.ts";
 import {
   createPackageKeyRotationOperation,
   getUserPackageBalance,
@@ -26,7 +26,7 @@ import {
   listInflightProxyRequests,
   updateTokenAccount,
   withUserKeyLifecycleLock,
-} from "./store.ts";
+} from "../store.ts";
 
 export async function provisionApprovedPackageRequest(requestId: string) {
   let context = await getPackageProvisioningContext(requestId);

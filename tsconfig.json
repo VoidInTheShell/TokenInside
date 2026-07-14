@@ -24,6 +24,15 @@
       }
     ],
     "paths": {
+      "@/lib/package-*": [
+        "./lib/billing/package-*"
+      ],
+      "@/lib/quota-display": [
+        "./lib/billing/quota-display"
+      ],
+      "@/lib/quota-display-model": [
+        "./lib/billing/quota-display-model"
+      ],
       "@/*": [
         "./*"
       ]

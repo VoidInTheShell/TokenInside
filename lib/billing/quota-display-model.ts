@@ -1,4 +1,4 @@
-import { sha256Hex } from "./crypto.ts";
+import { sha256Hex } from "../crypto.ts";
 import { PackageBillingError } from "./package-errors.ts";
 import { assertPositiveRawQuota, assertRawQuota } from "./package-model.ts";
 import type {

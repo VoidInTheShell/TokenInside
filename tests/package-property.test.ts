@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { planGrantAllocations, remainingGrantQuota } from "../lib/package-model.ts";
-import type { UserPackageGrant } from "../lib/package-types.ts";
+import { planGrantAllocations, remainingGrantQuota } from "../lib/billing/package-model.ts";
+import type { UserPackageGrant } from "../lib/billing/package-types.ts";
 
 const SEEDS = Array.from({ length: 20 }, (_, index) => 0x6d2b79f5 ^ (index * 0x9e3779b1));
 const STEPS_PER_SEED = 10_000;

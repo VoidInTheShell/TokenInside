@@ -4,7 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Progress } from "@/components/ui/progress";
-import type { ClientPackageGrant } from "@/components/package-client-types";
+import type { ClientPackageGrant } from "@/components/package/package-client-types";
 import { formatDateTime } from "@/lib/utils";
 
 const statusLabel: Record<ClientPackageGrant["status"], string> = {

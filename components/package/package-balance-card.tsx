@@ -4,7 +4,7 @@ import { CircleDollarSignIcon, Layers3Icon, RefreshCwIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import type { ClientPackageMe } from "@/components/package-client-types";
+import type { ClientPackageMe } from "@/components/package/package-client-types";
 import { formatDateTime } from "@/lib/utils";
 
 export function PackageBalanceCard({ data }: { data: ClientPackageMe }) {
