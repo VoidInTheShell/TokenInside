@@ -1,6 +1,7 @@
 import { after } from "next/server";
 import { buildNewApiProxyUrl } from "@/lib/newapi";
 import { getConfig } from "@/lib/config";
+import { finalizeBillingPeriodAfterSettlements } from "@/lib/billing-period-finalizer";
 import { randomId, sha256Hex } from "@/lib/crypto";
 import {
   acquireProxyConcurrencySlot,
@@ -14,7 +15,7 @@ import {
   upstreamRetryAfterSeconds,
 } from "@/lib/proxy-error";
 import { fetchUpstreamWithRetry } from "@/lib/proxy-retry";
-import { queueNewApiUsageSettlement } from "@/lib/usage-sync";
+import { syncNewApiUsageForProxyRequest } from "@/lib/usage-sync";
 import {
   createSseUsageCollector,
   extractUsageFromJson,
@@ -25,13 +26,15 @@ import {
 } from "@/lib/usage-metrics";
 import {
   addProxyLog,
-  beginProxyLog,
-  findActiveTokenPrincipalByHash,
+  beginQuotaAwareProxyLog,
+  findActiveTokenByHash,
+  getUserById,
   updateProxyLog,
 } from "@/lib/store";
-import { findActiveTokenPrincipalCached } from "@/lib/proxy-principal-cache";
-import { PackageBillingError } from "@/lib/package-errors";
-import { beginRequestBillingContext } from "@/lib/package-repository";
+import {
+  QuotaAdmissionClosedError,
+  StaleTokenGenerationError,
+} from "@/lib/quota-admission";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -168,6 +171,8 @@ function newApiResponseRequestIdPatch(newapiResponseRequestId?: string) {
 
 type ProxyUsageSettlementContext = {
   proxyLogId: string;
+  feishuUserId: string;
+  billingPeriod: string;
   newapiTokenId?: string;
   model?: string;
   isStream: boolean;
@@ -178,15 +183,21 @@ function settleNewApiUsageAfterResponse(
   context: ProxyUsageSettlementContext,
   newapiRequestId?: string,
 ) {
-  const newapiTokenId = context.newapiTokenId;
-  if (!newapiTokenId) return;
-  queueNewApiUsageSettlement({
-    proxyLogId: context.proxyLogId,
-    newapiTokenId,
-    newapiRequestId,
-    model: context.model,
-    isStream: context.isStream,
-    requestStartedAt: context.requestStartedAt,
+  after(async () => {
+    const result = await syncNewApiUsageForProxyRequest({
+      newapiRequestId,
+      proxyLogId: context.proxyLogId,
+      newapiTokenId: context.newapiTokenId,
+      model: context.model,
+      isStream: context.isStream,
+      requestStartedAt: context.requestStartedAt,
+    }).catch(() => undefined);
+    if (result?.backfill) {
+      await finalizeBillingPeriodAfterSettlements(
+        context.feishuUserId,
+        context.billingPeriod,
+      ).catch(() => undefined);
+    }
   });
 }
 
@@ -248,7 +259,6 @@ function streamWithProxyLog(input: {
   newapiResponseRequestId?: string;
   apiFormat: string;
   requestId: string;
-  settlementContext: ProxyUsageSettlementContext;
   releaseUpstreamSlot: () => void;
 }) {
   const reader = input.body.getReader();
@@ -257,25 +267,12 @@ function streamWithProxyLog(input: {
     fallbackSemantic: usageSemanticFromApiFormat(input.apiFormat),
   });
   const stopHeartbeat = startProxyLeaseHeartbeat(input.logId);
-  let finalized = false;
-  const releaseOnce = () => {
-    if (finalized) return false;
-    finalized = true;
-    stopHeartbeat();
-    input.releaseUpstreamSlot();
-    return true;
-  };
   return new ReadableStream<Uint8Array>({
-    start(controller) {
-      void (async () => {
-        try {
-          while (true) {
-            const result = await reader.read();
-            if (result.done) break;
-            usageCollector.ingest(result.value);
-            controller.enqueue(result.value);
-          }
-          if (!releaseOnce()) return;
+    async pull(controller) {
+      try {
+        const result = await reader.read();
+        if (result.done) {
+          stopHeartbeat();
           const usage = usageCollector.finish();
           await updateProxyLog(input.logId, {
             status: terminalStatus(input.statusCode),
@@ -287,47 +284,43 @@ function streamWithProxyLog(input: {
             ...usage,
             leaseExpiresAt: undefined,
           });
-          if (input.statusCode < 400 && input.settlementContext.newapiTokenId) {
-            queueNewApiUsageSettlement({
-              proxyLogId: input.settlementContext.proxyLogId,
-              newapiTokenId: input.settlementContext.newapiTokenId,
-              newapiRequestId: input.newapiResponseRequestId,
-              model: input.settlementContext.model,
-              isStream: input.settlementContext.isStream,
-              requestStartedAt: input.settlementContext.requestStartedAt,
-            });
-          }
+          input.releaseUpstreamSlot();
           controller.close();
-        } catch (err) {
-          if (!releaseOnce()) return;
-          await updateProxyLog(input.logId, {
-            status: "failed",
-            terminalStatus: "failed",
-            statusCode: input.statusCode >= 400 ? input.statusCode : 502,
-            durationMs: Date.now() - input.startedAt,
-            errorMessage: sanitizedErrorMessage(err),
-            responseTimeUpdatedAt: new Date().toISOString(),
-            leaseExpiresAt: undefined,
-          });
-          try {
-            controller.enqueue(buildProxyStreamErrorChunk({
-              status: 502,
-              message: `流式上游连接中断（${sanitizedErrorMessage(err)}），请在 2 秒后重试`,
-              code: "upstream_stream_interrupted",
-              type: "upstream_error",
-              requestId: input.requestId,
-              retryable: true,
-              retryAfterSeconds: 2,
-            }));
-            controller.close();
-          } catch {
-            controller.error(err);
-          }
+          return;
         }
-      })();
+        usageCollector.ingest(result.value);
+        controller.enqueue(result.value);
+      } catch (err) {
+        stopHeartbeat();
+        input.releaseUpstreamSlot();
+        await updateProxyLog(input.logId, {
+          status: "failed",
+          terminalStatus: "failed",
+          statusCode: input.statusCode >= 400 ? input.statusCode : 502,
+          durationMs: Date.now() - input.startedAt,
+          errorMessage: sanitizedErrorMessage(err),
+          responseTimeUpdatedAt: new Date().toISOString(),
+          leaseExpiresAt: undefined,
+        });
+        try {
+          controller.enqueue(buildProxyStreamErrorChunk({
+            status: 502,
+            message: `流式上游连接中断（${sanitizedErrorMessage(err)}），请在 2 秒后重试`,
+            code: "upstream_stream_interrupted",
+            type: "upstream_error",
+            requestId: input.requestId,
+            retryable: true,
+            retryAfterSeconds: 2,
+          }));
+          controller.close();
+        } catch {
+          controller.error(err);
+        }
+      }
     },
     async cancel(reason) {
-      if (!releaseOnce()) return;
+      stopHeartbeat();
+      input.releaseUpstreamSlot();
       try {
         await reader.cancel(reason);
       } finally {
@@ -360,9 +353,6 @@ async function recordFinishedProxyLog(input: {
   logId: string;
   startedAt: number;
   firstByteMs: number;
-  preparationMs: number;
-  billingContextMs: number;
-  upstreamFirstByteMs: number;
   upstream: Response;
   requestPath: string;
   settlementContext: ProxyUsageSettlementContext;
@@ -389,9 +379,6 @@ async function recordFinishedProxyLog(input: {
     statusCode: input.upstream.status,
     durationMs: Date.now() - input.startedAt,
     firstByteMs: input.firstByteMs,
-    preparationMs: input.preparationMs,
-    billingContextMs: input.billingContextMs,
-    upstreamFirstByteMs: input.upstreamFirstByteMs,
     responseTimeUpdatedAt: new Date().toISOString(),
     usageSource: hasUsageMetrics(usage) ? "proxy_json" : "missing",
     ...newApiResponseRequestIdPatch(newapiResponseRequestId),
@@ -437,14 +424,6 @@ function responseHeadersFrom(upstream: Response, requestId: string) {
   const responseHeaders = new Headers(upstream.headers);
   responseHeaders.delete("content-encoding");
   responseHeaders.delete("content-length");
-  responseHeaders.delete("connection");
-  responseHeaders.delete("keep-alive");
-  responseHeaders.delete("proxy-authenticate");
-  responseHeaders.delete("proxy-authorization");
-  responseHeaders.delete("te");
-  responseHeaders.delete("trailer");
-  responseHeaders.delete("transfer-encoding");
-  responseHeaders.delete("upgrade");
   responseHeaders.set("x-tokeninside-request-id", requestId);
   return responseHeaders;
 }
@@ -545,15 +524,12 @@ async function proxy(request: Request, context: RouteContext) {
     });
   }
 
-  let tokenAccount: NonNullable<Awaited<ReturnType<typeof findActiveTokenPrincipalByHash>>>["tokenAccount"];
-  let user: NonNullable<Awaited<ReturnType<typeof findActiveTokenPrincipalByHash>>>["user"] & {};
+  let tokenAccount: NonNullable<Awaited<ReturnType<typeof findActiveTokenByHash>>>;
+  let user: NonNullable<Awaited<ReturnType<typeof getUserById>>>;
+  let proxyLog: Awaited<ReturnType<typeof beginQuotaAwareProxyLog>>;
   try {
-    const keyHash = sha256Hex(key);
-    const principal = await findActiveTokenPrincipalCached(
-      keyHash,
-      () => findActiveTokenPrincipalByHash(keyHash),
-    );
-    if (!principal?.tokenAccount) {
+    const foundTokenAccount = await findActiveTokenByHash(sha256Hex(key));
+    if (!foundTokenAccount) {
       void addProxyLog({
         requestPath,
         method: request.method,
@@ -571,8 +547,9 @@ async function proxy(request: Request, context: RouteContext) {
         requestId,
       });
     }
-    tokenAccount = principal.tokenAccount;
-    if (!principal.user) {
+    tokenAccount = foundTokenAccount;
+    const foundUser = await getUserById(tokenAccount.feishuUserId);
+    if (!foundUser) {
       releaseUpstreamSlot();
       releaseUpstreamSlot = undefined;
       return buildProxyErrorResponse({
@@ -582,7 +559,7 @@ async function proxy(request: Request, context: RouteContext) {
         requestId,
       });
     }
-    user = principal.user;
+    user = foundUser;
     if (user.status === "disabled" || user.status === "deleted") {
       void addProxyLog({
         feishuUserId: user.id,
@@ -605,24 +582,46 @@ async function proxy(request: Request, context: RouteContext) {
         requestId,
       });
     }
-    if (!user.departmentId) {
-      throw new PackageBillingError(
-        "user_department_required",
-        "当前飞书用户没有可用于套餐计费的部门",
-        409,
-      );
-    }
+    proxyLog = await beginQuotaAwareProxyLog(tokenAccount, {
+      feishuUserId: user.id,
+      tokenAccountId: tokenAccount.id,
+      departmentId: user.departmentId,
+      departmentName: user.departmentName,
+      requestPath,
+      method: request.method,
+      model: metadata.model,
+      provider: "NewAPI",
+      providerKeyName: tokenAccount.newapiTokenId,
+      apiFormat,
+      endpointApiFormat: apiFormat,
+      requestType: metadata.requestType,
+      isStream: metadata.clientRequestedStream,
+      clientRequestedStream: metadata.clientRequestedStream,
+      clientIsStream: metadata.clientRequestedStream,
+      userAgent: userAgent ?? undefined,
+      clientIp,
+      clientFamily: detectClientFamily(userAgent),
+    });
   } catch (error) {
     releaseUpstreamSlot?.();
     releaseUpstreamSlot = undefined;
-    if (error instanceof PackageBillingError) {
+    if (error instanceof QuotaAdmissionClosedError) {
       return buildProxyErrorResponse({
-        status: error.status,
+        status: 409,
+        message: `${error.message}，请在 2 秒后重试`,
+        code: error.code,
+        requestId,
+        retryable: true,
+        retryAfterSeconds: 2,
+        details: error.operationId ? { operation_id: error.operationId } : undefined,
+      });
+    }
+    if (error instanceof StaleTokenGenerationError) {
+      return buildProxyErrorResponse({
+        status: 403,
         message: error.message,
         code: error.code,
         requestId,
-        retryable: error.retryable,
-        retryAfterSeconds: error.retryable ? 2 : undefined,
       });
     }
     console.error(JSON.stringify({
@@ -642,108 +641,42 @@ async function proxy(request: Request, context: RouteContext) {
     releasePreparationSlot?.();
     releasePreparationSlot = undefined;
   }
-  const preparationMs = Date.now() - startedAt;
-  const proxyLogId = randomId("pl");
-  const proxyLogCreatedAt = new Date().toISOString();
   const settlementContext: ProxyUsageSettlementContext = {
-    proxyLogId,
+    proxyLogId: proxyLog.id,
+    feishuUserId: user.id,
+    billingPeriod: tokenAccount.billingPeriod,
     newapiTokenId: tokenAccount.newapiTokenId,
     model: metadata.model,
     isStream: metadata.clientRequestedStream,
     requestStartedAt: new Date(startedAt).toISOString(),
   };
-  const stopRequestHeartbeat = startProxyLeaseHeartbeat(proxyLogId);
+  const stopRequestHeartbeat = startProxyLeaseHeartbeat(proxyLog.id);
 
   const upstreamUrl = buildNewApiProxyUrl(path, requestUrl.search);
-  let persistenceFailed = false;
   try {
     const retryConfig = getConfig().proxy;
-    const internalUpstreamAbort = new AbortController();
-    const upstreamSignal = AbortSignal.any([request.signal, internalUpstreamAbort.signal]);
-    const billingContextStartedAt = Date.now();
-    const billingContextPromise = (async () => {
-      try {
-        const proxyLog = await beginProxyLog({
-          feishuUserId: user.id,
-          tokenAccountId: tokenAccount.id,
-          departmentId: user.departmentId,
-          departmentName: user.departmentName,
-          requestPath,
-          method: request.method,
-          model: metadata.model,
-          provider: "NewAPI",
-          providerKeyName: tokenAccount.newapiTokenId,
-          apiFormat,
-          endpointApiFormat: apiFormat,
-          requestType: metadata.requestType,
-          isStream: metadata.clientRequestedStream,
-          clientRequestedStream: metadata.clientRequestedStream,
-          clientIsStream: metadata.clientRequestedStream,
-          userAgent: userAgent ?? undefined,
-          clientIp,
-          clientFamily: detectClientFamily(userAgent),
-          billingPeriod: tokenAccount.billingPeriod,
-          operationGeneration: tokenAccount.operationGeneration ?? 0,
-          heartbeatAt: new Date().toISOString(),
-          leaseExpiresAt: new Date(Date.now() + 2 * 60_000).toISOString(),
-        }, { id: proxyLogId, createdAt: proxyLogCreatedAt });
-        await beginRequestBillingContext({
-          proxyRequestId: proxyLog.id,
-          userId: user.id,
-          departmentId: user.departmentId!,
-          tokenAccount,
-          startedAt: proxyLog.createdAt,
-        });
-        return { proxyLog, billingContextMs: Date.now() - billingContextStartedAt };
-      } catch (error) {
-        persistenceFailed = true;
-        throw error;
-      }
-    })();
-    const upstreamStartedAt = Date.now();
-    const upstreamPromise = fetchUpstreamWithRetry(
+    const upstreamResult = await fetchUpstreamWithRetry(
       () => fetch(upstreamUrl, {
         method: request.method,
         headers: filteredProxyHeaders(request, key, requestId),
         body: upstreamBody,
         cache: "no-store",
-        signal: upstreamSignal,
+        signal: request.signal,
       }),
       {
         maxAttempts: retryConfig.upstreamMaxAttempts,
         baseDelayMs: retryConfig.upstreamRetryBaseMs,
         maxDelayMs: retryConfig.upstreamRetryMaxDelayMs,
-        signal: upstreamSignal,
+        signal: request.signal,
       },
-    ).then((result) => ({
-      result,
-      firstByteMs: Date.now() - upstreamStartedAt,
-    }));
-    let persisted: Awaited<typeof billingContextPromise>;
-    let upstreamOutcome: Awaited<typeof upstreamPromise>;
-    try {
-      [persisted, upstreamOutcome] = await Promise.all([
-        billingContextPromise,
-        upstreamPromise,
-      ]);
-    } catch (error) {
-      internalUpstreamAbort.abort();
-      await Promise.allSettled([billingContextPromise, upstreamPromise]);
-      throw error;
-    }
-    const { proxyLog, billingContextMs } = persisted;
-    const upstreamResult = upstreamOutcome.result;
+    );
     const upstream = upstreamResult.response;
     const firstByteMs = Date.now() - startedAt;
-    const upstreamFirstByteMs = upstreamOutcome.firstByteMs;
     const contentType = upstream.headers.get("content-type") ?? "";
     const upstreamIsStream = contentType.includes("text/event-stream");
     const newapiResponseRequestId = newApiResponseRequestIdFrom(upstream);
     const responseHeaders = responseHeadersFrom(upstream, requestId);
     responseHeaders.set("x-tokeninside-upstream-attempts", String(upstreamResult.attempts));
-    responseHeaders.set("x-tokeninside-preparation-ms", String(preparationMs));
-    responseHeaders.set("x-tokeninside-billing-context-ms", String(billingContextMs));
-    responseHeaders.set("x-tokeninside-upstream-first-byte-ms", String(upstreamFirstByteMs));
 
     if (upstream.status >= 400) {
       const responseBody = await readResponseBody(upstream);
@@ -751,9 +684,6 @@ async function proxy(request: Request, context: RouteContext) {
         logId: proxyLog.id,
         startedAt,
         firstByteMs,
-        preparationMs,
-        billingContextMs,
-        upstreamFirstByteMs,
         upstream,
         requestPath,
         settlementContext,
@@ -788,18 +718,11 @@ async function proxy(request: Request, context: RouteContext) {
     }
 
     if (upstreamIsStream && upstream.body) {
-      responseHeaders.set("content-type", "text/event-stream; charset=utf-8");
-      responseHeaders.set("cache-control", "no-cache, no-transform");
-      responseHeaders.set("x-accel-buffering", "no");
-      responseHeaders.delete("content-length");
       await updateProxyLog(proxyLog.id, {
         status: upstream.status >= 400 ? "failed" : "streaming",
         statusCode: upstream.status,
         durationMs: firstByteMs,
         firstByteMs,
-        preparationMs,
-        billingContextMs,
-        upstreamFirstByteMs,
         isStream: true,
         upstreamIsStream: true,
         ...newApiResponseRequestIdPatch(newapiResponseRequestId),
@@ -807,6 +730,9 @@ async function proxy(request: Request, context: RouteContext) {
         heartbeatAt: new Date().toISOString(),
         leaseExpiresAt: new Date(Date.now() + 2 * 60_000).toISOString(),
       });
+      if (upstream.status < 400) {
+        settleNewApiUsageAfterResponse(settlementContext, newapiResponseRequestId);
+      }
       stopRequestHeartbeat();
       return new Response(
         streamWithProxyLog({
@@ -817,7 +743,6 @@ async function proxy(request: Request, context: RouteContext) {
           newapiResponseRequestId,
           apiFormat,
           requestId,
-          settlementContext,
           releaseUpstreamSlot,
         }),
         {
@@ -833,9 +758,6 @@ async function proxy(request: Request, context: RouteContext) {
       logId: proxyLog.id,
       startedAt,
       firstByteMs,
-      preparationMs,
-      billingContextMs,
-      upstreamFirstByteMs,
       upstream,
       requestPath,
       settlementContext,
@@ -858,46 +780,8 @@ async function proxy(request: Request, context: RouteContext) {
     const aborted =
       request.signal.aborted ||
       (err instanceof DOMException && err.name === "AbortError");
-    if (err instanceof PackageBillingError) {
-      await updateProxyLog(proxyLogId, {
-        status: "failed",
-        terminalStatus: "failed",
-        statusCode: err.status,
-        durationMs: Date.now() - startedAt,
-        errorMessage: sanitizedErrorMessage(err),
-        responseTimeUpdatedAt: new Date().toISOString(),
-        leaseExpiresAt: undefined,
-      }).catch(() => undefined);
-      return buildProxyErrorResponse({
-        status: err.status,
-        message: err.message,
-        code: err.code,
-        requestId,
-        retryable: err.retryable,
-        retryAfterSeconds: err.retryable ? 2 : undefined,
-      });
-    }
-    if (persistenceFailed) {
-      await updateProxyLog(proxyLogId, {
-        status: "failed",
-        terminalStatus: "failed",
-        statusCode: 503,
-        durationMs: Date.now() - startedAt,
-        errorMessage: sanitizedErrorMessage(err),
-        responseTimeUpdatedAt: new Date().toISOString(),
-        leaseExpiresAt: undefined,
-      }).catch(() => undefined);
-      return buildProxyErrorResponse({
-        status: 503,
-        message: "TokenInside 数据库暂时繁忙，请在 2 秒后重试",
-        code: "gateway_storage_unavailable",
-        requestId,
-        retryable: true,
-        retryAfterSeconds: 2,
-      });
-    }
     await recordFailedProxyLog({
-      logId: proxyLogId,
+      logId: proxyLog.id,
       startedAt,
       err,
       aborted,

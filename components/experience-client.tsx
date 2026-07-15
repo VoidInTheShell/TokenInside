@@ -4,43 +4,63 @@ import Image from "next/image";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   BarChart3Icon,
+  CheckCircle2Icon,
   ClipboardCopyIcon,
   HistoryIcon,
   KeyRoundIcon,
-  Layers3Icon,
   ListFilterIcon,
   MenuIcon,
   RefreshCwIcon,
+  SaveIcon,
+  SendIcon,
   ShieldCheckIcon,
+  SlidersHorizontalIcon,
+  SparklesIcon,
+  XCircleIcon,
   XIcon,
 } from "lucide-react";
-import { PackageBalanceCard } from "@/components/package/package-balance-card";
-import type {
-  ClientAvailablePackage,
-  ClientPackageMe,
-} from "@/components/package/package-client-types";
-import { PackageGrantList } from "@/components/package/package-grant-list";
-import { PackageRequestForm } from "@/components/package/package-request-form";
-import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
-import { LoginWaitingScreen } from "@/components/login-waiting-screen";
-import { UsageRecordsTable, type UsageRecordFiltersState, type UsageRecordRow } from "@/components/usage-records-table";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Spinner } from "@/components/ui/spinner";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
+import { LoginWaitingScreen } from "@/components/login-waiting-screen";
+import { UsageOverviewCard } from "@/components/usage-overview-card";
+import {
+  UsageRecordsTable,
+  type UsageRecordRow,
+  type UsageRecordFiltersState,
+} from "@/components/usage-records-table";
+import {
+  UsageAnalysisTable,
+  type UsageAggregateRow,
+} from "@/components/usage-analysis-tables";
+import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
+import { pendingApprovalRouteNotice } from "@/lib/department-quota";
 import { shouldRedirectToDefaultAdminPath } from "@/lib/auth-landing";
-import { formatDateTime, formatDepartmentName, maskSecret } from "@/lib/utils";
+import {
+  tokenRequestAllowsQuotaEdit,
+  tokenRequestRequiresAdminDecision,
+} from "@/lib/token-request-policy";
 
 type SessionResponse = {
   authenticated: boolean;
   baseUrl: string;
+  settings?: {
+    defaultMonthlyQuota: number;
+  };
   user?: {
     id: string;
     name?: string;
     avatarUrl?: string;
+    tenantKey: string;
     openId: string;
     departmentId?: string;
     departmentName?: string;
@@ -48,89 +68,223 @@ type SessionResponse = {
   activeToken?: {
     id: string;
     status: string;
+    newapiTokenId?: string;
     maskedKey?: string;
+    billingPeriod: string;
     createdAt: string;
-    operationGeneration?: number;
+  };
+  billingPeriod?: {
+    period: string;
+    monthlyQuota: number;
+    quotaConsumed: number;
+    cost: number;
+    remainingQuota: number;
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    proxyLogCount: number;
+    usageRecordCount: number;
   } | null;
   adminScope?: {
     type: "global" | "department";
     departmentId?: string;
     departmentName?: string;
-    source: string;
-    role?: string;
+    source: "manual" | "department_supervisor" | "environment";
   } | null;
+  requests: Array<{
+    id: string;
+    requestType: string;
+    status: string;
+    reason: string;
+    approvalTargetSource?: string;
+    approvalRouteReason?:
+      | "department_leader"
+      | "parent_department_leader"
+      | "applicant_is_department_admin"
+      | "no_department"
+      | "no_leader"
+      | "directory_lookup_failed"
+      | "manual_fallback";
+    approvalRouteNotice?: string;
+    createdAt: string;
+    updatedAt: string;
+  }>;
+  proxyLogCount: number;
 };
 
-type ModelsResponse = { models?: Array<{ id: string; object?: string; ownedBy?: string }>; error?: string };
-type UsageResponse = {
-  records?: UsageRecordRow[];
-  total?: number;
-  filters?: { models?: string[]; apiFormats?: string[]; userAgents?: string[] };
+type ModelsResponse = {
+  models: Array<{
+    id: string;
+    object?: string;
+    ownedBy?: string;
+  }>;
   error?: string;
 };
-type Panel = "packages" | "usage" | "models" | "history";
 
-const openPackageStatuses = new Set([
-  "pending_card_send",
-  "pending_card_approval",
-  "approved",
-  "approved_provisioning",
-]);
+type UsageRecordsResponse = {
+  records: UsageRecordRow[];
+  total?: number;
+  limit?: number;
+  offset?: number;
+  filters?: {
+    models?: string[];
+    providers?: string[];
+    apiFormats?: string[];
+    clientFamilies?: string[];
+    userAgents?: string[];
+  };
+  modelStats?: UsageAggregateRow[];
+  apiFormatStats?: UsageAggregateRow[];
+  error?: string;
+};
 
-const packageRequestStatus: Record<string, string> = {
+type QuickApprovalRequest = {
+  id: string;
+  requestType: string;
+  status: string;
+  reason: string;
+  requestedMonthlyQuota: number;
+  approvedMonthlyQuota?: number;
+  requesterName?: string;
+  requesterOpenId?: string;
+  errorMessage?: string;
+  updatedAt: string;
+  createdAt: string;
+};
+
+type AdminTokenRequestsResponse = {
+  requests: QuickApprovalRequest[];
+  total?: number;
+  limit?: number;
+  offset?: number;
+  error?: string;
+};
+
+type SelfQuotaOperation = {
+  id: string;
+  operationType: string;
+  state: string;
+  lastErrorMessage?: string;
+  credentialPendingDelivery?: boolean;
+  updatedAt: string;
+};
+
+type WorkspacePanel = "account" | "usage" | "models" | "requests";
+
+const DEFAULT_REASON_PLACEHOLDER = "请说明使用场景、接入工具和预计调用方式。";
+const FALLBACK_MONTHLY_QUOTA = 200;
+const RECENT_APPROVAL_WINDOW_MS = 24 * 60 * 60 * 1000;
+const RECENT_APPROVAL_LIMIT = 500;
+
+const statusLabel: Record<string, string> = {
   pending_card_send: "发送审批卡片中",
-  pending_card_approval: "等待审批",
+  pending_card_approval: "卡片审批中",
   approval_card_send_failed: "审批卡片发送失败",
+  approval_route_failed: "审批路由失败",
+  pending_feishu_approval: "飞书审批中",
   approved: "审批通过",
-  approved_provisioning: "套餐发放中",
+  approved_provisioning: "发放中",
+  approved_provision_failed: "发放失败",
   provisioned: "已发放",
   rejected: "已拒绝",
   cancelled: "已取消",
-  failed: "处理失败",
+  invalidated: "其他请求已通过",
+  draft_pending_approval_config: "待配置审批",
 };
 
-const packageRequestKind: Record<string, string> = {
-  first: "首次套餐",
-  regrant: "重发套餐",
-  admin_grant: "管理员发放",
+const requestTypeLabel: Record<string, string> = {
+  first_apply: "首次申请",
+  quota_reset: "恢复可用额度",
+  quota_restore: "恢复可用额度",
+  key_reset: "Key 更换",
+  quota_adjust: "额度调整",
+  monthly_reset: "月度开账",
 };
 
-function apiError(body: unknown, fallback: string) {
-  if (!body || typeof body !== "object") return fallback;
-  const record = body as { error?: string | { message?: string } };
-  if (typeof record.error === "string") return record.error;
-  return record.error?.message ?? fallback;
+function badgeVariant(status?: string) {
+  if (!status) return "default";
+  if (["provisioned", "approved"].includes(status)) return "success";
+  if (["rejected", "cancelled", "invalidated", "approved_provision_failed"].includes(status)) {
+    return "danger";
+  }
+  return "warning";
 }
 
-function displayName(session: SessionResponse | null) {
-  return session?.user?.name || maskSecret(session?.user?.openId) || "-";
+function displayName(user?: SessionResponse["user"]) {
+  return user?.name || maskSecret(user?.openId) || "-";
 }
 
-function avatarInitial(session: SessionResponse | null) {
-  return displayName(session).trim().slice(0, 1).toUpperCase() || "T";
+function avatarInitial(user?: SessionResponse["user"]) {
+  return displayName(user).trim().slice(0, 1).toUpperCase() || "T";
+}
+
+function scopeLabel(scope?: SessionResponse["adminScope"]) {
+  if (!scope) return "";
+  if (scope.type === "global") return "系统管理员";
+  return "部门管理";
+}
+
+function canDecideRequest(request: { requestType: string; status: string }) {
+  return tokenRequestRequiresAdminDecision(request);
+}
+
+function canEditQuota(request: { requestType: string; status: string }) {
+  return tokenRequestAllowsQuotaEdit(request);
+}
+
+function appendUsageParam(params: URLSearchParams, key: string, value?: string) {
+  if (!value || value === "__all__") return;
+  params.set(key, value);
+}
+
+type RequestHistoryItem = SessionResponse["requests"][number];
+
+function RequestHistoryList({
+  requests,
+  emptyText = "暂无申请记录",
+}: {
+  requests: RequestHistoryItem[];
+  emptyText?: string;
+}) {
+  if (!requests.length) return <div className="empty">{emptyText}</div>;
+
+  return (
+    <div className="request-history-list">
+      {requests.map((request) => (
+        <article className="request-history-item" key={request.id}>
+          <div className="request-history-main">
+            <div className="request-history-heading">
+              <strong>{requestTypeLabel[request.requestType] ?? request.requestType}</strong>
+              <Badge variant={badgeVariant(request.status)}>
+                {statusLabel[request.status] ?? request.status}
+              </Badge>
+            </div>
+            <p>{request.reason || "未填写申请理由"}</p>
+          </div>
+          <div className="request-history-meta">
+            <span>提交时间</span>
+            <strong>{formatDateTime(request.createdAt)}</strong>
+            <span>更新时间</span>
+            <strong>{formatDateTime(request.updatedAt)}</strong>
+          </div>
+        </article>
+      ))}
+    </div>
+  );
 }
 
 export function ExperienceClient() {
   const [session, setSession] = useState<SessionResponse | null>(null);
-  const [packageMe, setPackageMe] = useState<ClientPackageMe | null>(null);
-  const [availablePackages, setAvailablePackages] = useState<ClientAvailablePackage[]>([]);
-  const [panel, setPanel] = useState<Panel>("packages");
-  const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [packageLoading, setPackageLoading] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [key, setKey] = useState<string | null>(null);
-  const [feishuSdkReady, setFeishuSdkReady] = useState(false);
-  const [autoLoginAttempted, setAutoLoginAttempted] = useState(false);
-  const [models, setModels] = useState<NonNullable<ModelsResponse["models"]>>([]);
-  const [modelsLoading, setModelsLoading] = useState(false);
+  const [models, setModels] = useState<ModelsResponse["models"]>([]);
   const [usageRecords, setUsageRecords] = useState<UsageRecordRow[]>([]);
-  const [usageTotal, setUsageTotal] = useState(0);
-  const [usageLoading, setUsageLoading] = useState(false);
+  const [usageModelStats, setUsageModelStats] = useState<UsageAggregateRow[]>([]);
+  const [usageApiFormatStats, setUsageApiFormatStats] = useState<UsageAggregateRow[]>([]);
+  const [usageTotalRecords, setUsageTotalRecords] = useState(0);
   const [usagePage, setUsagePage] = useState(1);
   const [usagePageSize, setUsagePageSize] = useState(20);
+  const [usageStatsExpanded, setUsageStatsExpanded] = useState(true);
+  const [usageAutoRefresh, setUsageAutoRefresh] = useState(true);
+  const [usageHideUnknownRecords, setUsageHideUnknownRecords] = useState(false);
   const [usageFilters, setUsageFilters] = useState<UsageRecordFiltersState>({
     preset: "today",
     search: "",
@@ -141,34 +295,42 @@ export function ExperienceClient() {
     status: "__all__",
     userAgent: "__all__",
   });
-  const [usageOptions, setUsageOptions] = useState({ models: [] as string[], apiFormats: [] as string[], userAgents: [] as string[] });
-
-  const loadPackages = useCallback(async () => {
-    setPackageLoading(true);
-    try {
-      const [meResponse, availableResponse] = await Promise.all([
-        fetch("/api/packages/me", { cache: "no-store" }),
-        fetch("/api/packages/available", { cache: "no-store" }),
-      ]);
-      const [meBody, availableBody] = await Promise.all([
-        meResponse.json().catch(() => ({})),
-        availableResponse.json().catch(() => ({})),
-      ]);
-      if (!meResponse.ok) throw new Error(apiError(meBody, "读取套餐账本失败"));
-      if (!availableResponse.ok) throw new Error(apiError(availableBody, "读取可申请套餐失败"));
-      setPackageMe(meBody as ClientPackageMe);
-      setAvailablePackages((availableBody as { items?: ClientAvailablePackage[] }).items ?? []);
-    } finally {
-      setPackageLoading(false);
-    }
-  }, []);
+  const [usageFilterOptions, setUsageFilterOptions] = useState<{
+    models: string[];
+    apiFormats: string[];
+    userAgents: string[];
+  }>({
+    models: [],
+    apiFormats: [],
+    userAgents: [],
+  });
+  const [quickApprovals, setQuickApprovals] = useState<QuickApprovalRequest[]>([]);
+  const [quickApprovalTotal, setQuickApprovalTotal] = useState(0);
+  const [modelsLoaded, setModelsLoaded] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [quickApprovalLoading, setQuickApprovalLoading] = useState(false);
+  const [quickApprovalBusy, setQuickApprovalBusy] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [key, setKey] = useState<string | null>(null);
+  const [quotaOperation, setQuotaOperation] = useState<SelfQuotaOperation | null>(null);
+  const [reason, setReason] = useState("");
+  const [quotaResetReason, setQuotaResetReason] = useState("");
+  const [quickApprovalQuotaDrafts, setQuickApprovalQuotaDrafts] = useState<Record<string, string>>({});
+  const [panel, setPanel] = useState<WorkspacePanel>("account");
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [feishuSdkReady, setFeishuSdkReady] = useState(false);
+  const [autoLoginAttempted, setAutoLoginAttempted] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch("/api/session", { cache: "no-store" });
-      const data = (await response.json()) as SessionResponse;
+      const res = await fetch("/api/session", { cache: "no-store" });
+      const data = (await res.json()) as SessionResponse;
       if (
         data.authenticated &&
         shouldRedirectToDefaultAdminPath({
@@ -181,117 +343,330 @@ export function ExperienceClient() {
         return;
       }
       setSession(data);
-      setKey(null);
-      if (data.authenticated) await loadPackages();
-      else {
-        setPackageMe(null);
-        setAvailablePackages([]);
+      const activeRouteNotice = pendingApprovalRouteNotice(
+        data.requests?.[0],
+        data.adminScope?.type === "department",
+      );
+      setMessage((current) => {
+        if (
+          !current ||
+          (!current.includes("发送给系统管理员") && !current.includes("不属于任何组织"))
+        ) {
+          return current;
+        }
+        return activeRouteNotice;
+      });
+      if (!data.activeToken) {
+        setPanel("account");
+        setKey(null);
+        setModels([]);
+        setModelsLoaded(false);
       }
-    } catch (refreshError) {
-      setError(refreshError instanceof Error ? refreshError.message : "读取会话失败");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取会话失败");
     } finally {
       setLoading(false);
     }
-  }, [loadPackages]);
-
-  useEffect(() => { void refresh(); }, [refresh]);
-
-  const connectFeishu = useCallback(async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const result = await loginWithFeishu();
-      if (result.redirectTo !== window.location.pathname) {
-        window.location.replace(result.redirectTo);
-        return;
-      }
-      await refresh();
-    } catch (loginError) {
-      setError(loginError instanceof Error ? loginError.message : "飞书登录失败");
-    } finally {
-      setBusy(false);
-    }
-  }, [refresh]);
-
-  useEffect(() => {
-    if (loading || busy || autoLoginAttempted || !feishuSdkReady || session?.authenticated) return;
-    setAutoLoginAttempted(true);
-    void connectFeishu();
-  }, [autoLoginAttempted, busy, connectFeishu, feishuSdkReady, loading, session?.authenticated]);
+  }, []);
 
   const loadModels = useCallback(async () => {
     if (!session?.activeToken) return;
     setModelsLoading(true);
     setError(null);
     try {
-      const response = await fetch("/api/models", { cache: "no-store" });
-      const body = (await response.json().catch(() => ({}))) as ModelsResponse;
-      if (!response.ok) throw new Error(body.error ?? "读取模型列表失败");
-      setModels(body.models ?? []);
-    } catch (modelError) {
-      setError(modelError instanceof Error ? modelError.message : "读取模型列表失败");
+      const res = await fetch("/api/models", { cache: "no-store" });
+      const data = (await res.json()) as ModelsResponse;
+      if (!res.ok) throw new Error(data.error ?? "读取模型列表失败");
+      setModels(data.models);
+      setModelsLoaded(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取模型列表失败");
     } finally {
       setModelsLoading(false);
     }
   }, [session?.activeToken]);
 
-  const loadUsage = useCallback(async () => {
+  const loadUsageRecords = useCallback(async (options: { quiet?: boolean } = {}) => {
     if (!session?.activeToken) return;
-    setUsageLoading(true);
+    if (!options.quiet) setUsageLoading(true);
     setError(null);
     try {
-      const params = new URLSearchParams({
-        limit: String(usagePageSize),
-        offset: String((usagePage - 1) * usagePageSize),
-        preset: usageFilters.preset,
-      });
-      for (const key of ["search", "model", "apiFormat", "status", "userAgent"] as const) {
-        const value = usageFilters[key];
-        if (value && value !== "__all__") params.set(key, value);
+      const params = new URLSearchParams();
+      params.set("limit", String(usagePageSize));
+      params.set("offset", String((usagePage - 1) * usagePageSize));
+      params.set("hideUnknownRecords", String(usageHideUnknownRecords));
+      appendUsageParam(params, "preset", usageFilters.preset);
+      appendUsageParam(params, "search", usageFilters.search);
+      appendUsageParam(params, "model", usageFilters.model);
+      appendUsageParam(params, "apiFormat", usageFilters.apiFormat);
+      appendUsageParam(params, "status", usageFilters.status);
+      appendUsageParam(params, "userAgent", usageFilters.userAgent);
+      const res = await fetch(`/api/usage-records?${params.toString()}`, { cache: "no-store" });
+      const data = (await res.json()) as UsageRecordsResponse;
+      if (!res.ok) throw new Error(data.error ?? "读取使用记录失败");
+      setUsageRecords(data.records);
+      setUsageTotalRecords(data.total ?? data.records.length);
+      setUsageModelStats(data.modelStats ?? []);
+      setUsageApiFormatStats(data.apiFormatStats ?? []);
+      if (data.filters) {
+        setUsageFilterOptions({
+          models: data.filters.models ?? [],
+          apiFormats: data.filters.apiFormats ?? [],
+          userAgents: data.filters.userAgents ?? [],
+        });
       }
-      const response = await fetch(`/api/usage-records?${params.toString()}`, { cache: "no-store" });
-      const body = (await response.json().catch(() => ({}))) as UsageResponse;
-      if (!response.ok) throw new Error(body.error ?? "读取使用记录失败");
-      setUsageRecords(body.records ?? []);
-      setUsageTotal(body.total ?? body.records?.length ?? 0);
-      setUsageOptions({
-        models: body.filters?.models ?? [],
-        apiFormats: body.filters?.apiFormats ?? [],
-        userAgents: body.filters?.userAgents ?? [],
-      });
-    } catch (usageError) {
-      setError(usageError instanceof Error ? usageError.message : "读取使用记录失败");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取使用记录失败");
     } finally {
-      setUsageLoading(false);
+      if (!options.quiet) setUsageLoading(false);
     }
-  }, [session?.activeToken, usageFilters, usagePage, usagePageSize]);
+  }, [
+    session?.activeToken,
+    usageFilters,
+    usageHideUnknownRecords,
+    usagePage,
+    usagePageSize,
+  ]);
 
-  useEffect(() => { if (panel === "models") void loadModels(); }, [loadModels, panel]);
-  useEffect(() => { if (panel === "usage") void loadUsage(); }, [loadUsage, panel]);
-  useEffect(() => { setUsagePage(1); }, [usageFilters, usagePageSize]);
+  const loadQuickApprovals = useCallback(async () => {
+    if (!session?.adminScope) {
+      setQuickApprovals([]);
+      setQuickApprovalTotal(0);
+      setQuickApprovalQuotaDrafts({});
+      return;
+    }
 
-  const pendingRequest = useMemo(
-    () => packageMe?.requests.find((request) => openPackageStatuses.has(request.status)),
-    [packageMe?.requests],
+    setQuickApprovalLoading(true);
+    try {
+      const createdAfter = new Date(Date.now() - RECENT_APPROVAL_WINDOW_MS).toISOString();
+      const requests: QuickApprovalRequest[] = [];
+      let offset = 0;
+      let total = 0;
+
+      do {
+        const params = new URLSearchParams();
+        params.set("limit", String(RECENT_APPROVAL_LIMIT));
+        params.set("offset", String(offset));
+        params.set("createdAfter", createdAfter);
+        params.set("decisionRequired", "true");
+        const res = await fetch(`/api/admin/token-requests?${params.toString()}`, { cache: "no-store" });
+        const data = (await res.json()) as AdminTokenRequestsResponse;
+        if (!res.ok) throw new Error(data.error ?? "读取最近24小时审批请求失败");
+        requests.push(...data.requests);
+        total = data.total ?? requests.length;
+        offset += data.requests.length;
+        if (!data.requests.length) break;
+      } while (offset < total);
+
+      setQuickApprovals(requests);
+      setQuickApprovalTotal(total);
+      setQuickApprovalQuotaDrafts((current) => ({
+        ...Object.fromEntries(
+          requests.map((request) => [
+            request.id,
+            String(request.approvedMonthlyQuota ?? request.requestedMonthlyQuota),
+          ]),
+        ),
+        ...current,
+      }));
+    } catch (err) {
+      setQuickApprovals([]);
+      setQuickApprovalTotal(0);
+      setQuickApprovalQuotaDrafts({});
+      setError(err instanceof Error ? err.message : "读取最近24小时审批请求失败");
+    } finally {
+      setQuickApprovalLoading(false);
+    }
+  }, [session?.adminScope]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    void loadQuickApprovals();
+  }, [loadQuickApprovals]);
+
+  useEffect(() => {
+    if (!session?.authenticated) return;
+    let cancelled = false;
+    void fetch("/api/quota-operations", { cache: "no-store" })
+      .then(async (res) => {
+        const body = (await res.json().catch(() => ({}))) as {
+          operations?: SelfQuotaOperation[];
+        };
+        if (!res.ok || cancelled) return;
+        const resumable = body.operations?.find(
+          (operation) =>
+            (operation.operationType === "key_rotation" ||
+              operation.operationType === "first_provision") &&
+            (operation.credentialPendingDelivery ||
+              !["completed", "compensated", "manual_review"].includes(operation.state)),
+        );
+        if (resumable) setQuotaOperation(resumable);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.authenticated]);
+
+  useEffect(() => {
+    if (!quotaOperation) return;
+    if (["compensated", "manual_review"].includes(quotaOperation.state)) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const res = await fetch(`/api/quota-operations/${encodeURIComponent(quotaOperation.id)}`, {
+          cache: "no-store",
+        });
+        const body = (await res.json().catch(() => ({}))) as {
+          operation?: SelfQuotaOperation;
+          key?: string;
+          error?: string;
+        };
+        if (!res.ok) throw new Error(body.error ?? "读取额度操作失败");
+        if (cancelled || !body.operation) return;
+        setQuotaOperation(body.operation);
+        if (body.key) {
+          setKey(body.key);
+          setModels([]);
+          setModelsLoaded(false);
+          try {
+            await navigator.clipboard.writeText(body.key);
+            setMessage(
+              body.operation.operationType === "first_provision"
+                ? "首次发放已完成，Key 已展示并复制。"
+                : "Key 更换已完成，新 Key 已展示并复制。旧 Key 已失效。",
+            );
+          } catch {
+            setMessage(
+              body.operation.operationType === "first_provision"
+                ? "首次发放已完成，Key 已展示。"
+                : "Key 更换已完成，新 Key 已展示。旧 Key 已失效。",
+            );
+          }
+          await refresh();
+          return;
+        }
+        if (body.operation.state === "completed") {
+          setMessage(
+            body.operation.operationType === "first_provision"
+              ? "首次发放已完成。Key 凭据已在此前受控交付。"
+              : "Key 更换已完成。新 Key 凭据已在此前受控交付。",
+          );
+          await refresh();
+          return;
+        }
+        if (body.operation.state === "manual_review") {
+          setError(body.operation.lastErrorMessage ?? "Key 更换需要管理员人工处置");
+          return;
+        }
+        timer = window.setTimeout(poll, 1500);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : "读取额度操作失败");
+      }
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [quotaOperation?.id, quotaOperation?.state, refresh]);
+
+  useEffect(() => {
+    if (panel === "models" && session?.activeToken && !modelsLoaded && !modelsLoading) {
+      void loadModels();
+    }
+  }, [loadModels, modelsLoaded, modelsLoading, panel, session?.activeToken]);
+
+  useEffect(() => {
+    if (panel === "usage" && session?.activeToken) {
+      void loadUsageRecords();
+    }
+  }, [loadUsageRecords, panel, session?.activeToken]);
+
+  useEffect(() => {
+    setUsagePage(1);
+  }, [usageFilters, usageHideUnknownRecords, usagePageSize]);
+
+  useEffect(() => {
+    if (panel !== "usage" || !session?.activeToken || !usageAutoRefresh) return;
+    const timer = window.setInterval(() => {
+      void loadUsageRecords({ quiet: true });
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [loadUsageRecords, panel, session?.activeToken, usageAutoRefresh]);
+
+  const requests = useMemo(() => session?.requests ?? [], [session]);
+  const latestRequest = requests[0];
+  const hasActiveToken = Boolean(session?.activeToken);
+  const title = hasActiveToken ? "用户后台" : "Token 申请";
+  const defaultMonthlyQuota = session?.settings?.defaultMonthlyQuota ?? FALLBACK_MONTHLY_QUOTA;
+  const currentBillingPeriod = session?.billingPeriod ?? null;
+  const currentBillingPeriodName =
+    currentBillingPeriod?.period ?? session?.activeToken?.billingPeriod ?? "-";
+  const remainingQuota = currentBillingPeriod?.remainingQuota;
+  const fallbackNotice = pendingApprovalRouteNotice(
+    latestRequest,
+    session?.adminScope?.type === "department",
   );
-  const hasGrant = Boolean(packageMe?.grants.some((grant) => grant.status === "active" || grant.status === "exhausted"));
 
-  async function submitPackageRequest(input: { packageVersionId: string; requestKind: "first" | "regrant"; reason: string }) {
+  function selectPanel(nextPanel: WorkspacePanel) {
+    setPanel(nextPanel);
+    setMobileNavOpen(false);
+  }
+
+  const connectFeishu = useCallback(async () => {
+    setError(null);
+    setMessage(null);
+    setBusy(true);
+    try {
+      const result = await loginWithFeishu();
+      setMessage(
+        result.method === "requestAuthCode"
+          ? "已通过飞书身份自动登录（兼容模式）。"
+          : "已通过飞书身份自动登录。",
+      );
+      if (result.redirectTo !== window.location.pathname) {
+        window.location.replace(result.redirectTo);
+        return;
+      }
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "飞书登录失败");
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  useEffect(() => {
+    if (loading || busy || autoLoginAttempted || !feishuSdkReady || session?.authenticated) {
+      return;
+    }
+    setAutoLoginAttempted(true);
+    void connectFeishu();
+  }, [autoLoginAttempted, busy, connectFeishu, feishuSdkReady, loading, session?.authenticated]);
+
+  async function requestToken() {
     setBusy(true);
     setError(null);
     setMessage(null);
     try {
-      const response = await fetch("/api/packages/requests", {
+      const res = await fetch("/api/token/request", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ...input, clientRequestId: window.crypto.randomUUID() }),
+        body: JSON.stringify({
+          reason: reason.trim(),
+        }),
       });
-      const body = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(apiError(body, "提交套餐申请失败"));
-      setMessage((body as { notice?: string }).notice ?? "套餐申请已提交，请在飞书审批卡片中跟踪进度。");
-      await loadPackages();
-    } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "提交套餐申请失败");
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "提交申请失败");
+      setMessage(body.notice ?? "申请已提交。");
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "提交申请失败");
     } finally {
       setBusy(false);
     }
@@ -300,47 +675,76 @@ export function ExperienceClient() {
   async function revealKey() {
     setBusy(true);
     setError(null);
+    setMessage(null);
     try {
-      const response = await fetch("/api/token/key", { cache: "no-store" });
-      const body = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(apiError(body, "读取 Key 失败"));
-      const fullKey = (body as { key?: string }).key;
-      if (!fullKey) throw new Error("服务端未返回 Key");
+      let fullKey = key;
+      if (!fullKey) {
+        const res = await fetch("/api/token/key", { cache: "no-store" });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.error ?? "读取 key 失败");
+        fullKey = body.key;
+      }
+      if (!fullKey) throw new Error("读取 key 失败");
       setKey(fullKey);
-      await navigator.clipboard.writeText(fullKey).catch(() => undefined);
-      setMessage("当前 active key 已展示，并已尝试复制到剪贴板。");
-    } catch (keyError) {
-      setError(keyError instanceof Error ? keyError.message : "读取 Key 失败");
+      try {
+        await navigator.clipboard.writeText(fullKey);
+        setMessage("已复制并展示当前 active key。");
+      } catch {
+        setMessage("已展示当前 active key，浏览器未允许自动复制。");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取 key 失败");
     } finally {
       setBusy(false);
     }
   }
 
-  async function rotateKey() {
-    if (!window.confirm("更换只改变凭证和 generation，不会重发套餐或清空历史用量。确认继续？")) return;
+  async function resetKey() {
+    if (!window.confirm("更换会立即停止旧 Key 接收新请求，排空已在途请求后停用旧 Key 并交付新 Key。是否继续？")) return;
     setBusy(true);
     setError(null);
-    setMessage("正在排空旧 generation 并核对替换 Key 水位，请保持页面打开。");
+    setMessage(null);
     try {
-      const response = await fetch("/api/token/reset", {
+      const res = await fetch("/api/token/reset", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          reason: "用户在 TokenInside 套餐后台发起 Key 更换",
+          reason: "用户在 TokenInside 用户后台发起 Key 更换",
           clientRequestId: window.crypto.randomUUID(),
         }),
       });
-      const body = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(apiError(body, "Key 更换失败"));
-      const deliveredKey = (body as { key?: string }).key;
-      if (deliveredKey) {
-        setKey(deliveredKey);
-        await navigator.clipboard.writeText(deliveredKey).catch(() => undefined);
-      }
-      setMessage(deliveredKey ? "Key 更换完成，新 Key 已展示并尝试复制。" : "Key 更换操作已幂等完成。");
+      const body = (await res.json().catch(() => ({}))) as {
+        operation?: SelfQuotaOperation;
+        error?: string;
+      };
+      if (!res.ok) throw new Error(body.error ?? "更换 Key 失败");
+      if (!body.operation) throw new Error("服务端未返回 Key 更换操作");
+      setQuotaOperation(body.operation);
+      setMessage("Key 更换已受理，旧 Key 已停止接收新请求，系统正在排空在途请求并执行切换校验。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Key 更换失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function requestQuotaReset() {
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/token/quota-reset", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reason: quotaResetReason.trim() }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "提交额度恢复申请失败");
+      setQuotaResetReason("");
+      setMessage(body.notice ?? "恢复可用额度申请已提交。");
       await refresh();
-    } catch (rotationError) {
-      setError(rotationError instanceof Error ? rotationError.message : "Key 更换失败");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "提交额度恢复申请失败");
     } finally {
       setBusy(false);
     }
@@ -348,18 +752,78 @@ export function ExperienceClient() {
 
   async function copyBaseUrl() {
     await navigator.clipboard.writeText(`${session?.baseUrl ?? ""}/v1`);
-    setMessage("Base URL 已复制。");
+    setMessage("已复制 Base URL。");
   }
 
-  function selectPanel(next: Panel) {
-    setPanel(next);
-    setMobileNavOpen(false);
+  async function saveQuickApprovalQuota(requestId: string) {
+    const approvedMonthlyQuota = Number(quickApprovalQuotaDrafts[requestId]);
+    if (!Number.isInteger(approvedMonthlyQuota) || approvedMonthlyQuota <= 0) {
+      setError("最终额度必须是正整数");
+      return;
+    }
+
+    setQuickApprovalBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(`/api/admin/token-requests/${encodeURIComponent(requestId)}/quota`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ approvedMonthlyQuota }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "保存最终额度失败");
+      setMessage("最终额度已保存。");
+      await Promise.all([refresh(), loadQuickApprovals()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存最终额度失败");
+    } finally {
+      setQuickApprovalBusy(false);
+    }
   }
 
-  if (loading || (!session?.authenticated && busy)) {
+  async function decideQuickApproval(requestId: string, action: "approve" | "reject") {
+    const approvedMonthlyQuota = Number(quickApprovalQuotaDrafts[requestId]);
+    if (action === "approve" && (!Number.isInteger(approvedMonthlyQuota) || approvedMonthlyQuota <= 0)) {
+      setError("通过审批前需要填写正整数最终额度");
+      return;
+    }
+
+    setQuickApprovalBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(
+        `/api/admin/token-requests/${encodeURIComponent(requestId)}/decision`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            action,
+            approvedMonthlyQuota: action === "approve" ? approvedMonthlyQuota : undefined,
+          }),
+        },
+      );
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error ?? "处理审批失败");
+      setMessage(action === "approve" ? "审批已通过，已触发发放。" : "审批请求已拒绝。");
+      await Promise.all([refresh(), loadQuickApprovals()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "处理审批失败");
+    } finally {
+      setQuickApprovalBusy(false);
+    }
+  }
+
+  const loginInProgress = loading || (!session?.authenticated && busy);
+
+  if (loginInProgress) {
     return (
       <>
-        <FeishuSdkScript onReady={() => setFeishuSdkReady(true)} onError={setError} />
+        <FeishuSdkScript
+          onReady={() => setFeishuSdkReady(true)}
+          onError={(sdkError) => setError(sdkError)}
+        />
         <LoginWaitingScreen />
       </>
     );
@@ -367,135 +831,573 @@ export function ExperienceClient() {
 
   return (
     <>
-      <FeishuSdkScript onReady={() => setFeishuSdkReady(true)} onError={setError} />
+      <FeishuSdkScript
+        onReady={() => setFeishuSdkReady(true)}
+        onError={(sdkError) => setError(sdkError)}
+      />
       <div className="app-shell">
         <aside className={mobileNavOpen ? "sidebar sidebar-open" : "sidebar"}>
           <div className="sidebar-head">
             <div className="brand">
-              <Image className="brand-mark" src="/icon.svg" alt="" aria-hidden="true" width={36} height={36} priority />
-              <div><h1 className="brand-title">TokenInside</h1><p className="brand-subtitle">共绩科技</p></div>
+              <Image
+                className="brand-mark"
+                src="/icon.svg"
+                alt=""
+                aria-hidden="true"
+                width={36}
+                height={36}
+                priority
+              />
+              <div>
+                <h1 className="brand-title">TokenInside</h1>
+                <p className="brand-subtitle">共绩科技</p>
+              </div>
             </div>
-            <button className="sidebar-toggle" type="button" aria-label="切换菜单" aria-expanded={mobileNavOpen} onClick={() => setMobileNavOpen((value) => !value)}>
+            <button
+              className="sidebar-toggle"
+              type="button"
+              aria-label={mobileNavOpen ? "收起菜单" : "展开菜单"}
+              aria-expanded={mobileNavOpen}
+              onClick={() => setMobileNavOpen((open) => !open)}
+            >
               {mobileNavOpen ? <XIcon /> : <MenuIcon />}
             </button>
           </div>
+
           <div className="sidebar-menu">
             <nav className="nav-list" aria-label="用户后台菜单">
-              <button className={panel === "packages" ? "nav-item active nav-button" : "nav-item nav-button"} type="button" onClick={() => selectPanel("packages")}>
-                <Layers3Icon data-icon="inline-start" />套餐与 Key
+              <button
+                className={panel === "account" ? "nav-item active nav-button" : "nav-item nav-button"}
+                type="button"
+                onClick={() => selectPanel("account")}
+              >
+                <KeyRoundIcon data-icon="inline-start" />
+                {hasActiveToken ? "账户密钥" : title}
               </button>
-              <button className={panel === "usage" ? "nav-item active nav-button" : "nav-item nav-button"} type="button" onClick={() => selectPanel("usage")} disabled={!session?.activeToken}>
-                <BarChart3Icon data-icon="inline-start" />用量记录
-              </button>
-              <button className={panel === "models" ? "nav-item active nav-button" : "nav-item nav-button"} type="button" onClick={() => selectPanel("models")} disabled={!session?.activeToken}>
-                <ListFilterIcon data-icon="inline-start" />模型列表
-              </button>
-              <button className={panel === "history" ? "nav-item active nav-button" : "nav-item nav-button"} type="button" onClick={() => selectPanel("history")}>
-                <HistoryIcon data-icon="inline-start" />处理记录
-              </button>
+              {hasActiveToken && (
+                <>
+                  <button
+                    className={panel === "usage" ? "nav-item active nav-button" : "nav-item nav-button"}
+                    type="button"
+                    onClick={() => selectPanel("usage")}
+                  >
+                    <BarChart3Icon data-icon="inline-start" />
+                    额度用量
+                  </button>
+                  <button
+                    className={panel === "models" ? "nav-item active nav-button" : "nav-item nav-button"}
+                    type="button"
+                    onClick={() => selectPanel("models")}
+                  >
+                    <ListFilterIcon data-icon="inline-start" />
+                    模型列表
+                  </button>
+                  <button
+                    className={panel === "requests" ? "nav-item active nav-button" : "nav-item nav-button"}
+                    type="button"
+                    onClick={() => selectPanel("requests")}
+                  >
+                    <HistoryIcon data-icon="inline-start" />
+                    申请记录
+                  </button>
+                </>
+              )}
             </nav>
           </div>
         </aside>
 
         <main className="main">
           <header className="topbar">
-            <div><h2 className="page-title">套餐工作台</h2><p className="page-description">套餐 grant 是唯一额度授权；Key 只是承载调用的可轮换凭证。</p></div>
-            <div className="toolbar">
-              {session?.adminScope && <a className="button button-outline" href="/admin"><ShieldCheckIcon data-icon="inline-start" />管理后台</a>}
-              <Button variant="outline" onClick={() => void refresh()} disabled={busy || packageLoading}><RefreshCwIcon data-icon="inline-start" />刷新</Button>
+            <div>
+              <h2 className="page-title">{title}</h2>
             </div>
           </header>
 
-          {error && <Alert variant="destructive"><AlertTitle>操作未完成</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
-          {message && <Alert><AlertTitle>状态更新</AlertTitle><AlertDescription>{message}</AlertDescription></Alert>}
+          {error && <div className="alert alert-danger">{error}</div>}
+          {message && <div className="alert">{message}</div>}
 
           <Card>
-            <CardContent className="package-user-strip">
-              <div className="user-avatar" aria-hidden="true">
-                {session?.user?.avatarUrl ? <img src={session.user.avatarUrl} alt="" /> : <span>{avatarInitial(session)}</span>}
+            <CardContent>
+              <div className={session?.adminScope ? "user-card user-card-with-action" : "user-card"}>
+                <div className="user-avatar" aria-hidden="true">
+                  {session?.user?.avatarUrl ? (
+                    <img src={session.user.avatarUrl} alt="" />
+                  ) : (
+                    <span>{avatarInitial(session?.user)}</span>
+                  )}
+                </div>
+                <div className="user-card-main">
+                  <span className="user-card-label">当前飞书用户</span>
+                  <strong>{session?.authenticated ? displayName(session.user) : "等待飞书身份"}</strong>
+                </div>
+                {session?.adminScope && (
+                  <div className="user-card-action">
+                    <a className="button button-outline" href="/admin">
+                      <ShieldCheckIcon data-icon="inline-start" />
+                      管理后台
+                    </a>
+                  </div>
+                )}
+                <div className="user-card-controls">
+                  {hasActiveToken && (
+                    <Badge variant="success" className="active-key-status">
+                      当前用户已有 active key
+                    </Badge>
+                  )}
+                  <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={busy}>
+                    <RefreshCwIcon data-icon="inline-start" />
+                    刷新
+                  </Button>
+                </div>
               </div>
-              <div className="user-card-main"><span className="user-card-label">当前飞书用户</span><strong>{displayName(session)}</strong><small>{formatDepartmentName(session?.user?.departmentName, session?.user?.departmentId)}</small></div>
-              <Badge variant={session?.activeToken ? "success" : "warning"}>{session?.activeToken ? "active key" : "尚无 active key"}</Badge>
             </CardContent>
           </Card>
 
-          {packageLoading && !packageMe ? (
-            <div className="package-skeleton-grid"><Skeleton className="h-52" /><Skeleton className="h-52" /></div>
-          ) : panel === "packages" ? (
-            <div className="stack">
-              {packageMe && <PackageBalanceCard data={packageMe} />}
-              <div className="package-two-column">
-                {packageMe && <PackageGrantList grants={packageMe.grants} />}
-                <PackageRequestForm items={availablePackages} hasGrant={hasGrant} pending={Boolean(pendingRequest)} busy={busy} onSubmit={submitPackageRequest} />
-              </div>
-              <Card>
-                <CardHeader><CardTitle>调用凭证</CardTitle><CardDescription>Key 更换不改变 grants、部门预算承诺或历史 allocation。</CardDescription></CardHeader>
-                <CardContent className="package-key-panel">
-                  <div><span>Base URL</span><code>{session?.baseUrl}/v1</code></div>
-                  <Button variant="outline" onClick={() => void copyBaseUrl()}><ClipboardCopyIcon data-icon="inline-start" />复制地址</Button>
-                  <div><span>active key</span><code>{key ?? session?.activeToken?.maskedKey ?? "套餐发放后可查看"}</code></div>
-                  <Button variant="outline" disabled={busy || !session?.activeToken} onClick={() => void revealKey()}><KeyRoundIcon data-icon="inline-start" />查看并复制</Button>
-                  <Button variant="outline" disabled={busy || !session?.activeToken || !packageMe?.balance.availableQuota} onClick={() => void rotateKey()}>
-                    {busy ? <Spinner data-icon="inline-start" /> : <RefreshCwIcon data-icon="inline-start" />}更换
+          {hasActiveToken && (
+            <UsageOverviewCard
+              period={currentBillingPeriodName}
+              monthlyQuota={currentBillingPeriod?.monthlyQuota}
+              quotaConsumed={currentBillingPeriod?.quotaConsumed}
+              remainingQuota={remainingQuota}
+              totalTokens={currentBillingPeriod?.totalTokens}
+            />
+          )}
+
+          {fallbackNotice && <div className="alert">{fallbackNotice}</div>}
+
+          {session?.adminScope && panel === "account" && (
+            <Card>
+              <CardHeader>
+                <CardTitle>审批处理</CardTitle>
+                <CardDescription>
+                  仅展示当前管理范围内最近 24 小时创建的审批请求，共 {quickApprovalTotal} 条。
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="toolbar toolbar-left recent-approval-toolbar">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={quickApprovalLoading || quickApprovalBusy}
+                    onClick={() => void loadQuickApprovals()}
+                  >
+                    <RefreshCwIcon data-icon="inline-start" />
+                    刷新
                   </Button>
+                  <Badge>{quickApprovalTotal} 条请求</Badge>
+                  <a className="button button-outline button-sm" href="/admin">
+                    <SlidersHorizontalIcon data-icon="inline-start" />
+                    进入完整审批页
+                  </a>
+                </div>
+
+                {quickApprovalLoading && !quickApprovals.length ? (
+                  <div className="empty">读取最近 24 小时审批请求中</div>
+                ) : !quickApprovals.length ? (
+                  <div className="empty">最近 24 小时暂无审批请求</div>
+                ) : (
+                  <div className="table-wrap table-scroll recent-approval-viewport">
+                    <table className="table recent-approval-table">
+                      <thead>
+                        <tr>
+                          <th>申请人</th>
+                          <th>类型</th>
+                          <th>状态</th>
+                          <th>申请额度</th>
+                          <th>最终额度</th>
+                          <th>申请理由</th>
+                          <th>申请时间</th>
+                          <th>快速审批</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {quickApprovals.map((request) => (
+                          <tr key={request.id}>
+                            <td>{request.requesterName ?? maskSecret(request.requesterOpenId)}</td>
+                            <td>{requestTypeLabel[request.requestType] ?? request.requestType}</td>
+                            <td>
+                              <Badge variant={badgeVariant(request.status)}>
+                                {statusLabel[request.status] ?? request.status}
+                              </Badge>
+                            </td>
+                            <td>{formatQuotaAmount(request.requestedMonthlyQuota)}</td>
+                            <td>
+                              <div className="quota-control quota-control-icon-action recent-approval-quota">
+                                <Input
+                                  aria-label={`最终额度-${request.id}`}
+                                  min={1}
+                                  step={1}
+                                  type="number"
+                                  value={
+                                    quickApprovalQuotaDrafts[request.id] ??
+                                    String(request.approvedMonthlyQuota ?? request.requestedMonthlyQuota)
+                                  }
+                                  onChange={(event) =>
+                                    setQuickApprovalQuotaDrafts((current) => ({
+                                      ...current,
+                                      [request.id]: event.target.value,
+                                    }))
+                                  }
+                                  disabled={!canEditQuota(request) || quickApprovalBusy}
+                                />
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  aria-label="保存最终额度"
+                                  title="保存最终额度"
+                                  disabled={!canEditQuota(request) || quickApprovalBusy}
+                                  onClick={() => void saveQuickApprovalQuota(request.id)}
+                                >
+                                  <SaveIcon data-icon="inline-start" />
+                                </Button>
+                              </div>
+                            </td>
+                            <td>
+                              <span className="recent-approval-reason" title={request.reason || undefined}>
+                                {request.reason || "-"}
+                              </span>
+                            </td>
+                            <td>{formatDateTime(request.createdAt)}</td>
+                            <td>
+                              <div className="toolbar toolbar-left recent-approval-actions">
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={!canDecideRequest(request) || quickApprovalBusy}
+                                  onClick={() => void decideQuickApproval(request.id, "approve")}
+                                >
+                                  <CheckCircle2Icon data-icon="inline-start" />
+                                  通过
+                                </Button>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={!canDecideRequest(request) || quickApprovalBusy}
+                                  onClick={() => void decideQuickApproval(request.id, "reject")}
+                                >
+                                  <XCircleIcon data-icon="inline-start" />
+                                  拒绝
+                                </Button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
+
+          {!hasActiveToken ? (
+            <>
+              <Card>
+                <CardHeader>
+                  <CardTitle>申请 Token</CardTitle>
+                  <CardDescription>
+                    {latestRequest
+                      ? `最近状态：${statusLabel[latestRequest.status] ?? latestRequest.status}`
+                      : "确认默认申请额度后即可提交，申请理由可选。"}
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="field-group">
+                    <div className="field">
+                      <label htmlFor="requestedMonthlyQuota">默认申请额度</label>
+                      <Input
+                        id="requestedMonthlyQuota"
+                        value={String(defaultMonthlyQuota)}
+                        disabled
+                      />
+                      <span className="field-description">当前 MVP 固定额度，用户不可修改。</span>
+                    </div>
+                    <div className="field">
+                      <label htmlFor="requestReason">申请理由（选填）</label>
+                      <Textarea
+                        id="requestReason"
+                        className="request-reason-textarea"
+                        placeholder={DEFAULT_REASON_PLACEHOLDER}
+                        value={reason}
+                        maxLength={500}
+                        rows={2}
+                        onChange={(event) => setReason(event.target.value)}
+                        disabled={!session?.authenticated || busy}
+                      />
+                    </div>
+                    <div className="apply-panel">
+                      <div className="apply-status">
+                        <SparklesIcon data-icon="inline-start" />
+                        <span>{latestRequest ? formatDateTime(latestRequest.updatedAt) : "首次申请"}</span>
+                      </div>
+                      <Button
+                        onClick={() => void requestToken()}
+                        disabled={!session?.authenticated || busy}
+                      >
+                        <SendIcon data-icon="inline-start" />
+                        申请 Token
+                      </Button>
+                    </div>
+                  </div>
                 </CardContent>
               </Card>
-            </div>
-          ) : panel === "usage" ? (
-            <Card>
-              <CardHeader><CardTitle>权威用量记录</CardTitle><CardDescription>额度消耗与输入、输出、缓存 Tokens 分栏展示。</CardDescription></CardHeader>
-              <CardContent>
-                <UsageRecordsTable
-                  records={usageRecords}
-                  showUser={false}
-                  loading={usageLoading}
-                  showControls
-                  filters={usageFilters}
-                  onFiltersChange={setUsageFilters}
-                  availableModels={usageOptions.models}
-                  availableApiFormats={usageOptions.apiFormats}
-                  availableUserAgents={usageOptions.userAgents}
-                  totalRecords={usageTotal}
-                  currentPage={usagePage}
-                  pageSize={usagePageSize}
-                  onPageChange={setUsagePage}
-                  onPageSizeChange={setUsagePageSize}
-                  onRefresh={() => void loadUsage()}
-                />
-              </CardContent>
-            </Card>
-          ) : panel === "models" ? (
-            <Card>
-              <CardHeader><CardTitle>可用模型</CardTitle><CardDescription>使用当前 active key 从 NewAPI 实时读取。</CardDescription></CardHeader>
-              <CardContent>
-                {modelsLoading ? <div className="package-loading"><Spinner />读取模型列表</div> : !models.length ? (
-                  <Empty><EmptyHeader><EmptyTitle>暂无模型</EmptyTitle><EmptyDescription>请确认 Key 已启用且 NewAPI 已配置可用渠道。</EmptyDescription></EmptyHeader></Empty>
-                ) : <div className="model-grid">{models.map((model) => <div className="model-item" key={model.id}><strong>{model.id}</strong><span>{model.ownedBy ?? model.object ?? "NewAPI"}</span></div>)}</div>}
-              </CardContent>
-            </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>申请记录</CardTitle>
+                  <CardDescription>展示当前用户提交过的全部申请及其最新状态。</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <RequestHistoryList requests={requests} />
+                </CardContent>
+              </Card>
+            </>
           ) : (
-            <div className="package-history-grid">
-              <Card>
-                <CardHeader><CardTitle>套餐申请</CardTitle><CardDescription>首次申请、重发和管理员发放的审批状态。</CardDescription></CardHeader>
-                <CardContent>
-                  {!packageMe?.requests.length ? <Empty><EmptyHeader><EmptyTitle>暂无申请记录</EmptyTitle></EmptyHeader></Empty> : (
-                    <div className="package-history-list">{packageMe.requests.map((request) => (
-                      <article key={request.id}><div><strong>{packageRequestKind[request.requestKind] ?? request.requestKind}</strong><Badge variant={request.status === "provisioned" ? "success" : request.status === "failed" || request.status === "rejected" ? "danger" : "warning"}>{packageRequestStatus[request.status] ?? request.status}</Badge></div><p>{request.reason || "未填写申请理由"}</p><small>{formatDateTime(request.updatedAt)}{request.errorMessage ? ` · ${request.errorMessage}` : ""}</small></article>
-                    ))}</div>
-                  )}
-                </CardContent>
-              </Card>
-              <Card>
-                <CardHeader><CardTitle>计费操作</CardTitle><CardDescription>发放、分摊、撤销、对账与 Key 更换的统一 operation。</CardDescription></CardHeader>
-                <CardContent>
-                  {!packageMe?.operations.length ? <Empty><EmptyHeader><EmptyTitle>暂无操作记录</EmptyTitle></EmptyHeader></Empty> : (
-                    <div className="package-history-list">{packageMe.operations.map((operation) => (
-                      <article key={operation.id}><div><strong>{operation.operationType}</strong><Badge variant={operation.state === "completed" ? "success" : operation.state === "manual_review" ? "danger" : "warning"}>{operation.state}</Badge></div><p>{operation.currentStep}</p><small>{formatDateTime(operation.updatedAt)}{operation.lastErrorMessage ? ` · ${operation.lastErrorMessage}` : ""}</small></article>
-                    ))}</div>
-                  )}
-                </CardContent>
-              </Card>
-            </div>
+            <>
+              {panel === "account" && (
+                <section className="grid grid-2">
+                  <Card>
+                    <CardHeader>
+                      <CardTitle>当前 key</CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="field">
+                        <label>Base URL</label>
+                        <div className="key-box">
+                          <span>{session?.baseUrl ? `${session.baseUrl}/v1` : "-"}</span>
+                          <Button variant="ghost" size="sm" onClick={() => void copyBaseUrl()}>
+                            <ClipboardCopyIcon data-icon="inline-start" />
+                            复制
+                          </Button>
+                        </div>
+                      </div>
+                      <div className="field">
+                        <label>NewAPI key</label>
+                        <div className="key-box">
+                          <span>{key ?? session?.activeToken?.maskedKey ?? "已发放"}</span>
+                          <div className="key-actions">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={busy}
+                              onClick={() => void revealKey()}
+                            >
+                              <KeyRoundIcon data-icon="inline-start" />
+                              查看
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={busy}
+                              onClick={() => void resetKey()}
+                            >
+                              <RefreshCwIcon data-icon="inline-start" />
+                              更换
+                            </Button>
+                          </div>
+                        </div>
+                        {quotaOperation && (
+                          <div className="toolbar toolbar-left">
+                            <Badge variant={badgeVariant(quotaOperation.state)}>
+                              {quotaOperation.operationType === "first_provision"
+                                ? "首次发放"
+                                : "Key 更换"}
+                              ：{quotaOperation.state}
+                            </Badge>
+                            <span className="field-description">
+                              {quotaOperation.lastErrorMessage ??
+                                "新 Key 只会在 completed 后受控展示一次。"}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card>
+                    <CardHeader>
+                      <CardTitle>可用端点</CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="endpoint-list">
+                        <Badge variant="success">GET /v1/models</Badge>
+                        <Badge variant="success">POST /v1/chat/completions</Badge>
+                        <Badge variant="success">POST /v1/responses</Badge>
+                        <Badge variant="success">POST /v1/messages</Badge>
+                      </div>
+                    </CardContent>
+                  </Card>
+                </section>
+              )}
+
+              {panel === "usage" && (
+                <div className="stack">
+                  <section className="grid">
+                    <Card>
+                      <CardHeader>
+                        <CardTitle>恢复可用额度</CardTitle>
+                        <CardDescription>
+                          {session?.adminScope?.type === "department"
+                            ? "部门管理员的个人恢复请求会发送给系统管理员；通过后仅补足低于授权线的差额。"
+                            : "提交后按组织审批链路发送；通过后仅补足低于授权线的差额，不返还已消费额度。"}
+                        </CardDescription>
+                      </CardHeader>
+                      <CardContent>
+                        <div className="field-group">
+                          <div className="field">
+                            <label htmlFor="quotaResetAmount">授权恢复线</label>
+                            <Input
+                              id="quotaResetAmount"
+                              value={String(defaultMonthlyQuota)}
+                              disabled
+                            />
+                            <span className="field-description">实际新增额度会受部门剩余预算约束。</span>
+                          </div>
+                          <div className="field">
+                            <label htmlFor="quotaResetReason">申请理由</label>
+                            <Textarea
+                              id="quotaResetReason"
+                              placeholder="请说明额度用尽原因、当前业务场景和预期恢复时间。"
+                              value={quotaResetReason}
+                              onChange={(event) => setQuotaResetReason(event.target.value)}
+                              disabled={busy}
+                            />
+                          </div>
+                          <Button
+                            variant="outline"
+                            disabled={busy || quotaResetReason.trim().length < 4}
+                            onClick={() => void requestQuotaReset()}
+                          >
+                            <RefreshCwIcon data-icon="inline-start" />
+                            申请恢复可用额度
+                          </Button>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  </section>
+
+                  <Card>
+                    <CardHeader>
+                      <div className="usage-section-header">
+                        <div>
+                          <CardTitle>用量分析</CardTitle>
+                        </div>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setUsageStatsExpanded((current) => !current)}
+                        >
+                          <BarChart3Icon data-icon="inline-start" />
+                          {usageStatsExpanded ? "收起" : "展开"}
+                        </Button>
+                      </div>
+                    </CardHeader>
+                    {usageStatsExpanded && (
+                      <CardContent>
+                        <div className="usage-analysis-grid usage-analysis-grid-user">
+                          <UsageAnalysisTable
+                            title="按模型分析"
+                            emptyText="暂无模型统计数据"
+                            rows={usageModelStats}
+                            terminalColumn="efficiency"
+                          />
+                          <UsageAnalysisTable
+                            title="按API格式分析"
+                            emptyText="暂无API格式统计数据"
+                            rows={usageApiFormatStats}
+                            terminalColumn="avgDuration"
+                          />
+                        </div>
+                      </CardContent>
+                    )}
+                  </Card>
+
+                  <Card>
+                    <CardHeader>
+                      <CardTitle>使用记录</CardTitle>
+                      <CardDescription>按 Aether 维度展示请求、tokens、额度消耗和首字/总耗时。</CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <UsageRecordsTable
+                        records={usageRecords}
+                        loading={usageLoading}
+                        showUser={false}
+                        showDepartment={false}
+                        showControls
+                        filters={usageFilters}
+                        onFiltersChange={setUsageFilters}
+                        availableModels={usageFilterOptions.models}
+                        availableApiFormats={usageFilterOptions.apiFormats}
+                        availableUserAgents={usageFilterOptions.userAgents}
+                        totalRecords={usageTotalRecords}
+                        currentPage={usagePage}
+                        pageSize={usagePageSize}
+                        onPageChange={setUsagePage}
+                        onPageSizeChange={setUsagePageSize}
+                        autoRefresh={usageAutoRefresh}
+                        onAutoRefreshChange={setUsageAutoRefresh}
+                        hideUnknownRecords={usageHideUnknownRecords}
+                        onHideUnknownRecordsChange={setUsageHideUnknownRecords}
+                        onRefresh={() => void loadUsageRecords()}
+                        emptyText="暂无个人使用记录"
+                      />
+                    </CardContent>
+                  </Card>
+                </div>
+              )}
+
+              {panel === "models" && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle>模型列表</CardTitle>
+                    <CardDescription>当前可用的模型ID</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="toolbar toolbar-left">
+                      <Button
+                        variant="outline"
+                        onClick={() => void loadModels()}
+                        disabled={modelsLoading}
+                      >
+                        <RefreshCwIcon data-icon="inline-start" />
+                        刷新模型
+                      </Button>
+                      <Badge variant={modelsLoaded ? "success" : "warning"}>
+                        {modelsLoading ? "读取中" : `${models.length} 个模型`}
+                      </Badge>
+                    </div>
+                    {models.length === 0 ? (
+                      <div className="empty">暂无模型</div>
+                    ) : (
+                      <div className="model-grid">
+                        {models.map((model) => (
+                          <div className="model-item" key={model.id}>
+                            <strong>{model.id}</strong>
+                            <span>{model.ownedBy ?? model.object ?? "model"}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              )}
+
+              {panel === "requests" && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle>申请记录</CardTitle>
+                    <CardDescription>
+                      {latestRequest
+                        ? `共 ${requests.length} 条申请，最近更新时间：${formatDateTime(latestRequest.updatedAt)}`
+                        : "当前用户暂无申请记录。"}
+                  </CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <RequestHistoryList requests={requests} />
+                  </CardContent>
+                </Card>
+              )}
+            </>
           )}
         </main>
       </div>

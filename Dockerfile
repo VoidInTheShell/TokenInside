@@ -3,9 +3,6 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
-FROM deps AS production-deps
-RUN npm prune --omit=dev
-
 FROM node:22-alpine AS builder
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
@@ -27,10 +24,11 @@ ENV PORT=16878
 RUN addgroup -S nodejs && adduser -S nextjs -G nodejs
 
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
-COPY --from=production-deps --chown=nextjs:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 COPY --from=builder --chown=nextjs:nodejs /app/scripts ./scripts
-COPY --from=builder --chown=nextjs:nodejs /app/lib ./lib
+COPY --from=builder --chown=nextjs:nodejs /app/lib/quota-migration.ts ./lib/quota-migration.ts
+COPY --from=builder --chown=nextjs:nodejs /app/lib/quota-model.ts ./lib/quota-model.ts
+COPY --from=builder --chown=nextjs:nodejs /app/lib/quota-risk.ts ./lib/quota-risk.ts
 
 RUN mkdir -p /app/.local-data && chown -R nextjs:nodejs /app/.local-data
 

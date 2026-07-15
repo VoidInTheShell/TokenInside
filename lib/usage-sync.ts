@@ -2,16 +2,18 @@ import { listNewApiUsageLogs } from "@/lib/newapi";
 import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
+import { fixedUsageSyncWindow, hongKongBillingPeriod } from "@/lib/quota-model";
 import { withPostgresAdvisoryLock } from "@/lib/postgres-store";
 import {
   backfillProxyLogsFromNewApiUsage,
   defaultUsageSyncPolicy,
   getAppSettings,
   getUsageSyncCheckpoint,
+  recordBillingOperation,
+  rebuildQuotaMaterializedSnapshots,
   saveUsageSyncCheckpoint,
   type NewApiUsageBackfillResult,
 } from "@/lib/store";
-import { allocateAuthoritativeUsageRecord } from "@/lib/billing/package-repository";
 
 type UsageSyncTrigger = "manual" | "auto";
 
@@ -170,131 +172,6 @@ export type NewApiProxyUsageSettlementResult = {
   backfill?: NewApiUsageBackfillResult;
 };
 
-type QueuedProxySettlement = {
-  proxyLogId: string;
-  newapiTokenId: string;
-  newapiRequestId?: string;
-  model?: string;
-  isStream?: boolean;
-  requestStartedAt: string;
-};
-
-const queuedProxySettlements = new Map<string, QueuedProxySettlement>();
-let queuedSettlementTimer: ReturnType<typeof setTimeout> | undefined;
-let queuedSettlementRunning = false;
-
-function scheduleQueuedSettlement(delayMs = 250) {
-  if (queuedSettlementTimer || queuedSettlementRunning || queuedProxySettlements.size === 0) return;
-  queuedSettlementTimer = setTimeout(() => {
-    queuedSettlementTimer = undefined;
-    void drainQueuedProxySettlements();
-  }, delayMs);
-  queuedSettlementTimer.unref?.();
-}
-
-export function queueNewApiUsageSettlement(input: QueuedProxySettlement) {
-  queuedProxySettlements.set(input.proxyLogId, input);
-  scheduleQueuedSettlement();
-}
-
-async function drainQueuedProxySettlements() {
-  if (queuedSettlementRunning || queuedProxySettlements.size === 0) return;
-  queuedSettlementRunning = true;
-  let retryDelayMs = 750;
-  try {
-    const pending = [...queuedProxySettlements.values()];
-    const tokenIds = new Set(pending.map((item) => item.newapiTokenId));
-    const earliestStartedAt = Math.min(
-      ...pending.map((item) => new Date(item.requestStartedAt).getTime()),
-    );
-    const startTimestamp = Number.isFinite(earliestStartedAt)
-      ? Math.floor((earliestStartedAt - 5_000) / 1000)
-      : undefined;
-    const maxPages = Math.min(Math.max(Math.ceil(pending.length / 100) + 2, 3), 20);
-    const usageLogs: NormalizedNewApiUsageLog[] = [];
-    for (let page = 0; page < maxPages; page += 1) {
-      const result = await listNewApiUsageLogs({ page, size: 100, startTimestamp });
-      usageLogs.push(...result.items.filter((item) => item.newapiTokenId && tokenIds.has(item.newapiTokenId)));
-      if (result.items.length < 100) break;
-    }
-    const uniqueLogs = uniqueUsageLogs(usageLogs);
-    if (uniqueLogs.length === 0) return;
-    const backfill = await backfillProxyLogsFromNewApiUsage(uniqueLogs, {
-      dryRun: false,
-      persistUnmatched: false,
-      targetProxyLogIds: pending.map((item) => item.proxyLogId),
-    });
-    await allocateMatchedPackageUsage(backfill);
-    for (const item of backfill.items) {
-      if (
-        item.proxyLogId &&
-        (item.action === "updated" || item.action === "matched_no_change")
-      ) {
-        queuedProxySettlements.delete(item.proxyLogId);
-      }
-    }
-    const unresolved = pending.filter((item) => queuedProxySettlements.has(item.proxyLogId));
-    for (const item of unresolved.slice(0, 20)) {
-      const targeted = await syncNewApiUsageForProxyRequest({
-        newapiRequestId: item.newapiRequestId,
-        proxyLogId: item.proxyLogId,
-        newapiTokenId: item.newapiTokenId,
-        model: item.model,
-        isStream: item.isStream,
-        requestStartedAt: item.requestStartedAt,
-        maxAttempts: 1,
-        pageSize: 100,
-      });
-      if (targeted.found > 0) queuedProxySettlements.delete(item.proxyLogId);
-    }
-  } catch (error) {
-    console.error(JSON.stringify({
-      event: "tokeninside.usage_settlement_queue_failed",
-      pending: queuedProxySettlements.size,
-      error: error instanceof Error ? error.message : "unknown error",
-    }));
-    retryDelayMs = 2_000;
-  } finally {
-    queuedSettlementRunning = false;
-    scheduleQueuedSettlement(retryDelayMs);
-  }
-}
-
-async function allocateMatchedPackageUsage(
-  backfill: NewApiUsageBackfillResult,
-  dryRun = false,
-) {
-  if (dryRun) return [];
-  const usageRecordIds = [
-    ...new Set(
-      backfill.items
-        .filter((item) => item.action === "updated" || item.action === "matched_no_change")
-        .map((item) => item.usageRecordId)
-        .filter((item): item is string => Boolean(item)),
-    ),
-  ];
-  const allocations = [];
-  for (const usageRecordId of usageRecordIds) {
-    allocations.push(await allocateAuthoritativeUsageRecord(usageRecordId));
-  }
-  return allocations;
-}
-
-function fixedUsageSyncWindow(input: {
-  runStartedAt: string;
-  settledThrough?: string;
-  overlapMinutes: number;
-  settlementLagMinutes: number;
-}) {
-  const runStartedMs = new Date(input.runStartedAt).getTime();
-  const scanEnd = new Date(runStartedMs - input.settlementLagMinutes * 60_000).toISOString();
-  const settledThroughMs = input.settledThrough
-    ? new Date(input.settledThrough).getTime()
-    : runStartedMs - 24 * 60 * 60 * 1000;
-  const scanStart = new Date(settledThroughMs - input.overlapMinutes * 60_000).toISOString();
-  return { scanStart, scanEnd };
-}
-
 export async function syncNewApiUsageForProxyRequest(input: {
   newapiRequestId?: string;
   proxyLogId?: string;
@@ -361,7 +238,6 @@ export async function syncNewApiUsageForProxyRequest(input: {
     });
     const matched = backfill.items.find((item) => item.proxyLogId === proxyLogId);
     if (!matched) continue;
-    await allocateMatchedPackageUsage(backfill);
     return {
       attempted: true,
       newapiRequestId,
@@ -501,7 +377,6 @@ async function syncNewApiUsageLogsUnlocked(input: {
         matchWindowMs: input.matchWindowMs,
         reservedProxyLogIds,
       });
-      await allocateMatchedPackageUsage(backfill, dryRun);
       for (const item of backfill.items) {
         if (item.proxyLogId && !reservedProxyLogIds.includes(item.proxyLogId)) {
           reservedProxyLogIds.push(item.proxyLogId);
@@ -580,6 +455,16 @@ async function syncNewApiUsageLogsUnlocked(input: {
           nextRunAfter,
         });
 
+    if (!dryRun) {
+      const affectedPeriods = new Set([
+        hongKongBillingPeriod(new Date(window.scanStart)),
+        hongKongBillingPeriod(new Date(window.scanEnd)),
+      ]);
+      for (const affectedPeriod of affectedPeriods) {
+        await rebuildQuotaMaterializedSnapshots(affectedPeriod);
+      }
+    }
+
     const result = {
       dryRun,
       pageStart,
@@ -603,8 +488,78 @@ async function syncNewApiUsageLogsUnlocked(input: {
         : undefined,
     };
 
+    if (input.operatedByFeishuUserId) {
+      await recordBillingOperation({
+        kind: "usage_sync",
+        status: dryRun ? "dry_run" : successfulStatus,
+        dryRun,
+        operatedByFeishuUserId: input.operatedByFeishuUserId,
+        input: {
+          page: pageStart,
+          size,
+          maxPages,
+          matchWindowMs: input.matchWindowMs,
+          overlapMinutes,
+          intervalMinutes,
+          settlementLagMinutes,
+          retryBaseMinutes,
+          runId,
+          scanStart: window.scanStart,
+          scanEnd: window.scanEnd,
+          trigger: input.trigger ?? "manual",
+        },
+        summary: {
+          pages: pages.length,
+          fetched: totals.fetched,
+          seen: totals.seen,
+          matched: totals.matched,
+          updated: totals.updated,
+          skippedUnknownToken: totals.skippedUnknownToken,
+          skippedNoMatch: totals.skippedNoMatch,
+          recordsUpserted: totals.recordsUpserted,
+          issuesUpserted: totals.issuesUpserted,
+          completedWindow,
+        },
+      });
+    }
+
     return result;
   } catch (err) {
+    if (input.operatedByFeishuUserId) {
+      await recordBillingOperation({
+        kind: "usage_sync",
+        status: statusFromError(pages.length),
+        dryRun,
+        operatedByFeishuUserId: input.operatedByFeishuUserId,
+        input: {
+          page: pageStart,
+          size,
+          maxPages,
+          matchWindowMs: input.matchWindowMs,
+          overlapMinutes,
+          intervalMinutes,
+          settlementLagMinutes,
+          retryBaseMinutes,
+          runId,
+          scanStart: window.scanStart,
+          scanEnd: window.scanEnd,
+          trigger: input.trigger ?? "manual",
+        },
+        summary: {
+          pages: pages.length,
+          fetched: totals.fetched,
+          seen: totals.seen,
+          matched: totals.matched,
+          updated: totals.updated,
+          skippedUnknownToken: totals.skippedUnknownToken,
+          skippedNoMatch: totals.skippedNoMatch,
+          recordsUpserted: totals.recordsUpserted,
+          issuesUpserted: totals.issuesUpserted,
+          failed: 1,
+        },
+        errorMessage: err instanceof Error ? err.message : "NewAPI usage sync failed",
+      });
+    }
     if (!dryRun) {
       const failedAt = nowIso();
       const failureCount = (previousCheckpoint?.failureCount ?? 0) + 1;

@@ -32,34 +32,6 @@ services:
         aliases:
           - postgres
 
-  redis:
-    image: redis:7-alpine
-    container_name: tokeninside-redis
-    restart: unless-stopped
-    command:
-      - redis-server
-      - --save
-      - ""
-      - --appendonly
-      - "no"
-      - --maxmemory
-      - "${TOKENINSIDE_REDIS_MAXMEMORY:-64mb}"
-      - --maxmemory-policy
-      - allkeys-lru
-    cpus: "${TOKENINSIDE_REDIS_CPUS:-0.15}"
-    mem_limit: "${TOKENINSIDE_REDIS_MEM_LIMIT:-128m}"
-    mem_reservation: "${TOKENINSIDE_REDIS_MEM_RESERVATION:-64m}"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
-      start_period: 5s
-    networks:
-      tokeninside_net:
-        aliases:
-          - redis
-
   tokeninside:
     image: ${TOKENINSIDE_IMAGE:-ghcr.io/voidintheshell/tokeninside:production}
     container_name: tokeninside
@@ -68,8 +40,6 @@ services:
       - ${TOKENINSIDE_ENV_FILE:-.env}
     depends_on:
       postgres:
-        condition: service_healthy
-      redis:
         condition: service_healthy
     expose:
       - "16878"

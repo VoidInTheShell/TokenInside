@@ -77,27 +77,6 @@ services:
       retries: 12
       start_period: 20s
 
-  redis:
-    image: redis:7-alpine
-    container_name: tokeninside-redis
-    restart: unless-stopped
-    command:
-      - redis-server
-      - --save
-      - ""
-      - --appendonly
-      - "no"
-      - --maxmemory
-      - "${TOKENINSIDE_REDIS_MAXMEMORY:-64mb}"
-      - --maxmemory-policy
-      - allkeys-lru
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
-      start_period: 5s
-
   tokeninside:
     image: ${TOKENINSIDE_IMAGE:-ghcr.io/voidintheshell/tokeninside:staging}
     container_name: tokeninside

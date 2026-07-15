@@ -7,7 +7,7 @@ import type { ProxyRequestLog, TokenAccount } from "../lib/types.ts";
 const account: TokenAccount = {
   id: "ta_test",
   feishuUserId: "fu_test",
-  sourceRequestId: "package-request-test",
+  tokenRequestId: "tr_test",
   newapiTokenId: "54",
   keyHash: "hash",
   status: "active",

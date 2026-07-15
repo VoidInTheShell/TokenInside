@@ -4,10 +4,8 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 import { getConfig } from "@/lib/config";
 import { proxyConcurrencySnapshot } from "@/lib/proxy-concurrency";
-import { checkPostgresSchema, postgresPoolSnapshot } from "@/lib/postgres-store";
+import { checkPostgresSchema } from "@/lib/postgres-store";
 import { ensureUsageSyncScheduler } from "@/lib/usage-sync";
-import { checkRedisConnection, redisRuntimeSnapshot } from "@/lib/redis-runtime";
-import { proxyPrincipalCacheSnapshot } from "@/lib/proxy-principal-cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -35,22 +33,9 @@ function configured(value: unknown) {
   return typeof value === "string" && value.length > 0;
 }
 
-export async function GET(request: Request) {
+export async function GET() {
   void ensureUsageSyncScheduler().catch(() => undefined);
   const config = getConfig();
-  const runtimeMetrics = {
-    timestamp: new Date().toISOString(),
-    proxyConcurrency: proxyConcurrencySnapshot(),
-    postgresPools:
-      config.storeBackend === "postgres" ? postgresPoolSnapshot() : undefined,
-    redis: redisRuntimeSnapshot(),
-    proxyPrincipalCache: proxyPrincipalCacheSnapshot(),
-  };
-  if (new URL(request.url).searchParams.get("scope") === "runtime") {
-    return NextResponse.json(runtimeMetrics, {
-      headers: { "Cache-Control": "no-store" },
-    });
-  }
   const postgresSchema =
     config.storeBackend === "postgres"
       ? await checkPostgresSchema().catch(() => ({
@@ -60,15 +45,13 @@ export async function GET(request: Request) {
           error: "connection_failed" as const,
         }))
       : undefined;
-  const redis = await checkRedisConnection();
   const storeWritable =
     config.storeBackend === "postgres"
       ? postgresSchema?.error !== "connection_failed"
       : await canWriteStoreDirectory(config.storePath);
   const storeReady =
     config.storeBackend === "postgres" ? storeWritable && postgresSchema?.ready : storeWritable;
-  const runtimeReady = storeReady && (!redis.required || redis.ready);
-  const status = runtimeReady ? "ok" : "degraded";
+  const status = storeReady ? "ok" : "degraded";
 
   return NextResponse.json(
     {
@@ -99,13 +82,12 @@ export async function GET(request: Request) {
                 connectionTimeoutMs: config.postgres.poolConnectionTimeoutMs,
               }
             : undefined,
-        proxyConcurrency: runtimeMetrics.proxyConcurrency,
-        postgresPoolRuntime: runtimeMetrics.postgresPools,
+        proxyConcurrency: proxyConcurrencySnapshot(),
       },
-      redis,
       configuration: {
         sessionSecret: configured(config.sessionSecret),
         feishuApp: configured(config.feishu.appId) && configured(config.feishu.appSecret),
+        approvalCode: configured(config.feishu.approvalCodeTokenRequest),
         approvalEventVerification: configured(config.feishu.eventVerificationToken),
         approvalEventEncryption: configured(config.feishu.eventEncryptKey),
         newapiControl:
@@ -117,16 +99,13 @@ export async function GET(request: Request) {
         newapiQuotaPerUnit: config.newapi.quotaPerUnit,
         newapiRequestTimeoutMs: config.newapi.requestTimeoutMs,
         proxyQueueTimeoutMs: config.proxy.queueTimeoutMs,
-        proxyQueueMax: config.proxy.queueMax,
-        proxyPreparationQueueMax: config.proxy.preparationQueueMax,
-        redisRequired: config.redis.required,
-        redisPrincipalTtlSeconds: config.redis.principalTtlSeconds,
         systemAdmins: config.admin.systemAdminOpenIds.length,
         environmentAdmins: config.admin.systemAdminOpenIds.length > 0,
+        monthlyResetEnabled: config.billing.monthlyResetEnabled,
       },
     },
     {
-      status: runtimeReady ? 200 : 503,
+      status: storeReady ? 200 : 503,
       headers: {
         "Cache-Control": "no-store",
       },

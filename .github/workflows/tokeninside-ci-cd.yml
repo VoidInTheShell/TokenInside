@@ -129,7 +129,7 @@ jobs:
           set -euo pipefail
           docker pull "$TOKENINSIDE_IMAGE"
           docker run --rm --entrypoint node "$TOKENINSIDE_IMAGE" --input-type=module \
-            -e "await import('pg'); await import('redis'); await import('./lib/billing/package-repository.ts'); await import('./lib/redis-runtime.ts'); await import('node:fs/promises').then(async ({ access }) => { await access('scripts/db-migrate.mjs'); await access('scripts/production-preflight.mjs'); })"
+            -e "await import('pg'); await import('./lib/quota-migration.ts'); await import('./lib/quota-risk.ts'); await import('node:fs/promises').then(({ access }) => access('scripts/db-migrate.mjs'))"
 
   deploy-staging:
     name: Deploy Staging
