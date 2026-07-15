@@ -44,7 +44,10 @@ import {
 } from "@/components/usage-analysis-tables";
 import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
 import { pendingApprovalRouteNotice } from "@/lib/department-quota";
-import { shouldRedirectToDefaultAdminPath } from "@/lib/auth-landing";
+import {
+  TOKEN_REQUEST_REFRESH_INTERVAL_MS,
+  tokenRequestsNeedAutoRefresh,
+} from "@/lib/token-request-refresh";
 import {
   tokenRequestAllowsQuotaEdit,
   tokenRequestRequiresAdminDecision,
@@ -324,24 +327,20 @@ export function ExperienceClient() {
   const [error, setError] = useState<string | null>(null);
   const [feishuSdkReady, setFeishuSdkReady] = useState(false);
   const [autoLoginAttempted, setAutoLoginAttempted] = useState(false);
+  const shouldAutoRefreshTokenRequests = Boolean(
+    session?.authenticated &&
+      !session.activeToken &&
+      tokenRequestsNeedAutoRefresh(session.requests),
+  );
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+  const refresh = useCallback(async (options: { quiet?: boolean } = {}) => {
+    if (!options.quiet) {
+      setLoading(true);
+      setError(null);
+    }
     try {
       const res = await fetch("/api/session", { cache: "no-store" });
       const data = (await res.json()) as SessionResponse;
-      if (
-        data.authenticated &&
-        shouldRedirectToDefaultAdminPath({
-          scope: data.adminScope ? { scopeType: data.adminScope.type } : null,
-          currentPath: window.location.pathname,
-          search: window.location.search,
-        })
-      ) {
-        window.location.replace("/admin");
-        return;
-      }
       setSession(data);
       const activeRouteNotice = pendingApprovalRouteNotice(
         data.requests?.[0],
@@ -363,9 +362,11 @@ export function ExperienceClient() {
         setModelsLoaded(false);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "读取会话失败");
+      if (!options.quiet) {
+        setError(err instanceof Error ? err.message : "读取会话失败");
+      }
     } finally {
-      setLoading(false);
+      if (!options.quiet) setLoading(false);
     }
   }, []);
 
@@ -482,6 +483,34 @@ export function ExperienceClient() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    if (!shouldAutoRefreshTokenRequests) return;
+
+    let refreshInFlight = false;
+    const refreshPendingRequest = async () => {
+      if (document.visibilityState === "hidden" || refreshInFlight) return;
+      refreshInFlight = true;
+      try {
+        await refresh({ quiet: true });
+      } finally {
+        refreshInFlight = false;
+      }
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") void refreshPendingRequest();
+    };
+    const timer = window.setInterval(
+      () => void refreshPendingRequest(),
+      TOKEN_REQUEST_REFRESH_INTERVAL_MS,
+    );
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [refresh, shouldAutoRefreshTokenRequests]);
 
   useEffect(() => {
     void loadQuickApprovals();
@@ -602,8 +631,8 @@ export function ExperienceClient() {
   const requests = useMemo(() => session?.requests ?? [], [session]);
   const latestRequest = requests[0];
   const hasActiveToken = Boolean(session?.activeToken);
-  const title = hasActiveToken ? "用户后台" : "Token 申请";
-  const defaultMonthlyQuota = session?.settings?.defaultMonthlyQuota ?? FALLBACK_MONTHLY_QUOTA;
+  const title = hasActiveToken ? "用户后台" : "套餐申请";
+  const effectiveGrantQuota = session?.settings?.defaultMonthlyQuota ?? FALLBACK_MONTHLY_QUOTA;
   const currentBillingPeriod = session?.billingPeriod ?? null;
   const currentBillingPeriodName =
     currentBillingPeriod?.period ?? session?.activeToken?.billingPeriod ?? "-";
@@ -1094,24 +1123,10 @@ export function ExperienceClient() {
             <>
               <Card>
                 <CardHeader>
-                  <CardTitle>申请 Token</CardTitle>
-                  <CardDescription>
-                    {latestRequest
-                      ? `最近状态：${statusLabel[latestRequest.status] ?? latestRequest.status}`
-                      : "确认默认申请额度后即可提交，申请理由可选。"}
-                  </CardDescription>
+                  <CardTitle>申请套餐</CardTitle>
                 </CardHeader>
                 <CardContent>
                   <div className="field-group">
-                    <div className="field">
-                      <label htmlFor="requestedMonthlyQuota">默认申请额度</label>
-                      <Input
-                        id="requestedMonthlyQuota"
-                        value={String(defaultMonthlyQuota)}
-                        disabled
-                      />
-                      <span className="field-description">当前 MVP 固定额度，用户不可修改。</span>
-                    </div>
                     <div className="field">
                       <label htmlFor="requestReason">申请理由（选填）</label>
                       <Textarea
@@ -1135,7 +1150,7 @@ export function ExperienceClient() {
                         disabled={!session?.authenticated || busy}
                       >
                         <SendIcon data-icon="inline-start" />
-                        申请 Token
+                        申请套餐
                       </Button>
                     </div>
                   </div>
@@ -1248,7 +1263,7 @@ export function ExperienceClient() {
                             <label htmlFor="quotaResetAmount">授权恢复线</label>
                             <Input
                               id="quotaResetAmount"
-                              value={String(defaultMonthlyQuota)}
+                              value={String(effectiveGrantQuota)}
                               disabled
                             />
                             <span className="field-description">实际新增额度会受部门剩余预算约束。</span>

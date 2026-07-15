@@ -1884,7 +1884,7 @@ export function AdminClient() {
                 {error && <div className="alert alert-danger">{error}</div>}
                 {message && <div className="alert">{message}</div>}
                 <div className="toolbar toolbar-left">
-                  <a className="button button-outline" href="/?view=user">
+                  <a className="button button-outline" href="/">
                     回到用户后台
                   </a>
                   {!data.authenticated && (
@@ -2028,7 +2028,7 @@ export function AdminClient() {
               <h2 className="page-title">TokenInside 管理后台</h2>
               <p className="page-description">用户、额度、管理员、统计和调用记录统一工作台。</p>
             </div>
-            <a className="button button-outline" href="/?view=user">
+            <a className="button button-outline" href="/">
               <ArrowLeftIcon data-icon="inline-start" />
               返回控制台
             </a>

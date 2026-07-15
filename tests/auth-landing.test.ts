@@ -3,18 +3,17 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   defaultPostLoginPath,
-  shouldRedirectToDefaultAdminPath,
 } from "../lib/auth-landing.ts";
 
-test("管理员角色登录后默认进入管理后台", () => {
+test("所有管理员角色登录后默认进入用户后台", () => {
   assert.equal(
     defaultPostLoginPath({ scopeType: "global", source: "environment", role: "root" }),
-    "/admin",
+    "/",
   );
-  assert.equal(defaultPostLoginPath({ scopeType: "global", source: "manual" }), "/admin");
+  assert.equal(defaultPostLoginPath({ scopeType: "global", source: "manual" }), "/");
   assert.equal(
     defaultPostLoginPath({ scopeType: "department", source: "department_supervisor" }),
-    "/admin",
+    "/",
   );
 });
 
@@ -22,20 +21,13 @@ test("普通用户登录后默认进入用户后台", () => {
   assert.equal(defaultPostLoginPath(null), "/");
 });
 
-test("已有 session 的管理员默认进入管理后台，但可显式返回用户后台", () => {
-  const scope = { scopeType: "global" as const, source: "manual" as const };
-  assert.equal(
-    shouldRedirectToDefaultAdminPath({ scope, currentPath: "/", search: "" }),
-    true,
+test("已有 session 的管理员留在用户后台", async () => {
+  const source = await readFile(
+    new URL("../components/experience-client.tsx", import.meta.url),
+    "utf8",
   );
-  assert.equal(
-    shouldRedirectToDefaultAdminPath({ scope, currentPath: "/", search: "?view=user" }),
-    false,
-  );
-  assert.equal(
-    shouldRedirectToDefaultAdminPath({ scope, currentPath: "/admin", search: "" }),
-    false,
-  );
+  assert.doesNotMatch(source, /shouldRedirectToDefaultAdminPath/);
+  assert.doesNotMatch(source, /location\.replace\(["']\/admin["']\)/);
 });
 
 test("session 查询不得创建申请或触发 Key 发放", async () => {
