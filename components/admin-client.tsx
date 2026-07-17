@@ -167,6 +167,13 @@ type AdminOverviewResponse = {
   };
   settings?: {
     defaultMonthlyQuota: number;
+    newapiControl?: {
+      baseUrl?: string;
+      controlUserId?: string;
+      accessTokenConfigured: boolean;
+      source: "system_settings" | "environment";
+      updatedAt?: string;
+    };
     usageSyncPolicy?: {
       enabled: boolean;
       intervalMinutes: number;
@@ -782,6 +789,11 @@ export function AdminClient() {
   const [panel, setPanel] = useState<AdminPanel>("overview");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [defaultQuotaDraft, setDefaultQuotaDraft] = useState("200");
+  const [newapiControlDraft, setNewapiControlDraft] = useState({
+    baseUrl: "",
+    controlUserId: "",
+    accessToken: "",
+  });
   const [usageSyncDraft, setUsageSyncDraft] = useState({
     page: "0",
     size: "100",
@@ -836,6 +848,14 @@ export function AdminClient() {
       setData(body);
       if (body.settings) {
         setDefaultQuotaDraft(String(body.settings.defaultMonthlyQuota));
+        if (body.settings.newapiControl) {
+          setNewapiControlDraft((current) => ({
+            ...current,
+            baseUrl: body.settings?.newapiControl?.baseUrl ?? "",
+            controlUserId: body.settings?.newapiControl?.controlUserId ?? "",
+            accessToken: "",
+          }));
+        }
         const policy = body.settings.usageSyncPolicy;
         if (policy) {
           setUsageSyncPolicyDraft({
@@ -1213,6 +1233,56 @@ export function AdminClient() {
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存默认额度失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveNewapiControl() {
+    const baseUrl = newapiControlDraft.baseUrl.trim().replace(/\/+$/, "");
+    const controlUserId = newapiControlDraft.controlUserId.trim();
+    if (!baseUrl || !controlUserId) {
+      setError("请填写完整的 NewAPI 链接和用户 ID");
+      return;
+    }
+    try {
+      new URL(baseUrl);
+    } catch {
+      setError("NewAPI 链接格式无效");
+      return;
+    }
+    if (
+      !newapiControlDraft.accessToken.trim() &&
+      data?.settings?.newapiControl?.source !== "system_settings"
+    ) {
+      setError("首次切换到系统设置时必须填写用户 AK");
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/admin/settings", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          newapiControl: {
+            baseUrl,
+            controlUserId,
+            ...(newapiControlDraft.accessToken.trim()
+              ? { accessToken: newapiControlDraft.accessToken.trim() }
+              : {}),
+          },
+        }),
+      });
+      const body = await readJsonResponse<{ error?: string }>(res);
+      if (!res.ok) throw new Error(body.error ?? "保存 NewAPI 上游连接失败");
+      setNewapiControlDraft((current) => ({ ...current, accessToken: "" }));
+      setMessage("NewAPI 上游连接已保存，新请求将使用新配置。");
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存 NewAPI 上游连接失败");
     } finally {
       setBusy(false);
     }
@@ -3472,6 +3542,75 @@ export function AdminClient() {
               </CardHeader>
               <CardContent>
                 {billingResult && <div className="alert">{billingResult}</div>}
+                {isRootAdmin && (
+                  <section className="settings-section">
+                    <div>
+                      <h3>NewAPI 上游连接</h3>
+                      <p>仅 root 可修改。保存后代理、Key 管理和用量同步会统一切换。</p>
+                    </div>
+                    <div className="field-group">
+                      <div className="field">
+                        <label htmlFor="newapiBaseUrl">上游 NewAPI 链接</label>
+                        <Input
+                          id="newapiBaseUrl"
+                          type="url"
+                          value={newapiControlDraft.baseUrl}
+                          placeholder="https://new-api.example.com"
+                          disabled={busy}
+                          onChange={(event) =>
+                            setNewapiControlDraft((current) => ({
+                              ...current,
+                              baseUrl: event.target.value,
+                            }))
+                          }
+                        />
+                      </div>
+                      <div className="field">
+                        <label htmlFor="newapiControlUserId">NewAPI 用户 ID</label>
+                        <Input
+                          id="newapiControlUserId"
+                          value={newapiControlDraft.controlUserId}
+                          placeholder="例如 33"
+                          disabled={busy}
+                          onChange={(event) =>
+                            setNewapiControlDraft((current) => ({
+                              ...current,
+                              controlUserId: event.target.value,
+                            }))
+                          }
+                        />
+                      </div>
+                      <div className="field">
+                        <label htmlFor="newapiAccessToken">NewAPI 用户 AK</label>
+                        <Input
+                          id="newapiAccessToken"
+                          type="password"
+                          autoComplete="new-password"
+                          value={newapiControlDraft.accessToken}
+                          placeholder={
+                            data?.settings?.newapiControl?.accessTokenConfigured
+                              ? "已配置；留空则保持不变"
+                              : "请输入用户 AK"
+                          }
+                          disabled={busy}
+                          onChange={(event) =>
+                            setNewapiControlDraft((current) => ({
+                              ...current,
+                              accessToken: event.target.value,
+                            }))
+                          }
+                        />
+                        <span className="field-description">
+                          AK 只会加密保存，管理接口不会回传明文。
+                        </span>
+                      </div>
+                      <Button disabled={busy} onClick={() => void saveNewapiControl()}>
+                        <SaveIcon data-icon="inline-start" />
+                        保存上游连接
+                      </Button>
+                    </div>
+                  </section>
+                )}
                 <section className="settings-section">
                   <div>
                     <h3>默认额度</h3>

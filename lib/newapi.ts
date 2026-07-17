@@ -1,5 +1,6 @@
 import { getConfig } from "@/lib/config";
 import { randomId } from "@/lib/crypto";
+import { getEffectiveNewApiConfig } from "@/lib/newapi-runtime";
 import {
   extractUsageFromNewApiOther,
   mergeUsageMetrics,
@@ -101,8 +102,7 @@ type NewApiModelsResponse = {
 
 type NewApiModelsEnvelope = NewApiModelsResponse | NewApiEnvelope<NewApiModel[]> | NewApiEnvelope<NewApiModelsResponse>;
 
-function getControlCredential() {
-  const { newapi } = getConfig();
+function getControlCredential(newapi: Awaited<ReturnType<typeof getEffectiveNewApiConfig>>) {
   return [newapi.accessToken, newapi.adminAccessToken, newapi.systemAk].find(
     (credential) => typeof credential === "string" && credential.length > 0,
   );
@@ -116,9 +116,11 @@ export function fromNewApiQuota(internalQuota: number) {
   return internalQuota / getConfig().newapi.quotaPerUnit;
 }
 
-function getNewApiHeaders(initHeaders?: HeadersInit) {
-  const { newapi } = getConfig();
-  const credential = getControlCredential();
+function getNewApiHeaders(
+  newapi: Awaited<ReturnType<typeof getEffectiveNewApiConfig>>,
+  initHeaders?: HeadersInit,
+) {
+  const credential = getControlCredential(newapi);
   if (!credential) {
     throw new Error("NEWAPI_ACCESS_TOKEN, NEWAPI_ADMIN_ACCESS_TOKEN or NEWAPI_SYSTEM_AK is required");
   }
@@ -144,11 +146,11 @@ function parseNewApiBody<T>(text: string, status: number) {
 }
 
 async function newApiFetch<T>(path: string, init: RequestInit = {}) {
-  const { newapi } = getConfig();
+  const newapi = await getEffectiveNewApiConfig();
   const timeoutSignal = AbortSignal.timeout(newapi.requestTimeoutMs);
   const res = await fetch(`${newapi.baseUrl}${path}`, {
     ...init,
-    headers: getNewApiHeaders(init.headers),
+    headers: getNewApiHeaders(newapi, init.headers),
     cache: "no-store",
     signal: init.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal,
   });
@@ -242,7 +244,7 @@ export async function createNewApiToken(input: {
   name: string;
   remainQuota: number;
 }) {
-  const { newapi } = getConfig();
+  const newapi = await getEffectiveNewApiConfig();
   if (newapi.mock) {
     const key = `sk-ti-${randomId("mock").replaceAll("_", "")}`;
     return {
@@ -296,7 +298,7 @@ async function mapWithConcurrency<T, R>(
 }
 
 export async function deleteNewApiTokens(newapiTokenIds: string[]) {
-  const { newapi } = getConfig();
+  const newapi = await getEffectiveNewApiConfig();
   if (newapiTokenIds.length === 0 || newapi.mock) return;
   const ids = newapiTokenIds.map(Number);
   if (ids.some((id) => !Number.isInteger(id))) {
@@ -316,7 +318,7 @@ export async function createPrewarmedNewApiTokens(input: {
   if (count < 1 || count > 100) {
     throw new Error("一次可预热的 NewAPI Key 数量必须在 1 到 100 之间");
   }
-  const { newapi } = getConfig();
+  const newapi = await getEffectiveNewApiConfig();
   const labelPrefix = (input.batchLabel ?? "department")
     .replace(/[^a-zA-Z0-9_-]/g, "")
     .slice(-10);
@@ -384,7 +386,7 @@ export async function createPrewarmedNewApiTokens(input: {
 }
 
 export async function getNewApiTokenKey(newapiTokenId: string) {
-  const { newapi } = getConfig();
+  const newapi = await getEffectiveNewApiConfig();
   if (newapi.mock) return `sk-ti-${newapiTokenId}`;
   const data = await newApiFetch<NewApiKeyResponse>(`/api/token/${newapiTokenId}/key`, {
     method: "POST",
@@ -393,14 +395,14 @@ export async function getNewApiTokenKey(newapiTokenId: string) {
 }
 
 export async function getNewApiTokenRemainQuota(newapiTokenId: string) {
-  const { newapi } = getConfig();
+  const newapi = await getEffectiveNewApiConfig();
   if (newapi.mock) return toNewApiQuota(200);
   const record = await getNewApiToken(newapiTokenId);
   return typeof record.remain_quota === "number" ? record.remain_quota : undefined;
 }
 
 export async function getNewApiTokenControlState(newapiTokenId: string) {
-  const { newapi } = getConfig();
+  const newapi = await getEffectiveNewApiConfig();
   if (newapi.mock) return { status: 1, remainQuota: toNewApiQuota(200) };
   const record = await getNewApiToken(newapiTokenId);
   return {
@@ -411,7 +413,7 @@ export async function getNewApiTokenControlState(newapiTokenId: string) {
 }
 
 export async function listModelsForNewApiToken(newapiTokenId: string) {
-  const { newapi } = getConfig();
+  const newapi = await getEffectiveNewApiConfig();
   if (newapi.mock) {
     return [
       { id: "gpt-4o-mini", object: "model", owned_by: "newapi" },
@@ -492,7 +494,7 @@ export async function listNewApiUsageLogs(input: {
   tokenName?: string;
   modelName?: string;
 } = {}): Promise<NewApiUsageLogPage> {
-  const { newapi } = getConfig();
+  const newapi = await getEffectiveNewApiConfig();
   const page = Math.max(input.page ?? 0, 0);
   const size = Math.min(Math.max(input.size ?? 100, 1), 100);
   if (newapi.mock) {
@@ -546,7 +548,7 @@ export async function listNewApiUsageLogs(input: {
 }
 
 async function setNewApiTokenStatus(newapiTokenId: string, status: 1 | 2) {
-  const { newapi } = getConfig();
+  const newapi = await getEffectiveNewApiConfig();
   if (newapi.mock) return;
   await newApiFetch<unknown>("/api/token/?status_only=true", {
     method: "PUT",
@@ -569,7 +571,7 @@ export async function updateNewApiTokenQuota(input: {
   newapiTokenId: string;
   remainQuota: number;
 }) {
-  const { newapi } = getConfig();
+  const newapi = await getEffectiveNewApiConfig();
   if (newapi.mock) return;
   const existing = await getNewApiToken(input.newapiTokenId);
   if (!existing.id) {
@@ -584,8 +586,8 @@ export async function updateNewApiTokenQuota(input: {
   });
 }
 
-export function buildNewApiProxyUrl(pathParts: string[], search: string) {
-  const { newapi } = getConfig();
+export async function buildNewApiProxyUrl(pathParts: string[], search: string) {
+  const newapi = await getEffectiveNewApiConfig();
   const safePath = pathParts.map(encodeURIComponent).join("/");
   return `${newapi.baseUrl}/v1/${safePath}${search}`;
 }

@@ -868,7 +868,7 @@ async function proxy(request: Request, context: RouteContext) {
   };
   const stopRequestHeartbeat = startProxyLeaseHeartbeat(proxyLog.id);
 
-  const upstreamUrl = buildNewApiProxyUrl(path, requestUrl.search);
+  const upstreamUrl = await buildNewApiProxyUrl(path, requestUrl.search);
   try {
     const retryConfig = getConfig().proxy;
     const upstreamResult = await fetchUpstreamWithRetry(

@@ -4,6 +4,7 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 import { billingPeriodFinalizationSnapshot } from "@/lib/billing-period-finalizer";
 import { getConfig } from "@/lib/config";
+import { getEffectiveNewApiConfig } from "@/lib/newapi-runtime";
 import { proxyConcurrencySnapshot } from "@/lib/proxy-concurrency";
 import { checkPostgresSchema, postgresPoolRuntimeSnapshot } from "@/lib/postgres-store";
 import { quotaOperationExecutionSnapshot } from "@/lib/quota-saga";
@@ -43,6 +44,7 @@ function configured(value: unknown) {
 export async function GET() {
   void ensureUsageSyncScheduler().catch(() => undefined);
   const config = getConfig();
+  const effectiveNewApi = await getEffectiveNewApiConfig();
   const postgresSchema =
     config.storeBackend === "postgres"
       ? await checkPostgresSchema().catch(() => ({
@@ -66,7 +68,7 @@ export async function GET() {
       status,
       timestamp: new Date().toISOString(),
       publicBaseUrlHost: hostFromUrl(config.publicBaseUrl),
-      newapiHost: hostFromUrl(config.newapi.baseUrl),
+      newapiHost: hostFromUrl(effectiveNewApi.baseUrl),
       store: {
         type: config.storeBackend,
         writable: storeWritable,
@@ -109,10 +111,10 @@ export async function GET() {
         approvalEventVerification: configured(config.feishu.eventVerificationToken),
         approvalEventEncryption: configured(config.feishu.eventEncryptKey),
         newapiControl:
-          configured(config.newapi.systemAk) ||
-          configured(config.newapi.accessToken) ||
-          configured(config.newapi.adminAccessToken),
-        newapiControlUserId: configured(config.newapi.controlUserId),
+          configured(effectiveNewApi.systemAk) ||
+          configured(effectiveNewApi.accessToken) ||
+          configured(effectiveNewApi.adminAccessToken),
+        newapiControlUserId: configured(effectiveNewApi.controlUserId),
         newapiMock: config.newapi.mock,
         newapiQuotaPerUnit: config.newapi.quotaPerUnit,
         newapiRequestTimeoutMs: config.newapi.requestTimeoutMs,

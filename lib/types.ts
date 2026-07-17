@@ -644,6 +644,13 @@ export type QuotaFeatureFlags = {
 
 export type AppSettings = {
   defaultMonthlyQuota: number;
+  newapiControl?: {
+    baseUrl?: string;
+    controlUserId?: string;
+    accessTokenCiphertext?: string;
+    updatedAt?: string;
+    updatedByFeishuUserId?: string;
+  };
   usageSyncPolicy?: UsageSyncPolicy;
   quotaFeatureFlags?: QuotaFeatureFlags;
   quotaMigration?: {

@@ -918,6 +918,7 @@ export async function enqueueBillingOperation(input: {
 
 export async function updateAppSettings(input: {
   defaultMonthlyQuota?: number;
+  newapiControl?: StoreShape["settings"]["newapiControl"];
   usageSyncPolicy?: Partial<UsageSyncPolicy>;
   quotaFeatureFlags?: Partial<QuotaFeatureFlags>;
   updatedByFeishuUserId: string;
@@ -955,6 +956,7 @@ export async function updateAppSettings(input: {
       store.settings = {
         ...store.settings,
         defaultMonthlyQuota: nextDefaultMonthlyQuota,
+        newapiControl: input.newapiControl ?? store.settings.newapiControl,
         usageSyncPolicy: nextUsageSyncPolicy,
         quotaFeatureFlags: nextQuotaFeatureFlags,
         updatedAt: nowIso(),
@@ -970,12 +972,14 @@ export async function updateAppSettings(input: {
           defaultMonthlyQuota: nextDefaultMonthlyQuota,
           usageSyncPolicyUpdated: Boolean(input.usageSyncPolicy),
           quotaFeatureFlagsUpdated: Boolean(input.quotaFeatureFlags),
+          newapiControlUpdated: Boolean(input.newapiControl),
         },
         summary: {
           previousDefaultMonthlyQuota,
           defaultMonthlyQuota: nextDefaultMonthlyQuota,
           usageSyncPolicyUpdated: Boolean(input.usageSyncPolicy),
           quotaFeatureFlagsUpdated: Boolean(input.quotaFeatureFlags),
+          newapiControlUpdated: Boolean(input.newapiControl),
         },
       });
       Object.assign(settings, store.settings);
@@ -1007,6 +1011,7 @@ export async function updateAppSettings(input: {
     store.settings = {
       ...store.settings,
       defaultMonthlyQuota: nextDefaultMonthlyQuota,
+      newapiControl: input.newapiControl ?? store.settings.newapiControl,
       usageSyncPolicy: nextUsageSyncPolicy,
       quotaFeatureFlags: nextQuotaFeatureFlags,
       updatedAt: nowIso(),
@@ -1022,12 +1027,14 @@ export async function updateAppSettings(input: {
         defaultMonthlyQuota: nextDefaultMonthlyQuota,
         usageSyncPolicyUpdated: Boolean(input.usageSyncPolicy),
         quotaFeatureFlagsUpdated: Boolean(input.quotaFeatureFlags),
+        newapiControlUpdated: Boolean(input.newapiControl),
       },
       summary: {
         previousDefaultMonthlyQuota,
         defaultMonthlyQuota: nextDefaultMonthlyQuota,
         usageSyncPolicyUpdated: Boolean(input.usageSyncPolicy),
         quotaFeatureFlagsUpdated: Boolean(input.quotaFeatureFlags),
+        newapiControlUpdated: Boolean(input.newapiControl),
       },
     });
     return store.settings;

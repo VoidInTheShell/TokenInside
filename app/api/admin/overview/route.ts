@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getEffectiveAdminScopeForUser, hydrateUserDepartment } from "@/lib/admin-sync";
+import { getConfig } from "@/lib/config";
 import { getCurrentUser } from "@/lib/session";
 import { getAdminOverview, getAdminOverviewMetadata } from "@/lib/store";
 import { ensureUsageSyncScheduler } from "@/lib/usage-sync";
@@ -18,8 +19,27 @@ function settingsForScope<
   settings: T,
   scope: Awaited<ReturnType<typeof getEffectiveAdminScopeForUser>>,
 ) {
-  if (scope?.scopeType === "global") return settings;
-  const { billingOperations: _billingOperations, ...visibleSettings } = settings;
+  const { newapiControl, ...settingsWithoutSecret } = settings;
+  const fallback = getConfig().newapi;
+  const withRootNewApi = scope?.role === "root"
+    ? {
+        ...settingsWithoutSecret,
+        newapiControl: {
+          baseUrl: newapiControl?.baseUrl ?? fallback.baseUrl,
+          controlUserId: newapiControl?.controlUserId ?? fallback.controlUserId,
+          accessTokenConfigured: Boolean(
+            newapiControl?.accessTokenCiphertext ||
+              fallback.accessToken ||
+              fallback.adminAccessToken ||
+              fallback.systemAk,
+          ),
+          source: newapiControl ? "system_settings" : "environment",
+          updatedAt: newapiControl?.updatedAt,
+        },
+      }
+    : settingsWithoutSecret;
+  if (scope?.scopeType === "global") return withRootNewApi;
+  const { billingOperations: _billingOperations, ...visibleSettings } = withRootNewApi;
   return visibleSettings;
 }
 

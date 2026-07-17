@@ -64,12 +64,14 @@ export async function GET(request: Request) {
     .filter((item) => visibleUserIds.has(item.feishuUserId) && item.period === period)
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     .slice(0, 100);
+  const settings = await getAppSettings();
+  const { newapiControl: _newapiControl, ...visibleSettings } = settings;
   return NextResponse.json({
     report,
     operations,
     ledgerEntries,
     reconciliationRecords,
-    settings: await getAppSettings(),
+    settings: visibleSettings,
     quotaPerUnit: getConfig().newapi.quotaPerUnit,
   });
 }
