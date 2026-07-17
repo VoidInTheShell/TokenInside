@@ -20,6 +20,15 @@ export class StaleTokenGenerationError extends Error {
   }
 }
 
+export class QuotaOperationBusyError extends Error {
+  readonly code = "quota_operation_busy";
+
+  constructor() {
+    super("额度操作锁正在切换，请稍后重试");
+    this.name = "QuotaOperationBusyError";
+  }
+}
+
 export function assertQuotaAdmission(state: UserQuotaState, account: TokenAccount) {
   if (state.admission !== "open") throw new QuotaAdmissionClosedError(state);
   const accountGeneration = account.operationGeneration ?? 0;

@@ -11,7 +11,7 @@ import {
   findQuotaOperationByIdempotencyKey,
   getActiveTokenForUser,
   getEffectiveUserGrantQuota,
-  updateTokenRequest,
+  updateTokenRequestForQuotaOperation,
 } from "@/lib/store";
 import { enqueueKeyRotation, runQuotaOperation } from "@/lib/quota-saga";
 
@@ -73,7 +73,7 @@ export async function POST(request: Request) {
         createdByOpenId: user.openId,
       });
     } catch (error) {
-      await updateTokenRequest(tokenRequest.id, {
+      await updateTokenRequestForQuotaOperation(tokenRequest.id, {
         status: "approved_provision_failed",
         errorMessage: error instanceof Error ? error.message : "Key 更换操作创建失败",
       });

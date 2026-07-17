@@ -7,6 +7,12 @@ export type UpstreamRetryOptions = {
   signal?: AbortSignal;
 };
 
+export function upstreamMaxAttemptsForMethod(method: string, configuredMaxAttempts: number) {
+  const normalized = method.trim().toUpperCase();
+  if (normalized !== "GET" && normalized !== "HEAD") return 1;
+  return Math.max(1, Math.trunc(configuredMaxAttempts));
+}
+
 function abortError() {
   return new DOMException("The request was aborted", "AbortError");
 }

@@ -16,7 +16,7 @@ test("auto refresh stays active while a package request can still progress", () 
   ]) {
     assert.equal(tokenRequestsNeedAutoRefresh([{ status }]), true, status);
   }
-  assert.equal(TOKEN_REQUEST_REFRESH_INTERVAL_MS, 3000);
+  assert.equal(TOKEN_REQUEST_REFRESH_INTERVAL_MS, 1000);
 });
 
 test("auto refresh stops for terminal or failed package requests", () => {

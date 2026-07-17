@@ -6,7 +6,7 @@ const AUTO_REFRESH_REQUEST_STATUSES = new Set([
   "approved_provisioning",
 ]);
 
-export const TOKEN_REQUEST_REFRESH_INTERVAL_MS = 3000;
+export const TOKEN_REQUEST_REFRESH_INTERVAL_MS = 1000;
 
 export function tokenRequestsNeedAutoRefresh(requests: Array<{ status: string }>) {
   return requests.some((request) => AUTO_REFRESH_REQUEST_STATUSES.has(request.status));

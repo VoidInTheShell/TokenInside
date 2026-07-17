@@ -178,6 +178,7 @@ const DEFAULT_REASON_PLACEHOLDER = "请说明使用场景、接入工具和预�
 const FALLBACK_MONTHLY_QUOTA = 200;
 const RECENT_APPROVAL_WINDOW_MS = 24 * 60 * 60 * 1000;
 const RECENT_APPROVAL_LIMIT = 500;
+const QUOTA_OPERATION_POLL_INTERVAL_MS = 500;
 
 const statusLabel: Record<string, string> = {
   pending_card_send: "发送审批卡片中",
@@ -592,7 +593,7 @@ export function ExperienceClient() {
           setError(body.operation.lastErrorMessage ?? "Key 更换需要管理员人工处置");
           return;
         }
-        timer = window.setTimeout(poll, 1500);
+        timer = window.setTimeout(poll, QUOTA_OPERATION_POLL_INTERVAL_MS);
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : "读取额度操作失败");
       }

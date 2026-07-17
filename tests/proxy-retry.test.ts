@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { fetchUpstreamWithRetry } from "../lib/proxy-retry.ts";
+import {
+  fetchUpstreamWithRetry,
+  upstreamMaxAttemptsForMethod,
+} from "../lib/proxy-retry.ts";
 
 const zeroDelay = { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1 };
 
@@ -32,4 +35,11 @@ test("upstream retry never retries a non-retryable client error", async () => {
   assert.equal(result.response.status, 400);
   assert.equal(result.attempts, 1);
   assert.equal(calls, 1);
+});
+
+test("non-idempotent proxy methods never perform automatic upstream retries", () => {
+  assert.equal(upstreamMaxAttemptsForMethod("POST", 3), 1);
+  assert.equal(upstreamMaxAttemptsForMethod("PATCH", 3), 1);
+  assert.equal(upstreamMaxAttemptsForMethod("GET", 3), 3);
+  assert.equal(upstreamMaxAttemptsForMethod("HEAD", 2), 2);
 });

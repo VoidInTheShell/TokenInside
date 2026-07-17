@@ -30,22 +30,27 @@ import {
 import { openQuotaCredential, sealQuotaCredential } from "@/lib/secret-box";
 import {
   addTokenAccount,
+  addTokenAccountForQuotaOperation,
   appendQuotaLedgerEntry,
   claimQuotaOperationExecution,
   createQuotaOperation,
   createMonthlyOpenQuotaOperations,
   createUserQuotaPolicyVersion,
-  finalizeTokenRotation,
+  finalizeTokenRotationForQuotaOperation,
   findQuotaOperationById,
   finalizeTokenProvision,
   getActiveTokenForUser,
   getEffectiveUserQuotaPolicy,
-  getStoreSnapshot,
+  getUserById,
   getUserBillingPeriod,
   getUserQuotaState,
   listInflightProxyRequests,
+  listInflightProxyRequestsForQuotaOperation,
   listQuotaOperations,
-  rebuildQuotaMaterializedSnapshots,
+  listTokenAccountsForUser,
+  rebuildUserQuotaMaterializedSnapshot,
+  rebuildUserQuotaMaterializedSnapshotForQuotaOperation,
+  refreshUserBillingTokenMetadataForQuotaOperation,
   releaseQuotaOperationExecution,
   renewQuotaOperationExecution,
   reserveQuotaOperationDepartmentBudget,
@@ -53,7 +58,9 @@ import {
   transitionQuotaOperation,
   updateQuotaOperation,
   updateTokenAccount,
+  updateTokenAccountForQuotaOperation,
   updateTokenRequest,
+  updateTokenRequestForQuotaOperation,
   withUserQuotaOperationLock,
 } from "@/lib/store";
 import {
@@ -71,6 +78,27 @@ const maxAttempts = 5;
 const retryDelayMs = 2_000;
 let workerStarted = false;
 let workerTimer: ReturnType<typeof setTimeout> | undefined;
+let activeQuotaOperations = 0;
+const quotaOperationWaiters: Array<() => void> = [];
+
+async function acquireQuotaOperationSlot() {
+  if (
+    activeQuotaOperations >= getConfig().billing.operationConcurrencyMax ||
+    quotaOperationWaiters.length > 0
+  ) {
+    await new Promise<void>((resolve) => quotaOperationWaiters.push(resolve));
+  } else {
+    activeQuotaOperations += 1;
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = quotaOperationWaiters.shift();
+    if (next) next();
+    else activeQuotaOperations = Math.max(activeQuotaOperations - 1, 0);
+  };
+}
 
 function addMilliseconds(value: string, milliseconds: number) {
   return new Date(new Date(value).getTime() + milliseconds).toISOString();
@@ -98,6 +126,65 @@ async function assignedQuotaForUser(feishuUserId: string, period: string) {
   if (policy) return policy.assignedMonthlyQuota;
   const billing = await getUserBillingPeriod(feishuUserId, period);
   return toNewApiQuota(billing?.monthlyQuota ?? 0);
+}
+
+function usesIsolatedQuotaControlPool(operation: QuotaOperation) {
+  return operation.operationType === "quota_restore" || operation.operationType === "key_rotation";
+}
+
+function updateOperationTokenAccount(
+  operation: QuotaOperation,
+  accountId: string,
+  patch: Partial<TokenAccount>,
+  allowedStatuses?: TokenAccount["status"][],
+) {
+  const update = usesIsolatedQuotaControlPool(operation)
+    ? updateTokenAccountForQuotaOperation
+    : updateTokenAccount;
+  return update(accountId, patch, allowedStatuses);
+}
+
+function updateOperationTokenRequest(
+  operation: QuotaOperation,
+  requestId: string,
+  patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
+) {
+  const update = usesIsolatedQuotaControlPool(operation)
+    ? updateTokenRequestForQuotaOperation
+    : updateTokenRequest;
+  return update(requestId, patch);
+}
+
+function listOperationInflightProxyRequests(
+  operation: QuotaOperation,
+  operationGeneration: number,
+) {
+  const list = usesIsolatedQuotaControlPool(operation)
+    ? listInflightProxyRequestsForQuotaOperation
+    : listInflightProxyRequests;
+  return list(operation.feishuUserId, operationGeneration);
+}
+
+function rebuildOperationQuotaSnapshot(operation: QuotaOperation) {
+  const rebuild = usesIsolatedQuotaControlPool(operation)
+    ? rebuildUserQuotaMaterializedSnapshotForQuotaOperation
+    : rebuildUserQuotaMaterializedSnapshot;
+  return rebuild(
+    operation.feishuUserId,
+    operation.billingPeriod,
+    operation.operationType === "key_rotation" ? undefined : operation.departmentId,
+  );
+}
+
+async function clearCommittedDepartmentReservation(operation: QuotaOperation) {
+  if ((operation.reservedDepartmentQuota ?? 0) <= 0) return operation;
+  return (
+    (await updateQuotaOperation(
+      operation.id,
+      { reservedDepartmentQuota: 0 },
+      [operation.state],
+    )) ?? operation
+  );
 }
 
 async function reopenAdmission(operation: QuotaOperation) {
@@ -146,7 +233,8 @@ async function prepareAndDrain(
     if (!current) throw new Error("额度操作关闭准入失败");
 
     if (drainingAccount && drainingAccount.status === "active") {
-      await updateTokenAccount(
+      await updateOperationTokenAccount(
+        current,
         drainingAccount.id,
         { status: "draining", drainStartedAt: nowIso() },
         ["active"],
@@ -171,10 +259,7 @@ async function prepareAndDrain(
           (await updateQuotaOperation(current.id, { evidence }, [current.state])) ?? current;
       }
     }
-    const inflight = await listInflightProxyRequests(
-      current.feishuUserId,
-      state.activeGeneration,
-    );
+    const inflight = await listOperationInflightProxyRequests(current, state.activeGeneration);
     if (inflight.length > 0) {
       if (current.state === "admission_closed" || current.state === "upstream_frozen") {
         current = await transitionQuotaOperation(current.id, "draining", {
@@ -283,7 +368,7 @@ async function finalizeCommon(
 ) {
   let current = (await findQuotaOperationById(operation.id)) ?? operation;
   if (account) {
-    await updateTokenAccount(account.id, {
+    await updateOperationTokenAccount(current, account.id, {
       ...accountPatch,
       operationGeneration: current.operationGeneration,
     });
@@ -301,9 +386,10 @@ async function finalizeCommon(
   if (current.state === "local_finalized") {
     current = (await transitionQuotaOperation(current.id, "reconciling")) ?? current;
   }
-  await rebuildQuotaMaterializedSnapshots(current.billingPeriod);
+  current = await clearCommittedDepartmentReservation(current);
+  await rebuildOperationQuotaSnapshot(current);
   if (current.requestId) {
-    await updateTokenRequest(current.requestId, {
+    await updateOperationTokenRequest(current, current.requestId, {
       status: "provisioned",
       tokenAccountId: account?.id,
       errorMessage: undefined,
@@ -468,8 +554,8 @@ async function handleQuotaRestore(operation: QuotaOperation) {
 
 async function firstProvisionAccount(operation: QuotaOperation) {
   if (!operation.tokenAccountIdAfter) return null;
-  const store = await getStoreSnapshot();
-  return store.tokenAccounts.find((item) => item.id === operation.tokenAccountIdAfter) ?? null;
+  const accounts = await listTokenAccountsForUser(operation.feishuUserId);
+  return accounts.find((item) => item.id === operation.tokenAccountIdAfter) ?? null;
 }
 
 async function finalizeFirstProvision(
@@ -513,9 +599,10 @@ async function finalizeFirstProvision(
   if (current.state === "local_finalized") {
     current = (await transitionQuotaOperation(current.id, "reconciling")) ?? current;
   }
-  await rebuildQuotaMaterializedSnapshots(current.billingPeriod);
+  current = await clearCommittedDepartmentReservation(current);
+  await rebuildOperationQuotaSnapshot(current);
   if (current.requestId) {
-    await updateTokenRequest(current.requestId, {
+    await updateOperationTokenRequest(current, current.requestId, {
       status: "provisioned",
       tokenAccountId: account.id,
       errorMessage: undefined,
@@ -555,7 +642,7 @@ async function handleFirstProvision(operation: QuotaOperation) {
     );
   }
   if (current.targetRemainQuota === undefined) {
-    await rebuildQuotaMaterializedSnapshots(current.billingPeriod);
+    await rebuildOperationQuotaSnapshot(current);
     const period = await getUserBillingPeriod(
       current.feishuUserId,
       current.billingPeriod,
@@ -639,9 +726,9 @@ async function handleFirstProvision(operation: QuotaOperation) {
   if (!key) throw new Error("NewAPI 未返回首次发放 Key 明文");
 
   if (!account) {
-    const store = await getStoreSnapshot();
+    const accounts = await listTokenAccountsForUser(current.feishuUserId);
     account =
-      store.tokenAccounts.find(
+      accounts.find(
         (item) =>
           item.feishuUserId === current.feishuUserId &&
           item.newapiTokenId === upstreamTokenIdAfter,
@@ -695,14 +782,14 @@ async function handleFirstProvision(operation: QuotaOperation) {
 }
 
 async function accountBeforeRotation(operation: QuotaOperation) {
-  const store = await getStoreSnapshot();
+  const accounts = await listTokenAccountsForUser(operation.feishuUserId);
   if (!operation.tokenAccountIdBefore) {
     return (
-      store.tokenAccounts.find(
+      accounts.find(
         (item) =>
           item.feishuUserId === operation.feishuUserId && item.status === "active",
       ) ??
-      [...store.tokenAccounts]
+      [...accounts]
         .filter(
           (item) =>
             item.feishuUserId === operation.feishuUserId &&
@@ -712,7 +799,7 @@ async function accountBeforeRotation(operation: QuotaOperation) {
       null
     );
   }
-  return store.tokenAccounts.find((item) => item.id === operation.tokenAccountIdBefore) ?? null;
+  return accounts.find((item) => item.id === operation.tokenAccountIdBefore) ?? null;
 }
 
 async function quarantineUnexpectedRotationAccounts(
@@ -720,8 +807,8 @@ async function quarantineUnexpectedRotationAccounts(
   oldAccount: TokenAccount,
 ) {
   if (!operation.requestId) return operation;
-  const store = await getStoreSnapshot();
-  const candidates = store.tokenAccounts.filter(
+  const accounts = await listTokenAccountsForUser(operation.feishuUserId);
+  const candidates = accounts.filter(
     (account) =>
       account.feishuUserId === operation.feishuUserId &&
       account.id !== oldAccount.id &&
@@ -732,7 +819,8 @@ async function quarantineUnexpectedRotationAccounts(
   if (!candidates.length) return operation;
   for (const account of candidates) {
     if (account.newapiTokenId) await disableNewApiToken(account.newapiTokenId);
-    await updateTokenAccount(
+    await updateOperationTokenAccount(
+      operation,
       account.id,
       { status: "orphaned", disabledAt: nowIso() },
       ["pending_activation", "active", "draining", "settling"],
@@ -751,6 +839,7 @@ async function quarantineUnexpectedRotationAccounts(
 
 async function handleKeyRotation(operation: QuotaOperation) {
   let current = operation;
+  let materializedPreDrainSnapshot = false;
   let oldAccount = await accountBeforeRotation(current);
   if (!oldAccount?.newapiTokenId) throw new Error("当前用户没有可轮换的 active NewAPI key");
   if (!current.tokenAccountIdBefore || !current.upstreamTokenIdBefore) {
@@ -766,13 +855,13 @@ async function handleKeyRotation(operation: QuotaOperation) {
     current.state === "local_finalized" ||
     current.state === "reconciling"
   ) {
-    const store = await getStoreSnapshot();
+    const accounts = await listTokenAccountsForUser(current.feishuUserId);
     const newAccount = current.tokenAccountIdAfter
-      ? store.tokenAccounts.find((item) => item.id === current.tokenAccountIdAfter)
+      ? accounts.find((item) => item.id === current.tokenAccountIdAfter)
       : undefined;
     if (!newAccount) throw new Error("Key 轮换恢复时找不到新 TokenAccount");
     if (current.state === "upstream_activated") {
-      await finalizeTokenRotation({
+      await finalizeTokenRotationForQuotaOperation({
         feishuUserId: current.feishuUserId,
         oldTokenAccountId: oldAccount.id,
         newTokenAccountId: newAccount.id,
@@ -785,9 +874,10 @@ async function handleKeyRotation(operation: QuotaOperation) {
     if (current.state === "local_finalized") {
       current = (await transitionQuotaOperation(current.id, "reconciling")) ?? current;
     }
-    await rebuildQuotaMaterializedSnapshots(current.billingPeriod);
+    current = await clearCommittedDepartmentReservation(current);
+    await rebuildOperationQuotaSnapshot(current);
     if (current.requestId) {
-      await updateTokenRequest(current.requestId, {
+      await updateOperationTokenRequest(current, current.requestId, {
         status: "provisioned",
         tokenAccountId: newAccount.id,
         errorMessage: undefined,
@@ -807,7 +897,8 @@ async function handleKeyRotation(operation: QuotaOperation) {
   if (!oldAccount?.newapiTokenId) throw new Error("轮换前旧 Key 记录丢失");
   if (current.targetRemainQuota === undefined) {
     const observation = await conservativeRemainQuotaAfterDrain(oldAccount.newapiTokenId);
-    await rebuildQuotaMaterializedSnapshots(current.billingPeriod);
+    await rebuildOperationQuotaSnapshot(current);
+    materializedPreDrainSnapshot = true;
     const billingPeriod = await getUserBillingPeriod(
       current.feishuUserId,
       current.billingPeriod,
@@ -870,16 +961,16 @@ async function handleKeyRotation(operation: QuotaOperation) {
   if (!key) key = await getNewApiTokenKey(upstreamTokenIdAfter);
   if (!key) throw new Error("NewAPI 未返回可恢复的新 Key 明文");
 
-  const store = await getStoreSnapshot();
+  const accounts = await listTokenAccountsForUser(current.feishuUserId);
   let newAccount = current.tokenAccountIdAfter
-    ? store.tokenAccounts.find((item) => item.id === current.tokenAccountIdAfter)
-    : store.tokenAccounts.find(
+    ? accounts.find((item) => item.id === current.tokenAccountIdAfter)
+    : accounts.find(
         (item) =>
           item.feishuUserId === current.feishuUserId &&
           item.newapiTokenId === upstreamTokenIdAfter,
       );
   if (!newAccount) {
-    newAccount = await addTokenAccount({
+    newAccount = await addTokenAccountForQuotaOperation({
       feishuUserId: current.feishuUserId,
       tokenRequestId: current.requestId ?? current.id,
       newapiTokenId: upstreamTokenIdAfter,
@@ -928,7 +1019,7 @@ async function handleKeyRotation(operation: QuotaOperation) {
   }
   current =
     (await transitionQuotaOperation(current.id, "upstream_activated")) ?? current;
-  const finalized = await finalizeTokenRotation({
+  const finalized = await finalizeTokenRotationForQuotaOperation({
     feishuUserId: current.feishuUserId,
     oldTokenAccountId: oldAccount.id,
     newTokenAccountId: newAccount.id,
@@ -938,9 +1029,21 @@ async function handleKeyRotation(operation: QuotaOperation) {
   current =
     (await transitionQuotaOperation(current.id, "local_finalized")) ?? current;
   current = (await transitionQuotaOperation(current.id, "reconciling")) ?? current;
-  await rebuildQuotaMaterializedSnapshots(current.billingPeriod);
+  current = await clearCommittedDepartmentReservation(current);
+  if (materializedPreDrainSnapshot) {
+    // The normal uninterrupted rotation path made an authoritative snapshot
+    // after drain and key rotation itself adds no usage or ledger rows. Refresh
+    // only token metadata here; retries/recovery retain the full rebuild below.
+    const refreshed = await refreshUserBillingTokenMetadataForQuotaOperation(
+      current.feishuUserId,
+      current.billingPeriod,
+    );
+    if (!refreshed) await rebuildOperationQuotaSnapshot(current);
+  } else {
+    await rebuildOperationQuotaSnapshot(current);
+  }
   if (current.requestId) {
-    await updateTokenRequest(current.requestId, {
+    await updateOperationTokenRequest(current, current.requestId, {
       status: "provisioned",
       tokenAccountId: finalized.newAccount.id,
       errorMessage: undefined,
@@ -970,7 +1073,7 @@ async function handleMonthlyOpen(operation: QuotaOperation) {
   const prepared = await prepareAndDrain(current);
   if (!prepared.ready) return prepared.operation;
   current = prepared.operation;
-  await rebuildQuotaMaterializedSnapshots(current.billingPeriod);
+  await rebuildOperationQuotaSnapshot(current);
   const newPeriod = await getUserBillingPeriod(
     current.feishuUserId,
     current.billingPeriod,
@@ -1080,7 +1183,8 @@ async function compensateKeyRotationBeforeUpstream(
     }
   }
   if (oldAccount && ["draining", "settling"].includes(oldAccount.status)) {
-    await updateTokenAccount(
+    await updateOperationTokenAccount(
+      operation,
       oldAccount.id,
       { status: "active", drainStartedAt: undefined },
       ["draining", "settling"],
@@ -1113,7 +1217,7 @@ async function markOperationFailure(operationId: string, error: unknown) {
   const compensated = await compensateKeyRotationBeforeUpstream(current, message);
   if (compensated) {
     if (current.requestId) {
-      await updateTokenRequest(current.requestId, {
+      await updateOperationTokenRequest(current, current.requestId, {
         status: "approved_provision_failed",
         errorMessage: message,
       }).catch(() => undefined);
@@ -1147,7 +1251,7 @@ async function markOperationFailure(operationId: string, error: unknown) {
     }),
   );
   if (current.requestId) {
-    await updateTokenRequest(current.requestId, {
+    await updateOperationTokenRequest(current, current.requestId, {
       status: "approved_provision_failed",
       errorMessage: message,
     }).catch(() => undefined);
@@ -1166,7 +1270,7 @@ export function canResumeBudgetBlockedOperation(operation: QuotaOperation) {
   );
 }
 
-export async function runQuotaOperation(operationId: string) {
+async function runQuotaOperationInner(operationId: string) {
   const leaseId = randomId("qow");
   const leaseMilliseconds = 2 * 60_000;
   const claimed = await claimQuotaOperationExecution({
@@ -1185,7 +1289,6 @@ export async function runQuotaOperation(operationId: string) {
   leaseTimer.unref?.();
   let operation = claimed;
   try {
-    operation = (await findQuotaOperationById(operationId)) ?? claimed;
     if (operation.state === "completed" || operation.state === "compensated") {
       return operation;
     }
@@ -1245,6 +1348,15 @@ export async function runQuotaOperation(operationId: string) {
   } finally {
     clearInterval(leaseTimer);
     await releaseQuotaOperationExecution({ operationId, leaseId }).catch(() => undefined);
+  }
+}
+
+export async function runQuotaOperation(operationId: string) {
+  const release = await acquireQuotaOperationSlot();
+  try {
+    return await runQuotaOperationInner(operationId);
+  } finally {
+    release();
   }
 }
 
@@ -1347,8 +1459,7 @@ export async function enqueueQuotaAdjustment(input: {
 
 export async function enqueueQuotaRestoreForRequest(request: TokenRequest) {
   await assertQuotaWriteActionEnabled("quota_restore");
-  const store = await getStoreSnapshot();
-  const user = store.users.find((item) => item.id === request.feishuUserId);
+  const user = await getUserById(request.feishuUserId);
   const operation = await createQuotaOperation({
     operationType: "quota_restore",
     idempotencyKey: `quota-operation:${request.id}`,
@@ -1454,6 +1565,16 @@ export async function takeQuotaOperationCredential(
   operationId: string,
   feishuUserId: string,
 ) {
+  const candidate = await findQuotaOperationById(operationId);
+  if (
+    !candidate ||
+    candidate.feishuUserId !== feishuUserId ||
+    candidate.state !== "completed" ||
+    !candidate.credentialCiphertext ||
+    candidate.credentialDeliveredAt
+  ) {
+    return null;
+  }
   return withUserQuotaOperationLock(feishuUserId, async () => {
     const operation = await findQuotaOperationById(operationId);
     if (!operation || operation.feishuUserId !== feishuUserId) return null;

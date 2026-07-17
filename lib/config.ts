@@ -8,6 +8,7 @@ export type RuntimeConfig = {
   databaseUrl?: string;
   postgres: {
     poolMax: number;
+    controlPoolMax: number;
     lockPoolMax: number;
     poolIdleTimeoutMs: number;
     poolConnectionTimeoutMs: number;
@@ -17,6 +18,7 @@ export type RuntimeConfig = {
     queueTimeoutMs: number;
     preparationMaxConcurrency: number;
     preparationQueueTimeoutMs: number;
+    persistenceMaxConcurrency: number;
     upstreamMaxAttempts: number;
     upstreamRetryBaseMs: number;
     upstreamRetryMaxDelayMs: number;
@@ -44,6 +46,8 @@ export type RuntimeConfig = {
   };
   billing: {
     monthlyResetEnabled: boolean;
+    operationConcurrencyMax: number;
+    settlementConcurrencyMax: number;
   };
 };
 
@@ -88,6 +92,7 @@ export function getConfig(): RuntimeConfig {
     databaseUrl: process.env.DATABASE_URL,
     postgres: {
       poolMax: positiveIntegerFromEnv(process.env.DATABASE_POOL_MAX, 10),
+      controlPoolMax: positiveIntegerFromEnv(process.env.DATABASE_CONTROL_POOL_MAX, 4),
       lockPoolMax: positiveIntegerFromEnv(process.env.DATABASE_LOCK_POOL_MAX, 10),
       poolIdleTimeoutMs: positiveIntegerFromEnv(
         process.env.DATABASE_POOL_IDLE_TIMEOUT_MS,
@@ -114,6 +119,10 @@ export function getConfig(): RuntimeConfig {
       preparationQueueTimeoutMs: positiveIntegerFromEnv(
         process.env.TOKENINSIDE_PROXY_PREPARATION_QUEUE_TIMEOUT_MS,
         30000,
+      ),
+      persistenceMaxConcurrency: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_PROXY_PERSISTENCE_CONCURRENCY_MAX,
+        8,
       ),
       upstreamMaxAttempts: positiveIntegerFromEnv(
         process.env.TOKENINSIDE_PROXY_UPSTREAM_MAX_ATTEMPTS,
@@ -157,6 +166,14 @@ export function getConfig(): RuntimeConfig {
     },
     billing: {
       monthlyResetEnabled: process.env.TOKENINSIDE_MONTHLY_RESET_ENABLED === "true",
+      operationConcurrencyMax: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_QUOTA_OPERATION_CONCURRENCY_MAX,
+        4,
+      ),
+      settlementConcurrencyMax: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_USAGE_SETTLEMENT_CONCURRENCY_MAX,
+        16,
+      ),
     },
   };
 }

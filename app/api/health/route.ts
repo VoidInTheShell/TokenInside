@@ -75,8 +75,9 @@ export async function GET() {
             : undefined,
         postgresPool:
           config.storeBackend === "postgres"
-            ? {
+              ? {
                 max: config.postgres.poolMax,
+                controlMax: config.postgres.controlPoolMax,
                 lockMax: config.postgres.lockPoolMax,
                 idleTimeoutMs: config.postgres.poolIdleTimeoutMs,
                 connectionTimeoutMs: config.postgres.poolConnectionTimeoutMs,

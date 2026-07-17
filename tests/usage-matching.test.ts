@@ -175,6 +175,85 @@ test("keeps an already settled request matched when list queries renumber the lo
   assert.equal(matched?.id, settled.id);
 });
 
+test("does not fall back to a settled proxy when the usage request identity conflicts", () => {
+  const settled = proxy({
+    id: "pl_terminal",
+    newapiResponseRequestId: "terminal-request-id",
+    newapiRequestId: "terminal-request-id",
+    newapiLogId: "terminal-log-id",
+    usageSource: "newapi_log",
+  });
+  const matched = findProxyLogForNewApiUsage({
+    proxyLogs: [settled],
+    usageLog: usage({
+      newapiLogId: "retry-log-id",
+      newapiRequestId: "discarded-retry-request-id",
+    }),
+    account,
+    matchWindowMs: 30_000,
+  });
+
+  assert.equal(matched, undefined);
+});
+
+test("matches a cancelled delivery only by the exact successful NewAPI response identity", () => {
+  const cancelled = proxy({
+    id: "pl_cancelled_billed",
+    status: "cancelled",
+    statusCode: 499,
+    upstreamStatusCode: 200,
+    newapiResponseRequestId: "newapi-log-request-id",
+    usageSource: "missing",
+    promptTokens: undefined,
+    completionTokens: undefined,
+    totalTokens: undefined,
+  });
+  const matched = findProxyLogForNewApiUsage({
+    proxyLogs: [cancelled],
+    usageLog: usage({ newapiRequestId: "newapi-log-request-id" }),
+    account,
+    matchWindowMs: 30_000,
+  });
+
+  assert.equal(matched?.id, cancelled.id);
+});
+
+test("never time-or-token matches a cancelled delivery without an exact NewAPI identity", () => {
+  const cancelled = proxy({
+    id: "pl_cancelled_ambiguous",
+    status: "cancelled",
+    statusCode: 499,
+    upstreamStatusCode: 200,
+    newapiResponseRequestId: undefined,
+  });
+  const matched = findProxyLogForNewApiUsage({
+    proxyLogs: [cancelled],
+    usageLog: usage({ newapiRequestId: "some-other-request" }),
+    account,
+    matchWindowMs: 30_000,
+  });
+
+  assert.equal(matched, undefined);
+});
+
+test("does not recover a failed delivery when NewAPI itself returned an error", () => {
+  const failed = proxy({
+    id: "pl_upstream_failed",
+    status: "failed",
+    statusCode: 502,
+    upstreamStatusCode: 502,
+    newapiResponseRequestId: "newapi-log-request-id",
+  });
+  const matched = findProxyLogForNewApiUsage({
+    proxyLogs: [failed],
+    usageLog: usage({ newapiRequestId: "newapi-log-request-id" }),
+    account,
+    matchWindowMs: 30_000,
+  });
+
+  assert.equal(matched, undefined);
+});
+
 test("reconciles the seven-log production shape one-to-one and leaves the direct call unmatched", () => {
   const proxyLogs = [
     proxy({

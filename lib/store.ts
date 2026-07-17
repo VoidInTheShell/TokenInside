@@ -4,12 +4,13 @@ import { tokenRequestInAdminScope } from "@/lib/admin-scope";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
 import { isAtOrAfterIsoTimestamp } from "@/lib/iso-time";
+import { createRerunSingleFlight } from "@/lib/rerun-single-flight";
 import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
 import {
   sameNewApiUsageSource,
   stableNewApiUsageRecordId,
 } from "@/lib/newapi-usage-identity";
-import { findProxyLogForNewApiUsage } from "@/lib/usage-matching";
+import { findProxyLogForNewApiUsage, isBillableProxyLog } from "@/lib/usage-matching";
 import { isUsageRecordRequest } from "@/lib/usage-record-visibility";
 import { normalizedInputTokensTotal } from "@/lib/usage-metrics";
 import { assertQuotaAdmission } from "@/lib/quota-admission";
@@ -32,37 +33,63 @@ import {
 import {
   enablePostgresUserAccess,
   claimPostgresQuotaOperationExecution,
+  beginPostgresQuotaAwareProxyRequest,
   createPostgresMonthlyOpenOperations,
   createPostgresQuotaOperation,
+  findPostgresQuotaOperationById,
+  findPostgresQuotaOperationByIdempotencyKey,
   findPostgresActiveTokenByHash,
   finalizePostgresTokenProvision,
   finalizePostgresTokenRotation,
+  finalizePostgresTokenRotationForQuotaOperation,
   getPostgresDisabledTokenForUser,
   getPostgresActiveTokenForUser,
+  getPostgresActiveAdminScopeForUser,
   getPostgresAppSettings,
+  getPostgresAppSettingsForQuotaOperation,
   getPostgresFeishuEventByUuid,
+  getPostgresEffectiveUserQuotaPolicy,
+  getPostgresTokenRequestById,
+  getPostgresUserBillingPeriod,
   getPostgresUserById,
   getPostgresUserQuotaState,
+  insertPostgresQuotaAwareProxyLog,
   insertPostgresProxyLog,
   insertPostgresQuotaLedgerEntry,
   insertPostgresTokenAccount,
+  insertPostgresTokenAccountForQuotaOperation,
   insertPostgresTokenRequest,
   insertPostgresDepartmentQuotaRequest,
   invalidatePostgresOpenFirstApplyRequests,
+  listPostgresInflightProxyRequests,
+  listPostgresInflightProxyRequestsForQuotaOperation,
+  listPostgresQuotaOperations,
+  listPostgresTokenAccountsForUser,
   mutatePostgresAppSettings,
   recordPostgresMonthlyResetApplied,
+  rebuildPostgresDepartmentQuotaMaterializedSnapshot,
+  rebuildPostgresDepartmentQuotaMaterializedSnapshotForQuotaOperation,
+  rebuildPostgresQuotaMaterializedUsers,
   replacePostgresActiveTokenAccount,
   readPostgresStore,
   readPostgresUsageMatchingSnapshot,
+  reconcilePostgresBillingPeriodForUser,
+  reconcilePostgresBillingPeriodForQuotaOperation,
+  refreshPostgresBillingPeriodTokenMetadataForQuotaOperation,
   releasePostgresQuotaOperationExecution,
   renewPostgresQuotaOperationExecution,
+  reservePostgresQuotaOperationDepartmentBudget,
   revokePostgresAdminScopesForUser,
+  settlePostgresMatchedNewApiUsage,
   syncPostgresDepartmentSupervisorAdminScope,
+  transitionPostgresQuotaOperation,
   transitionPostgresTokenRequest,
   updatePostgresManualAdminScope,
   updatePostgresProxyLog,
   updatePostgresTokenRequest,
+  updatePostgresTokenRequestForQuotaOperation,
   updatePostgresTokenAccount,
+  updatePostgresTokenAccountForQuotaOperation,
   updatePostgresDepartmentQuotaRequest,
   updatePostgresUserAccessStatus,
   updatePostgresQuotaOperation,
@@ -91,7 +118,9 @@ import type {
   FeishuUser,
   NewApiUsageMatchStatus,
   NewApiUsageRecord,
+  ProxyAdmissionLogInput,
   ProxyRequestLog,
+  ProxyRequestAdmissionResult,
   QuotaChangeEvent,
   QuotaFeatureFlags,
   QuotaLedgerEntry,
@@ -113,12 +142,15 @@ import type {
 
 export function defaultUsageSyncPolicy(): UsageSyncPolicy {
   return {
-    enabled: false,
-    intervalMinutes: 60,
+    // Authoritative NewAPI usage is the recovery source for process restarts,
+    // delayed control-plane logs and downstream cancellations. New installs
+    // must not silently run without that durable repair loop.
+    enabled: true,
+    intervalMinutes: 5,
     pageSize: 100,
     maxPagesPerRun: 3,
     overlapMinutes: 120,
-    settlementLagMinutes: 5,
+    settlementLagMinutes: 1,
     matchWindowMinutes: 30,
     retryBaseMinutes: 5,
   };
@@ -562,14 +594,18 @@ function syncBillingPeriods(store: StoreShape) {
 
   const proxyLogIdsBackedByNewApiRecords = new Set<string>();
   for (const record of store.newapiUsageRecords) {
+    if (record.matchStatus !== "matched") continue;
     if (record.matchedProxyLogId) {
       proxyLogIdsBackedByNewApiRecords.add(record.matchedProxyLogId);
     }
     if (!record.feishuUserId) continue;
-    if (record.matchStatus === "unknown_token" || record.matchStatus === "malformed_log") continue;
     const quotaConsumed = usageRecordQuotaConsumed(record);
     const period = usageRecordPeriod(record);
     const summary = ensure(record.feishuUserId, period);
+    summary.promptTokens += record.promptTokens ?? 0;
+    summary.completionTokens += record.completionTokens ?? 0;
+    summary.totalTokens +=
+      record.totalTokens ?? (record.promptTokens ?? 0) + (record.completionTokens ?? 0);
     summary.quotaConsumed += quotaConsumed;
     summary.cost += quotaConsumed;
     summary.usageRecordCount += 1;
@@ -583,16 +619,18 @@ function syncBillingPeriods(store: StoreShape) {
 
   for (const log of store.proxyRequestLogs) {
     if (!log.feishuUserId) continue;
+    if (!isBillableProxyLog(log)) continue;
     const period = resolveUsageBillingPeriod({
       billingPeriod: log.billingPeriod,
       occurredAt: log.createdAt,
     });
     const summary = ensure(log.feishuUserId, period);
-    summary.promptTokens += log.promptTokens ?? 0;
-    summary.completionTokens += log.completionTokens ?? 0;
-    summary.totalTokens += log.totalTokens ?? 0;
     summary.proxyLogCount += 1;
     if (!proxyLogIdsBackedByNewApiRecords.has(log.id)) {
+      summary.promptTokens += log.promptTokens ?? 0;
+      summary.completionTokens += log.completionTokens ?? 0;
+      summary.totalTokens +=
+        log.totalTokens ?? (log.promptTokens ?? 0) + (log.completionTokens ?? 0);
       const quotaConsumed = proxyLogQuotaConsumed(log);
       if (quotaConsumed || log.cost !== undefined || log.quota !== undefined) {
         summary.quotaConsumed += quotaConsumed;
@@ -696,6 +734,19 @@ export async function getAppSettings() {
   }
   const store = await readStore();
   return store.settings;
+}
+
+export async function getAppSettingsForQuotaOperation() {
+  if (isPostgresBackend()) {
+    const settings = await getPostgresAppSettingsForQuotaOperation();
+    return {
+      ...settings,
+      usageSyncPolicy: normalizeUsageSyncPolicy(settings.usageSyncPolicy),
+      quotaFeatureFlags: normalizeQuotaFeatureFlags(settings.quotaFeatureFlags),
+      billingOperations: settings.billingOperations ?? [],
+    };
+  }
+  return getAppSettings();
 }
 
 function prependBillingOperation(
@@ -1072,6 +1123,14 @@ export async function updateTokenRequest(
   });
 }
 
+export async function updateTokenRequestForQuotaOperation(
+  id: string,
+  patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
+) {
+  if (isPostgresBackend()) return updatePostgresTokenRequestForQuotaOperation(id, patch);
+  return updateTokenRequest(id, patch);
+}
+
 export async function transitionTokenRequestStatus(
   id: string,
   patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
@@ -1137,6 +1196,7 @@ export async function findTokenRequestByInstance(instanceCode: string) {
 }
 
 export async function findTokenRequestById(id: string) {
+  if (isPostgresBackend()) return getPostgresTokenRequestById(id);
   const store = await readStore();
   return store.tokenRequests.find((request) => request.id === id) ?? null;
 }
@@ -1171,6 +1231,14 @@ export async function getDisabledTokenForUser(feishuUserId: string) {
   );
 }
 
+export async function listTokenAccountsForUser(feishuUserId: string) {
+  if (isPostgresBackend()) {
+    return listPostgresTokenAccountsForUser(feishuUserId);
+  }
+  const store = await readStore();
+  return store.tokenAccounts.filter((account) => account.feishuUserId === feishuUserId);
+}
+
 export async function listActiveTokenAccounts() {
   const store = await readStore();
   const usersById = new Map(store.users.map((user) => [user.id, user]));
@@ -1183,6 +1251,9 @@ export async function listActiveTokenAccounts() {
 }
 
 export async function getUserBillingPeriod(feishuUserId: string, period: string) {
+  if (isPostgresBackend()) {
+    return getPostgresUserBillingPeriod(feishuUserId, period);
+  }
   const store = await readStore();
   return (
     store.userBillingPeriods.find(
@@ -1240,6 +1311,17 @@ export async function updateTokenAccount(
   });
 }
 
+export async function updateTokenAccountForQuotaOperation(
+  accountId: string,
+  patch: Partial<TokenAccount>,
+  allowedStatuses?: TokenStatus[],
+) {
+  if (isPostgresBackend()) {
+    return updatePostgresTokenAccountForQuotaOperation(accountId, patch, allowedStatuses);
+  }
+  return updateTokenAccount(accountId, patch, allowedStatuses);
+}
+
 export function withUserQuotaOperationLock<T>(
   feishuUserId: string,
   fn: () => Promise<T>,
@@ -1258,6 +1340,9 @@ export async function getEffectiveUserQuotaPolicy(
   feishuUserId: string,
   period = currentQuotaPeriod(),
 ) {
+  if (isPostgresBackend()) {
+    return getPostgresEffectiveUserQuotaPolicy(feishuUserId, period);
+  }
   const store = await readStore();
   return (
     store.userQuotaPolicies
@@ -1533,11 +1618,15 @@ export async function createMonthlyOpenQuotaOperations(
 }
 
 export async function findQuotaOperationById(operationId: string) {
+  if (isPostgresBackend()) return findPostgresQuotaOperationById(operationId);
   const store = await readStore();
   return store.quotaOperations.find((item) => item.id === operationId) ?? null;
 }
 
 export async function findQuotaOperationByIdempotencyKey(idempotencyKey: string) {
+  if (isPostgresBackend()) {
+    return findPostgresQuotaOperationByIdempotencyKey(idempotencyKey);
+  }
   const store = await readStore();
   return store.quotaOperations.find((item) => item.idempotencyKey === idempotencyKey) ?? null;
 }
@@ -1618,6 +1707,9 @@ export async function transitionQuotaOperation(
   state: QuotaOperation["state"],
   patch: Partial<QuotaOperation> = {},
 ) {
+  if (isPostgresBackend()) {
+    return transitionPostgresQuotaOperation(operationId, state, patch);
+  }
   const current = await findQuotaOperationById(operationId);
   if (!current) return null;
   assertQuotaOperationTransition(current.state, state);
@@ -1641,6 +1733,12 @@ export async function reserveQuotaOperationDepartmentBudget(
   if (!initial) throw new Error("额度操作不存在");
   if (reservedDepartmentQuota <= 0) return initial;
   if (!initial.departmentId) throw new Error("额度操作缺少部门，无法预占部门预算");
+  if (isPostgresBackend()) {
+    return reservePostgresQuotaOperationDepartmentBudget(
+      operationId,
+      reservedDepartmentQuota,
+    );
+  }
   return withDepartmentQuotaLock(
     initial.departmentId,
     initial.billingPeriod,
@@ -1693,6 +1791,7 @@ export async function listQuotaOperations(input: {
   state?: QuotaOperation["state"];
   limit?: number;
 } = {}) {
+  if (isPostgresBackend()) return listPostgresQuotaOperations(input);
   const store = await readStore();
   return store.quotaOperations
     .filter(
@@ -1765,11 +1864,82 @@ function authoritativeQuotaFromRecord(record: NewApiUsageRecord, quotaPerUnit: n
   return 0;
 }
 
-export async function rebuildQuotaMaterializedSnapshots(
+async function rebuildDepartmentQuotaMaterializedSnapshots(
+  period: string,
+  quotaPerUnit: number,
+  materializedAt: string,
+) {
+  const refreshed = await readStore();
+  const departmentRows: DepartmentQuotaPeriod[] = [];
+  for (const existing of refreshed.departmentQuotaPeriods.filter((item) => item.period === period)) {
+    const departmentUserIds = new Set(
+      refreshed.users
+        .filter((item) => item.departmentId === existing.departmentId && item.status !== "deleted")
+        .map((item) => item.id),
+    );
+    const committedAuthorizedQuota = refreshed.quotaLedgerEntries
+      .filter(
+        (item) =>
+          item.period === period &&
+          (item.departmentId === existing.departmentId || departmentUserIds.has(item.feishuUserId)),
+      )
+      .reduce((sum, item) => sum + item.signedQuota, 0);
+    const pendingReservedQuota = refreshed.quotaOperations
+      .filter(
+        (item) =>
+          item.departmentId === existing.departmentId &&
+          item.billingPeriod === period &&
+          item.state !== "completed" &&
+          item.state !== "compensated",
+      )
+      .reduce((sum, item) => sum + Math.max(item.reservedDepartmentQuota, 0), 0);
+    const materialized = materializeDepartmentQuota({
+      budgetQuota: Math.max(Math.round(existing.quotaLimit * quotaPerUnit), 0),
+      committedAuthorizedQuota: Math.max(committedAuthorizedQuota, 0),
+      pendingReservedQuota,
+    });
+    const row: DepartmentQuotaPeriod = {
+      ...existing,
+      ...materialized,
+      materializedAt,
+      updatedAt: existing.updatedAt,
+    };
+    departmentRows.push(row);
+    await persistDepartmentQuotaPeriod(row);
+  }
+  return departmentRows;
+}
+
+async function rebuildQuotaMaterializedSnapshotsNow(
   period = hongKongBillingPeriod(),
 ) {
-  const store = await readStore();
   const quotaPerUnit = getConfig().newapi.quotaPerUnit;
+  if (isPostgresBackend()) {
+    // PostgreSQL must never persist UserBillingPeriod objects computed from the
+    // lock-free readStore snapshot. Each user row is rebuilt from base tables
+    // inside the same billing-period-finalize transaction fence as settlement.
+    const rebuilt = await rebuildPostgresQuotaMaterializedUsers(period);
+    const departmentRows = await rebuildDepartmentQuotaMaterializedSnapshots(
+      period,
+      quotaPerUnit,
+      rebuilt.materializedAt,
+    );
+    return {
+      period,
+      materializedAt: rebuilt.materializedAt,
+      users: rebuilt.users,
+      departments: departmentRows.map((item) => ({
+        departmentId: item.departmentId,
+        budgetQuota: item.budgetQuota ?? 0,
+        committedAuthorizedQuota: item.committedAuthorizedQuota ?? 0,
+        pendingReservedQuota: item.pendingReservedQuota ?? 0,
+        availableQuota: item.availableQuota ?? 0,
+        overcommittedQuota: item.overcommittedQuota ?? 0,
+      })),
+    };
+  }
+
+  const store = await readStore();
   const ledgerAuthoritative = Boolean(store.settings.quotaMigration?.appliedAt);
   const now = nowIso();
   const userRows: UserBillingPeriod[] = [];
@@ -1817,8 +1987,7 @@ export async function rebuildQuotaMaterializedSnapshots(
       (item) =>
         item.feishuUserId === feishuUserId &&
         quotaRecordPeriod(item) === period &&
-        item.matchStatus !== "unknown_token" &&
-        item.matchStatus !== "malformed_log",
+        item.matchStatus === "matched",
     );
     const assignedMonthlyQuota = policy?.assignedMonthlyQuota ??
       (ledgerAuthoritative
@@ -1884,45 +2053,11 @@ export async function rebuildQuotaMaterializedSnapshots(
   }
 
   for (const row of userRows) await persistUserBillingPeriod(row);
-
-  const refreshed = await readStore();
-  const departmentRows: DepartmentQuotaPeriod[] = [];
-  for (const existing of refreshed.departmentQuotaPeriods.filter((item) => item.period === period)) {
-    const departmentUserIds = new Set(
-      refreshed.users
-        .filter((item) => item.departmentId === existing.departmentId && item.status !== "deleted")
-        .map((item) => item.id),
-    );
-    const committedAuthorizedQuota = refreshed.quotaLedgerEntries
-      .filter(
-        (item) =>
-          item.period === period &&
-          (item.departmentId === existing.departmentId || departmentUserIds.has(item.feishuUserId)),
-      )
-      .reduce((sum, item) => sum + item.signedQuota, 0);
-    const pendingReservedQuota = refreshed.quotaOperations
-      .filter(
-        (item) =>
-          item.departmentId === existing.departmentId &&
-          item.billingPeriod === period &&
-          item.state !== "completed" &&
-          item.state !== "compensated",
-      )
-      .reduce((sum, item) => sum + Math.max(item.reservedDepartmentQuota, 0), 0);
-    const materialized = materializeDepartmentQuota({
-      budgetQuota: Math.max(Math.round(existing.quotaLimit * quotaPerUnit), 0),
-      committedAuthorizedQuota: Math.max(committedAuthorizedQuota, 0),
-      pendingReservedQuota,
-    });
-    const row: DepartmentQuotaPeriod = {
-      ...existing,
-      ...materialized,
-      materializedAt: now,
-      updatedAt: existing.updatedAt,
-    };
-    departmentRows.push(row);
-    await persistDepartmentQuotaPeriod(row);
-  }
+  const departmentRows = await rebuildDepartmentQuotaMaterializedSnapshots(
+    period,
+    quotaPerUnit,
+    now,
+  );
 
   return {
     period,
@@ -1937,6 +2072,106 @@ export async function rebuildQuotaMaterializedSnapshots(
       overcommittedQuota: item.overcommittedQuota ?? 0,
     })),
   };
+}
+
+type QuotaMaterializationResult = Awaited<
+  ReturnType<typeof rebuildQuotaMaterializedSnapshotsNow>
+>;
+
+type QuotaMaterializationRun = {
+  rerun: boolean;
+  promise: Promise<QuotaMaterializationResult>;
+};
+
+const quotaMaterializationRuns = new Map<string, QuotaMaterializationRun>();
+
+export function rebuildQuotaMaterializedSnapshots(period = hongKongBillingPeriod()) {
+  const existing = quotaMaterializationRuns.get(period);
+  if (existing) {
+    existing.rerun = true;
+    return existing.promise;
+  }
+
+  const entry = {
+    rerun: false,
+    promise: undefined as unknown as Promise<QuotaMaterializationResult>,
+  } satisfies QuotaMaterializationRun;
+  entry.promise = (async () => {
+    let result: QuotaMaterializationResult;
+    do {
+      entry.rerun = false;
+      result = await rebuildQuotaMaterializedSnapshotsNow(period);
+    } while (entry.rerun);
+    return result;
+  })().finally(() => {
+    if (quotaMaterializationRuns.get(period) === entry) {
+      quotaMaterializationRuns.delete(period);
+    }
+  });
+  quotaMaterializationRuns.set(period, entry);
+  return entry.promise;
+}
+
+export async function rebuildUserQuotaMaterializedSnapshot(
+  feishuUserId: string,
+  period = hongKongBillingPeriod(),
+  departmentId?: string,
+) {
+  if (isPostgresBackend()) {
+    const [billingPeriod, departmentPeriod] = await Promise.all([
+      reconcilePostgresBillingPeriodForUser(feishuUserId, period),
+      departmentId
+        ? rebuildPostgresDepartmentQuotaMaterializedSnapshot(departmentId, period)
+        : Promise.resolve(null),
+    ]);
+    return { billingPeriod, departmentPeriod };
+  }
+  return rebuildQuotaMaterializedSnapshots(period);
+}
+
+const rebuildQuotaOperationDepartmentMaterializedSnapshot = createRerunSingleFlight(
+  (input: { departmentId: string; period: string }) =>
+    `${input.departmentId}\u0000${input.period}`,
+  ({ departmentId, period }) =>
+    rebuildPostgresDepartmentQuotaMaterializedSnapshotForQuotaOperation(
+      departmentId,
+      period,
+    ),
+);
+
+export async function rebuildUserQuotaMaterializedSnapshotForQuotaOperation(
+  feishuUserId: string,
+  period = hongKongBillingPeriod(),
+  departmentId?: string,
+) {
+  if (isPostgresBackend()) {
+    // Keep at most one control-pool checkout per operation. With four saga
+    // workers and an eight-connection control pool, the former concurrent fan-out
+    // could consume the whole pool and starve submit/poll requests.
+    const billingPeriod = await reconcilePostgresBillingPeriodForQuotaOperation(
+      feishuUserId,
+      period,
+    );
+    const departmentPeriod = departmentId
+      ? await rebuildQuotaOperationDepartmentMaterializedSnapshot({ departmentId, period })
+      : null;
+    return { billingPeriod, departmentPeriod };
+  }
+  return rebuildUserQuotaMaterializedSnapshot(feishuUserId, period, departmentId);
+}
+
+export async function refreshUserBillingTokenMetadataForQuotaOperation(
+  feishuUserId: string,
+  period = hongKongBillingPeriod(),
+) {
+  if (isPostgresBackend()) {
+    return refreshPostgresBillingPeriodTokenMetadataForQuotaOperation(
+      feishuUserId,
+      period,
+    );
+  }
+  await rebuildUserQuotaMaterializedSnapshot(feishuUserId, period);
+  return getUserBillingPeriod(feishuUserId, period);
 }
 
 async function persistDepartmentQuotaPeriod(period: DepartmentQuotaPeriod) {
@@ -2397,6 +2632,22 @@ export async function decideDepartmentQuotaRequest(input: {
 
 export async function getEffectiveUserGrantQuota(feishuUserId: string) {
   const period = currentQuotaPeriod();
+  if (isPostgresBackend()) {
+    // Existing users almost always have a current billing row. Read it first
+    // so a key-reset submit consumes one control checkout instead of two.
+    const billing = await getPostgresUserBillingPeriod(feishuUserId, period);
+    if (billing) return billing.monthlyQuota;
+    const user = await getPostgresUserById(feishuUserId);
+    if (!user?.departmentId) {
+      return (await getAppSettingsForQuotaOperation()).defaultMonthlyQuota;
+    }
+    const policy = await ensureDepartmentQuotaPeriod({
+      departmentId: user.departmentId,
+      departmentName: user.departmentName,
+      period,
+    });
+    return policy.defaultGrantQuota;
+  }
   const store = await readStore();
   const user = store.users.find((item) => item.id === feishuUserId);
   const billing = store.userBillingPeriods.find(
@@ -2691,7 +2942,7 @@ export async function findActiveTokenByHash(keyHash: string) {
   );
 }
 
-export async function addTokenAccount(input: {
+type AddTokenAccountInput = {
   feishuUserId: string;
   tokenRequestId: string;
   keyHash: string;
@@ -2703,47 +2954,44 @@ export async function addTokenAccount(input: {
   prewarmedAt?: string;
   prewarmDepartmentId?: string;
   prewarmedCredentialCiphertext?: string;
-}) {
+};
+
+function tokenAccountFromInput(input: AddTokenAccountInput) {
+  const now = nowIso();
+  return {
+    id: randomId("ta"),
+    feishuUserId: input.feishuUserId,
+    tokenRequestId: input.tokenRequestId,
+    keyHash: input.keyHash,
+    newapiTokenId: input.newapiTokenId,
+    status: input.status ?? "active",
+    billingPeriod: input.billingPeriod ?? now.slice(0, 7),
+    operationGeneration: input.operationGeneration,
+    activatedAt: input.activatedAt ?? (input.status && input.status !== "active" ? undefined : now),
+    prewarmedAt: input.prewarmedAt,
+    prewarmDepartmentId: input.prewarmDepartmentId,
+    prewarmedCredentialCiphertext: input.prewarmedCredentialCiphertext,
+    createdAt: now,
+  } satisfies TokenAccount;
+}
+
+export async function addTokenAccount(input: AddTokenAccountInput) {
   if (isPostgresBackend()) {
-    const now = nowIso();
-    const account: TokenAccount = {
-      id: randomId("ta"),
-      feishuUserId: input.feishuUserId,
-      tokenRequestId: input.tokenRequestId,
-      keyHash: input.keyHash,
-      newapiTokenId: input.newapiTokenId,
-      status: input.status ?? "active",
-      billingPeriod: input.billingPeriod ?? now.slice(0, 7),
-      operationGeneration: input.operationGeneration,
-      activatedAt: input.activatedAt ?? (input.status && input.status !== "active" ? undefined : now),
-      prewarmedAt: input.prewarmedAt,
-      prewarmDepartmentId: input.prewarmDepartmentId,
-      prewarmedCredentialCiphertext: input.prewarmedCredentialCiphertext,
-      createdAt: now,
-    };
-    return insertPostgresTokenAccount(account);
+    return insertPostgresTokenAccount(tokenAccountFromInput(input));
   }
 
   return mutate((store) => {
-    const now = nowIso();
-    const account: TokenAccount = {
-      id: randomId("ta"),
-      feishuUserId: input.feishuUserId,
-      tokenRequestId: input.tokenRequestId,
-      keyHash: input.keyHash,
-      newapiTokenId: input.newapiTokenId,
-      status: input.status ?? "active",
-      billingPeriod: input.billingPeriod ?? now.slice(0, 7),
-      operationGeneration: input.operationGeneration,
-      activatedAt: input.activatedAt ?? (input.status && input.status !== "active" ? undefined : now),
-      prewarmedAt: input.prewarmedAt,
-      prewarmDepartmentId: input.prewarmDepartmentId,
-      prewarmedCredentialCiphertext: input.prewarmedCredentialCiphertext,
-      createdAt: now,
-    };
+    const account = tokenAccountFromInput(input);
     store.tokenAccounts.push(account);
     return account;
   });
+}
+
+export async function addTokenAccountForQuotaOperation(input: AddTokenAccountInput) {
+  if (isPostgresBackend()) {
+    return insertPostgresTokenAccountForQuotaOperation(tokenAccountFromInput(input));
+  }
+  return addTokenAccount(input);
 }
 
 export async function recordMonthlyResetApplied(input: {
@@ -3014,6 +3262,19 @@ export async function finalizeTokenRotation(input: {
   });
 }
 
+export async function finalizeTokenRotationForQuotaOperation(input: {
+  feishuUserId: string;
+  oldTokenAccountId: string;
+  newTokenAccountId: string;
+  operationGeneration: number;
+  operationId: string;
+}) {
+  if (isPostgresBackend()) {
+    return finalizePostgresTokenRotationForQuotaOperation({ ...input, now: nowIso() });
+  }
+  return finalizeTokenRotation(input);
+}
+
 export async function finalizeTokenProvision(input: {
   feishuUserId: string;
   tokenAccountId: string;
@@ -3059,6 +3320,21 @@ export async function beginQuotaAwareProxyLog(
   log: Omit<ProxyRequestLog, "id" | "createdAt" | "statusCode" | "durationMs"> &
     Partial<Pick<ProxyRequestLog, "statusCode" | "durationMs">>,
 ) {
+  if (isPostgresBackend()) {
+    const now = nowIso();
+    return insertPostgresQuotaAwareProxyLog(account, {
+      id: randomId("pl"),
+      createdAt: now,
+      updatedAt: now,
+      statusCode: log.statusCode ?? 0,
+      durationMs: log.durationMs ?? 0,
+      ...log,
+      status: log.status ?? "pending",
+      billingPeriod: account.billingPeriod,
+      heartbeatAt: now,
+      leaseExpiresAt: new Date(new Date(now).getTime() + 2 * 60_000).toISOString(),
+    });
+  }
   return withUserQuotaOperationLock(account.feishuUserId, async () => {
     const state = await getUserQuotaState(account.feishuUserId);
     assertQuotaAdmission(state, account);
@@ -3073,11 +3349,44 @@ export async function beginQuotaAwareProxyLog(
   });
 }
 
+export async function beginQuotaAwareProxyRequest(
+  keyHash: string,
+  log: ProxyAdmissionLogInput,
+): Promise<ProxyRequestAdmissionResult> {
+  if (isPostgresBackend()) {
+    return beginPostgresQuotaAwareProxyRequest(keyHash, log);
+  }
+
+  const account = await findActiveTokenByHash(keyHash);
+  if (!account) return { status: "inactive_token" };
+  const user = await getUserById(account.feishuUserId);
+  if (!user) return { status: "bound_user_missing", account };
+  if (user.status === "disabled" || user.status === "deleted") {
+    return { status: "bound_user_inactive", account, user };
+  }
+  const proxyLog = await beginQuotaAwareProxyLog(account, {
+    ...log,
+    feishuUserId: user.id,
+    tokenAccountId: account.id,
+    departmentId: user.departmentId,
+    departmentName: user.departmentName,
+    providerKeyName: account.newapiTokenId,
+  });
+  return { status: "admitted", account, user, proxyLog };
+}
+
 export async function listInflightProxyRequests(
   feishuUserId: string,
   operationGeneration: number,
   at = nowIso(),
 ) {
+  if (isPostgresBackend()) {
+    return listPostgresInflightProxyRequests(
+      feishuUserId,
+      operationGeneration,
+      at,
+    );
+  }
   const store = await readStore();
   return store.proxyRequestLogs.filter(
     (log) =>
@@ -3086,6 +3395,21 @@ export async function listInflightProxyRequests(
       (log.status === "pending" || log.status === "streaming") &&
       (!log.leaseExpiresAt || log.leaseExpiresAt > at),
   );
+}
+
+export async function listInflightProxyRequestsForQuotaOperation(
+  feishuUserId: string,
+  operationGeneration: number,
+  at = nowIso(),
+) {
+  if (isPostgresBackend()) {
+    return listPostgresInflightProxyRequestsForQuotaOperation(
+      feishuUserId,
+      operationGeneration,
+      at,
+    );
+  }
+  return listInflightProxyRequests(feishuUserId, operationGeneration, at);
 }
 
 export async function updateProxyLog(
@@ -3118,6 +3442,7 @@ export type NewApiUsageBackfillItem = {
   proxyLogId?: string;
   feishuUserId?: string;
   tokenAccountId?: string;
+  billingPeriod?: string;
   usageRecordId?: string;
   issueId?: string;
   cost?: number;
@@ -3148,6 +3473,10 @@ function buildUsagePatch(
 ) {
   const patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">> = {
     usageSource: "newapi_log",
+    usageSettlementStatus: "matched",
+    usageSettlementLastError: undefined,
+    usageSettlementNextRetryAt: undefined,
+    usageSettledAt: nowIso(),
   };
 
   if (usageLog.newapiLogId) patch.newapiLogId = usageLog.newapiLogId;
@@ -3206,9 +3535,13 @@ function buildUsagePatch(
   }
   if (
     (currentLog.status === "pending" || currentLog.status === "streaming") &&
-    currentLog.statusCode < 400
+    (currentLog.upstreamStatusCode ?? currentLog.statusCode) < 400
   ) {
     patch.status = "completed";
+    patch.terminalStatus = "completed";
+    if (currentLog.statusCode === 0 && currentLog.upstreamStatusCode !== undefined) {
+      patch.statusCode = currentLog.upstreamStatusCode;
+    }
   }
 
   return patch;
@@ -3352,13 +3685,30 @@ function upsertUsageRecordInStore(store: StoreShape, record: NewApiUsageRecord) 
 }
 
 function upsertUsageIssueInStore(store: StoreShape, issue: UsageSyncIssue) {
+  const resolvedRecord =
+    issue.issueType === "no_proxy_match"
+      ? store.newapiUsageRecords.find(
+          (record) =>
+            record.matchStatus === "matched" &&
+            Boolean(record.matchedProxyLogId) &&
+            sameNewApiUsageSource(record, issue),
+        )
+      : undefined;
   const index = store.usageSyncIssues.findIndex((item) => {
     if (item.issueType !== issue.issueType) return false;
     return sameNewApiUsageSource(item, issue);
   });
   if (index === -1) {
-    store.usageSyncIssues.push(issue);
-    return issue;
+    const created: UsageSyncIssue = resolvedRecord
+      ? {
+          ...issue,
+          status: "closed",
+          matchedProxyLogId: resolvedRecord.matchedProxyLogId,
+          closedAt: issue.lastSyncedAt,
+        }
+      : issue;
+    store.usageSyncIssues.push(created);
+    return created;
   }
   const existing = store.usageSyncIssues[index];
   const updated: UsageSyncIssue = {
@@ -3369,10 +3719,34 @@ function upsertUsageIssueInStore(store: StoreShape, issue: UsageSyncIssue) {
     occurrences: existing.occurrences + 1,
     lastSeenAt: issue.lastSeenAt,
     lastSyncedAt: issue.lastSyncedAt,
-    status: "open",
+    status: resolvedRecord ? "closed" : "open",
+    matchedProxyLogId: resolvedRecord?.matchedProxyLogId ?? issue.matchedProxyLogId,
+    closedAt: resolvedRecord ? issue.lastSyncedAt : undefined,
   };
   store.usageSyncIssues[index] = updated;
   return updated;
+}
+
+function closeResolvedNoProxyMatchIssuesInStore(
+  store: StoreShape,
+  record: NewApiUsageRecord,
+  syncedAt: string,
+) {
+  for (const issue of store.usageSyncIssues) {
+    if (
+      issue.issueType !== "no_proxy_match" ||
+      issue.status !== "open" ||
+      !sameNewApiUsageSource(issue, record)
+    ) {
+      continue;
+    }
+    Object.assign(issue, {
+      status: "closed",
+      matchedProxyLogId: record.matchedProxyLogId,
+      lastSyncedAt: syncedAt,
+      closedAt: syncedAt,
+    } satisfies Partial<UsageSyncIssue>);
+  }
 }
 
 export async function backfillProxyLogsFromNewApiUsage(
@@ -3398,6 +3772,12 @@ export async function backfillProxyLogsFromNewApiUsage(
     ) => Promise<void>,
     persistUsageRecord?: (record: NewApiUsageRecord) => Promise<NewApiUsageRecord>,
     persistIssue?: (issue: UsageSyncIssue) => Promise<UsageSyncIssue>,
+    persistMatched?: (
+      record: NewApiUsageRecord,
+      proxyLog: ProxyRequestLog,
+      patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">>,
+      syncedAt: string,
+    ) => Promise<{ usageRecord: NewApiUsageRecord; proxyLog: ProxyRequestLog | null }>,
   ) => {
     const syncedAt = nowIso();
     const accountByNewApiTokenId = new Map(
@@ -3521,7 +3901,6 @@ export async function backfillProxyLogsFromNewApiUsage(
       }
 
       reservedProxyLogIds.add(proxyLog.id);
-      result.matched += 1;
       const record = buildNewApiUsageRecord({
         store,
         usageLog,
@@ -3530,7 +3909,31 @@ export async function backfillProxyLogsFromNewApiUsage(
         account,
         proxyLog,
       });
-      const storedRecord = await persistRecord(record);
+      const patch = buildUsagePatch(usageLog, proxyLog);
+      const changed = patchChangesLog(proxyLog, patch);
+      let storedRecord: NewApiUsageRecord;
+      let atomicallyStoredProxyLog: ProxyRequestLog | null | undefined;
+      if (!dryRun && persistMatched) {
+        const settled = await persistMatched(record, proxyLog, patch, syncedAt);
+        storedRecord = settled.usageRecord;
+        atomicallyStoredProxyLog = settled.proxyLog;
+      } else {
+        storedRecord = await persistRecord(record);
+      }
+      if (!sameNewApiUsageSource(storedRecord, usageLog)) {
+        result.skippedNoMatch += 1;
+        result.items.push({
+          action: "skipped_no_match",
+          newapiLogId: usageLog.newapiLogId,
+          newapiRequestId: usageLog.newapiRequestId,
+          newapiTokenId: usageLog.newapiTokenId,
+          feishuUserId: account.feishuUserId,
+          tokenAccountId: account.id,
+          usageRecordId: storedRecord.id,
+          reason: "Proxy request already has a different authoritative NewAPI source",
+        });
+        continue;
+      }
       if (
         storedRecord.matchedProxyLogId &&
         storedRecord.matchedProxyLogId !== proxyLog.id
@@ -3548,6 +3951,11 @@ export async function backfillProxyLogsFromNewApiUsage(
         });
         continue;
       }
+      if (!dryRun && !persistMatched) {
+        closeResolvedNoProxyMatchIssuesInStore(store, storedRecord, syncedAt);
+      }
+      result.matched += 1;
+      if (!dryRun) result.recordsUpserted += persistMatched ? 1 : 0;
       if (usageLog.cost === undefined && usageLog.quota === undefined) {
         const issue = buildUsageSyncIssue({
           issueType: "missing_cost",
@@ -3559,12 +3967,12 @@ export async function backfillProxyLogsFromNewApiUsage(
         });
         await persistSyncIssue(issue);
       }
-      const patch = buildUsagePatch(usageLog, proxyLog);
-      const changed = patchChangesLog(proxyLog, patch);
       if (changed) {
         result.updated += 1;
         if (!dryRun) {
-          if (persistLog) {
+          if (atomicallyStoredProxyLog) {
+            Object.assign(proxyLog, atomicallyStoredProxyLog);
+          } else if (persistLog) {
             await persistLog(proxyLog, patch, syncedAt);
           } else {
             Object.assign(proxyLog, patch, {
@@ -3582,7 +3990,9 @@ export async function backfillProxyLogsFromNewApiUsage(
         proxyLogId: proxyLog.id,
         feishuUserId: proxyLog.feishuUserId ?? account.feishuUserId,
         tokenAccountId: proxyLog.tokenAccountId ?? account.id,
-        usageRecordId: record.id,
+        billingPeriod:
+          proxyLog.billingPeriod ?? resolveUsageBillingPeriod({ occurredAt: proxyLog.createdAt }),
+        usageRecordId: storedRecord.id,
         cost: usageLog.cost,
         quota: usageLog.quota,
       });
@@ -3595,17 +4005,25 @@ export async function backfillProxyLogsFromNewApiUsage(
   };
 
   if (isPostgresBackend()) {
-    const store = input.targetProxyLogIds?.length
-      ? {
-          ...structuredClone(initialStore),
-          ...(await readPostgresUsageMatchingSnapshot({
-            newapiTokenIds: usageLogs
-              .map((item) => item.newapiTokenId)
-              .filter((item): item is string => Boolean(item)),
-            proxyLogIds: input.targetProxyLogIds,
-          })),
-        }
-      : await readPostgresStore();
+    const matchingTimes = usageLogs
+      .map((item) => item.createdAt && new Date(item.createdAt).getTime())
+      .filter((item): item is number => Number.isFinite(item));
+    const matchingWindowMs = input.matchWindowMs ?? 30 * 60 * 1000;
+    const store = {
+      ...structuredClone(initialStore),
+      ...(await readPostgresUsageMatchingSnapshot({
+        newapiTokenIds: usageLogs
+          .map((item) => item.newapiTokenId)
+          .filter((item): item is string => Boolean(item)),
+        proxyLogIds: input.targetProxyLogIds ?? [],
+        proxyCreatedAfter: matchingTimes.length
+          ? new Date(Math.min(...matchingTimes) - matchingWindowMs).toISOString()
+          : undefined,
+        proxyCreatedBefore: matchingTimes.length
+          ? new Date(Math.max(...matchingTimes) + matchingWindowMs).toISOString()
+          : undefined,
+      })),
+    };
     return runBackfill(
       store,
       async (proxyLog, patch, syncedAt) => {
@@ -3617,6 +4035,15 @@ export async function backfillProxyLogsFromNewApiUsage(
       },
       upsertPostgresNewApiUsageRecord,
       upsertPostgresUsageSyncIssue,
+      async (record, proxyLog, patch, syncedAt) => {
+        const settled = await settlePostgresMatchedNewApiUsage({
+          record,
+          proxyLogId: proxyLog.id,
+          patch,
+          syncedAt,
+        });
+        return settled;
+      },
     );
   }
 
@@ -3624,8 +4051,10 @@ export async function backfillProxyLogsFromNewApiUsage(
 }
 
 export async function getAdminScopeForUser(feishuUserId: string) {
-  const store = await readStore();
-  const user = store.users.find((item) => item.id === feishuUserId);
+  const store = isPostgresBackend() ? undefined : await readStore();
+  const user = isPostgresBackend()
+    ? await getPostgresUserById(feishuUserId)
+    : store!.users.find((item) => item.id === feishuUserId);
   if (!user) return null;
   if (isInactiveUser(user)) return null;
 
@@ -3643,23 +4072,25 @@ export async function getAdminScopeForUser(feishuUserId: string) {
     } satisfies AdminScope;
   }
 
-  const storedScope =
-    store.adminScopes.find(
-      (scope) => scope.feishuUserId === feishuUserId && scope.status === "active",
-    ) ?? null;
+  const storedScope = isPostgresBackend()
+    ? await getPostgresActiveAdminScopeForUser(feishuUserId)
+    : store!.adminScopes.find(
+        (scope) => scope.feishuUserId === feishuUserId && scope.status === "active",
+      ) ?? null;
   if (storedScope) return storedScope;
 
-  const assignedRequest = store.tokenRequests
+  const fallbackStore = store ?? await readStore();
+  const assignedRequest = fallbackStore.tokenRequests
     .filter((request) => request.approvalTargetOpenId === user.openId)
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
   if (assignedRequest?.approvalDepartmentId) {
-    const blockedByGlobalRevocation = store.adminScopes.some(
+    const blockedByGlobalRevocation = fallbackStore.adminScopes.some(
       (scope) =>
         scope.feishuUserId === feishuUserId && blocksAllAutomaticAdminRestoreForUser(scope),
     );
     if (blockedByGlobalRevocation) return null;
 
-    const blockedByRevokedScope = store.adminScopes.some(
+    const blockedByRevokedScope = fallbackStore.adminScopes.some(
       (scope) =>
         scope.feishuUserId === feishuUserId &&
         scope.scopeType === "department" &&
@@ -3958,6 +4389,25 @@ function scopedUsersForStore(store: StoreShape, scope: AdminScope) {
 }
 
 export async function getScopedTokenRequest(scope: AdminScope, requestId: string) {
+  if (isPostgresBackend()) {
+    const request = await getPostgresTokenRequestById(requestId);
+    if (!request) return null;
+    if (scope.scopeType === "global") return request;
+
+    const [requester, requesterAdminScope] = await Promise.all([
+      getPostgresUserById(request.feishuUserId),
+      getPostgresActiveAdminScopeForUser(request.feishuUserId),
+    ]);
+    const usersById = new Map<string, FeishuUser>();
+    const systemAdminOpenIds = new Set(getConfig().admin.systemAdminOpenIds);
+    if (requester) {
+      usersById.set(requester.id, requester);
+      if (requesterAdminScope?.scopeType === "global") {
+        systemAdminOpenIds.add(requester.openId);
+      }
+    }
+    return tokenRequestInScope(request, scope, usersById, systemAdminOpenIds) ? request : null;
+  }
   const store = await readStore();
   const request = store.tokenRequests.find((item) => item.id === requestId);
   if (!request) return null;
@@ -3966,6 +4416,11 @@ export async function getScopedTokenRequest(scope: AdminScope, requestId: string
 }
 
 export async function getScopedUser(scope: AdminScope, feishuUserId: string) {
+  if (isPostgresBackend()) {
+    const user = await getPostgresUserById(feishuUserId);
+    if (!user) return null;
+    return userInAdminScope(user, scope) ? user : null;
+  }
   const store = await readStore();
   const user = store.users.find((item) => item.id === feishuUserId);
   if (!user) return null;

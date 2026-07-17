@@ -159,6 +159,7 @@ if (storeBackend === "json") {
 
 if (storeBackend === "postgres") {
   const businessPoolMax = Number(process.env.DATABASE_POOL_MAX ?? "10");
+  const controlPoolMax = Number(process.env.DATABASE_CONTROL_POOL_MAX ?? "4");
   const lockPoolMax = Number(process.env.DATABASE_LOCK_POOL_MAX ?? "10");
   const postgresMaxConnections = Number(process.env.POSTGRES_MAX_CONNECTIONS ?? "30");
   const postgresReservedConnections = Number(
@@ -176,6 +177,13 @@ if (storeBackend === "postgres") {
   );
   checks.push(
     result(
+      "DATABASE_CONTROL_POOL_MAX",
+      Number.isInteger(controlPoolMax) && controlPoolMax >= 1,
+      "control pool max must be a positive integer",
+    ),
+  );
+  checks.push(
+    result(
       "DATABASE_LOCK_POOL_MAX",
       Number.isInteger(lockPoolMax) && lockPoolMax >= 1,
       "advisory lock pool max must be a positive integer",
@@ -186,9 +194,9 @@ if (storeBackend === "postgres") {
       "POSTGRES_APP_CONNECTION_BUDGET",
       Number.isInteger(postgresMaxConnections) &&
         Number.isInteger(postgresReservedConnections) &&
-        businessPoolMax + lockPoolMax + 5 <
+        businessPoolMax + controlPoolMax + lockPoolMax + 5 <
           postgresMaxConnections - postgresReservedConnections,
-      "business pool + lock pool + 5 maintenance connections must stay below PostgreSQL usable connections",
+      "business pool + control pool + lock pool + 5 maintenance connections must stay below PostgreSQL usable connections",
     ),
   );
 }

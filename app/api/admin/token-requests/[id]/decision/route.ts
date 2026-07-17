@@ -3,7 +3,11 @@ import { z } from "zod";
 import { requireAdminScope } from "@/lib/admin";
 import { nowIso } from "@/lib/crypto";
 import { provisionTokenForRequest } from "@/lib/provisioning";
-import { getScopedTokenRequest, updateTokenRequest } from "@/lib/store";
+import {
+  getScopedTokenRequest,
+  updateTokenRequest,
+  updateTokenRequestForQuotaOperation,
+} from "@/lib/store";
 import { enqueueQuotaRestoreForRequest, runQuotaOperation } from "@/lib/quota-saga";
 import { quotaFeatureErrorStatus } from "@/lib/quota-guard";
 import { tokenRequestRequiresAdminDecision } from "@/lib/token-request-policy";
@@ -41,9 +45,13 @@ export async function POST(
     return NextResponse.json({ error: "审批动作或最终额度无效" }, { status: 400 });
   }
 
+  const updateDecisionRequest =
+    tokenRequest.requestType === "quota_reset" || tokenRequest.requestType === "quota_restore"
+      ? updateTokenRequestForQuotaOperation
+      : updateTokenRequest;
   const operatedAt = nowIso();
   if (parsed.data.action === "reject") {
-    const updated = await updateTokenRequest(tokenRequest.id, {
+    const updated = await updateDecisionRequest(tokenRequest.id, {
       status: "rejected",
       approvalOperatorOpenId: auth.user.openId,
       approvalOperatedAt: operatedAt,
@@ -55,7 +63,7 @@ export async function POST(
     parsed.data.approvedMonthlyQuota ??
     tokenRequest.approvedMonthlyQuota ??
     tokenRequest.requestedMonthlyQuota;
-  const approved = await updateTokenRequest(tokenRequest.id, {
+  const approved = await updateDecisionRequest(tokenRequest.id, {
     status: "approved",
     approvedMonthlyQuota,
     approvalOperatorOpenId: auth.user.openId,
@@ -68,7 +76,9 @@ export async function POST(
   if (approved.requestType === "quota_reset" || approved.requestType === "quota_restore") {
     try {
       const operation = await enqueueQuotaRestoreForRequest(approved);
-      await updateTokenRequest(approved.id, { status: "approved_provisioning" });
+      await updateTokenRequestForQuotaOperation(approved.id, {
+        status: "approved_provisioning",
+      });
       after(() => runQuotaOperation(operation.id).catch(() => undefined));
       return NextResponse.json({ request: approved, operation }, { status: 202 });
     } catch (err) {

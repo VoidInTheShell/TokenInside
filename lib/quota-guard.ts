@@ -1,4 +1,8 @@
-import { defaultQuotaFeatureFlags, getAppSettings } from "./store";
+import {
+  defaultQuotaFeatureFlags,
+  getAppSettings,
+  getAppSettingsForQuotaOperation,
+} from "./store";
 import type { QuotaFeatureFlags } from "./types";
 
 export type QuotaWriteAction =
@@ -36,7 +40,7 @@ export function quotaWriteActionEnabled(
 }
 
 export async function getQuotaFeatureFlags() {
-  const settings = await getAppSettings();
+  const settings = await getAppSettingsForQuotaOperation();
   return {
     ...defaultQuotaFeatureFlags(),
     ...settings.quotaFeatureFlags,
@@ -45,7 +49,10 @@ export async function getQuotaFeatureFlags() {
 }
 
 export async function assertQuotaWriteActionEnabled(action: QuotaWriteAction) {
-  const settings = await getAppSettings();
+  const settings =
+    action === "quota_restore" || action === "key_rotation"
+      ? await getAppSettingsForQuotaOperation()
+      : await getAppSettings();
   const flags = {
     ...defaultQuotaFeatureFlags(),
     ...settings.quotaFeatureFlags,

@@ -143,6 +143,10 @@ export type ProxyRequestLog = {
   method: string;
   status?: ProxyRequestStatus;
   statusCode: number;
+  upstreamStatusCode?: number;
+  upstreamResponseReceivedAt?: string;
+  upstreamHeadersMs?: number;
+  clientDeliveryStatus?: "completed" | "failed" | "cancelled";
   durationMs: number;
   firstByteMs?: number;
   responseTimeUpdatedAt?: string;
@@ -171,6 +175,11 @@ export type ProxyRequestLog = {
   actualCost?: number;
   usageSource?: "proxy_json" | "proxy_stream" | "newapi_log" | "missing";
   usageSyncedAt?: string;
+  usageSettlementStatus?: "pending" | "retrying" | "matched" | "manual_review";
+  usageSettlementAttempts?: number;
+  usageSettlementLastError?: string;
+  usageSettlementNextRetryAt?: string;
+  usageSettledAt?: string;
   newapiLogId?: string;
   newapiRequestId?: string;
   newapiResponseRequestId?: string;
@@ -189,6 +198,41 @@ export type ProxyRequestLog = {
   createdAt: string;
   updatedAt?: string;
 };
+
+export type ProxyAdmissionLogInput = Omit<
+  ProxyRequestLog,
+  | "id"
+  | "feishuUserId"
+  | "tokenAccountId"
+  | "departmentId"
+  | "departmentName"
+  | "providerKeyName"
+  | "status"
+  | "statusCode"
+  | "durationMs"
+  | "billingPeriod"
+  | "operationGeneration"
+  | "leaseExpiresAt"
+  | "heartbeatAt"
+  | "createdAt"
+  | "updatedAt"
+> &
+  Partial<Pick<ProxyRequestLog, "status" | "statusCode" | "durationMs">>;
+
+export type ProxyRequestAdmissionResult =
+  | {
+      status: "admitted";
+      account: TokenAccount;
+      user: FeishuUser;
+      proxyLog: ProxyRequestLog;
+    }
+  | { status: "inactive_token" }
+  | { status: "bound_user_missing"; account: TokenAccount }
+  | {
+      status: "bound_user_inactive";
+      account: TokenAccount;
+      user: FeishuUser;
+    };
 
 export type NewApiUsageMatchStatus =
   | "matched"
@@ -281,6 +325,7 @@ export type UsageSyncIssue = {
   firstSeenAt: string;
   lastSeenAt: string;
   lastSyncedAt: string;
+  closedAt?: string;
 };
 
 export type UserBillingPeriod = {

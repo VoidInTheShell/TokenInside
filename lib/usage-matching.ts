@@ -72,31 +72,108 @@ export function isBillableProxyLog(log: ProxyRequestLog) {
   );
 }
 
+type NewApiUsageIdentity = Pick<
+  NormalizedNewApiUsageLog,
+  "newapiLogId" | "newapiRequestId" | "newapiUpstreamRequestId"
+>;
+
+function exactUsageIdentity(log: ProxyRequestLog, usageLog: NewApiUsageIdentity) {
+  const exactRequestId = Boolean(
+    usageLog.newapiRequestId && log.newapiRequestId === usageLog.newapiRequestId,
+  );
+  const exactResponseRequestId = Boolean(
+    log.newapiResponseRequestId &&
+      (log.newapiResponseRequestId === usageLog.newapiRequestId ||
+        log.newapiResponseRequestId === usageLog.newapiUpstreamRequestId),
+  );
+  const exactUpstreamRequestId = Boolean(
+    usageLog.newapiUpstreamRequestId &&
+      log.newapiUpstreamRequestId === usageLog.newapiUpstreamRequestId,
+  );
+  const exactLogId = Boolean(
+    usageLog.newapiLogId &&
+      log.newapiLogId === usageLog.newapiLogId &&
+      (!usageLog.newapiRequestId || !log.newapiRequestId || exactRequestId),
+  );
+  return {
+    exactRequestId,
+    exactResponseRequestId,
+    exactUpstreamRequestId,
+    exactLogId,
+  };
+}
+
+/**
+ * A cancelled/failed delivery is eligible only when NewAPI already returned a
+ * successful response and its durable request identity matches exactly. This
+ * deliberately forbids the model/time/token fallback used for ordinary 2xx
+ * proxy logs: a partial stream must never be charged unless NewAPI itself has
+ * an authoritative source row for this exact request.
+ */
+export function isNewApiUsageMatchEligibleProxyLog(
+  log: ProxyRequestLog,
+  usageLog: NewApiUsageIdentity,
+) {
+  if (
+    log.method.toUpperCase() !== "POST" ||
+    !BILLABLE_PROXY_PATHS.has(normalizedProxyPath(log.requestPath))
+  ) {
+    return false;
+  }
+  if (isBillableProxyLog(log)) return true;
+  const upstreamStatusCode = log.upstreamStatusCode;
+  if (
+    upstreamStatusCode === undefined ||
+    upstreamStatusCode < 200 ||
+    upstreamStatusCode >= 400
+  ) {
+    return false;
+  }
+  const identity = exactUsageIdentity(log, usageLog);
+  return (
+    identity.exactRequestId ||
+    identity.exactResponseRequestId ||
+    identity.exactUpstreamRequestId ||
+    identity.exactLogId
+  );
+}
+
 function matchScore(input: {
   proxyLog: ProxyRequestLog;
   usageLog: NormalizedNewApiUsageLog;
   matchWindowMs: number;
 }) {
   const { proxyLog, usageLog, matchWindowMs } = input;
-  if (!isBillableProxyLog(proxyLog)) return undefined;
+  if (!isNewApiUsageMatchEligibleProxyLog(proxyLog, usageLog)) return undefined;
 
-  const exactRequestId = Boolean(
-    usageLog.newapiRequestId && proxyLog.newapiRequestId === usageLog.newapiRequestId,
+  const {
+    exactRequestId,
+    exactResponseRequestId,
+    exactUpstreamRequestId,
+    exactLogId,
+  } = exactUsageIdentity(proxyLog, usageLog);
+  const strictExactRecovery = !isBillableProxyLog(proxyLog);
+  const usageHasRequestIdentity = Boolean(
+    usageLog.newapiRequestId || usageLog.newapiUpstreamRequestId,
   );
-  const exactResponseRequestId = Boolean(
+  if (
+    usageHasRequestIdentity &&
     proxyLog.newapiResponseRequestId &&
-      (proxyLog.newapiResponseRequestId === usageLog.newapiRequestId ||
-        proxyLog.newapiResponseRequestId === usageLog.newapiUpstreamRequestId),
-  );
-  const exactUpstreamRequestId = Boolean(
-    usageLog.newapiUpstreamRequestId &&
-      proxyLog.newapiUpstreamRequestId === usageLog.newapiUpstreamRequestId,
-  );
-  const exactLogId = Boolean(
-    usageLog.newapiLogId &&
-      proxyLog.newapiLogId === usageLog.newapiLogId &&
-      (!usageLog.newapiRequestId || !proxyLog.newapiRequestId || exactRequestId),
-  );
+    !exactResponseRequestId &&
+    !exactUpstreamRequestId
+  ) {
+    return undefined;
+  }
+  if (
+    usageHasRequestIdentity &&
+    proxyLog.usageSource === "newapi_log" &&
+    Boolean(proxyLog.newapiRequestId || proxyLog.newapiUpstreamRequestId) &&
+    !exactRequestId &&
+    !exactResponseRequestId &&
+    !exactUpstreamRequestId
+  ) {
+    return undefined;
+  }
 
   const proxyModel = normalizedModel(proxyLog.model);
   const usageModel = normalizedModel(usageLog.model);
@@ -118,6 +195,7 @@ function matchScore(input: {
     return 50_000 + (Number.isFinite(timeDelta) ? timeDelta : 0);
   }
   if (exactLogId) return 100_000 + (Number.isFinite(timeDelta) ? timeDelta : 0);
+  if (strictExactRecovery) return undefined;
   if (!Number.isFinite(timeDelta) || timeDelta > maxTimeDelta) return undefined;
 
   const exactUsage = usageMetricsMatch(proxyLog, usageLog);

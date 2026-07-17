@@ -19,8 +19,16 @@ export async function GET(
   if (!operation || operation.feishuUserId !== user.id) {
     return NextResponse.json({ error: "额度操作不存在" }, { status: 404 });
   }
-  const key = await takeQuotaOperationCredential(operation.id, user.id);
-  const refreshed = (await findQuotaOperationById(operation.id)) ?? operation;
+  const credentialReady =
+    operation.state === "completed" &&
+    Boolean(operation.credentialCiphertext) &&
+    !operation.credentialDeliveredAt;
+  const key = credentialReady
+    ? await takeQuotaOperationCredential(operation.id, user.id)
+    : null;
+  const refreshed = key
+    ? ((await findQuotaOperationById(operation.id)) ?? operation)
+    : operation;
   const { credentialCiphertext: _credentialCiphertext, ...visibleOperation } = refreshed;
   return NextResponse.json({
     operation: visibleOperation,

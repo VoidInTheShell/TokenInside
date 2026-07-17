@@ -4,8 +4,25 @@ import { nowIso, randomId } from "@/lib/crypto";
 import {
   hasConflictingProxyMatch,
   newApiUsageIdentityLockKeys,
+  sameNewApiUsageSource,
 } from "@/lib/newapi-usage-identity";
-import { initialUnassignedMonthlyQuota } from "@/lib/quota-model";
+import {
+  initialUnassignedMonthlyQuota,
+  materializeDepartmentQuota,
+  materializeUserQuota,
+  resolveUsageBillingPeriod,
+} from "@/lib/quota-model";
+import { assertQuotaOperationTransition } from "@/lib/quota-saga-state";
+import {
+  assertQuotaAdmission,
+  QuotaAdmissionClosedError,
+  QuotaOperationBusyError,
+  StaleTokenGenerationError,
+} from "@/lib/quota-admission";
+import {
+  isBillableProxyLog,
+  isNewApiUsageMatchEligibleProxyLog,
+} from "@/lib/usage-matching";
 import type {
   AdminScope,
   AppSettings,
@@ -14,7 +31,9 @@ import type {
   FeishuEvent,
   FeishuUser,
   NewApiUsageRecord,
+  ProxyAdmissionLogInput,
   ProxyRequestLog,
+  ProxyRequestAdmissionResult,
   QuotaChangeEvent,
   QuotaLedgerEntry,
   QuotaOperation,
@@ -32,6 +51,7 @@ import type {
 } from "@/lib/types";
 
 let pool: Pool | undefined;
+let controlPool: Pool | undefined;
 let advisoryLockPool: Pool | undefined;
 
 export const REQUIRED_POSTGRES_TABLES = [
@@ -71,6 +91,22 @@ function getPool() {
     connectionTimeoutMillis: config.postgres.poolConnectionTimeoutMs,
   });
   return pool;
+}
+
+function getControlPool() {
+  if (controlPool) return controlPool;
+  const config = getConfig();
+  const databaseUrl = config.databaseUrl;
+  if (!databaseUrl) {
+    throw new Error("DATABASE_URL is required when TOKENINSIDE_STORE_BACKEND=postgres");
+  }
+  controlPool = new Pool({
+    connectionString: databaseUrl,
+    max: config.postgres.controlPoolMax,
+    idleTimeoutMillis: config.postgres.poolIdleTimeoutMs,
+    connectionTimeoutMillis: config.postgres.poolConnectionTimeoutMs,
+  });
+  return controlPool;
 }
 
 function getAdvisoryLockPool() {
@@ -115,6 +151,15 @@ async function withClient<T>(fn: (client: PoolClient) => Promise<T>) {
   }
 }
 
+async function withControlClient<T>(fn: (client: PoolClient) => Promise<T>) {
+  const client = await getControlPool().connect();
+  try {
+    return await fn(client);
+  } finally {
+    client.release();
+  }
+}
+
 async function withAdvisoryLockClient<T>(fn: (client: PoolClient) => Promise<T>) {
   const client = await getAdvisoryLockPool().connect();
   try {
@@ -138,6 +183,20 @@ async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>) {
   });
 }
 
+async function withControlTransaction<T>(fn: (client: PoolClient) => Promise<T>) {
+  return withControlClient(async (client) => {
+    try {
+      await client.query("begin");
+      const result = await fn(client);
+      await client.query("commit");
+      return result;
+    } catch (err) {
+      await client.query("rollback");
+      throw err;
+    }
+  });
+}
+
 function periodFromIso(value?: string) {
   return value?.slice(0, 7) || nowIso().slice(0, 7);
 }
@@ -145,10 +204,6 @@ function periodFromIso(value?: string) {
 function latestIso(...values: Array<string | undefined>) {
   const sorted = values.filter(Boolean).sort();
   return sorted.length ? sorted[sorted.length - 1] : nowIso();
-}
-
-function sameStringArray(left: string[], right: string[]) {
-  return left.length === right.length && left.every((item, index) => item === right[index]);
 }
 
 function finiteUsageAmount(value?: number) {
@@ -165,8 +220,39 @@ function usageRecordQuotaConsumed(record: NewApiUsageRecord) {
 }
 
 function usageRecordPeriod(record: NewApiUsageRecord) {
-  return periodFromIso(record.newapiCreatedAt ?? record.lastSyncedAt ?? record.firstSeenAt);
+  return resolveUsageBillingPeriod({
+    billingPeriod: record.billingPeriod,
+    occurredAt: record.newapiCreatedAt ?? record.lastSyncedAt ?? record.firstSeenAt,
+  });
 }
+
+async function lockPostgresUserQuotaFence(client: PoolClient, feishuUserId: string) {
+  await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+    `user-quota-fence:${feishuUserId}`,
+  ]);
+}
+
+function authoritativeQuotaFromRecord(record: NewApiUsageRecord, quotaPerUnit: number) {
+  if (Number.isFinite(record.quota)) return Math.max(Math.round(record.quota as number), 0);
+  if (Number.isFinite(record.cost)) {
+    return Math.max(Math.round((record.cost as number) * quotaPerUnit), 0);
+  }
+  return 0;
+}
+
+type PostgresUserQuotaMaterialization = {
+  feishuUserId: string;
+  period: string;
+  legacyMonthlyQuota: number;
+  legacyConsumedQuota: number;
+  assignedMonthlyQuota: number;
+  authorizedQuota: number;
+  authoritativeConsumedQuota: number;
+  expectedAvailableQuota: number;
+  overageQuota: number;
+  ledgerEntries: number;
+  policyPresent: boolean;
+};
 
 async function readSettingsRow(client: PoolClient) {
   const result = await client.query<{ data: AppSettings }>(
@@ -790,9 +876,17 @@ async function syncPostgresBillingPeriodForUser(
   client: PoolClient,
   feishuUserId: string,
   period: string,
+  materializedAt = nowIso(),
 ) {
+  // Every writer that derives this shared row uses the same transaction fence.
+  // This serializes finalizers with quota materialization without holding a
+  // stale UserBillingPeriod snapshot outside the lock.
+  await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+    `billing-period-finalize:${feishuUserId}:${period}`,
+  ]);
+
   const settings = await readSettingsRow(client);
-  const seededAt = nowIso();
+  const seededAt = materializedAt;
   const initialMonthlyQuota = initialUnassignedMonthlyQuota({
     defaultMonthlyQuota: settings.defaultMonthlyQuota,
     quotaMigrationApplied: Boolean(settings.quotaMigration?.appliedAt),
@@ -854,14 +948,39 @@ async function syncPostgresBillingPeriodForUser(
       [feishuUserId],
     )
   ).rows.map((row) => row.data);
+  const policy = (
+    await client.query<{ data: UserQuotaPolicy }>(
+      `select data
+       from user_quota_policies
+       where feishu_user_id = $1
+         and effective_from_period <= $2
+         and (effective_to_period is null or effective_to_period >= $2)
+       order by version desc, id desc
+       limit 1`,
+      [feishuUserId, period],
+    )
+  ).rows[0]?.data;
+  const ledgerEntries = (
+    await client.query<{ data: QuotaLedgerEntry }>(
+      `select data
+       from quota_ledger_entries
+       where feishu_user_id = $1 and period = $2
+       order by created_at, id`,
+      [feishuUserId, period],
+    )
+  ).rows.map((row) => row.data);
+  const usageCheckpoint = (
+    await client.query<{ data: UsageSyncCheckpoint }>(
+      `select data
+       from usage_sync_checkpoints
+       where scope = 'newapi_usage_logs'
+       limit 1`,
+    )
+  ).rows[0]?.data;
 
   const requestById = new Map(requests.map((request) => [request.id, request]));
   const accountById = new Map(accounts.map((account) => [account.id, account]));
   const summary: UserBillingPeriod & { quotaUpdatedAt?: string; sourceUpdatedAt?: string } = {
-    // Legacy request/proxy aggregation and the F-stage ledger materialization share
-    // this row. Keep the ledger-authoritative fields until the F materializer
-    // refreshes them; otherwise an unrelated legacy sync silently erases them.
-    ...(existing ?? {}),
     id: existing?.id ?? randomId("bp"),
     feishuUserId,
     period,
@@ -878,9 +997,9 @@ async function syncPostgresBillingPeriodForUser(
     tokenAccountIds: [],
     assignedQuotaUpdatedAt: existing?.assignedQuotaUpdatedAt,
     assignedQuotaUpdatedByFeishuUserId: existing?.assignedQuotaUpdatedByFeishuUserId,
-    updatedAt: existing?.updatedAt ?? nowIso(),
+    updatedAt: existing?.updatedAt ?? seededAt,
     quotaUpdatedAt: existing?.assignedQuotaUpdatedAt,
-    sourceUpdatedAt: existing?.updatedAt,
+    sourceUpdatedAt: undefined,
   };
 
   function setQuota(quota: number | undefined, at: string) {
@@ -933,9 +1052,13 @@ async function syncPostgresBillingPeriodForUser(
 
   const proxyLogIdsBackedByNewApiRecords = new Set<string>();
   for (const record of usageRecords) {
+    if (record.matchStatus !== "matched") continue;
     if (record.matchedProxyLogId) proxyLogIdsBackedByNewApiRecords.add(record.matchedProxyLogId);
     if (usageRecordPeriod(record) !== period) continue;
-    if (record.matchStatus === "unknown_token" || record.matchStatus === "malformed_log") continue;
+    summary.promptTokens += record.promptTokens ?? 0;
+    summary.completionTokens += record.completionTokens ?? 0;
+    summary.totalTokens +=
+      record.totalTokens ?? (record.promptTokens ?? 0) + (record.completionTokens ?? 0);
     const quotaConsumed = usageRecordQuotaConsumed(record);
     summary.quotaConsumed += quotaConsumed;
     summary.cost += quotaConsumed;
@@ -949,12 +1072,21 @@ async function syncPostgresBillingPeriodForUser(
   }
 
   for (const log of logs) {
-    if (periodFromIso(log.createdAt) !== period) continue;
-    summary.promptTokens += log.promptTokens ?? 0;
-    summary.completionTokens += log.completionTokens ?? 0;
-    summary.totalTokens += log.totalTokens ?? 0;
+    if (
+      resolveUsageBillingPeriod({
+        billingPeriod: log.billingPeriod,
+        occurredAt: log.createdAt,
+      }) !== period
+    ) {
+      continue;
+    }
+    if (!isBillableProxyLog(log)) continue;
     summary.proxyLogCount += 1;
     if (!proxyLogIdsBackedByNewApiRecords.has(log.id)) {
+      summary.promptTokens += log.promptTokens ?? 0;
+      summary.completionTokens += log.completionTokens ?? 0;
+      summary.totalTokens +=
+        log.totalTokens ?? (log.promptTokens ?? 0) + (log.completionTokens ?? 0);
       const quotaConsumed = proxyLogQuotaConsumed(log);
       if (quotaConsumed || log.cost !== undefined || log.quota !== undefined) {
         summary.quotaConsumed += quotaConsumed;
@@ -968,45 +1100,237 @@ async function syncPostgresBillingPeriodForUser(
   summary.tokenAccountIds = [...new Set(summary.tokenAccountIds)].sort();
   summary.quotaConsumed = Number(summary.quotaConsumed.toFixed(8));
   summary.cost = Number(summary.cost.toFixed(8));
-  summary.remainingQuota = Math.max(Number((summary.monthlyQuota - summary.quotaConsumed).toFixed(8)), 0);
-  summary.updatedAt = summary.sourceUpdatedAt ?? summary.updatedAt;
+  const legacyMonthlyQuota = summary.monthlyQuota;
+  const legacyConsumedQuota = summary.quotaConsumed;
+  const quotaPerUnit = getConfig().newapi.quotaPerUnit;
+  const ledgerAuthoritative = Boolean(settings.quotaMigration?.appliedAt);
+  const assignedMonthlyQuota =
+    policy?.assignedMonthlyQuota ??
+    (ledgerAuthoritative
+      ? 0
+      : Math.max(Math.round(legacyMonthlyQuota * quotaPerUnit), 0));
+  const authoritativeConsumedQuota = usageRecords
+    .filter((record) => record.matchStatus === "matched" && usageRecordPeriod(record) === period)
+    .reduce(
+      (total, record) => total + authoritativeQuotaFromRecord(record, quotaPerUnit),
+      0,
+    );
+  const materialized = materializeUserQuota({
+    assignedMonthlyQuota,
+    authoritativeConsumedQuota,
+    ledgerEntries,
+  });
+
+  summary.monthlyQuota = ledgerAuthoritative
+    ? assignedMonthlyQuota / quotaPerUnit
+    : legacyMonthlyQuota;
+  summary.remainingQuota = ledgerAuthoritative
+    ? materialized.expectedAvailableQuota / quotaPerUnit
+    : Math.max(Number((legacyMonthlyQuota - legacyConsumedQuota).toFixed(8)), 0);
+  Object.assign(summary, materialized, {
+    settledThrough: usageCheckpoint?.settledThrough,
+    sourceVersion: `${policy?.version ?? 0}:${ledgerEntries.length}:${summary.usageRecordCount}`,
+    materializedAt,
+  });
+  summary.updatedAt = summary.sourceUpdatedAt ?? existing?.updatedAt ?? seededAt;
   delete summary.quotaUpdatedAt;
   delete summary.sourceUpdatedAt;
 
-  if (
-    !existing ||
-    existing.monthlyQuota !== summary.monthlyQuota ||
-    existing.quotaConsumed !== summary.quotaConsumed ||
-    existing.cost !== summary.cost ||
-    existing.remainingQuota !== summary.remainingQuota ||
-    existing.promptTokens !== summary.promptTokens ||
-    existing.completionTokens !== summary.completionTokens ||
-    existing.totalTokens !== summary.totalTokens ||
-    existing.proxyLogCount !== summary.proxyLogCount ||
-    existing.usageRecordCount !== summary.usageRecordCount ||
-    existing.activeTokenAccountId !== summary.activeTokenAccountId ||
-    !sameStringArray(existing.tokenAccountIds, summary.tokenAccountIds) ||
-    existing.assignedQuotaUpdatedAt !== summary.assignedQuotaUpdatedAt ||
-    existing.assignedQuotaUpdatedByFeishuUserId !==
-      summary.assignedQuotaUpdatedByFeishuUserId ||
-    existing.updatedAt !== summary.updatedAt
-  ) {
-    return saveUserBillingPeriodRow(client, summary);
-  }
-  return existing;
+  const billingPeriod = await saveUserBillingPeriodRow(client, summary);
+  const materialization: PostgresUserQuotaMaterialization = {
+    feishuUserId,
+    period,
+    legacyMonthlyQuota: Math.round(legacyMonthlyQuota * quotaPerUnit),
+    legacyConsumedQuota: Math.round(legacyConsumedQuota * quotaPerUnit),
+    assignedMonthlyQuota,
+    authorizedQuota: materialized.authorizedQuota,
+    authoritativeConsumedQuota,
+    expectedAvailableQuota: materialized.expectedAvailableQuota,
+    overageQuota: materialized.overageQuota,
+    ledgerEntries: ledgerEntries.length,
+    policyPresent: Boolean(policy),
+  };
+  return { billingPeriod, materialization };
 }
 
 export async function reconcilePostgresBillingPeriodForUser(
   feishuUserId: string,
   period: string,
 ) {
-  return withTransaction(async (client) => {
-    await client.query(
-      "select pg_advisory_xact_lock(hashtext($1)::bigint)",
-      [`billing-period-finalize:${feishuUserId}:${period}`],
+  const result = await withTransaction((client) =>
+    syncPostgresBillingPeriodForUser(client, feishuUserId, period),
+  );
+  return result.billingPeriod;
+}
+
+export async function reconcilePostgresBillingPeriodForQuotaOperation(
+  feishuUserId: string,
+  period: string,
+) {
+  const result = await withControlTransaction((client) =>
+    syncPostgresBillingPeriodForUser(client, feishuUserId, period),
+  );
+  return result.billingPeriod;
+}
+
+export async function refreshPostgresBillingPeriodTokenMetadataForQuotaOperation(
+  feishuUserId: string,
+  period: string,
+) {
+  return withControlTransaction(async (client) => {
+    // Keep this lightweight metadata-only refresh ordered with full billing
+    // materialization so it cannot overwrite a newer authoritative snapshot.
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `billing-period-finalize:${feishuUserId}:${period}`,
+    ]);
+    const existingResult = await client.query<{ data: UserBillingPeriod }>(
+      `select data from user_billing_periods
+       where feishu_user_id = $1 and period = $2
+       for update`,
+      [feishuUserId, period],
     );
-    return syncPostgresBillingPeriodForUser(client, feishuUserId, period);
+    const existing = existingResult.rows[0]?.data;
+    if (!existing) return null;
+
+    const accounts = (
+      await client.query<{ data: TokenAccount }>(
+        `select data from token_accounts
+         where feishu_user_id = $1
+         order by created_at, id`,
+        [feishuUserId],
+      )
+    ).rows.map((row) => row.data);
+    const periodAccounts = accounts.filter(
+      (account) => (account.billingPeriod || periodFromIso(account.createdAt)) === period,
+    );
+    const activeTokenAccountId = periodAccounts.find(
+      (account) => account.status === "active",
+    )?.id;
+    return saveUserBillingPeriodRow(client, {
+      ...existing,
+      activeTokenAccountId,
+      tokenAccountIds: [...new Set(periodAccounts.map((account) => account.id))].sort(),
+      materializedAt: nowIso(),
+    });
   });
+}
+
+async function rebuildPostgresDepartmentQuotaMaterializedSnapshotWithClient(
+  client: PoolClient,
+  departmentId: string,
+  period: string,
+) {
+  await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+    `department-quota:${departmentId}:${period}`,
+  ]);
+  const existingResult = await client.query<{ data: DepartmentQuotaPeriod }>(
+    `select data
+     from department_quota_periods
+     where department_id = $1 and period = $2
+     for update`,
+    [departmentId, period],
+  );
+  const existing = existingResult.rows[0]?.data;
+  if (!existing) return null;
+
+  const committedResult = await client.query<{ quota: string }>(
+    `select coalesce(sum(entry.signed_quota), 0)::text as quota
+     from quota_ledger_entries entry
+     where entry.period = $2
+       and (
+         entry.department_id = $1
+         or exists (
+           select 1 from feishu_users user_row
+           where user_row.id = entry.feishu_user_id
+             and user_row.department_id = $1
+             and coalesce(user_row.data->>'status', 'active') <> 'deleted'
+         )
+       )`,
+    [departmentId, period],
+  );
+  const pendingResult = await client.query<{ quota: string }>(
+    `select coalesce(
+       sum(greatest(coalesce((data->>'reservedDepartmentQuota')::bigint, 0), 0)),
+       0
+     )::text as quota
+     from quota_operations
+     where department_id = $1
+       and billing_period = $2
+       and state not in ('completed', 'compensated')`,
+    [departmentId, period],
+  );
+  const materialized = materializeDepartmentQuota({
+    budgetQuota: Math.max(
+      Math.round(existing.quotaLimit * getConfig().newapi.quotaPerUnit),
+      0,
+    ),
+    committedAuthorizedQuota: Math.max(
+      Number(committedResult.rows[0]?.quota ?? 0),
+      0,
+    ),
+    pendingReservedQuota: Math.max(Number(pendingResult.rows[0]?.quota ?? 0), 0),
+  });
+  return saveDepartmentQuotaPeriodRow(client, {
+    ...existing,
+    ...materialized,
+    materializedAt: nowIso(),
+    updatedAt: existing.updatedAt,
+  });
+}
+
+export async function rebuildPostgresDepartmentQuotaMaterializedSnapshot(
+  departmentId: string,
+  period: string,
+) {
+  return withTransaction((client) =>
+    rebuildPostgresDepartmentQuotaMaterializedSnapshotWithClient(client, departmentId, period),
+  );
+}
+
+export async function rebuildPostgresDepartmentQuotaMaterializedSnapshotForQuotaOperation(
+  departmentId: string,
+  period: string,
+) {
+  return withControlTransaction((client) =>
+    rebuildPostgresDepartmentQuotaMaterializedSnapshotWithClient(client, departmentId, period),
+  );
+}
+
+export async function rebuildPostgresQuotaMaterializedUsers(period: string) {
+  const materializedAt = nowIso();
+  const userIds = await withClient(async (client) => {
+    const result = await client.query<{ feishu_user_id: string }>(
+      `select id as feishu_user_id from feishu_users
+       union
+       select feishu_user_id from user_billing_periods where period = $1
+       union
+       select feishu_user_id
+       from user_quota_policies
+       where effective_from_period <= $1
+         and (effective_to_period is null or effective_to_period >= $1)
+       union
+       select feishu_user_id from quota_ledger_entries where period = $1
+       order by feishu_user_id`,
+      [period],
+    );
+    return result.rows.map((row) => row.feishu_user_id);
+  });
+  const users = new Array<PostgresUserQuotaMaterialization>(userIds.length);
+  let cursor = 0;
+  const workerCount = Math.min(8, userIds.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (cursor < userIds.length) {
+        const index = cursor;
+        cursor += 1;
+        const result = await withTransaction((client) =>
+          syncPostgresBillingPeriodForUser(client, userIds[index], period, materializedAt),
+        );
+        users[index] = result.materialization;
+      }
+    }),
+  );
+  return { materializedAt, users };
 }
 
 export async function checkPostgresConnection() {
@@ -1138,9 +1462,15 @@ export async function getPostgresAppSettings() {
   return withClient((client) => readSettingsRow(client));
 }
 
+export async function getPostgresAppSettingsForQuotaOperation() {
+  return withControlClient((client) => readSettingsRow(client));
+}
+
 export async function readPostgresUsageMatchingSnapshot(input: {
   newapiTokenIds: string[];
   proxyLogIds: string[];
+  proxyCreatedAfter?: string;
+  proxyCreatedBefore?: string;
 }) {
   const newapiTokenIds = [...new Set(input.newapiTokenIds.filter(Boolean))];
   const proxyLogIds = [...new Set(input.proxyLogIds.filter(Boolean))];
@@ -1158,11 +1488,26 @@ export async function readPostgresUsageMatchingSnapshot(input: {
           [userIds],
         )
       : { rows: [] as Array<{ data: FeishuUser }> };
+    const accountIds = accounts.rows.map((row) => row.data.id);
     const proxyLogs = proxyLogIds.length
       ? await client.query<{ data: ProxyRequestLog }>(
           "select data from proxy_request_logs where id = any($1::text[])",
           [proxyLogIds],
         )
+      : accountIds.length
+        ? await client.query<{ data: ProxyRequestLog }>(
+            `select data
+             from proxy_request_logs
+             where token_account_id = any($1::text[])
+               and ($2::timestamptz is null or created_at >= $2::timestamptz)
+               and ($3::timestamptz is null or created_at <= $3::timestamptz)
+             order by created_at, id`,
+            [
+              accountIds,
+              input.proxyCreatedAfter ?? null,
+              input.proxyCreatedBefore ?? null,
+            ],
+          )
       : { rows: [] as Array<{ data: ProxyRequestLog }> };
     const usageRecords = newapiTokenIds.length
       ? await client.query<{ data: NewApiUsageRecord }>(
@@ -1180,7 +1525,7 @@ export async function readPostgresUsageMatchingSnapshot(input: {
 }
 
 export async function getPostgresUserById(feishuUserId: string) {
-  return withClient(async (client) => {
+  return withControlClient(async (client) => {
     const result = await client.query<{ data: FeishuUser }>(
       "select data from feishu_users where id = $1 limit 1",
       [feishuUserId],
@@ -1189,21 +1534,134 @@ export async function getPostgresUserById(feishuUserId: string) {
   });
 }
 
-export async function getPostgresUserQuotaState(feishuUserId: string) {
-  return withClient(async (client) => {
-    const result = await client.query<{ data: UserQuotaState | null; generation: number }>(
+async function readPostgresUserQuotaState(client: PoolClient, feishuUserId: string) {
+  const result = await client.query<{ data: UserQuotaState | null; generation: number }>(
       `select
          (select data from user_quota_states where feishu_user_id = $1) as data,
          coalesce((select max(operation_generation) from token_accounts where feishu_user_id = $1), 0)::integer as generation`,
       [feishuUserId],
+  );
+  const row = result.rows[0];
+  return row?.data ?? {
+    feishuUserId,
+    admission: "open" as const,
+    activeGeneration: row?.generation ?? 0,
+    updatedAt: nowIso(),
+  };
+}
+
+export async function getPostgresActiveAdminScopeForUser(feishuUserId: string) {
+  return withControlClient(async (client) => {
+    const result = await client.query<{ data: AdminScope }>(
+      `select data
+       from admin_scopes
+       where feishu_user_id = $1 and status = 'active'
+       order by case when scope_type = 'global' then 0 else 1 end, updated_at desc, id
+       limit 1`,
+      [feishuUserId],
     );
-    const row = result.rows[0];
-    return row?.data ?? {
-      feishuUserId,
-      admission: "open" as const,
-      activeGeneration: row?.generation ?? 0,
-      updatedAt: nowIso(),
-    };
+    return result.rows[0]?.data ?? null;
+  });
+}
+
+export async function getPostgresTokenRequestById(requestId: string) {
+  return withControlClient(async (client) => {
+    const result = await client.query<{ data: TokenRequest }>(
+      "select data from token_requests where id = $1 limit 1",
+      [requestId],
+    );
+    return result.rows[0]?.data ?? null;
+  });
+}
+
+export async function getPostgresUserBillingPeriod(
+  feishuUserId: string,
+  period: string,
+) {
+  return withControlClient(async (client) => {
+    const result = await client.query<{ data: UserBillingPeriod }>(
+      `select data from user_billing_periods
+       where feishu_user_id = $1 and period = $2
+       limit 1`,
+      [feishuUserId, period],
+    );
+    return result.rows[0]?.data ?? null;
+  });
+}
+
+export async function getPostgresEffectiveUserQuotaPolicy(
+  feishuUserId: string,
+  period: string,
+) {
+  return withControlClient(async (client) => {
+    const result = await client.query<{ data: UserQuotaPolicy }>(
+      `select data
+       from user_quota_policies
+       where feishu_user_id = $1
+         and effective_from_period <= $2
+         and (effective_to_period is null or effective_to_period >= $2)
+       order by version desc, id desc
+       limit 1`,
+      [feishuUserId, period],
+    );
+    return result.rows[0]?.data ?? null;
+  });
+}
+
+export async function listPostgresTokenAccountsForUser(feishuUserId: string) {
+  return withControlClient(async (client) => {
+    const result = await client.query<{ data: TokenAccount }>(
+      `select data from token_accounts
+       where feishu_user_id = $1
+       order by created_at, id`,
+      [feishuUserId],
+    );
+    return result.rows.map((row) => row.data);
+  });
+}
+
+async function listPostgresInflightProxyRequestsWithClient(
+  client: PoolClient,
+  feishuUserId: string,
+  operationGeneration: number,
+  at: string,
+) {
+  const result = await client.query<{ data: ProxyRequestLog }>(
+    `select data
+     from proxy_request_logs
+     where feishu_user_id = $1
+       and operation_generation = $2
+       and data->>'status' in ('pending', 'streaming')
+       and (lease_expires_at is null or lease_expires_at > $3::timestamptz)
+     order by created_at, id`,
+    [feishuUserId, operationGeneration, at],
+  );
+  return result.rows.map((row) => row.data);
+}
+
+export async function listPostgresInflightProxyRequests(
+  feishuUserId: string,
+  operationGeneration: number,
+  at: string,
+) {
+  return withClient((client) =>
+    listPostgresInflightProxyRequestsWithClient(client, feishuUserId, operationGeneration, at),
+  );
+}
+
+export async function listPostgresInflightProxyRequestsForQuotaOperation(
+  feishuUserId: string,
+  operationGeneration: number,
+  at: string,
+) {
+  return withControlClient((client) =>
+    listPostgresInflightProxyRequestsWithClient(client, feishuUserId, operationGeneration, at),
+  );
+}
+
+export async function getPostgresUserQuotaState(feishuUserId: string) {
+  return withControlClient(async (client) => {
+    return readPostgresUserQuotaState(client, feishuUserId);
   });
 }
 
@@ -1235,7 +1693,7 @@ export async function mutatePostgresAppSettings<T>(
 }
 
 export async function upsertPostgresUserQuotaPolicy(policy: UserQuotaPolicy) {
-  return withTransaction(async (client) => {
+  return withControlTransaction(async (client) => {
     await client.query("select pg_advisory_xact_lock(hashtext($1))", [
       `user-quota:${policy.feishuUserId}`,
     ]);
@@ -1243,13 +1701,54 @@ export async function upsertPostgresUserQuotaPolicy(policy: UserQuotaPolicy) {
   });
 }
 
+export async function findPostgresQuotaOperationById(operationId: string) {
+  return withControlClient(async (client) => {
+    const result = await client.query<{ data: QuotaOperation }>(
+      "select data from quota_operations where id = $1 limit 1",
+      [operationId],
+    );
+    return result.rows[0]?.data ?? null;
+  });
+}
+
+export async function findPostgresQuotaOperationByIdempotencyKey(
+  idempotencyKey: string,
+) {
+  return withControlClient(async (client) => {
+    const result = await client.query<{ data: QuotaOperation }>(
+      "select data from quota_operations where idempotency_key = $1 limit 1",
+      [idempotencyKey],
+    );
+    return result.rows[0]?.data ?? null;
+  });
+}
+
+export async function listPostgresQuotaOperations(input: {
+  feishuUserId?: string;
+  state?: QuotaOperation["state"];
+  limit?: number;
+} = {}) {
+  const limit = Math.min(Math.max(Math.trunc(input.limit ?? 100), 0), 1_000);
+  if (limit === 0) return [];
+  return withControlClient(async (client) => {
+    const result = await client.query<{ data: QuotaOperation }>(
+      `select data
+       from quota_operations
+       where ($1::text is null or feishu_user_id = $1)
+         and ($2::text is null or state = $2)
+       order by updated_at desc, id desc
+       limit $3`,
+      [input.feishuUserId ?? null, input.state ?? null, limit],
+    );
+    return result.rows.map((row) => row.data);
+  });
+}
+
 export async function createPostgresQuotaOperation(operation: QuotaOperation) {
-  return withTransaction(async (client) => {
-    if (operation.departmentId) {
-      await client.query("select pg_advisory_xact_lock(hashtext($1))", [
-        `department-quota:${operation.departmentId}:${operation.billingPeriod}`,
-      ]);
-    }
+  return withControlTransaction(async (client) => {
+    // A newly-created operation is still only planned and does not reserve
+    // department budget. Department serialization belongs to the later budget
+    // reservation transaction; taking it here needlessly queues unrelated users.
     await client.query("select pg_advisory_xact_lock(hashtext($1))", [
       `user-quota:${operation.feishuUserId}`,
     ]);
@@ -1416,7 +1915,7 @@ export async function updatePostgresQuotaOperation(
   patch: Partial<QuotaOperation>,
   allowedStates?: QuotaOperation["state"][],
 ) {
-  return withTransaction(async (client) => {
+  return withControlTransaction(async (client) => {
     const current = await client.query<{ data: QuotaOperation }>(
       "select data from quota_operations where id = $1 for update",
       [operationId],
@@ -1434,12 +1933,39 @@ export async function updatePostgresQuotaOperation(
   });
 }
 
+export async function transitionPostgresQuotaOperation(
+  operationId: string,
+  state: QuotaOperation["state"],
+  patch: Partial<QuotaOperation> = {},
+) {
+  return withControlTransaction(async (client) => {
+    const current = await client.query<{ data: QuotaOperation }>(
+      "select data from quota_operations where id = $1 for update",
+      [operationId],
+    );
+    const operation = current.rows[0]?.data;
+    if (!operation) return null;
+    assertQuotaOperationTransition(operation.state, state);
+    const updated: QuotaOperation = {
+      ...operation,
+      ...patch,
+      id: operation.id,
+      idempotencyKey: operation.idempotencyKey,
+      state,
+      completedAt:
+        state === "completed" || state === "compensated" ? nowIso() : patch.completedAt,
+      updatedAt: patch.updatedAt ?? nowIso(),
+    };
+    return saveQuotaOperationRow(client, updated);
+  });
+}
+
 export async function claimPostgresQuotaOperationExecution(input: {
   operationId: string;
   leaseId: string;
   leaseExpiresAt: string;
 }) {
-  return withTransaction(async (client) => {
+  return withControlTransaction(async (client) => {
     const current = await client.query<{ data: QuotaOperation }>(
       "select data from quota_operations where id = $1 for update",
       [input.operationId],
@@ -1467,7 +1993,7 @@ export async function renewPostgresQuotaOperationExecution(input: {
   leaseId: string;
   leaseExpiresAt: string;
 }) {
-  return withTransaction(async (client) => {
+  return withControlTransaction(async (client) => {
     const current = await client.query<{ data: QuotaOperation }>(
       "select data from quota_operations where id = $1 for update",
       [input.operationId],
@@ -1485,7 +2011,7 @@ export async function releasePostgresQuotaOperationExecution(input: {
   operationId: string;
   leaseId: string;
 }) {
-  return withTransaction(async (client) => {
+  return withControlTransaction(async (client) => {
     const current = await client.query<{ data: QuotaOperation }>(
       "select data from quota_operations where id = $1 for update",
       [input.operationId],
@@ -1501,11 +2027,11 @@ export async function releasePostgresQuotaOperationExecution(input: {
 }
 
 export async function insertPostgresQuotaLedgerEntry(entry: QuotaLedgerEntry) {
-  return withTransaction((client) => insertQuotaLedgerEntryRow(client, entry));
+  return withControlTransaction((client) => insertQuotaLedgerEntryRow(client, entry));
 }
 
 export async function upsertPostgresUserQuotaState(state: UserQuotaState) {
-  return withTransaction(async (client) => {
+  return withControlTransaction(async (client) => {
     await client.query("select pg_advisory_xact_lock(hashtext($1))", [
       `user-quota:${state.feishuUserId}`,
     ]);
@@ -1575,7 +2101,7 @@ export async function upsertPostgresFeishuUser(input: {
 }
 
 export async function insertPostgresTokenRequest(request: TokenRequest) {
-  return withTransaction(async (client) => {
+  return withControlTransaction(async (client) => {
     const stored = await saveTokenRequestRow(client, request);
     if (stored.requestType === "first_apply") {
       const userResult = await client.query<{ data: FeishuUser }>(
@@ -1605,42 +2131,68 @@ export async function updatePostgresTokenRequest(
   return transitionPostgresTokenRequest(id, patch);
 }
 
+export async function updatePostgresTokenRequestForQuotaOperation(
+  id: string,
+  patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
+) {
+  return transitionPostgresTokenRequestForQuotaOperation(id, patch);
+}
+
+async function transitionPostgresTokenRequestWithClient(
+  client: PoolClient,
+  id: string,
+  patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
+  allowedStatuses?: RequestStatus[],
+) {
+  const result = await client.query<{ data: TokenRequest }>(
+    "select data from token_requests where id = $1 for update",
+    [id],
+  );
+  const existing = result.rows[0]?.data;
+  if (!existing) return null;
+  if (allowedStatuses && !allowedStatuses.includes(existing.status)) return null;
+
+  const updated: TokenRequest = {
+    ...existing,
+    ...patch,
+    updatedAt: nowIso(),
+  };
+  const stored = await saveTokenRequestRow(client, updated);
+  if (stored.tokenAccountId) {
+    const accountResult = await client.query<{ data: TokenAccount }>(
+      "select data from token_accounts where id = $1",
+      [stored.tokenAccountId],
+    );
+    const account = accountResult.rows[0]?.data;
+    if (account) {
+      await syncPostgresBillingPeriodForUser(
+        client,
+        account.feishuUserId,
+        account.billingPeriod || periodFromIso(account.createdAt),
+      );
+    }
+  }
+  return stored;
+}
+
 export async function transitionPostgresTokenRequest(
   id: string,
   patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
   allowedStatuses?: RequestStatus[],
 ) {
-  return withTransaction(async (client) => {
-    const result = await client.query<{ data: TokenRequest }>(
-      "select data from token_requests where id = $1 for update",
-      [id],
-    );
-    const existing = result.rows[0]?.data;
-    if (!existing) return null;
-    if (allowedStatuses && !allowedStatuses.includes(existing.status)) return null;
+  return withTransaction((client) =>
+    transitionPostgresTokenRequestWithClient(client, id, patch, allowedStatuses),
+  );
+}
 
-    const updated: TokenRequest = {
-      ...existing,
-      ...patch,
-      updatedAt: nowIso(),
-    };
-    const stored = await saveTokenRequestRow(client, updated);
-    if (stored.tokenAccountId) {
-      const accountResult = await client.query<{ data: TokenAccount }>(
-        "select data from token_accounts where id = $1",
-        [stored.tokenAccountId],
-      );
-      const account = accountResult.rows[0]?.data;
-      if (account) {
-        await syncPostgresBillingPeriodForUser(
-          client,
-          account.feishuUserId,
-          account.billingPeriod || periodFromIso(account.createdAt),
-        );
-      }
-    }
-    return stored;
-  });
+export async function transitionPostgresTokenRequestForQuotaOperation(
+  id: string,
+  patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
+  allowedStatuses?: RequestStatus[],
+) {
+  return withControlTransaction((client) =>
+    transitionPostgresTokenRequestWithClient(client, id, patch, allowedStatuses),
+  );
 }
 
 export async function upsertPostgresUserBillingPeriod(period: UserBillingPeriod) {
@@ -1718,7 +2270,7 @@ export async function invalidatePostgresOpenFirstApplyRequests(input: {
 }
 
 export async function getPostgresActiveTokenForUser(feishuUserId: string) {
-  return withClient(async (client) => {
+  return withControlClient(async (client) => {
     const result = await client.query<{ data: TokenAccount }>(
       `select data from token_accounts
        where feishu_user_id = $1 and status = 'active'
@@ -1756,7 +2308,7 @@ export async function findPostgresActiveTokenByHash(keyHash: string) {
 }
 
 export async function insertPostgresTokenAccount(account: TokenAccount) {
-  return withTransaction(async (client) => {
+  return withControlTransaction(async (client) => {
     const stored = await saveTokenAccountRow(client, account);
     await syncPostgresBillingPeriodForUser(
       client,
@@ -1767,26 +2319,52 @@ export async function insertPostgresTokenAccount(account: TokenAccount) {
   });
 }
 
+export async function insertPostgresTokenAccountForQuotaOperation(account: TokenAccount) {
+  // quota_restore/key_rotation already perform an authoritative snapshot at
+  // their accounting boundary. A pending replacement account has no usage or
+  // ledger effect, so inserting it must not trigger another full user rebuild.
+  return withControlTransaction((client) => saveTokenAccountRow(client, account));
+}
+
+async function updatePostgresTokenAccountWithClient(
+  client: PoolClient,
+  accountId: string,
+  patch: Partial<TokenAccount>,
+  allowedStatuses?: TokenStatus[],
+) {
+  const result = await client.query<{ data: TokenAccount }>(
+    "select data from token_accounts where id = $1 for update",
+    [accountId],
+  );
+  const account = result.rows[0]?.data;
+  if (!account || (allowedStatuses && !allowedStatuses.includes(account.status))) return null;
+  return saveTokenAccountRow(client, {
+    ...account,
+    ...patch,
+    id: account.id,
+    feishuUserId: account.feishuUserId,
+    keyHash: account.keyHash,
+  });
+}
+
 export async function updatePostgresTokenAccount(
   accountId: string,
   patch: Partial<TokenAccount>,
   allowedStatuses?: TokenStatus[],
 ) {
-  return withTransaction(async (client) => {
-    const result = await client.query<{ data: TokenAccount }>(
-      "select data from token_accounts where id = $1 for update",
-      [accountId],
-    );
-    const account = result.rows[0]?.data;
-    if (!account || (allowedStatuses && !allowedStatuses.includes(account.status))) return null;
-    return saveTokenAccountRow(client, {
-      ...account,
-      ...patch,
-      id: account.id,
-      feishuUserId: account.feishuUserId,
-      keyHash: account.keyHash,
-    });
-  });
+  return withTransaction((client) =>
+    updatePostgresTokenAccountWithClient(client, accountId, patch, allowedStatuses),
+  );
+}
+
+export async function updatePostgresTokenAccountForQuotaOperation(
+  accountId: string,
+  patch: Partial<TokenAccount>,
+  allowedStatuses?: TokenStatus[],
+) {
+  return withControlTransaction((client) =>
+    updatePostgresTokenAccountWithClient(client, accountId, patch, allowedStatuses),
+  );
 }
 
 export async function replacePostgresActiveTokenAccount(input: {
@@ -1794,6 +2372,7 @@ export async function replacePostgresActiveTokenAccount(input: {
   account: TokenAccount;
 }) {
   return withTransaction(async (client) => {
+    await lockPostgresUserQuotaFence(client, input.account.feishuUserId);
     const oldResult = await client.query<{ data: TokenAccount }>(
       `select data from token_accounts
        where id = $1 and feishu_user_id = $2 and status = 'active'
@@ -1826,51 +2405,68 @@ export async function replacePostgresActiveTokenAccount(input: {
   });
 }
 
-export async function finalizePostgresTokenRotation(input: {
+type FinalizePostgresTokenRotationInput = {
   feishuUserId: string;
   oldTokenAccountId: string;
   newTokenAccountId: string;
   operationGeneration: number;
   operationId: string;
   now: string;
-}) {
-  return withTransaction(async (client) => {
-    await client.query("select pg_advisory_xact_lock(hashtext($1))", [
-      `user-quota:${input.feishuUserId}`,
-    ]);
-    const result = await client.query<{ data: TokenAccount }>(
-      `select data from token_accounts
-       where id = any($1::text[])
-       order by id
-       for update`,
-      [[input.oldTokenAccountId, input.newTokenAccountId]],
-    );
-    const accounts = new Map(result.rows.map((row) => [row.data.id, row.data]));
-    const oldAccount = accounts.get(input.oldTokenAccountId);
-    const newAccount = accounts.get(input.newTokenAccountId);
-    if (!oldAccount || !newAccount) throw new Error("Key 轮换本地账号记录不完整");
-    const storedOld = await saveTokenAccountRow(client, {
-      ...oldAccount,
-      status: "replaced",
-      disabledAt: input.now,
-      replacedByTokenAccountId: newAccount.id,
-    });
-    const storedNew = await saveTokenAccountRow(client, {
-      ...newAccount,
-      status: "active",
-      operationGeneration: input.operationGeneration,
-      activatedAt: input.now,
-    });
-    const state = await saveUserQuotaStateRow(client, {
-      feishuUserId: input.feishuUserId,
-      admission: "open",
-      activeGeneration: input.operationGeneration,
-      operationId: undefined,
-      closedReason: undefined,
-      updatedAt: input.now,
-    });
-    return { oldAccount: storedOld, newAccount: storedNew, state };
+};
+
+async function finalizePostgresTokenRotationWithClient(
+  client: PoolClient,
+  input: FinalizePostgresTokenRotationInput,
+) {
+  await client.query("select pg_advisory_xact_lock(hashtext($1))", [
+    `user-quota:${input.feishuUserId}`,
+  ]);
+  const result = await client.query<{ data: TokenAccount }>(
+    `select data from token_accounts
+     where id = any($1::text[])
+     order by id
+     for update`,
+    [[input.oldTokenAccountId, input.newTokenAccountId]],
+  );
+  const accounts = new Map(result.rows.map((row) => [row.data.id, row.data]));
+  const oldAccount = accounts.get(input.oldTokenAccountId);
+  const newAccount = accounts.get(input.newTokenAccountId);
+  if (!oldAccount || !newAccount) throw new Error("Key 轮换本地账号记录不完整");
+  const storedOld = await saveTokenAccountRow(client, {
+    ...oldAccount,
+    status: "replaced",
+    disabledAt: input.now,
+    replacedByTokenAccountId: newAccount.id,
   });
+  const storedNew = await saveTokenAccountRow(client, {
+    ...newAccount,
+    status: "active",
+    operationGeneration: input.operationGeneration,
+    activatedAt: input.now,
+  });
+  const state = await saveUserQuotaStateRow(client, {
+    feishuUserId: input.feishuUserId,
+    admission: "open",
+    activeGeneration: input.operationGeneration,
+    operationId: undefined,
+    closedReason: undefined,
+    updatedAt: input.now,
+  });
+  return { oldAccount: storedOld, newAccount: storedNew, state };
+}
+
+export async function finalizePostgresTokenRotation(
+  input: FinalizePostgresTokenRotationInput,
+) {
+  return withTransaction((client) => finalizePostgresTokenRotationWithClient(client, input));
+}
+
+export async function finalizePostgresTokenRotationForQuotaOperation(
+  input: FinalizePostgresTokenRotationInput,
+) {
+  return withControlTransaction((client) =>
+    finalizePostgresTokenRotationWithClient(client, input),
+  );
 }
 
 export async function finalizePostgresTokenProvision(input: {
@@ -1879,7 +2475,7 @@ export async function finalizePostgresTokenProvision(input: {
   operationGeneration: number;
   now: string;
 }) {
-  return withTransaction(async (client) => {
+  return withControlTransaction(async (client) => {
     await client.query("select pg_advisory_xact_lock(hashtext($1))", [
       `user-quota:${input.feishuUserId}`,
     ]);
@@ -1926,6 +2522,7 @@ export async function recordPostgresMonthlyResetApplied(input: {
   approvalUuid: string;
 }) {
   return withTransaction(async (client) => {
+    await lockPostgresUserQuotaFence(client, input.feishuUserId);
     const accountResult = await client.query<{ data: TokenAccount }>(
       `select data from token_accounts
        where id = $1 and feishu_user_id = $2 and status = 'active'
@@ -2217,6 +2814,7 @@ export async function updatePostgresUserAccessStatus(input: {
   adminRevokedByFeishuUserId?: string;
 }) {
   return withTransaction(async (client) => {
+    await lockPostgresUserQuotaFence(client, input.feishuUserId);
     const now = nowIso();
     const userResult = await client.query<{ data: FeishuUser }>(
       "select data from feishu_users where id = $1 for update",
@@ -2290,6 +2888,7 @@ export async function enablePostgresUserAccess(input: {
   reason?: string;
 }) {
   return withTransaction(async (client) => {
+    await lockPostgresUserQuotaFence(client, input.feishuUserId);
     const now = nowIso();
     const userResult = await client.query<{ data: FeishuUser }>(
       "select data from feishu_users where id = $1 for update",
@@ -2340,17 +2939,274 @@ export async function enablePostgresUserAccess(input: {
 }
 
 export async function insertPostgresProxyLog(log: ProxyRequestLog) {
-  return withTransaction(async (client) => {
-    const stored = await saveProxyLogRow(client, log);
-    if (stored.feishuUserId) {
-      await syncPostgresBillingPeriodForUser(
-        client,
-        stored.feishuUserId,
-        periodFromIso(stored.createdAt),
+  return withClient((client) => saveProxyLogRow(client, log));
+}
+
+export async function insertPostgresQuotaAwareProxyLog(
+  account: TokenAccount,
+  log: ProxyRequestLog,
+) {
+  const retryDelaysMs = [10, 25, 50, 100, 200];
+  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+    const stored = await withTransaction(async (client) => {
+      // Proxy admissions share this transaction lock with each other. A quota
+      // saga holds the same key as a session-level exclusive lock, so it still
+      // fences new admissions while changing generation or account state.
+      const lockResult = await client.query<{ locked: boolean }>(
+        "select pg_try_advisory_xact_lock_shared(hashtext($1)::bigint) as locked",
+        [`user-quota-fence:${account.feishuUserId}`],
       );
-    }
-    return stored;
-  });
+      if (!lockResult.rows[0]?.locked) return null;
+
+      const currentResult = await client.query<{
+        account: TokenAccount;
+        user: FeishuUser;
+      }>(
+        `select a.data as account, u.data as user
+         from token_accounts a
+         join feishu_users u on u.id = a.feishu_user_id
+         where a.id = $1
+           and a.key_hash = $2
+           and a.feishu_user_id = $3
+           and a.status in ('active', 'draining', 'settling')
+         limit 1`,
+        [account.id, account.keyHash, account.feishuUserId],
+      );
+      const currentAccount = currentResult.rows[0]?.account;
+      const currentUser = currentResult.rows[0]?.user;
+      if (
+        !currentAccount ||
+        !currentUser ||
+        (currentUser.status && currentUser.status !== "active")
+      ) {
+        throw new StaleTokenGenerationError();
+      }
+      const state = await readPostgresUserQuotaState(client, account.feishuUserId);
+      assertQuotaAdmission(state, currentAccount);
+      return saveProxyLogRow(client, {
+        ...log,
+        billingPeriod: currentAccount.billingPeriod,
+        operationGeneration: state.activeGeneration,
+      });
+    });
+    if (stored) return stored;
+
+    // A closed state is definitive and should fail immediately. An open state
+    // can mean that the exclusive saga fence was acquired just before its
+    // state transition, so retry the shared lock for a short bounded window.
+    const state = await getPostgresUserQuotaState(account.feishuUserId);
+    assertQuotaAdmission(state, account);
+    const retryDelayMs = retryDelaysMs[attempt];
+    if (retryDelayMs === undefined) throw new QuotaOperationBusyError();
+    const jitterMs = Math.floor(Math.random() * Math.max(Math.floor(retryDelayMs / 2), 1));
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs + jitterMs));
+  }
+  throw new QuotaOperationBusyError();
+}
+
+type ProxyAdmissionRetry = {
+  status: "retry";
+};
+
+/**
+ * Authenticates and admits a proxy request on one pool client. The first
+ * lookup intentionally returns only scalar identity columns; all mutable
+ * account, user and quota state is reread after taking the shared saga fence.
+ */
+export async function beginPostgresQuotaAwareProxyRequest(
+  keyHash: string,
+  log: ProxyAdmissionLogInput,
+): Promise<ProxyRequestAdmissionResult> {
+  const retryDelaysMs = [10, 25, 50, 100, 200];
+  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+    const result = await withTransaction<ProxyRequestAdmissionResult | ProxyAdmissionRetry>(
+      async (client) => {
+        // Business statement 1/2: discover the fence key and take the shared
+        // transaction lock. Mutable state is deliberately not trusted here;
+        // the next statement gets a fresh READ COMMITTED snapshot after the
+        // fence has been acquired.
+        const fenceResult = await client.query<{
+          account_id: string;
+          feishu_user_id: string;
+          locked: boolean;
+        }>(
+          `with candidate as materialized (
+             select id as account_id, feishu_user_id
+             from token_accounts
+             where key_hash = $1 and status in ('active', 'draining', 'settling')
+             limit 1
+           )
+           select account_id,
+                  feishu_user_id,
+                  pg_try_advisory_xact_lock_shared(
+                    hashtext('user-quota-fence:' || feishu_user_id)::bigint
+                  ) as locked
+           from candidate`,
+          [keyHash],
+        );
+        const candidate = fenceResult.rows[0];
+        if (!candidate) return { status: "inactive_token" };
+        if (!candidate.locked) return { status: "retry" };
+
+        const now = nowIso();
+        const logId = randomId("pl");
+        const leaseExpiresAt = new Date(new Date(now).getTime() + 2 * 60_000).toISOString();
+        const baseLog: ProxyRequestLog = {
+          ...log,
+          id: logId,
+          createdAt: now,
+          updatedAt: now,
+          statusCode: log.statusCode ?? 0,
+          durationMs: log.durationMs ?? 0,
+          status: log.status ?? "pending",
+        };
+
+        // Business statement 2/2: revalidate every mutable field under the
+        // held fence and conditionally insert the pending log in one SQL
+        // statement. This keeps admission and its durable billing identity
+        // atomic without a separate SELECT and INSERT round trip.
+        const currentResult = await client.query<{
+          outcome:
+            | "admitted"
+            | "bound_user_missing"
+            | "bound_user_inactive"
+            | "quota_admission_closed"
+            | "stale_token_generation";
+          account: TokenAccount | null;
+          user: FeishuUser | null;
+          quota_state: UserQuotaState | null;
+          proxy_log: ProxyRequestLog | null;
+        }>(
+          `with snapshot as materialized (
+             select a.id as account_id,
+                    a.feishu_user_id,
+                    a.billing_period,
+                    coalesce(a.operation_generation, 0)::integer as account_generation,
+                    a.data as account,
+                    u.data as user_data,
+                    s.data as quota_state,
+                    coalesce(s.admission, 'open') as admission,
+                    coalesce(
+                      s.active_generation,
+                      (select max(generation_source.operation_generation)
+                       from token_accounts generation_source
+                       where generation_source.feishu_user_id = a.feishu_user_id),
+                      0
+                    )::integer as active_generation
+             from token_accounts a
+             left join feishu_users u on u.id = a.feishu_user_id
+             left join user_quota_states s on s.feishu_user_id = a.feishu_user_id
+             where a.id = $1
+               and a.key_hash = $2
+               and a.feishu_user_id = $3
+               and a.status in ('active', 'draining', 'settling')
+             limit 1
+           ), decision as materialized (
+             select snapshot.*,
+                    case
+                      when user_data is null then 'bound_user_missing'
+                      when coalesce(user_data->>'status', 'active') <> 'active'
+                        then 'bound_user_inactive'
+                      when admission <> 'open' then 'quota_admission_closed'
+                      when account_generation <> active_generation
+                        then 'stale_token_generation'
+                      else 'admitted'
+                    end as outcome
+             from snapshot
+           ), payload as materialized (
+             select decision.*,
+                    jsonb_strip_nulls(
+                      $5::jsonb || jsonb_build_object(
+                        'feishuUserId', feishu_user_id,
+                        'tokenAccountId', account_id,
+                        'departmentId', user_data->>'departmentId',
+                        'departmentName', user_data->>'departmentName',
+                        'providerKeyName', account->>'newapiTokenId',
+                        'billingPeriod', billing_period,
+                        'operationGeneration', active_generation,
+                        'heartbeatAt', $6::text,
+                        'leaseExpiresAt', $7::text
+                      )
+                    ) as proxy_log
+             from decision
+           ), inserted as (
+             insert into proxy_request_logs
+               (id, feishu_user_id, token_account_id, request_path, method,
+                status_code, billing_period, operation_generation,
+                lease_expires_at, heartbeat_at, data, created_at)
+             select $4,
+                    feishu_user_id,
+                    account_id,
+                    $5::jsonb->>'requestPath',
+                    $5::jsonb->>'method',
+                    coalesce(($5::jsonb->>'statusCode')::integer, 0),
+                    billing_period,
+                    active_generation,
+                    $7::timestamptz,
+                    $6::timestamptz,
+                    proxy_log,
+                    $6::timestamptz
+             from payload
+             where outcome = 'admitted'
+             returning data
+           )
+           select coalesce(
+                    (select outcome from decision),
+                    'stale_token_generation'
+                  ) as outcome,
+                  (select account from decision) as account,
+                  (select user_data from decision) as user,
+                  (select quota_state from decision) as quota_state,
+                  (select data from inserted) as proxy_log`,
+          [
+            candidate.account_id,
+            keyHash,
+            candidate.feishu_user_id,
+            logId,
+            baseLog,
+            now,
+            leaseExpiresAt,
+          ],
+        );
+        const current = currentResult.rows[0];
+        if (!current || current.outcome === "stale_token_generation") {
+          throw new StaleTokenGenerationError();
+        }
+        if (current.outcome === "quota_admission_closed") {
+          if (!current.quota_state) throw new StaleTokenGenerationError();
+          throw new QuotaAdmissionClosedError(current.quota_state);
+        }
+        if (current.outcome === "bound_user_missing") {
+          if (!current.account) throw new StaleTokenGenerationError();
+          return { status: "bound_user_missing", account: current.account };
+        }
+        if (current.outcome === "bound_user_inactive") {
+          if (!current.account || !current.user) throw new StaleTokenGenerationError();
+          return {
+            status: "bound_user_inactive",
+            account: current.account,
+            user: current.user,
+          };
+        }
+        if (!current.account || !current.user || !current.proxy_log) {
+          throw new StaleTokenGenerationError();
+        }
+        return {
+          status: "admitted",
+          account: current.account,
+          user: current.user,
+          proxyLog: current.proxy_log,
+        };
+      },
+    );
+    if (result.status !== "retry") return result;
+
+    const retryDelayMs = retryDelaysMs[attempt];
+    if (retryDelayMs === undefined) throw new QuotaOperationBusyError();
+    const jitterMs = Math.floor(Math.random() * Math.max(Math.floor(retryDelayMs / 2), 1));
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs + jitterMs));
+  }
+  throw new QuotaOperationBusyError();
 }
 
 export async function updatePostgresProxyLog(
@@ -2376,82 +3232,316 @@ export async function updatePostgresProxyLog(
     ) {
       updated.totalTokens = updated.promptTokens + updated.completionTokens;
     }
-    const stored = await saveProxyLogRow(client, updated);
-    if (stored.feishuUserId) {
-      await syncPostgresBillingPeriodForUser(
-        client,
-        stored.feishuUserId,
-        periodFromIso(stored.createdAt),
+    return saveProxyLogRow(client, updated);
+  });
+}
+
+export async function reservePostgresQuotaOperationDepartmentBudget(
+  operationId: string,
+  reservedDepartmentQuota: number,
+) {
+  const retryDelaysMs = [10, 25, 50, 100, 200, 400, 800];
+  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+    const reserved = await withControlTransaction(async (client) => {
+      const identity = await client.query<{
+        department_id: string | null;
+        billing_period: string;
+      }>(
+        `select department_id, billing_period
+         from quota_operations
+         where id = $1`,
+        [operationId],
       );
+      const departmentId = identity.rows[0]?.department_id;
+      const billingPeriod = identity.rows[0]?.billing_period;
+      if (!billingPeriod) throw new Error("额度操作不存在");
+      if (!departmentId) throw new Error("额度操作缺少部门，无法预占部门预算");
+
+      const lockResult = await client.query<{ locked: boolean }>(
+        "select pg_try_advisory_xact_lock(hashtext($1)::bigint) as locked",
+        [`department-quota:${departmentId}:${billingPeriod}`],
+      );
+      if (!lockResult.rows[0]?.locked) return null;
+
+      const operationResult = await client.query<{ data: QuotaOperation }>(
+        "select data from quota_operations where id = $1 for update",
+        [operationId],
+      );
+      const operation = operationResult.rows[0]?.data;
+      if (!operation) throw new Error("额度操作不存在");
+      if (operation.reservedDepartmentQuota === reservedDepartmentQuota) return operation;
+
+      const policyResult = await client.query<{ data: DepartmentQuotaPeriod }>(
+        `select data
+         from department_quota_periods
+         where department_id = $1 and period = $2
+         limit 1`,
+        [departmentId, billingPeriod],
+      );
+      const policy = policyResult.rows[0]?.data;
+      if (!policy) throw new Error("部门账期预算不存在");
+
+      const committedResult = await client.query<{ quota: string }>(
+        `select coalesce(sum(entry.signed_quota), 0)::text as quota
+         from quota_ledger_entries entry
+         where entry.period = $2
+           and (
+             entry.department_id = $1
+             or exists (
+               select 1 from feishu_users user_row
+               where user_row.id = entry.feishu_user_id
+                 and user_row.department_id = $1
+                 and coalesce(user_row.data->>'status', 'active') <> 'deleted'
+             )
+           )`,
+        [departmentId, billingPeriod],
+      );
+      const pendingResult = await client.query<{ quota: string }>(
+        `select coalesce(
+           sum(greatest(coalesce((data->>'reservedDepartmentQuota')::bigint, 0), 0)),
+           0
+         )::text as quota
+         from quota_operations
+         where id <> $1
+           and department_id = $2
+           and billing_period = $3
+           and state not in ('completed', 'compensated')`,
+        [operationId, departmentId, billingPeriod],
+      );
+      const budgetQuota = Math.max(
+        Math.round(policy.quotaLimit * getConfig().newapi.quotaPerUnit),
+        0,
+      );
+      const committedAuthorizedQuota = Math.max(
+        Number(committedResult.rows[0]?.quota ?? 0),
+        0,
+      );
+      const pendingReservedQuota = Math.max(
+        Number(pendingResult.rows[0]?.quota ?? 0),
+        0,
+      );
+      const availableQuota = Math.max(
+        budgetQuota - committedAuthorizedQuota - pendingReservedQuota,
+        0,
+      );
+      if (reservedDepartmentQuota > availableQuota) {
+        throw new Error("部门可用额度不足，无法预占本次额度操作");
+      }
+
+      assertQuotaOperationTransition(operation.state, "budget_reserved");
+      return saveQuotaOperationRow(client, {
+        ...operation,
+        state: "budget_reserved",
+        reservedDepartmentQuota,
+        updatedAt: nowIso(),
+      });
+    });
+    if (reserved) return reserved;
+
+    const retryDelayMs = retryDelaysMs[attempt];
+    if (retryDelayMs === undefined) throw new QuotaOperationBusyError();
+    const jitterMs = Math.floor(Math.random() * Math.max(Math.floor(retryDelayMs / 2), 1));
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs + jitterMs));
+  }
+  throw new QuotaOperationBusyError();
+}
+
+async function upsertPostgresNewApiUsageRecordWithClient(
+  client: PoolClient,
+  record: NewApiUsageRecord,
+) {
+  const lockKeys = newApiUsageIdentityLockKeys(record);
+  if (record.matchStatus === "matched" && record.matchedProxyLogId) {
+    lockKeys.push(`newapi_usage:proxy:${record.matchedProxyLogId}`);
+    lockKeys.sort();
+  }
+  for (const lockKey of lockKeys) {
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [lockKey]);
+  }
+  if (record.matchStatus === "matched" && record.matchedProxyLogId) {
+    const proxyMatchResult = await client.query<{ data: NewApiUsageRecord }>(
+      `select data
+       from newapi_usage_records
+       where match_status = 'matched'
+         and data->>'matchedProxyLogId' = $1
+       order by last_synced_at desc, first_seen_at, id
+       limit 1
+       for update`,
+      [record.matchedProxyLogId],
+    );
+    const proxyMatch = proxyMatchResult.rows[0]?.data;
+    if (proxyMatch && !sameNewApiUsageSource(proxyMatch, record)) {
+      return proxyMatch;
     }
-    return stored;
+  }
+  const existingResult = await client.query<{ data: NewApiUsageRecord }>(
+    `select data
+     from newapi_usage_records
+     where id = $1
+        or (
+          newapi_token_id is not distinct from $2
+          and (
+            ($3::text is not null and newapi_request_id = $3)
+            or (
+              ($3::text is null or newapi_request_id is null)
+              and $4::text is not null
+              and newapi_log_id = $4
+            )
+          )
+        )
+     order by case
+       when id = $1 then 0
+       when $3::text is not null and newapi_request_id = $3 then 1
+       else 2
+     end
+     limit 1
+     for update`,
+    [record.id, record.newapiTokenId ?? null, record.newapiRequestId ?? null, record.newapiLogId ?? null],
+  );
+  const existing = existingResult.rows[0]?.data;
+  if (hasConflictingProxyMatch(existing, record)) {
+    return existing;
+  }
+  return saveNewApiUsageRecordRow(client, {
+    ...existing,
+    ...record,
+    id: existing?.id ?? record.id,
+    firstSeenAt: existing?.firstSeenAt ?? record.firstSeenAt,
   });
 }
 
 export async function upsertPostgresNewApiUsageRecord(record: NewApiUsageRecord) {
-  return withTransaction(async (client) => {
-    for (const lockKey of newApiUsageIdentityLockKeys(record)) {
-      await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [lockKey]);
-    }
-    const existingResult = await client.query<{ data: NewApiUsageRecord }>(
-      `select data
-       from newapi_usage_records
-       where id = $1
-          or (
-            newapi_token_id is not distinct from $2
-            and (
-              ($3::text is not null and newapi_request_id = $3)
-              or (
-                ($3::text is null or newapi_request_id is null)
-                and $4::text is not null
-                and newapi_log_id = $4
-              )
-            )
-          )
-       order by case
-         when id = $1 then 0
-         when $3::text is not null and newapi_request_id = $3 then 1
-         else 2
-       end
-       limit 1
-       for update`,
-      [record.id, record.newapiTokenId ?? null, record.newapiRequestId ?? null, record.newapiLogId ?? null],
-    );
-    const existing = existingResult.rows[0]?.data;
-    if (hasConflictingProxyMatch(existing, record)) {
-      return existing;
-    }
-    const stored = await saveNewApiUsageRecordRow(client, {
-      ...existing,
-      ...record,
-      id: existing?.id ?? record.id,
-      firstSeenAt: existing?.firstSeenAt ?? record.firstSeenAt,
-    });
+  return withTransaction((client) => upsertPostgresNewApiUsageRecordWithClient(client, record));
+}
 
-    const affected = new Map<string, { feishuUserId: string; period: string }>();
-    if (existing?.feishuUserId) {
-      const period = usageRecordPeriod(existing);
-      affected.set(`${existing.feishuUserId}\n${period}`, {
-        feishuUserId: existing.feishuUserId,
-        period,
-      });
+async function closePostgresResolvedNoProxyMatchIssues(
+  client: PoolClient,
+  record: NewApiUsageRecord,
+  proxyLogId: string,
+  syncedAt: string,
+) {
+  const issues = await client.query<{ data: UsageSyncIssue }>(
+    `select data
+       from usage_sync_issues
+      where issue_type = 'no_proxy_match'
+        and status = 'open'
+        and newapi_token_id is not distinct from $1
+        and (
+          ($2::text is not null and newapi_request_id = $2)
+          or (
+            ($2::text is null or newapi_request_id is null)
+            and $3::text is not null
+            and newapi_log_id = $3
+          )
+        )
+      for update`,
+    [record.newapiTokenId ?? null, record.newapiRequestId ?? null, record.newapiLogId ?? null],
+  );
+  for (const row of issues.rows) {
+    if (!sameNewApiUsageSource(row.data, record)) continue;
+    await saveUsageSyncIssueRow(client, {
+      ...row.data,
+      status: "closed",
+      matchedProxyLogId: proxyLogId,
+      lastSyncedAt: syncedAt,
+      closedAt: syncedAt,
+    });
+  }
+}
+
+export async function settlePostgresMatchedNewApiUsage(input: {
+  record: NewApiUsageRecord;
+  proxyLogId: string;
+  patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">>;
+  syncedAt: string;
+}) {
+  return withTransaction(async (client) => {
+    const usageRecord = await upsertPostgresNewApiUsageRecordWithClient(client, input.record);
+    if (
+      !sameNewApiUsageSource(usageRecord, input.record) ||
+      usageRecord.matchStatus !== "matched" ||
+      usageRecord.matchedProxyLogId !== input.proxyLogId
+    ) {
+      return { usageRecord, proxyLog: null };
     }
-    if (stored.feishuUserId) {
-      const period = usageRecordPeriod(stored);
-      affected.set(`${stored.feishuUserId}\n${period}`, {
-        feishuUserId: stored.feishuUserId,
-        period,
-      });
+
+    const result = await client.query<{ data: ProxyRequestLog }>(
+      "select data from proxy_request_logs where id = $1 for update",
+      [input.proxyLogId],
+    );
+    const existing = result.rows[0]?.data;
+    if (!existing) {
+      throw new Error(`Matched proxy log ${input.proxyLogId} disappeared during settlement`);
     }
-    for (const item of affected.values()) {
-      await syncPostgresBillingPeriodForUser(client, item.feishuUserId, item.period);
+    if (!isNewApiUsageMatchEligibleProxyLog(existing, input.record)) {
+      throw new Error(
+        `Matched proxy log ${input.proxyLogId} is neither billable nor an exact successful-upstream recovery`,
+      );
     }
-    return stored;
+    if (
+      input.record.tokenAccountId &&
+      existing.tokenAccountId &&
+      input.record.tokenAccountId !== existing.tokenAccountId
+    ) {
+      throw new Error(`Matched proxy log ${input.proxyLogId} belongs to another token account`);
+    }
+    if (
+      existing.newapiResponseRequestId &&
+      existing.newapiResponseRequestId !== input.record.newapiRequestId &&
+      existing.newapiResponseRequestId !== input.record.newapiUpstreamRequestId
+    ) {
+      throw new Error(`Matched proxy log ${input.proxyLogId} has a conflicting NewAPI identity`);
+    }
+    const updated: ProxyRequestLog = {
+      ...existing,
+      ...input.patch,
+      usageSyncedAt: input.syncedAt,
+      updatedAt: input.syncedAt,
+    };
+    if (
+      updated.totalTokens === undefined &&
+      updated.promptTokens !== undefined &&
+      updated.completionTokens !== undefined
+    ) {
+      updated.totalTokens = updated.promptTokens + updated.completionTokens;
+    }
+    const proxyLog = await saveProxyLogRow(client, updated);
+    await closePostgresResolvedNoProxyMatchIssues(
+      client,
+      usageRecord,
+      proxyLog.id,
+      input.syncedAt,
+    );
+    return { usageRecord, proxyLog };
   });
 }
 
 export async function upsertPostgresUsageSyncIssue(issue: UsageSyncIssue) {
   return withTransaction(async (client) => {
+    for (const lockKey of newApiUsageIdentityLockKeys(issue)) {
+      await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [lockKey]);
+    }
+    const resolvedResult =
+      issue.issueType === "no_proxy_match"
+        ? await client.query<{ data: NewApiUsageRecord }>(
+            `select data
+               from newapi_usage_records
+              where match_status = 'matched'
+                and newapi_token_id is not distinct from $1
+                and (
+                  ($2::text is not null and newapi_request_id = $2)
+                  or (
+                    ($2::text is null or newapi_request_id is null)
+                    and $3::text is not null
+                    and newapi_log_id = $3
+                  )
+                )
+              order by last_synced_at desc, first_seen_at, id
+              limit 1`,
+            [issue.newapiTokenId ?? null, issue.newapiRequestId ?? null, issue.newapiLogId ?? null],
+          )
+        : undefined;
+    const resolved = resolvedResult?.rows[0]?.data;
     const existingResult = await client.query<{ data: UsageSyncIssue }>(
       "select data from usage_sync_issues where id = $1 for update",
       [issue.id],
@@ -2463,7 +3553,9 @@ export async function upsertPostgresUsageSyncIssue(issue: UsageSyncIssue) {
       id: existing?.id ?? issue.id,
       firstSeenAt: existing?.firstSeenAt ?? issue.firstSeenAt,
       occurrences: existing ? existing.occurrences + 1 : issue.occurrences,
-      status: "open",
+      status: resolved ? "closed" : "open",
+      matchedProxyLogId: resolved?.matchedProxyLogId ?? issue.matchedProxyLogId,
+      closedAt: resolved ? issue.lastSyncedAt : undefined,
     });
   });
 }

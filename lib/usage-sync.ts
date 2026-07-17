@@ -3,6 +3,7 @@ import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
 import { fixedUsageSyncWindow, hongKongBillingPeriod } from "@/lib/quota-model";
+import { finalizeBillingPeriodAfterSettlements } from "@/lib/billing-period-finalizer";
 import { withPostgresAdvisoryLock } from "@/lib/postgres-store";
 import {
   backfillProxyLogsFromNewApiUsage,
@@ -59,6 +60,27 @@ const usageSyncLockKey = "usage_sync:newapi_logs";
 let jsonUsageSyncRunning = false;
 let schedulerStarted = false;
 let schedulerTimer: ReturnType<typeof setTimeout> | undefined;
+let activeImmediateSettlements = 0;
+const immediateSettlementWaiters: Array<() => void> = [];
+
+async function acquireImmediateSettlementSlot() {
+  if (
+    activeImmediateSettlements >= getConfig().billing.settlementConcurrencyMax ||
+    immediateSettlementWaiters.length > 0
+  ) {
+    await new Promise<void>((resolve) => immediateSettlementWaiters.push(resolve));
+  } else {
+    activeImmediateSettlements += 1;
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = immediateSettlementWaiters.shift();
+    if (next) next();
+    else activeImmediateSettlements = Math.max(activeImmediateSettlements - 1, 0);
+  };
+}
 
 const immediateSettlementDefaults = {
   maxAttempts: 6,
@@ -144,13 +166,17 @@ async function listUsageLogsForProxyRequest(input: {
   const exact = input.newapiRequestId
     ? await listNewApiUsageLogs({ requestId: input.newapiRequestId, size: input.pageSize })
     : { items: [] as NormalizedNewApiUsageLog[] };
-  const recent = await listNewApiUsageLogs({
-    startTimestamp,
-    size: input.pageSize,
-  });
+  const candidates = exact.items.length
+    ? exact.items
+    : (
+        await listNewApiUsageLogs({
+          startTimestamp,
+          size: input.pageSize,
+        })
+      ).items;
   const expectedModel = normalizedModel(input.model);
 
-  return uniqueUsageLogs([...exact.items, ...recent.items])
+  return uniqueUsageLogs(candidates)
     .filter((log) => log.newapiTokenId === input.newapiTokenId)
     .filter(
       (log) =>
@@ -163,6 +189,24 @@ async function listUsageLogsForProxyRequest(input: {
     });
 }
 
+async function finalizeBackfillBillingPeriods(backfills: NewApiUsageBackfillResult[]) {
+  const affected = new Map<string, { feishuUserId: string; period: string }>();
+  for (const backfill of backfills) {
+    for (const item of backfill.items) {
+      if (!item.proxyLogId || !item.feishuUserId || !item.billingPeriod) continue;
+      affected.set(`${item.feishuUserId}\n${item.billingPeriod}`, {
+        feishuUserId: item.feishuUserId,
+        period: item.billingPeriod,
+      });
+    }
+  }
+  await Promise.all(
+    [...affected.values()].map((item) =>
+      finalizeBillingPeriodAfterSettlements(item.feishuUserId, item.period),
+    ),
+  );
+}
+
 export type NewApiProxyUsageSettlementResult = {
   attempted: boolean;
   newapiRequestId?: string;
@@ -172,7 +216,7 @@ export type NewApiProxyUsageSettlementResult = {
   backfill?: NewApiUsageBackfillResult;
 };
 
-export async function syncNewApiUsageForProxyRequest(input: {
+async function syncNewApiUsageForProxyRequestInner(input: {
   newapiRequestId?: string;
   proxyLogId?: string;
   newapiTokenId?: string;
@@ -238,6 +282,7 @@ export async function syncNewApiUsageForProxyRequest(input: {
     });
     const matched = backfill.items.find((item) => item.proxyLogId === proxyLogId);
     if (!matched) continue;
+    await finalizeBackfillBillingPeriods([backfill]);
     return {
       attempted: true,
       newapiRequestId,
@@ -254,6 +299,17 @@ export async function syncNewApiUsageForProxyRequest(input: {
     found: 0,
     reason: "not_found",
   };
+}
+
+export async function syncNewApiUsageForProxyRequest(
+  input: Parameters<typeof syncNewApiUsageForProxyRequestInner>[0],
+) {
+  const release = await acquireImmediateSettlementSlot();
+  try {
+    return await syncNewApiUsageForProxyRequestInner(input);
+  } finally {
+    release();
+  }
 }
 
 export async function syncNewApiUsageLogs(input: {
@@ -406,6 +462,10 @@ async function syncNewApiUsageLogsUnlocked(input: {
         break;
       }
       cursorPage = page + 1;
+    }
+
+    if (!dryRun) {
+      await finalizeBackfillBillingPeriods(pages.map((page) => page.backfill));
     }
 
     const lastRunAt = nowIso();
