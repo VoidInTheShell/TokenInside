@@ -568,6 +568,15 @@ function syncBillingPeriods(store: StoreShape) {
   }
 
   for (const account of store.tokenAccounts) {
+    // A prewarmed account is inventory, not an issued entitlement. It must not
+    // create a user billing row or inherit the default application quota.
+    if (
+      account.status === "pending_activation" &&
+      Boolean(account.prewarmedAt) &&
+      account.tokenRequestId.startsWith("prewarm:")
+    ) {
+      continue;
+    }
     const period = account.billingPeriod || periodFromIso(account.createdAt);
     const summary = ensure(account.feishuUserId, period);
     summary.tokenAccountIds.push(account.id);
@@ -711,6 +720,58 @@ function syncBillingPeriods(store: StoreShape) {
     if (existing.updatedAt !== summary.updatedAt) patch.updatedAt = summary.updatedAt;
     if (Object.keys(patch).length) {
       Object.assign(existing, patch);
+      changed = true;
+    }
+  }
+
+  for (const billing of store.userBillingPeriods) {
+    if (billing.assignedQuotaUpdatedAt) continue;
+    const periodAccounts = store.tokenAccounts.filter(
+      (account) =>
+        account.feishuUserId === billing.feishuUserId &&
+        (account.billingPeriod || periodFromIso(account.createdAt)) === billing.period,
+    );
+    const prewarmOnly =
+      periodAccounts.length > 0 &&
+      periodAccounts.every(
+        (account) =>
+          account.status === "pending_activation" &&
+          Boolean(account.prewarmedAt) &&
+          account.tokenRequestId.startsWith("prewarm:"),
+      );
+    const hasIssuedRequest = store.tokenRequests.some(
+      (request) => {
+        if (
+          request.feishuUserId !== billing.feishuUserId ||
+          request.status !== "provisioned"
+        ) {
+          return false;
+        }
+        const issuedAccount = store.tokenAccounts.find(
+          (account) =>
+            account.id === request.tokenAccountId || account.tokenRequestId === request.id,
+        );
+        return Boolean(
+          issuedAccount &&
+            (issuedAccount.billingPeriod || periodFromIso(issuedAccount.createdAt)) ===
+              billing.period,
+        );
+      },
+    );
+    const hasLedgerGrant = store.quotaLedgerEntries.some(
+      (entry) =>
+        entry.feishuUserId === billing.feishuUserId &&
+        entry.period === billing.period &&
+        entry.signedQuota !== 0,
+    );
+    const hasUsage =
+      (billing.quotaConsumed ?? 0) > 0 ||
+      (billing.proxyLogCount ?? 0) > 0 ||
+      (billing.usageRecordCount ?? 0) > 0;
+    if (!prewarmOnly || hasIssuedRequest || hasLedgerGrant || hasUsage) continue;
+    if (billing.monthlyQuota !== 0 || billing.remainingQuota !== 0) {
+      billing.monthlyQuota = 0;
+      billing.remainingQuota = 0;
       changed = true;
     }
   }
