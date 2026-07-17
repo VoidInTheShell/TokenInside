@@ -88,13 +88,16 @@ type AdminScopeRecord = {
 type BillingOperationRecord = {
   id: string;
   kind: "usage_sync" | "monthly_reset" | "settings_update";
-  status: "dry_run" | "applied" | "partial_failed" | "failed";
+  status: "pending" | "running" | "dry_run" | "applied" | "partial_failed" | "failed";
   dryRun: boolean;
   operatedByFeishuUserId: string;
   period?: string;
   input?: Record<string, unknown>;
   summary: Record<string, string | number | boolean | undefined>;
   errorMessage?: string;
+  attemptCount?: number;
+  startedAt?: string;
+  completedAt?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -417,21 +420,9 @@ type MonthlyResetDraft = {
   limit: string;
 };
 
-type UsageSyncResult = {
-  dryRun: boolean;
-  pageStart: number;
-  size: number;
-  maxPages: number;
-  totals: {
-    fetched: number;
-    seen: number;
-    matched: number;
-    updated: number;
-    skippedUnknownToken: number;
-    skippedNoMatch: number;
-    recordsUpserted: number;
-    issuesUpserted: number;
-  };
+type UsageSyncAccepted = {
+  operation: BillingOperationRecord;
+  deduplicated?: boolean;
 };
 
 type MonthlyResetResult = {
@@ -645,6 +636,8 @@ function billingKindLabel(kind: BillingOperationRecord["kind"]) {
 }
 
 function billingStatusLabel(status: BillingOperationRecord["status"]) {
+  if (status === "pending") return "已排队";
+  if (status === "running") return "执行中";
   if (status === "dry_run") return "试算";
   if (status === "partial_failed") return "部分失败";
   if (status === "failed") return "失败";
@@ -678,6 +671,10 @@ function quotaOperationVariant(state: string) {
 }
 
 function billingSummaryText(operation: BillingOperationRecord) {
+  if (operation.status === "pending") return "后台任务已持久化，等待 worker 领取";
+  if (operation.status === "running") {
+    return `后台执行中${operation.attemptCount ? `，第 ${operation.attemptCount} 次尝试` : ""}`;
+  }
   const summary = operation.summary ?? {};
   if (operation.kind === "usage_sync") {
     return `取回 ${summary.fetched ?? 0}，匹配 ${summary.matched ?? 0}，更新 ${summary.updated ?? 0}，记录 ${summary.recordsUpserted ?? 0}，异常 ${summary.issuesUpserted ?? 0}`;
@@ -815,6 +812,7 @@ export function AdminClient() {
     limit: "",
   } satisfies MonthlyResetDraft);
   const [billingResult, setBillingResult] = useState<string | null>(null);
+  const [usageSyncOperationId, setUsageSyncOperationId] = useState<string | null>(null);
   const [lastUsageSyncDryRunSignature, setLastUsageSyncDryRunSignature] = useState<string | null>(null);
   const [lastUsageSyncDryRunSummary, setLastUsageSyncDryRunSummary] = useState<string | null>(null);
   const [lastMonthlyResetDryRunSignature, setLastMonthlyResetDryRunSignature] = useState<string | null>(null);
@@ -1339,6 +1337,8 @@ export function AdminClient() {
   }
 
   async function runUsageSync(dryRun: boolean) {
+    let acceptedOperationId: string | null = null;
+    let requestBusyReleased = false;
     try {
       const signature = usageSyncDraftSignature(usageSyncDraft);
       const page = parseIntegerDraft(usageSyncDraft.page, "起始页", { min: 0 });
@@ -1380,15 +1380,58 @@ export function AdminClient() {
           matchWindowMinutes,
         }),
       });
-      const body = await readJsonResponse<UsageSyncResult>(res);
+      const body = await readJsonResponse<UsageSyncAccepted>(res);
       if (!res.ok) throw new Error(body.error ?? "同步 NewAPI 用量失败");
-      const summary = `取回 ${body.totals.fetched}，匹配 ${body.totals.matched}，更新 ${body.totals.updated}，记录 ${body.totals.recordsUpserted}，异常 ${body.totals.issuesUpserted}，未绑定 ${body.totals.skippedUnknownToken}，未匹配 ${body.totals.skippedNoMatch}`;
-      setBillingResult(`NewAPI 用量${dryRun ? "试算" : "同步"}完成：${summary}`);
-      setMessage(`NewAPI 用量${dryRun ? "试算" : "同步"}完成。`);
-      if (dryRun) {
+      acceptedOperationId = body.operation.id;
+      setUsageSyncOperationId(body.operation.id);
+      setBusy(false);
+      requestBusyReleased = true;
+      setBillingResult(
+        `NewAPI 用量${dryRun ? "试算" : "同步"}已进入后台队列（${body.operation.id}）。`,
+      );
+      setMessage(body.deduplicated ? "已有相同用量同步任务，继续跟踪原任务。" : "用量同步任务已受理。" );
+
+      let completed: BillingOperationRecord | null = null;
+      for (let attempt = 0; attempt < 150; attempt += 1) {
+        const statusResponse = await fetch(
+          `/api/admin/billing-operations/${encodeURIComponent(body.operation.id)}`,
+          { cache: "no-store" },
+        );
+        const statusBody = await readJsonResponse<{ operation: BillingOperationRecord }>(
+          statusResponse,
+        );
+        if (!statusResponse.ok) {
+          throw new Error(statusBody.error ?? "读取用量同步任务状态失败");
+        }
+        if (["dry_run", "applied", "partial_failed", "failed"].includes(statusBody.operation.status)) {
+          completed = statusBody.operation;
+          break;
+        }
+        setBillingResult(
+          `NewAPI 用量${dryRun ? "试算" : "同步"}${billingStatusLabel(statusBody.operation.status)}（${statusBody.operation.id}）。`,
+        );
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 2_000));
+      }
+
+      if (!completed) {
+        setMessage("用量同步仍在后台执行，可稍后在计费操作记录中查看结果。");
+        return;
+      }
+      const summary = billingSummaryText(completed);
+      setBillingResult(
+        `NewAPI 用量${dryRun ? "试算" : "同步"}${billingStatusLabel(completed.status)}：${summary}`,
+      );
+      if (completed.status === "failed") {
+        setError(completed.errorMessage ?? "NewAPI 用量同步失败");
+      } else if (completed.status === "partial_failed") {
+        setMessage("用量同步完成当前批次，剩余窗口将由持久化 checkpoint 续跑。");
+      } else {
+        setMessage(`NewAPI 用量${dryRun ? "试算" : "同步"}完成。`);
+      }
+      if (dryRun && completed.status === "dry_run") {
         setLastUsageSyncDryRunSignature(signature);
         setLastUsageSyncDryRunSummary(summary);
-      } else {
+      } else if (!dryRun) {
         setLastUsageSyncDryRunSignature(null);
         setLastUsageSyncDryRunSummary(null);
       }
@@ -1396,7 +1439,12 @@ export function AdminClient() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "同步 NewAPI 用量失败");
     } finally {
-      setBusy(false);
+      if (acceptedOperationId) {
+        setUsageSyncOperationId((current) =>
+          current === acceptedOperationId ? null : current,
+        );
+      }
+      if (!requestBusyReleased) setBusy(false);
     }
   }
 
@@ -3716,14 +3764,24 @@ export function AdminClient() {
                     </div>
                   </div>
                   <div className="toolbar toolbar-left">
-                    <Button variant="outline" size="sm" disabled={!data?.authorized || busy} onClick={() => void runUsageSync(true)}>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={!data?.authorized || busy || Boolean(usageSyncOperationId)}
+                      onClick={() => void runUsageSync(true)}
+                    >
                       <RefreshCwIcon data-icon="inline-start" />
                       试算同步
                     </Button>
                     <Button
                       variant="outline"
                       size="sm"
-                      disabled={!data?.authorized || busy || !usageSyncReadyToExecute}
+                      disabled={
+                        !data?.authorized ||
+                        busy ||
+                        Boolean(usageSyncOperationId) ||
+                        !usageSyncReadyToExecute
+                      }
                       title={usageSyncReadyToExecute ? "执行同步" : "请先用相同参数试算同步"}
                       onClick={() => void runUsageSync(false)}
                     >

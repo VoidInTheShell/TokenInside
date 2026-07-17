@@ -1,6 +1,15 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { tokenRequestInAdminScope } from "@/lib/admin-scope";
+import {
+  resolveSessionAdminScopeProjection,
+  tokenRequestInAdminScope,
+} from "@/lib/admin-scope";
+import {
+  canClaimBillingOperation,
+  isTerminalBillingOperationStatus,
+  retainBillingOperationRecords,
+  sameBillingOperationInput,
+} from "@/lib/billing-operation-state";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
 import { isAtOrAfterIsoTimestamp } from "@/lib/iso-time";
@@ -13,6 +22,14 @@ import {
 import { findProxyLogForNewApiUsage, isBillableProxyLog } from "@/lib/usage-matching";
 import { isUsageRecordRequest } from "@/lib/usage-record-visibility";
 import { normalizedInputTokensTotal } from "@/lib/usage-metrics";
+import {
+  getPostgresAdminOverview,
+  getPostgresAdminOverviewMetadata,
+  getPostgresAuthenticatedSessionProjection,
+  getPostgresSessionStoreSummary,
+  listPostgresAdminUsers,
+  listPostgresUsageReport,
+} from "@/lib/postgres-control-queries";
 import { assertQuotaAdmission } from "@/lib/quota-admission";
 import {
   hongKongBillingPeriod,
@@ -45,6 +62,7 @@ import {
   getPostgresDisabledTokenForUser,
   getPostgresActiveTokenForUser,
   getPostgresActiveAdminScopeForUser,
+  getPostgresAdminScopeFallbackData,
   getPostgresAppSettings,
   getPostgresAppSettingsForQuotaOperation,
   getPostgresFeishuEventByUuid,
@@ -53,6 +71,7 @@ import {
   getPostgresUserBillingPeriod,
   getPostgresUserById,
   getPostgresUserQuotaState,
+  getPostgresUsageSyncCheckpoint,
   insertPostgresQuotaAwareProxyLog,
   insertPostgresProxyLog,
   insertPostgresQuotaLedgerEntry,
@@ -64,6 +83,7 @@ import {
   listPostgresInflightProxyRequests,
   listPostgresInflightProxyRequestsForQuotaOperation,
   listPostgresQuotaOperations,
+  listPostgresTokenRequestsForUser,
   listPostgresTokenAccountsForUser,
   mutatePostgresAppSettings,
   recordPostgresMonthlyResetApplied,
@@ -80,12 +100,13 @@ import {
   renewPostgresQuotaOperationExecution,
   reservePostgresQuotaOperationDepartmentBudget,
   revokePostgresAdminScopesForUser,
-  settlePostgresMatchedNewApiUsage,
   syncPostgresDepartmentSupervisorAdminScope,
   transitionPostgresQuotaOperation,
   transitionPostgresTokenRequest,
+  transitionPostgresTokenRequestAfterQuotaMaterialization,
   updatePostgresManualAdminScope,
   updatePostgresProxyLog,
+  updatePostgresProxyUsageSettlementRetryIfUnsettled,
   updatePostgresTokenRequest,
   updatePostgresTokenRequestForQuotaOperation,
   updatePostgresTokenAccount,
@@ -101,11 +122,10 @@ import {
   upsertPostgresUserQuotaPolicy,
   upsertPostgresUserQuotaState,
   upsertPostgresUserBillingPeriod,
-  upsertPostgresNewApiUsageRecord,
   upsertPostgresUsageSyncCheckpoint,
-  upsertPostgresUsageSyncIssue,
   upsertPostgresManualAdminScope,
   withPostgresAdvisoryLock,
+  withPostgresUsageSettlementBatch,
 } from "@/lib/postgres-store";
 import type {
   AdminScope,
@@ -355,8 +375,8 @@ function normalizeStore(store: StoreShape) {
     changed = true;
   }
   if (store.settings.billingOperations.length > maxBillingOperationRecords) {
-    store.settings.billingOperations = store.settings.billingOperations.slice(
-      0,
+    store.settings.billingOperations = retainBillingOperationRecords(
+      store.settings.billingOperations,
       maxBillingOperationRecords,
     );
     changed = true;
@@ -722,6 +742,53 @@ export async function getStoreSnapshot() {
   return readStore();
 }
 
+export async function getSessionStoreSummary() {
+  if (isPostgresBackend()) {
+    return getPostgresSessionStoreSummary();
+  }
+  const store = await readStore();
+  return {
+    settings: {
+      defaultMonthlyQuota: store.settings.defaultMonthlyQuota,
+    },
+    proxyLogCount: store.proxyRequestLogs.length,
+  };
+}
+
+export async function getAuthenticatedSessionProjection(user: FeishuUser) {
+  if (!isPostgresBackend()) return null;
+
+  const projection = await getPostgresAuthenticatedSessionProjection({
+    feishuUserId: user.id,
+    approvalTargetOpenId: user.openId,
+    departmentId: user.departmentId,
+    currentPeriod: currentQuotaPeriod(),
+  });
+  const adminScope = resolveSessionAdminScopeProjection({
+    user,
+    systemAdminOpenIds: new Set(getConfig().admin.systemAdminOpenIds),
+    activeScope: projection.activeAdminScope,
+    assignedRequest: projection.assignedRequest,
+    scopes: projection.adminScopes,
+    now: nowIso(),
+  });
+  const effectiveGrantQuota =
+    projection.currentBilling?.monthlyQuota ??
+    projection.departmentQuotaPeriod?.defaultGrantQuota ??
+    projection.defaultMonthlyQuota;
+
+  return {
+    settings: {
+      defaultMonthlyQuota: effectiveGrantQuota,
+    },
+    requests: projection.requests,
+    activeToken: projection.activeToken,
+    billingPeriod: projection.activeTokenBilling,
+    adminScope,
+    proxyLogCount: projection.proxyLogCount,
+  };
+}
+
 export async function getAppSettings() {
   if (isPostgresBackend()) {
     const settings = await getPostgresAppSettings();
@@ -749,29 +816,104 @@ export async function getAppSettingsForQuotaOperation() {
   return getAppSettings();
 }
 
-function prependBillingOperation(
-  store: StoreShape,
-  input: {
-    kind: BillingOperationKind;
-    status: BillingOperationStatus;
-    dryRun: boolean;
-    operatedByFeishuUserId: string;
-    period?: string;
-    input?: Record<string, unknown>;
-    summary: BillingOperationRecord["summary"];
-    errorMessage?: string;
-  },
+export async function getAdminOverviewMetadata() {
+  if (isPostgresBackend()) {
+    const metadata = await getPostgresAdminOverviewMetadata();
+    return {
+      settings: {
+        ...metadata.settings,
+        usageSyncPolicy: normalizeUsageSyncPolicy(metadata.settings.usageSyncPolicy),
+        quotaFeatureFlags: normalizeQuotaFeatureFlags(metadata.settings.quotaFeatureFlags),
+        billingOperations: metadata.settings.billingOperations ?? [],
+      },
+      usageSyncCheckpoint: metadata.usageSyncCheckpoint,
+    };
+  }
+  const [settings, usageSyncCheckpoint] = await Promise.all([
+    getAppSettings(),
+    getUsageSyncCheckpoint(),
+  ]);
+  return { settings, usageSyncCheckpoint };
+}
+
+type BillingOperationWrite = {
+  id?: string;
+  kind: BillingOperationKind;
+  status: BillingOperationStatus;
+  dryRun: boolean;
+  operatedByFeishuUserId: string;
+  period?: string;
+  input?: Record<string, unknown>;
+  summary: BillingOperationRecord["summary"];
+  errorMessage?: string;
+};
+
+function upsertBillingOperation(
+  settings: StoreShape["settings"],
+  input: BillingOperationWrite,
 ) {
   const now = nowIso();
+  const records = settings.billingOperations ?? [];
+  const existing = input.id ? records.find((item) => item.id === input.id) : undefined;
+  const terminal = isTerminalBillingOperationStatus(input.status);
   const record: BillingOperationRecord = {
-    id: randomId("bo"),
-    createdAt: now,
-    updatedAt: now,
+    ...existing,
     ...input,
+    id: input.id ?? existing?.id ?? randomId("bo"),
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+    attemptCount: existing?.attemptCount,
+    leaseId: terminal ? undefined : existing?.leaseId,
+    leaseExpiresAt: terminal ? undefined : existing?.leaseExpiresAt,
+    startedAt: existing?.startedAt,
+    completedAt: terminal ? now : undefined,
   };
-  const records = store.settings.billingOperations ?? [];
-  store.settings.billingOperations = [record, ...records].slice(0, maxBillingOperationRecords);
+  settings.billingOperations = retainBillingOperationRecords(
+    [record, ...records.filter((item) => item.id !== record.id)],
+    maxBillingOperationRecords,
+  );
   return record;
+}
+
+function prependBillingOperation(store: StoreShape, input: BillingOperationWrite) {
+  return upsertBillingOperation(store.settings, input);
+}
+
+async function mutateBillingOperations<T>(
+  fn: (settings: StoreShape["settings"]) => T | Promise<T>,
+) {
+  if (isPostgresBackend()) return mutatePostgresAppSettings(fn);
+  return mutate((store) => fn(store.settings));
+}
+
+export async function enqueueBillingOperation(input: {
+  kind: BillingOperationKind;
+  dryRun: boolean;
+  operatedByFeishuUserId: string;
+  period?: string;
+  input?: Record<string, unknown>;
+}) {
+  return mutateBillingOperations((settings) => {
+    const existing = (settings.billingOperations ?? []).find(
+      (operation) =>
+        operation.kind === input.kind && !isTerminalBillingOperationStatus(operation.status),
+    );
+    if (existing) {
+      const sameInput =
+        existing.dryRun === input.dryRun &&
+        sameBillingOperationInput(existing.input, input.input);
+      return { operation: existing, created: false, conflicted: !sameInput };
+    }
+    return {
+      operation: upsertBillingOperation(settings, {
+        ...input,
+        status: "pending",
+        summary: {},
+      }),
+      created: true,
+      conflicted: false,
+    };
+  });
 }
 
 export async function updateAppSettings(input: {
@@ -893,6 +1035,8 @@ export async function updateAppSettings(input: {
 }
 
 export async function recordBillingOperation(input: {
+  id?: string;
+  expectedLeaseId?: string;
   kind: BillingOperationKind;
   status: BillingOperationStatus;
   dryRun: boolean;
@@ -902,23 +1046,104 @@ export async function recordBillingOperation(input: {
   summary: BillingOperationRecord["summary"];
   errorMessage?: string;
 }) {
-  if (isPostgresBackend()) {
-    return mutatePostgresAppSettings((settings) => {
-      const store = {
-        ...structuredClone(initialStore),
-        settings: {
-          ...initialStore.settings,
-          ...settings,
-        },
-      };
-      const record = prependBillingOperation(store, input);
-      Object.assign(settings, store.settings);
-      return record;
-    });
-  }
+  const { expectedLeaseId, ...write } = input;
+  return mutateBillingOperations((settings) => {
+    if (expectedLeaseId) {
+      const current = (settings.billingOperations ?? []).find(
+        (operation) => operation.id === input.id,
+      );
+      if (
+        !current ||
+        current.status !== "running" ||
+        current.leaseId !== expectedLeaseId
+      ) {
+        throw new Error(`billing operation lease lost: ${input.id ?? "unknown"}`);
+      }
+    }
+    return upsertBillingOperation(settings, write);
+  });
+}
 
-  return mutate((store) => {
-    return prependBillingOperation(store, input);
+export async function findBillingOperationById(operationId: string) {
+  const settings = await getAppSettings();
+  return (settings.billingOperations ?? []).find((item) => item.id === operationId) ?? null;
+}
+
+export async function listRunnableBillingOperations(input: {
+  kind: BillingOperationKind;
+  limit?: number;
+  now?: Date;
+}) {
+  const settings = await getAppSettings();
+  const now = input.now ?? new Date();
+  return (settings.billingOperations ?? [])
+    .filter(
+      (operation) =>
+        operation.kind === input.kind && canClaimBillingOperation(operation, now),
+    )
+    .slice(0, Math.max(input.limit ?? 1, 0));
+}
+
+export async function claimBillingOperationExecution(input: {
+  operationId: string;
+  kind: BillingOperationKind;
+  leaseId: string;
+  leaseExpiresAt: string;
+  now?: Date;
+}) {
+  return mutateBillingOperations((settings) => {
+    const records = settings.billingOperations ?? [];
+    const operation = records.find((item) => item.id === input.operationId);
+    const now = input.now ?? new Date();
+    if (
+      !operation ||
+      operation.kind !== input.kind ||
+      !canClaimBillingOperation(operation, now)
+    ) {
+      return null;
+    }
+    const claimed: BillingOperationRecord = {
+      ...operation,
+      status: "running",
+      attemptCount: (operation.attemptCount ?? 0) + 1,
+      leaseId: input.leaseId,
+      leaseExpiresAt: input.leaseExpiresAt,
+      startedAt: operation.startedAt ?? now.toISOString(),
+      updatedAt: now.toISOString(),
+    };
+    settings.billingOperations = retainBillingOperationRecords(
+      [claimed, ...records.filter((item) => item.id !== claimed.id)],
+      maxBillingOperationRecords,
+    );
+    return claimed;
+  });
+}
+
+export async function renewBillingOperationExecution(input: {
+  operationId: string;
+  leaseId: string;
+  leaseExpiresAt: string;
+}) {
+  return mutateBillingOperations((settings) => {
+    const records = settings.billingOperations ?? [];
+    const operation = records.find((item) => item.id === input.operationId);
+    if (
+      !operation ||
+      operation.status !== "running" ||
+      operation.leaseId !== input.leaseId
+    ) {
+      return null;
+    }
+    const renewed: BillingOperationRecord = {
+      ...operation,
+      leaseExpiresAt: input.leaseExpiresAt,
+      updatedAt: nowIso(),
+    };
+    settings.billingOperations = retainBillingOperationRecords(
+      [renewed, ...records.filter((item) => item.id !== renewed.id)],
+      maxBillingOperationRecords,
+    );
+    return renewed;
   });
 }
 
@@ -932,6 +1157,7 @@ export async function listBillingOperations(limit = 20) {
 }
 
 export async function getUsageSyncCheckpoint(scope: UsageSyncCheckpoint["scope"] = "newapi_usage_logs") {
+  if (isPostgresBackend()) return getPostgresUsageSyncCheckpoint(scope);
   const store = await readStore();
   return store.usageSyncCheckpoints.find((checkpoint) => checkpoint.scope === scope) ?? null;
 }
@@ -1131,6 +1357,16 @@ export async function updateTokenRequestForQuotaOperation(
   return updateTokenRequest(id, patch);
 }
 
+export async function updateTokenRequestAfterQuotaMaterialization(
+  id: string,
+  patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
+) {
+  if (isPostgresBackend()) {
+    return transitionPostgresTokenRequestAfterQuotaMaterialization(id, patch);
+  }
+  return updateTokenRequest(id, patch);
+}
+
 export async function transitionTokenRequestStatus(
   id: string,
   patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
@@ -1202,6 +1438,7 @@ export async function findTokenRequestById(id: string) {
 }
 
 export async function listUserTokenRequests(feishuUserId: string) {
+  if (isPostgresBackend()) return listPostgresTokenRequestsForUser(feishuUserId);
   const store = await readStore();
   return store.tokenRequests
     .filter((request) => request.feishuUserId === feishuUserId)
@@ -3434,6 +3671,28 @@ export async function updateProxyLog(
   });
 }
 
+export async function updateProxyUsageSettlementRetryIfUnsettled(
+  id: string,
+  patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">>,
+) {
+  if (isPostgresBackend()) {
+    return updatePostgresProxyUsageSettlementRetryIfUnsettled(id, patch);
+  }
+
+  return mutate((store) => {
+    const log = store.proxyRequestLogs.find((item) => item.id === id);
+    if (
+      !log ||
+      (log.usageSettlementStatus !== "pending" &&
+        log.usageSettlementStatus !== "retrying")
+    ) {
+      return null;
+    }
+    Object.assign(log, patch, { updatedAt: nowIso() });
+    return log;
+  });
+}
+
 export type NewApiUsageBackfillItem = {
   action: "updated" | "matched_no_change" | "skipped_unknown_token" | "skipped_no_match";
   newapiLogId?: string;
@@ -3460,6 +3719,15 @@ export type NewApiUsageBackfillResult = {
   recordsUpserted: number;
   issuesUpserted: number;
   items: NewApiUsageBackfillItem[];
+  snapshot?: {
+    usageSources: number;
+    tokenAccounts: number;
+    exactProxyCandidates: number;
+    fallbackSources: number;
+    fallbackProxyCandidates: number;
+    proxyCandidates: number;
+    usageRecords: number;
+  };
 };
 
 function isUnknownModel(value?: string) {
@@ -3998,56 +4266,130 @@ export async function backfillProxyLogsFromNewApiUsage(
       });
     }
 
-    if (!dryRun && (result.updated > 0 || result.recordsUpserted > 0) && !persistLog) {
+    if (
+      !dryRun &&
+      (result.updated > 0 || result.recordsUpserted > 0) &&
+      !persistLog &&
+      !persistMatched
+    ) {
       syncBillingPeriods(store);
     }
     return result;
   };
 
   if (isPostgresBackend()) {
-    const matchingTimes = usageLogs
-      .map((item) => item.createdAt && new Date(item.createdAt).getTime())
-      .filter((item): item is number => Number.isFinite(item));
-    const matchingWindowMs = input.matchWindowMs ?? 30 * 60 * 1000;
+    // The matcher itself caps non-identity fallback at 30 seconds around the
+    // proxy finishedAt timestamp. Exact request/upstream identities are read
+    // independently, so long-running streams remain recoverable without
+    // loading a ±30 minute proxy history on every 100-row NewAPI page.
+    const fallbackMatchingWindowMs = Math.min(
+      Math.max(input.matchWindowMs ?? 30 * 60 * 1000, 0),
+      30_000,
+    );
+    const usageSources = usageLogs.map((usageLog) => ({
+      recordId: usageRecordIdFromLog(usageLog),
+      usageLog,
+    }));
+    const matchingSnapshot = await readPostgresUsageMatchingSnapshot({
+      usageSources,
+      proxyLogIds: input.targetProxyLogIds ?? [],
+      fallbackWindowMs: fallbackMatchingWindowMs,
+    });
     const store = {
       ...structuredClone(initialStore),
-      ...(await readPostgresUsageMatchingSnapshot({
-        newapiTokenIds: usageLogs
-          .map((item) => item.newapiTokenId)
-          .filter((item): item is string => Boolean(item)),
-        proxyLogIds: input.targetProxyLogIds ?? [],
-        proxyCreatedAfter: matchingTimes.length
-          ? new Date(Math.min(...matchingTimes) - matchingWindowMs).toISOString()
-          : undefined,
-        proxyCreatedBefore: matchingTimes.length
-          ? new Date(Math.max(...matchingTimes) + matchingWindowMs).toISOString()
-          : undefined,
-      })),
+      ...matchingSnapshot,
     };
-    return runBackfill(
-      store,
-      async (proxyLog, patch, syncedAt) => {
-        const updated = await updatePostgresProxyLog(proxyLog.id, {
-          ...patch,
-          usageSyncedAt: syncedAt,
-        });
-        if (updated) Object.assign(proxyLog, updated);
-      },
-      upsertPostgresNewApiUsageRecord,
-      upsertPostgresUsageSyncIssue,
-      async (record, proxyLog, patch, syncedAt) => {
-        const settled = await settlePostgresMatchedNewApiUsage({
-          record,
-          proxyLogId: proxyLog.id,
-          patch,
-          syncedAt,
-        });
-        return settled;
-      },
+    const withSnapshotStats = (result: NewApiUsageBackfillResult) => ({
+      ...result,
+      snapshot: matchingSnapshot.stats,
+    });
+    if (dryRun) return withSnapshotStats(await runBackfill(store));
+    // Matching remains strictly ordered inside runBackfill so its in-memory
+    // reservation set chooses at most one source for each proxy request. All
+    // authoritative writes for this NewAPI page then share one transaction:
+    // a failure rolls the whole page back and the usage cursor cannot advance.
+    return withSnapshotStats(
+      await withPostgresUsageSettlementBatch(
+        (writer, lockedSnapshot) =>
+          runBackfill(
+            lockedSnapshot
+              ? {
+                  ...store,
+                  newapiUsageRecords: lockedSnapshot.newapiUsageRecords,
+                  proxyRequestLogs: lockedSnapshot.proxyRequestLogs,
+                }
+              : store,
+            undefined,
+            writer.upsertUsageRecord,
+            writer.upsertUsageIssue,
+            async (record, proxyLog, patch, syncedAt) =>
+              writer.settleMatchedUsage({
+                record,
+                proxyLogId: proxyLog.id,
+                patch,
+                syncedAt,
+              }),
+        ),
+        {
+          usageSources,
+          proxyLogIds: matchingSnapshot.proxyRequestLogs.map(
+            (proxyLog) => proxyLog.id,
+          ),
+        },
+      ),
     );
   }
 
   return mutate((store) => runBackfill(store));
+}
+
+async function resolveAdminScopeForKnownUser(
+  user: FeishuUser,
+  jsonStore?: StoreShape,
+) {
+  if (isInactiveUser(user)) return null;
+  const systemAdminOpenIds = new Set(getConfig().admin.systemAdminOpenIds);
+
+  // Environment administrators need no second database lookup after session
+  // authentication. Other users retain the exact stored/fallback/revocation
+  // semantics, but the already-authenticated user row is reused.
+  if (systemAdminOpenIds.has(user.openId)) {
+    return resolveSessionAdminScopeProjection({
+      user,
+      systemAdminOpenIds,
+      activeScope: null,
+      assignedRequest: null,
+      scopes: [],
+    });
+  }
+
+  const activeScope = isPostgresBackend()
+    ? await getPostgresActiveAdminScopeForUser(user.id)
+    : jsonStore!.adminScopes.find(
+        (scope) => scope.feishuUserId === user.id && scope.status === "active",
+      ) ?? null;
+  if (activeScope) return activeScope;
+
+  const fallback = isPostgresBackend()
+    ? await getPostgresAdminScopeFallbackData(user.id, user.openId)
+    : {
+        assignedRequest: jsonStore!.tokenRequests
+          .filter((request) => request.approvalTargetOpenId === user.openId)
+          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0] ?? null,
+        scopes: jsonStore!.adminScopes.filter((scope) => scope.feishuUserId === user.id),
+      };
+  return resolveSessionAdminScopeProjection({
+    user,
+    systemAdminOpenIds,
+    activeScope: null,
+    assignedRequest: fallback.assignedRequest,
+    scopes: fallback.scopes,
+  });
+}
+
+export async function getAdminScopeForKnownUser(user: FeishuUser) {
+  const store = isPostgresBackend() ? undefined : await readStore();
+  return resolveAdminScopeForKnownUser(user, store);
 }
 
 export async function getAdminScopeForUser(feishuUserId: string) {
@@ -4056,62 +4398,7 @@ export async function getAdminScopeForUser(feishuUserId: string) {
     ? await getPostgresUserById(feishuUserId)
     : store!.users.find((item) => item.id === feishuUserId);
   if (!user) return null;
-  if (isInactiveUser(user)) return null;
-
-  if (getConfig().admin.systemAdminOpenIds.includes(user.openId)) {
-    const now = nowIso();
-    return {
-      id: `env-admin-${feishuUserId}`,
-      feishuUserId,
-      scopeType: "global",
-      source: "environment",
-      role: "root",
-      status: "active",
-      createdAt: now,
-      updatedAt: now,
-    } satisfies AdminScope;
-  }
-
-  const storedScope = isPostgresBackend()
-    ? await getPostgresActiveAdminScopeForUser(feishuUserId)
-    : store!.adminScopes.find(
-        (scope) => scope.feishuUserId === feishuUserId && scope.status === "active",
-      ) ?? null;
-  if (storedScope) return storedScope;
-
-  const fallbackStore = store ?? await readStore();
-  const assignedRequest = fallbackStore.tokenRequests
-    .filter((request) => request.approvalTargetOpenId === user.openId)
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
-  if (assignedRequest?.approvalDepartmentId) {
-    const blockedByGlobalRevocation = fallbackStore.adminScopes.some(
-      (scope) =>
-        scope.feishuUserId === feishuUserId && blocksAllAutomaticAdminRestoreForUser(scope),
-    );
-    if (blockedByGlobalRevocation) return null;
-
-    const blockedByRevokedScope = fallbackStore.adminScopes.some(
-      (scope) =>
-        scope.feishuUserId === feishuUserId &&
-        scope.scopeType === "department" &&
-        scope.departmentId === assignedRequest.approvalDepartmentId &&
-        blocksAutomaticAdminRestore(scope),
-    );
-    if (blockedByRevokedScope) return null;
-
-    const now = nowIso();
-    return {
-      id: `assigned-admin-${feishuUserId}`,
-      feishuUserId,
-      scopeType: "department",
-      departmentId: assignedRequest.approvalDepartmentId,
-      source: "department_supervisor",
-      status: "active",
-      createdAt: now,
-      updatedAt: now,
-    } satisfies AdminScope;
-  }
-  return null;
+  return resolveAdminScopeForKnownUser(user, store);
 }
 
 export async function listAdminScopes() {
@@ -4522,6 +4809,9 @@ export async function enableUserAccess(input: {
 }
 
 export async function listAdminUsers(scope: AdminScope) {
+  if (isPostgresBackend()) {
+    return listPostgresAdminUsers(scope, nowIso().slice(0, 7));
+  }
   const store = await readStore();
   const users = scopedUsersForStore(store, scope);
   const activeAccountsByUserId = new Map(
@@ -4757,6 +5047,44 @@ function matchesDateRange(log: ProxyRequestLog, filters: UsageRecordFilters) {
   if (start !== undefined && createdAt < start) return false;
   if (end !== undefined && createdAt > end) return false;
   return true;
+}
+
+function postgresUsageDateRange(filters: UsageRecordFilters) {
+  const preset = presetDateRange(filters.preset);
+  const start = dateBoundary(filters.startDate, false) ?? preset.start;
+  const end = dateBoundary(filters.endDate, true) ?? preset.end;
+  return {
+    startAt: start === undefined ? undefined : new Date(start).toISOString(),
+    endAt: end === undefined ? undefined : new Date(end).toISOString(),
+  };
+}
+
+function postgresUsageFilters(filters: UsageRecordFilters) {
+  return {
+    userId: normalizeFilter(filters.userId),
+    departmentId: normalizeFilter(filters.departmentId),
+    model: normalizeFilter(filters.model),
+    provider: normalizeFilter(filters.provider),
+    apiFormat: normalizeFilter(filters.apiFormat),
+    status: normalizeFilter(filters.status),
+    userAgent: normalizeFilter(filters.userAgent),
+    clientFamily: normalizeFilter(filters.clientFamily),
+    search: normalizeFilter(filters.search),
+    hideUnknownRecords: filters.hideUnknownRecords,
+    ...postgresUsageDateRange(filters),
+  };
+}
+
+function mapPostgresUsagePage(
+  page: Array<{ log: ProxyRequestLog; user: FeishuUser | null }>,
+) {
+  const usersById = new Map(
+    page
+      .map((item) => item.user)
+      .filter((user): user is FeishuUser => Boolean(user))
+      .map((user) => [user.id, user]),
+  );
+  return page.map((item) => mapUsageRecord(item.log, usersById));
 }
 
 function matchesSearch(log: ProxyRequestLog, user: FeishuUser | undefined, search?: string) {
@@ -5002,6 +5330,26 @@ function filterUsageLogs(
 export async function listAdminUsageRecords(input: UsageRecordFilters & {
   scope: AdminScope;
 }) {
+  if (isPostgresBackend()) {
+    const limit = boundedLimit(input.limit, 100);
+    const offset = boundedOffset(input.offset);
+    const report = await listPostgresUsageReport({
+      scope: input.scope,
+      ...postgresUsageFilters(input),
+      limit,
+      offset,
+    });
+    return {
+      records: mapPostgresUsagePage(report.page),
+      total: report.total,
+      limit,
+      offset,
+      filters: report.filters,
+      modelStats: report.modelStats,
+      departmentStats: report.departmentStats,
+      apiFormatStats: report.apiFormatStats,
+    };
+  }
   const store = await readStore();
   const usersById = new Map(store.users.map((user) => [user.id, user]));
   const scopedLogs = store.proxyRequestLogs
@@ -5098,6 +5446,15 @@ export async function listAdminUsageRecords(input: UsageRecordFilters & {
 }
 
 export async function listUserUsageRecords(feishuUserId: string, limit = 100) {
+  if (isPostgresBackend()) {
+    const bounded = boundedLimit(limit, 100);
+    const report = await listPostgresUsageReport({
+      feishuUserId,
+      limit: bounded,
+      offset: 0,
+    });
+    return mapPostgresUsagePage(report.page);
+  }
   const store = await readStore();
   const usersById = new Map(store.users.map((user) => [user.id, user]));
   const bounded = boundedLimit(limit, 100);
@@ -5112,6 +5469,31 @@ export async function listUserUsageRecords(feishuUserId: string, limit = 100) {
 export async function listUserUsageReport(input: UsageRecordFilters & {
   feishuUserId: string;
 }) {
+  if (isPostgresBackend()) {
+    const limit = boundedLimit(input.limit, 100);
+    const offset = boundedOffset(input.offset);
+    const report = await listPostgresUsageReport({
+      feishuUserId: input.feishuUserId,
+      ...postgresUsageFilters(input),
+      limit,
+      offset,
+    });
+    return {
+      records: mapPostgresUsagePage(report.page),
+      total: report.total,
+      limit,
+      offset,
+      filters: {
+        models: report.filters.models,
+        providers: report.filters.providers,
+        apiFormats: report.filters.apiFormats,
+        userAgents: report.filters.userAgents,
+        clientFamilies: report.filters.clientFamilies,
+      },
+      modelStats: report.modelStats,
+      apiFormatStats: report.apiFormatStats,
+    };
+  }
   const store = await readStore();
   const usersById = new Map(store.users.map((user) => [user.id, user]));
   const scopedLogs = store.proxyRequestLogs
@@ -5311,6 +5693,96 @@ export async function listAdminTokenRequests(input: {
 }
 
 export async function getAdminOverview(scope: AdminScope) {
+  if (isPostgresBackend()) {
+    const currentPeriod = nowIso().slice(0, 7);
+    const cached = await getPostgresAdminOverview(scope, currentPeriod);
+    const snapshot = cached.snapshot;
+    const totals = snapshot.totals;
+    if (!totals) throw new Error("PostgreSQL admin overview returned no totals row");
+    return {
+      overviewAsOf: cached.overviewAsOf,
+      overviewCacheState: cached.overviewCacheState,
+      scope: {
+        type: scope.scopeType,
+        departmentId: scope.departmentId,
+        departmentName: snapshot.departmentName,
+        source: scope.source,
+        role: scope.role,
+      },
+      totals: {
+        users: Number(totals.users) || 0,
+        keyedUsers: Number(totals.keyed_users) || 0,
+        tokenRequests: Number(totals.token_requests) || 0,
+        pendingRequests: Number(totals.pending_requests) || 0,
+        provisionedRequests: Number(totals.provisioned_requests) || 0,
+        failedRequests: Number(totals.failed_requests) || 0,
+        activeTokens: Number(totals.active_tokens) || 0,
+        proxyLogs: Number(totals.proxy_logs) || 0,
+        promptTokens: Number(totals.prompt_tokens) || 0,
+        completionTokens: Number(totals.completion_tokens) || 0,
+        totalTokens: Number(totals.total_tokens) || 0,
+        currentBillingPeriod: currentPeriod,
+        currentPeriodMonthlyQuota: Number(totals.current_period_monthly_quota) || 0,
+        currentPeriodQuotaConsumed: Number(totals.current_period_quota_consumed) || 0,
+        currentPeriodCost: Number(totals.current_period_cost) || 0,
+        currentPeriodRemainingQuota: Number(totals.current_period_remaining_quota) || 0,
+        currentPeriodUsageRecords: Number(totals.current_period_usage_records) || 0,
+        currentPeriodProxyLogs: Number(totals.current_period_proxy_logs) || 0,
+        currentPeriodPromptTokens: Number(totals.current_period_prompt_tokens) || 0,
+        currentPeriodCompletionTokens:
+          Number(totals.current_period_completion_tokens) || 0,
+        currentPeriodTotalTokens: Number(totals.current_period_total_tokens) || 0,
+      },
+      latestRequests: snapshot.latestRequests.map((row) =>
+        mapAdminTokenRequest(row.request_data, row.user_data ?? undefined),
+      ),
+      users: snapshot.users.map((row) => {
+        const user = row.user_data;
+        const activeAccount = row.account_data;
+        const billingPeriod = activeAccount?.billingPeriod ?? currentPeriod;
+        const billing = row.billing_data;
+        return {
+          id: user.id,
+          name: user.name,
+          openId: user.openId,
+          departmentId: user.departmentId,
+          departmentName: user.departmentName,
+          activeTokenStatus: activeAccount?.status,
+          activeTokenCreatedAt: activeAccount?.createdAt,
+          billingPeriod,
+          billingMonthlyQuota: billing?.monthlyQuota,
+          billingPromptTokens: billing?.promptTokens,
+          billingCompletionTokens: billing?.completionTokens,
+          billingTotalTokens: billing?.totalTokens,
+          billingQuotaConsumed: billing?.quotaConsumed,
+          billingCost: billing?.cost,
+          billingRemainingQuota: billing?.remainingQuota,
+          billingProxyLogCount: billing?.proxyLogCount,
+          billingUsageRecordCount: billing?.usageRecordCount,
+          requestCount: Number(row.request_count) || 0,
+          proxyLogCount: Number(row.proxy_log_count) || 0,
+          totalTokens: Number(row.total_tokens) || 0,
+          updatedAt: user.updatedAt,
+          createdAt: user.createdAt,
+        };
+      }),
+      latestProxyLogs: snapshot.latestProxyLogs.map((row) => ({
+        id: row.log_data.id,
+        requestPath: row.log_data.requestPath,
+        method: row.log_data.method,
+        statusCode: row.log_data.statusCode,
+        durationMs: row.log_data.durationMs,
+        promptTokens: row.log_data.promptTokens,
+        completionTokens: row.log_data.completionTokens,
+        totalTokens: row.log_data.totalTokens,
+        clientIp: row.log_data.clientIp,
+        userAgent: row.log_data.userAgent,
+        requesterName: row.user_data?.name,
+        requesterOpenId: row.user_data?.openId,
+        createdAt: row.log_data.createdAt,
+      })),
+    };
+  }
   const store = await readStore();
   const currentPeriod = nowIso().slice(0, 7);
   const usersById = new Map(store.users.map((user) => [user.id, user]));
@@ -5405,6 +5877,8 @@ export async function getAdminOverview(scope: AdminScope) {
   );
 
   return {
+    overviewAsOf: nowIso(),
+    overviewCacheState: "uncached" as const,
     scope: {
       type: scope.scopeType,
       departmentId: scope.departmentId,

@@ -1,6 +1,76 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
+import ts from "typescript";
 import { createBillingPeriodFinalizer } from "../lib/billing-period-finalizer.ts";
+
+const billingPeriodFinalizerPath = new URL(
+  "../lib/billing-period-finalizer.ts",
+  import.meta.url,
+);
+
+type ProductionBillingPeriodFinalizerApi = {
+  finalizeBillingPeriodAfterSettlements(
+    feishuUserId: string,
+    period: string,
+    delayMs?: number,
+  ): Promise<void>;
+  drainBillingPeriodFinalizations(): Promise<void>;
+  billingPeriodFinalizationSnapshot(): {
+    active: number;
+    queued: number;
+    pendingKeys: number;
+    maxConcurrency: number;
+  };
+};
+
+async function loadProductionFinalizerChunk(input: {
+  sharedGlobal: Record<string, unknown>;
+  reconcile: (feishuUserId: string, period: string) => Promise<void>;
+  maxConcurrency?: number;
+}) {
+  const source = await readFile(billingPeriodFinalizerPath, "utf8");
+  const transpiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: "billing-period-finalizer.ts",
+  }).outputText;
+  const module = { exports: {} as ProductionBillingPeriodFinalizerApi };
+  const imports: Record<string, Record<string, unknown>> = {
+    "./config.ts": {
+      getConfig: () => ({
+        storeBackend: "postgres",
+        billing: {
+          materializationConcurrencyMax: input.maxConcurrency ?? 2,
+        },
+      }),
+    },
+    "./postgres-store.ts": {
+      reconcilePostgresBillingPeriodForUser: input.reconcile,
+    },
+  };
+  runInNewContext(
+    transpiled,
+    {
+      module,
+      exports: module.exports,
+      require: (specifier: string) => {
+        const dependency = imports[specifier];
+        if (!dependency) throw new Error(`unexpected finalizer import: ${specifier}`);
+        return dependency;
+      },
+      setTimeout,
+      clearTimeout,
+      globalThis: input.sharedGlobal,
+    },
+    { filename: "billing-period-finalizer.js" },
+  );
+  return module.exports;
+}
 
 function deferred() {
   let resolve!: () => void;
@@ -137,4 +207,196 @@ test("a dirty request retries a failed running generation before settling caller
   await Promise.all([first, retryDemand]);
   assert.equal(first, retryDemand);
   assert.equal(runs, 2);
+});
+
+test("drain bypasses the debounce delay and waits for all pending keys", async () => {
+  const runs: string[] = [];
+  const finalize = createBillingPeriodFinalizer(async (userId, period) => {
+    runs.push(`${userId}:${period}`);
+  });
+
+  const first = finalize("fu_drain_a", "2026-07", 60_000);
+  const second = finalize("fu_drain_b", "2026-08", 60_000);
+  assert.equal(finalize.pendingCount(), 2);
+
+  await finalize.drain();
+  await Promise.all([first, second]);
+
+  assert.deepEqual(runs.sort(), ["fu_drain_a:2026-07", "fu_drain_b:2026-08"]);
+  assert.equal(finalize.pendingCount(), 0);
+});
+
+test("drain waits through a dirty trailing generation", async () => {
+  const firstStarted = deferred();
+  const releaseFirst = deferred();
+  let runs = 0;
+  const finalize = createBillingPeriodFinalizer(async () => {
+    runs += 1;
+    if (runs === 1) {
+      firstStarted.resolve();
+      await releaseFirst.promise;
+    }
+  });
+
+  const batch = finalize("fu_drain_dirty", "2026-07", 0);
+  await firstStarted.promise;
+  finalize("fu_drain_dirty", "2026-07", 60_000);
+  const drained = finalize.drain();
+  releaseFirst.resolve();
+
+  await Promise.all([batch, drained]);
+  assert.equal(runs, 2);
+  assert.equal(finalize.pendingCount(), 0);
+});
+
+test("drain reports failures after removing failed entries", async () => {
+  const expected = new Error("drain reconcile failed");
+  const finalize = createBillingPeriodFinalizer(async () => {
+    throw expected;
+  });
+
+  void finalize("fu_drain_failure", "2026-07", 60_000).catch(() => undefined);
+  await assert.rejects(finalize.drain(), AggregateError);
+  assert.equal(finalize.pendingCount(), 0);
+});
+
+test("materialization concurrency is bounded and drain waits for queued keys", async () => {
+  const starts = [deferred(), deferred(), deferred()];
+  const releases = [deferred(), deferred(), deferred()];
+  let runs = 0;
+  let active = 0;
+  let maxObserved = 0;
+  const finalize = createBillingPeriodFinalizer(
+    async () => {
+      const index = runs;
+      runs += 1;
+      active += 1;
+      maxObserved = Math.max(maxObserved, active);
+      starts[index]?.resolve();
+      await releases[index]?.promise;
+      active -= 1;
+    },
+    { maxConcurrency: () => 2 },
+  );
+
+  const batches = [
+    finalize("fu_bounded_a", "2026-07", 0),
+    finalize("fu_bounded_b", "2026-07", 0),
+    finalize("fu_bounded_c", "2026-07", 0),
+  ];
+  await Promise.all([starts[0].promise, starts[1].promise]);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(finalize.snapshot(), {
+    active: 2,
+    queued: 1,
+    pendingKeys: 3,
+    maxConcurrency: 2,
+  });
+
+  const drained = finalize.drain();
+  releases[0].resolve();
+  await starts[2].promise;
+  assert.equal(maxObserved, 2);
+  releases[1].resolve();
+  releases[2].resolve();
+
+  await Promise.all([...batches, drained]);
+  assert.equal(maxObserved, 2);
+  assert.deepEqual(finalize.snapshot(), {
+    active: 0,
+    queued: 0,
+    pendingKeys: 0,
+    maxConcurrency: 2,
+  });
+});
+
+test("independent production chunks share one versioned finalizer runtime", async () => {
+  const starts = [deferred(), deferred(), deferred()];
+  const releases = [deferred(), deferred(), deferred()];
+  const sharedGlobal: Record<string, unknown> = {};
+  let runs = 0;
+  let active = 0;
+  let maxObserved = 0;
+  const reconcile = async () => {
+    const index = runs;
+    runs += 1;
+    active += 1;
+    maxObserved = Math.max(maxObserved, active);
+    starts[index]?.resolve();
+    await releases[index]?.promise;
+    active -= 1;
+  };
+
+  const instrumentationChunk = await loadProductionFinalizerChunk({
+    sharedGlobal,
+    reconcile,
+  });
+  const healthRouteChunk = await loadProductionFinalizerChunk({
+    sharedGlobal,
+    reconcile,
+  });
+
+  const batches = [
+    instrumentationChunk.finalizeBillingPeriodAfterSettlements(
+      "fu_chunk_a",
+      "2026-07",
+      0,
+    ),
+    instrumentationChunk.finalizeBillingPeriodAfterSettlements(
+      "fu_chunk_b",
+      "2026-07",
+      0,
+    ),
+    healthRouteChunk.finalizeBillingPeriodAfterSettlements(
+      "fu_chunk_c",
+      "2026-07",
+      0,
+    ),
+  ];
+
+  await Promise.all([starts[0].promise, starts[1].promise]);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(instrumentationChunk.billingPeriodFinalizationSnapshot())),
+    {
+      active: 2,
+      queued: 1,
+      pendingKeys: 3,
+      maxConcurrency: 2,
+    },
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(healthRouteChunk.billingPeriodFinalizationSnapshot())),
+    {
+      active: 2,
+      queued: 1,
+      pendingKeys: 3,
+      maxConcurrency: 2,
+    },
+  );
+  assert.equal(
+    (sharedGlobal.__tokenInsideBillingPeriodFinalizerRuntimeV1 as { version: number })
+      .version,
+    1,
+  );
+
+  const drained = healthRouteChunk.drainBillingPeriodFinalizations();
+  releases[0].resolve();
+  await starts[2].promise;
+  assert.equal(maxObserved, 2);
+  releases[1].resolve();
+  releases[2].resolve();
+  await Promise.all([...batches, drained]);
+
+  assert.equal(runs, 3);
+  assert.equal(maxObserved, 2);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(instrumentationChunk.billingPeriodFinalizationSnapshot())),
+    {
+      active: 0,
+      queued: 0,
+      pendingKeys: 0,
+      maxConcurrency: 2,
+    },
+  );
 });

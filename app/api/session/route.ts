@@ -1,68 +1,45 @@
 import { NextResponse } from "next/server";
 import { getEffectiveAdminScopeForUser, hydrateUserDepartment } from "@/lib/admin-sync";
 import { getConfig } from "@/lib/config";
-import { getNewApiTokenKey } from "@/lib/newapi";
 import { getCurrentUser } from "@/lib/session";
 import {
+  getAuthenticatedSessionProjection,
   getActiveTokenForUser,
   getEffectiveUserGrantQuota,
-  getStoreSnapshot,
+  getSessionStoreSummary,
   getUserBillingPeriod,
   listUserTokenRequests,
 } from "@/lib/store";
-import { maskApiKey } from "@/lib/utils";
+import type {
+  AdminScope,
+  FeishuUser,
+  TokenAccount,
+  TokenRequest,
+  UserBillingPeriod,
+} from "@/lib/types";
 
 export const runtime = "nodejs";
 
-export async function GET() {
-  const user = await hydrateUserDepartment(await getCurrentUser());
-  const config = getConfig();
-  if (!user) {
-    const store = await getStoreSnapshot();
-    return NextResponse.json({
-      authenticated: false,
-      baseUrl: config.publicBaseUrl,
-      settings: store.settings,
-      requests: [],
-      proxyLogCount: store.proxyRequestLogs.length,
-    });
-  }
+type AuthenticatedSessionData = {
+  settings: {
+    defaultMonthlyQuota: number;
+  };
+  requests: TokenRequest[];
+  activeToken: TokenAccount | null;
+  billingPeriod: UserBillingPeriod | null;
+  adminScope: AdminScope | null;
+  proxyLogCount: number;
+};
 
-  const [requests, activeToken, adminScope, store] = await Promise.all([
-    listUserTokenRequests(user.id),
-    getActiveTokenForUser(user.id),
-    getEffectiveAdminScopeForUser(user),
-    getStoreSnapshot(),
-  ]);
-  const effectiveGrantQuota = await getEffectiveUserGrantQuota(user.id).catch(
-    () => store.settings.defaultMonthlyQuota,
-  );
-  const billingPeriod = activeToken
-    ? await getUserBillingPeriod(user.id, activeToken.billingPeriod)
-    : null;
-  let activeTokenResponse:
-    | (typeof activeToken & {
-        maskedKey?: string;
-      })
-    | null = activeToken;
-  if (activeToken?.newapiTokenId) {
-    try {
-      const key = await getNewApiTokenKey(activeToken.newapiTokenId);
-      activeTokenResponse = {
-        ...activeToken,
-        maskedKey: maskApiKey(key),
-      };
-    } catch {
-      activeTokenResponse = { ...activeToken };
-    }
-  }
+function authenticatedSessionResponse(
+  baseUrl: string,
+  user: FeishuUser,
+  session: AuthenticatedSessionData,
+) {
   return NextResponse.json({
     authenticated: true,
-    baseUrl: config.publicBaseUrl,
-    settings: {
-      ...store.settings,
-      defaultMonthlyQuota: effectiveGrantQuota,
-    },
+    baseUrl,
+    settings: session.settings,
     user: {
       id: user.id,
       name: user.name,
@@ -72,19 +49,67 @@ export async function GET() {
       departmentId: user.departmentId,
       departmentName: user.departmentName,
     },
-    activeToken: activeTokenResponse,
-    billingPeriod,
-    adminScope: adminScope
+    activeToken: session.activeToken,
+    billingPeriod: session.billingPeriod,
+    adminScope: session.adminScope
       ? {
-          type: adminScope.scopeType,
-          departmentId: adminScope.departmentId,
+          type: session.adminScope.scopeType,
+          departmentId: session.adminScope.departmentId,
           departmentName:
-            adminScope.departmentId === user.departmentId ? user.departmentName : undefined,
-          source: adminScope.source,
-          role: adminScope.role,
+            session.adminScope.departmentId === user.departmentId
+              ? user.departmentName
+              : undefined,
+          source: session.adminScope.source,
+          role: session.adminScope.role,
         }
       : null,
+    requests: session.requests,
+    proxyLogCount: session.proxyLogCount,
+  });
+}
+
+export async function GET() {
+  const config = getConfig();
+  const currentUser = await getCurrentUser();
+  if (!currentUser) {
+    const store = await getSessionStoreSummary();
+    return NextResponse.json({
+      authenticated: false,
+      baseUrl: config.publicBaseUrl,
+      settings: store.settings,
+      requests: [],
+      proxyLogCount: store.proxyLogCount,
+    });
+  }
+
+  const postgresSession = await getAuthenticatedSessionProjection(currentUser);
+  if (postgresSession) {
+    return authenticatedSessionResponse(config.publicBaseUrl, currentUser, postgresSession);
+  }
+
+  const user = await hydrateUserDepartment(currentUser);
+
+  const [requests, activeToken, adminScope, store] = await Promise.all([
+    listUserTokenRequests(user.id),
+    getActiveTokenForUser(user.id),
+    getEffectiveAdminScopeForUser(user),
+    getSessionStoreSummary(),
+  ]);
+  const effectiveGrantQuota = await getEffectiveUserGrantQuota(user.id).catch(
+    () => store.settings.defaultMonthlyQuota,
+  );
+  const billingPeriod = activeToken
+    ? await getUserBillingPeriod(user.id, activeToken.billingPeriod)
+    : null;
+  return authenticatedSessionResponse(config.publicBaseUrl, user, {
+    settings: {
+      ...store.settings,
+      defaultMonthlyQuota: effectiveGrantQuota,
+    },
+    activeToken,
+    billingPeriod,
+    adminScope,
     requests,
-    proxyLogCount: store.proxyRequestLogs.length,
+    proxyLogCount: store.proxyLogCount,
   });
 }

@@ -1,14 +1,20 @@
-import { after, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireAdminScope } from "@/lib/admin";
+import { getConfig } from "@/lib/config";
 import { nowIso } from "@/lib/crypto";
 import { provisionTokenForRequest } from "@/lib/provisioning";
+import {
+  QuotaSubmissionError,
+  submitPostgresQuotaRestoreDecision,
+} from "@/lib/quota-operation-submit";
+import { getCurrentSessionIdentity } from "@/lib/session";
 import {
   getScopedTokenRequest,
   updateTokenRequest,
   updateTokenRequestForQuotaOperation,
 } from "@/lib/store";
-import { enqueueQuotaRestoreForRequest, runQuotaOperation } from "@/lib/quota-saga";
+import { enqueueQuotaRestoreForRequest, ensureQuotaOperationWorker } from "@/lib/quota-saga";
 import { quotaFeatureErrorStatus } from "@/lib/quota-guard";
 import { tokenRequestRequiresAdminDecision } from "@/lib/token-request-policy";
 
@@ -24,10 +30,56 @@ export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
+  const identity = await getCurrentSessionIdentity();
+  if (!identity) {
+    return NextResponse.json({ error: "需要飞书 OAuth 会话" }, { status: 401 });
+  }
+  const parsed = decisionSchema.safeParse(await request.json());
+  if (!parsed.success) {
+    return NextResponse.json({ error: "审批动作或最终额度无效" }, { status: 400 });
+  }
+  const { id } = await params;
+
+  if (getConfig().storeBackend === "postgres" && parsed.data.action === "approve") {
+    try {
+      const submitted = await submitPostgresQuotaRestoreDecision({
+        actorUserId: identity.userId,
+        requestId: id,
+        approvedMonthlyQuota: parsed.data.approvedMonthlyQuota,
+      });
+      if (submitted.handled) {
+        ensureQuotaOperationWorker();
+        return NextResponse.json(
+          {
+            request: submitted.request,
+            operation: submitted.operation,
+            deduplicated: submitted.deduplicated,
+          },
+          { status: 202 },
+        );
+      }
+    } catch (err) {
+      if (err instanceof QuotaSubmissionError) {
+        return NextResponse.json(
+          { error: err.message, code: err.code },
+          {
+            status: err.status,
+            headers: err.retryAfterSeconds
+              ? { "Retry-After": String(err.retryAfterSeconds) }
+              : undefined,
+          },
+        );
+      }
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : "额度恢复操作创建失败" },
+        { status: 502 },
+      );
+    }
+  }
+
   const auth = await requireAdminScope();
   if (auth.error) return auth.error;
 
-  const { id } = await params;
   const tokenRequest = await getScopedTokenRequest(auth.scope, id);
   if (!tokenRequest) {
     return NextResponse.json({ error: "申请单不存在或不在当前管理范围内" }, { status: 404 });
@@ -38,11 +90,6 @@ export async function POST(
       { error: "当前记录不是可人工处理的审批申请" },
       { status: 409 },
     );
-  }
-
-  const parsed = decisionSchema.safeParse(await request.json());
-  if (!parsed.success) {
-    return NextResponse.json({ error: "审批动作或最终额度无效" }, { status: 400 });
   }
 
   const updateDecisionRequest =
@@ -79,7 +126,8 @@ export async function POST(
       await updateTokenRequestForQuotaOperation(approved.id, {
         status: "approved_provisioning",
       });
-      after(() => runQuotaOperation(operation.id).catch(() => undefined));
+      // quota_operations is a durable queue. The process worker owns Saga
+      // execution so accepting one request cannot starve later submissions.
       return NextResponse.json({ request: approved, operation }, { status: 202 });
     } catch (err) {
       return NextResponse.json(

@@ -144,6 +144,14 @@ const checks = [
       Number(process.env.TOKENINSIDE_PROXY_QUEUE_TIMEOUT_MS ?? "30000") >= 1000,
     "must be an integer of at least 1000 milliseconds",
   ),
+  result(
+    "TOKENINSIDE_BILLING_MATERIALIZATION_CONCURRENCY_MAX",
+    Number.isInteger(
+      Number(process.env.TOKENINSIDE_BILLING_MATERIALIZATION_CONCURRENCY_MAX ?? "4"),
+    ) &&
+      Number(process.env.TOKENINSIDE_BILLING_MATERIALIZATION_CONCURRENCY_MAX ?? "4") >= 1,
+    "must be a positive integer",
+  ),
 ];
 
 if (storeBackend === "json") {
@@ -158,8 +166,10 @@ if (storeBackend === "json") {
 }
 
 if (storeBackend === "postgres") {
-  const businessPoolMax = Number(process.env.DATABASE_POOL_MAX ?? "10");
+  const businessPoolMax = Number(process.env.DATABASE_POOL_MAX ?? "8");
+  const settlementPoolMax = Number(process.env.DATABASE_SETTLEMENT_POOL_MAX ?? "2");
   const controlPoolMax = Number(process.env.DATABASE_CONTROL_POOL_MAX ?? "4");
+  const quotaSubmitPoolMax = Number(process.env.DATABASE_QUOTA_SUBMIT_POOL_MAX ?? "2");
   const lockPoolMax = Number(process.env.DATABASE_LOCK_POOL_MAX ?? "10");
   const postgresMaxConnections = Number(process.env.POSTGRES_MAX_CONNECTIONS ?? "30");
   const postgresReservedConnections = Number(
@@ -177,11 +187,35 @@ if (storeBackend === "postgres") {
   );
   checks.push(
     result(
+      "DATABASE_SETTLEMENT_POOL_MAX",
+      Number.isInteger(settlementPoolMax) && settlementPoolMax >= 1,
+      "authoritative settlement pool max must be a positive integer",
+    ),
+  );
+  checks.push(
+    result(
       "DATABASE_CONTROL_POOL_MAX",
       Number.isInteger(controlPoolMax) && controlPoolMax >= 1,
       "control pool max must be a positive integer",
     ),
   );
+  checks.push(
+    result(
+      "DATABASE_QUOTA_SUBMIT_POOL_MAX",
+      Number.isInteger(quotaSubmitPoolMax) && quotaSubmitPoolMax >= 1,
+      "quota submission pool max must be a positive integer",
+    ),
+  );
+  for (const [name, fallback] of [
+    ["DATABASE_QUOTA_SUBMIT_CONNECTION_TIMEOUT_MS", "1000"],
+    ["DATABASE_QUOTA_SUBMIT_STATEMENT_TIMEOUT_MS", "3000"],
+    ["DATABASE_QUOTA_SUBMIT_LOCK_TIMEOUT_MS", "1000"],
+  ]) {
+    const value = Number(process.env[name] ?? fallback);
+    checks.push(
+      result(name, Number.isInteger(value) && value >= 100, `${name} must be an integer >= 100ms`),
+    );
+  }
   checks.push(
     result(
       "DATABASE_LOCK_POOL_MAX",
@@ -194,9 +228,9 @@ if (storeBackend === "postgres") {
       "POSTGRES_APP_CONNECTION_BUDGET",
       Number.isInteger(postgresMaxConnections) &&
         Number.isInteger(postgresReservedConnections) &&
-        businessPoolMax + controlPoolMax + lockPoolMax + 5 <
+        businessPoolMax + settlementPoolMax + controlPoolMax + quotaSubmitPoolMax + lockPoolMax + 5 <
           postgresMaxConnections - postgresReservedConnections,
-      "business pool + control pool + lock pool + 5 maintenance connections must stay below PostgreSQL usable connections",
+      "business + settlement + control + quota-submit + lock pools and 5 maintenance connections must stay below PostgreSQL usable connections",
     ),
   );
 }

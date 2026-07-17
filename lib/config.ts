@@ -8,7 +8,12 @@ export type RuntimeConfig = {
   databaseUrl?: string;
   postgres: {
     poolMax: number;
+    settlementPoolMax: number;
     controlPoolMax: number;
+    quotaSubmitPoolMax: number;
+    quotaSubmitConnectionTimeoutMs: number;
+    quotaSubmitStatementTimeoutMs: number;
+    quotaSubmitLockTimeoutMs: number;
     lockPoolMax: number;
     poolIdleTimeoutMs: number;
     poolConnectionTimeoutMs: number;
@@ -48,6 +53,8 @@ export type RuntimeConfig = {
     monthlyResetEnabled: boolean;
     operationConcurrencyMax: number;
     settlementConcurrencyMax: number;
+    materializationConcurrencyMax: number;
+    usageSyncContinuationDelayMs: number;
   };
 };
 
@@ -91,8 +98,32 @@ export function getConfig(): RuntimeConfig {
     ),
     databaseUrl: process.env.DATABASE_URL,
     postgres: {
-      poolMax: positiveIntegerFromEnv(process.env.DATABASE_POOL_MAX, 10),
+      // The settlement pool is carved out of the historical ten-connection
+      // default rather than added on top of it. This keeps the single-process
+      // PostgreSQL budget stable while preventing proxy preparation and
+      // persistence from starving authoritative usage writes.
+      poolMax: positiveIntegerFromEnv(process.env.DATABASE_POOL_MAX, 8),
+      settlementPoolMax: positiveIntegerFromEnv(
+        process.env.DATABASE_SETTLEMENT_POOL_MAX,
+        2,
+      ),
       controlPoolMax: positiveIntegerFromEnv(process.env.DATABASE_CONTROL_POOL_MAX, 4),
+      quotaSubmitPoolMax: positiveIntegerFromEnv(
+        process.env.DATABASE_QUOTA_SUBMIT_POOL_MAX,
+        2,
+      ),
+      quotaSubmitConnectionTimeoutMs: positiveIntegerFromEnv(
+        process.env.DATABASE_QUOTA_SUBMIT_CONNECTION_TIMEOUT_MS,
+        1000,
+      ),
+      quotaSubmitStatementTimeoutMs: positiveIntegerFromEnv(
+        process.env.DATABASE_QUOTA_SUBMIT_STATEMENT_TIMEOUT_MS,
+        3000,
+      ),
+      quotaSubmitLockTimeoutMs: positiveIntegerFromEnv(
+        process.env.DATABASE_QUOTA_SUBMIT_LOCK_TIMEOUT_MS,
+        1000,
+      ),
       lockPoolMax: positiveIntegerFromEnv(process.env.DATABASE_LOCK_POOL_MAX, 10),
       poolIdleTimeoutMs: positiveIntegerFromEnv(
         process.env.DATABASE_POOL_IDLE_TIMEOUT_MS,
@@ -168,11 +199,19 @@ export function getConfig(): RuntimeConfig {
       monthlyResetEnabled: process.env.TOKENINSIDE_MONTHLY_RESET_ENABLED === "true",
       operationConcurrencyMax: positiveIntegerFromEnv(
         process.env.TOKENINSIDE_QUOTA_OPERATION_CONCURRENCY_MAX,
-        4,
+        1,
       ),
       settlementConcurrencyMax: positiveIntegerFromEnv(
         process.env.TOKENINSIDE_USAGE_SETTLEMENT_CONCURRENCY_MAX,
         16,
+      ),
+      materializationConcurrencyMax: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_BILLING_MATERIALIZATION_CONCURRENCY_MAX,
+        4,
+      ),
+      usageSyncContinuationDelayMs: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_USAGE_SYNC_CONTINUATION_DELAY_MS,
+        250,
       ),
     },
   };

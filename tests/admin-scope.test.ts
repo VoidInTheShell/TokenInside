@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { tokenRequestInAdminScope } from "../lib/admin-scope.ts";
+import {
+  resolveSessionAdminScopeProjection,
+  tokenRequestInAdminScope,
+} from "../lib/admin-scope.ts";
 import type { AdminScope, FeishuUser, TokenRequest } from "../lib/types.ts";
 
 const now = "2026-07-11T00:00:00.000Z";
@@ -49,6 +52,42 @@ const users = new Map<string, FeishuUser>([
   ["requester-a", user("requester-a", "department-a")],
   ["requester-b", user("requester-b", "department-b")],
 ]);
+
+function projectedScope(input: {
+  scopeType: AdminScope["scopeType"];
+  departmentId?: string;
+  status?: AdminScope["status"];
+  disabledReason?: AdminScope["disabledReason"];
+}): AdminScope {
+  return {
+    id: `projected-${input.scopeType}-${input.departmentId ?? "global"}`,
+    feishuUserId: "manager",
+    scopeType: input.scopeType,
+    departmentId: input.departmentId,
+    source: input.scopeType === "global" ? "manual" : "department_supervisor",
+    status: input.status ?? "active",
+    disabledReason: input.disabledReason,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function resolveProjectedScope(input: {
+  projectedUser?: FeishuUser;
+  systemAdminOpenIds?: string[];
+  activeScope?: AdminScope | null;
+  assignedRequest?: TokenRequest | null;
+  scopes?: AdminScope[];
+}) {
+  return resolveSessionAdminScopeProjection({
+    user: input.projectedUser ?? users.get("manager")!,
+    systemAdminOpenIds: new Set(input.systemAdminOpenIds ?? []),
+    activeScope: input.activeScope ?? null,
+    assignedRequest: input.assignedRequest ?? null,
+    scopes: input.scopes ?? [],
+    now,
+  });
+}
 
 test("department administrators cannot use approver assignment to cross department boundaries", () => {
   const crossDepartment = request({
@@ -141,5 +180,100 @@ test("department administrators cannot read a system administrator request from 
       systemAdminOpenIds,
     ),
     true,
+  );
+});
+
+test("session projection gives environment administrators precedence and rejects inactive users", () => {
+  const manager = users.get("manager")!;
+  const active = projectedScope({ scopeType: "department", departmentId: "department-a" });
+  const environment = resolveProjectedScope({
+    systemAdminOpenIds: [manager.openId],
+    activeScope: active,
+  });
+
+  assert.equal(environment?.scopeType, "global");
+  assert.equal(environment?.source, "environment");
+  assert.equal(environment?.role, "root");
+  assert.equal(
+    resolveProjectedScope({
+      projectedUser: { ...manager, status: "disabled" },
+      systemAdminOpenIds: [manager.openId],
+      activeScope: active,
+    }),
+    null,
+  );
+});
+
+test("session projection returns an active stored scope before assigned-request fallback", () => {
+  const active = projectedScope({ scopeType: "department", departmentId: "department-a" });
+  const resolved = resolveProjectedScope({
+    activeScope: active,
+    assignedRequest: request({ approvalDepartmentId: "department-b" }),
+    scopes: [
+      projectedScope({
+        scopeType: "global",
+        status: "disabled",
+        disabledReason: "manual_revoke",
+      }),
+    ],
+  });
+
+  assert.equal(resolved, active);
+});
+
+test("session projection synthesizes assigned department scope when no revocation blocks it", () => {
+  const resolved = resolveProjectedScope({
+    assignedRequest: request({ approvalDepartmentId: "department-a" }),
+    scopes: [
+      projectedScope({
+        scopeType: "global",
+        status: "disabled",
+        disabledReason: "auto_sync_lost",
+      }),
+      projectedScope({
+        scopeType: "department",
+        departmentId: "department-b",
+        status: "disabled",
+        disabledReason: "manual_revoke",
+      }),
+    ],
+  });
+
+  assert.equal(resolved?.scopeType, "department");
+  assert.equal(resolved?.departmentId, "department-a");
+  assert.equal(resolved?.source, "department_supervisor");
+});
+
+test("session projection honors global and matching-department revocation blockers", () => {
+  const assignedRequest = request({ approvalDepartmentId: "department-a" });
+  for (const disabledReason of [undefined, "manual_revoke", "user_deleted"] as const) {
+    assert.equal(
+      resolveProjectedScope({
+        assignedRequest,
+        scopes: [
+          projectedScope({
+            scopeType: "global",
+            status: "disabled",
+            disabledReason,
+          }),
+        ],
+      }),
+      null,
+    );
+  }
+
+  assert.equal(
+    resolveProjectedScope({
+      assignedRequest,
+      scopes: [
+        projectedScope({
+          scopeType: "department",
+          departmentId: "department-a",
+          status: "disabled",
+          disabledReason: "manual_revoke",
+        }),
+      ],
+    }),
+    null,
   );
 });

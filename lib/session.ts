@@ -5,7 +5,7 @@ import { getUserById } from "@/lib/store";
 
 export const sessionCookieName = "ti_session";
 
-type SessionPayload = {
+export type SessionPayload = {
   userId: string;
   tenantKey: string;
   openId: string;
@@ -44,10 +44,15 @@ export function verifySessionToken(token?: string | null) {
 }
 
 export async function getCurrentUser() {
-  const cookieStore = await cookies();
-  const payload = verifySessionToken(cookieStore.get(sessionCookieName)?.value);
+  const payload = await getCurrentSessionIdentity();
   if (!payload) return null;
   return getUserById(payload.userId);
+}
+
+export async function getCurrentSessionIdentity() {
+  const cookieStore = await cookies();
+  const payload = verifySessionToken(cookieStore.get(sessionCookieName)?.value);
+  return payload;
 }
 
 export async function setSessionCookie(token: string) {

@@ -59,6 +59,7 @@ import {
   updateQuotaOperation,
   updateTokenAccount,
   updateTokenAccountForQuotaOperation,
+  updateTokenRequestAfterQuotaMaterialization,
   updateTokenRequest,
   updateTokenRequestForQuotaOperation,
   withUserQuotaOperationLock,
@@ -76,27 +77,68 @@ import type {
 
 const maxAttempts = 5;
 const retryDelayMs = 2_000;
-let workerStarted = false;
-let workerTimer: ReturnType<typeof setTimeout> | undefined;
-let activeQuotaOperations = 0;
-const quotaOperationWaiters: Array<() => void> = [];
+const quotaSagaRuntimeVersion = 1 as const;
+
+type QuotaSagaRuntimeV1 = {
+  version: typeof quotaSagaRuntimeVersion;
+  workerStarted: boolean;
+  workerTimer: ReturnType<typeof setTimeout> | undefined;
+  activeQuotaOperations: number;
+  quotaOperationWaiters: Array<() => void>;
+};
+
+type QuotaSagaGlobalRuntime = typeof globalThis & {
+  __tokenInsideQuotaSagaRuntimeV1?: QuotaSagaRuntimeV1;
+};
+
+// Next.js may emit the instrumentation worker and route handlers into separate
+// server chunks. Their module scopes are independent even though they execute
+// in one Node process, so the in-process worker and admission gate must share a
+// versioned process-global runtime. The durable database lease remains the
+// cross-process ownership fence for every individual operation.
+const quotaSagaGlobalRuntime = globalThis as QuotaSagaGlobalRuntime;
+const quotaSagaRuntime =
+  quotaSagaGlobalRuntime.__tokenInsideQuotaSagaRuntimeV1 ??=
+    {
+      version: quotaSagaRuntimeVersion,
+      workerStarted: false,
+      workerTimer: undefined,
+      activeQuotaOperations: 0,
+      quotaOperationWaiters: [],
+    };
 
 async function acquireQuotaOperationSlot() {
   if (
-    activeQuotaOperations >= getConfig().billing.operationConcurrencyMax ||
-    quotaOperationWaiters.length > 0
+    quotaSagaRuntime.activeQuotaOperations >=
+      getConfig().billing.operationConcurrencyMax ||
+    quotaSagaRuntime.quotaOperationWaiters.length > 0
   ) {
-    await new Promise<void>((resolve) => quotaOperationWaiters.push(resolve));
+    await new Promise<void>((resolve) =>
+      quotaSagaRuntime.quotaOperationWaiters.push(resolve),
+    );
   } else {
-    activeQuotaOperations += 1;
+    quotaSagaRuntime.activeQuotaOperations += 1;
   }
   let released = false;
   return () => {
     if (released) return;
     released = true;
-    const next = quotaOperationWaiters.shift();
+    const next = quotaSagaRuntime.quotaOperationWaiters.shift();
     if (next) next();
-    else activeQuotaOperations = Math.max(activeQuotaOperations - 1, 0);
+    else {
+      quotaSagaRuntime.activeQuotaOperations = Math.max(
+        quotaSagaRuntime.activeQuotaOperations - 1,
+        0,
+      );
+    }
+  };
+}
+
+export function quotaOperationExecutionSnapshot() {
+  return {
+    active: quotaSagaRuntime.activeQuotaOperations,
+    queued: quotaSagaRuntime.quotaOperationWaiters.length,
+    maxConcurrency: getConfig().billing.operationConcurrencyMax,
   };
 }
 
@@ -153,6 +195,17 @@ function updateOperationTokenRequest(
     ? updateTokenRequestForQuotaOperation
     : updateTokenRequest;
   return update(requestId, patch);
+}
+
+function updateOperationTokenRequestAfterMaterialization(
+  operation: QuotaOperation,
+  requestId: string,
+  patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
+) {
+  if (usesIsolatedQuotaControlPool(operation)) {
+    return updateTokenRequestAfterQuotaMaterialization(requestId, patch);
+  }
+  return updateOperationTokenRequest(operation, requestId, patch);
 }
 
 function listOperationInflightProxyRequests(
@@ -389,7 +442,7 @@ async function finalizeCommon(
   current = await clearCommittedDepartmentReservation(current);
   await rebuildOperationQuotaSnapshot(current);
   if (current.requestId) {
-    await updateOperationTokenRequest(current, current.requestId, {
+    await updateOperationTokenRequestAfterMaterialization(current, current.requestId, {
       status: "provisioned",
       tokenAccountId: account?.id,
       errorMessage: undefined,
@@ -877,7 +930,7 @@ async function handleKeyRotation(operation: QuotaOperation) {
     current = await clearCommittedDepartmentReservation(current);
     await rebuildOperationQuotaSnapshot(current);
     if (current.requestId) {
-      await updateOperationTokenRequest(current, current.requestId, {
+      await updateOperationTokenRequestAfterMaterialization(current, current.requestId, {
         status: "provisioned",
         tokenAccountId: newAccount.id,
         errorMessage: undefined,
@@ -1043,7 +1096,7 @@ async function handleKeyRotation(operation: QuotaOperation) {
     await rebuildOperationQuotaSnapshot(current);
   }
   if (current.requestId) {
-    await updateOperationTokenRequest(current, current.requestId, {
+    await updateOperationTokenRequestAfterMaterialization(current, current.requestId, {
       status: "provisioned",
       tokenAccountId: finalized.newAccount.id,
       errorMessage: undefined,
@@ -1387,8 +1440,10 @@ export async function runDueQuotaOperations(limit = 20) {
 }
 
 function scheduleQuotaWorker(delayMs: number) {
-  if (workerTimer) clearTimeout(workerTimer);
-  workerTimer = setTimeout(async () => {
+  if (quotaSagaRuntime.workerTimer) {
+    clearTimeout(quotaSagaRuntime.workerTimer);
+  }
+  quotaSagaRuntime.workerTimer = setTimeout(async () => {
     try {
       const flags = await getQuotaFeatureFlags();
       if (flags.quotaSagaWritesEnabled) await runDueQuotaOperations();
@@ -1403,12 +1458,12 @@ function scheduleQuotaWorker(delayMs: number) {
       scheduleQuotaWorker(2_000);
     }
   }, Math.max(delayMs, 250));
-  workerTimer.unref?.();
+  quotaSagaRuntime.workerTimer.unref?.();
 }
 
 export function ensureQuotaOperationWorker() {
-  if (workerStarted) return;
-  workerStarted = true;
+  if (quotaSagaRuntime.workerStarted) return;
+  quotaSagaRuntime.workerStarted = true;
   scheduleQuotaWorker(500);
 }
 

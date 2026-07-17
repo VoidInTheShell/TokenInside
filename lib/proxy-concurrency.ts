@@ -22,7 +22,11 @@ type PersistenceWaiter = {
   resolve: (release: () => void) => void;
 };
 
-const persistenceAcceptanceBurstMax = 4;
+// Each successful request normally needs one acceptance update and one
+// terminal update. Per-request promise chaining already preserves acceptance
+// before terminal, so a 1:1 global ratio prevents continuous new traffic from
+// retaining completed response bodies behind a long terminal queue.
+const persistenceAcceptanceBurstMax = 1;
 
 export class ProxyQueueTimeoutError extends Error {
   constructor() {

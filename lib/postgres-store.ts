@@ -1,6 +1,7 @@
 import { Pool, type PoolClient } from "pg";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
+import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
 import {
   hasConflictingProxyMatch,
   newApiUsageIdentityLockKeys,
@@ -20,6 +21,7 @@ import {
   StaleTokenGenerationError,
 } from "@/lib/quota-admission";
 import {
+  findProxyLogForNewApiUsage,
   isBillableProxyLog,
   isNewApiUsageMatchEligibleProxyLog,
 } from "@/lib/usage-matching";
@@ -50,9 +52,78 @@ import type {
   UserBillingPeriod,
 } from "@/lib/types";
 
-let pool: Pool | undefined;
-let controlPool: Pool | undefined;
-let advisoryLockPool: Pool | undefined;
+const POSTGRES_POOL_REGISTRY_VERSION = 1;
+
+type PostgresPoolRegistry = {
+  version: typeof POSTGRES_POOL_REGISTRY_VERSION;
+  configFingerprint?: string;
+  business?: Pool;
+  settlement?: Pool;
+  control?: Pool;
+  advisoryLock?: Pool;
+};
+
+type PostgresPoolGlobal = typeof globalThis & {
+  __tokenInsidePostgresPoolRegistry?: PostgresPoolRegistry;
+};
+
+// Next.js emits independent server chunks for instrumentation, /v1, health,
+// and control routes. Module-local Pool variables are duplicated in those
+// chunks, so both the connection budget and health snapshot would otherwise
+// be false. All chunks in this Node process share this one versioned registry.
+const postgresPoolGlobal = globalThis as PostgresPoolGlobal;
+
+function getPostgresPoolRegistry() {
+  const existing = postgresPoolGlobal.__tokenInsidePostgresPoolRegistry;
+  if (existing) {
+    if (existing.version !== POSTGRES_POOL_REGISTRY_VERSION) {
+      throw new Error("PostgreSQL pool registry version mismatch; restart TokenInside");
+    }
+    return existing;
+  }
+  const created: PostgresPoolRegistry = {
+    version: POSTGRES_POOL_REGISTRY_VERSION,
+  };
+  postgresPoolGlobal.__tokenInsidePostgresPoolRegistry = created;
+  return created;
+}
+
+function getValidatedPostgresPoolRegistry() {
+  const config = getConfig();
+  const fingerprint = JSON.stringify({
+    databaseUrl: config.databaseUrl,
+    poolMax: config.postgres.poolMax,
+    settlementPoolMax: config.postgres.settlementPoolMax,
+    controlPoolMax: config.postgres.controlPoolMax,
+    lockPoolMax: config.postgres.lockPoolMax,
+    idleTimeoutMs: config.postgres.poolIdleTimeoutMs,
+    connectionTimeoutMs: config.postgres.poolConnectionTimeoutMs,
+  });
+  const registry = getPostgresPoolRegistry();
+  if (registry.configFingerprint && registry.configFingerprint !== fingerprint) {
+    throw new Error("PostgreSQL pool configuration changed at runtime; restart TokenInside");
+  }
+  registry.configFingerprint ??= fingerprint;
+  return { config, registry };
+}
+
+function poolRuntimeSnapshot(target?: Pool) {
+  return {
+    total: target?.totalCount ?? 0,
+    idle: target?.idleCount ?? 0,
+    waiting: target?.waitingCount ?? 0,
+  };
+}
+
+export function postgresPoolRuntimeSnapshot() {
+  const registry = getPostgresPoolRegistry();
+  return {
+    business: poolRuntimeSnapshot(registry.business),
+    settlement: poolRuntimeSnapshot(registry.settlement),
+    control: poolRuntimeSnapshot(registry.control),
+    lock: poolRuntimeSnapshot(registry.advisoryLock),
+  };
+}
 
 export const REQUIRED_POSTGRES_TABLES = [
   "schema_migrations",
@@ -78,51 +149,67 @@ export const REQUIRED_POSTGRES_TABLES = [
 ] as const;
 
 function getPool() {
-  if (pool) return pool;
-  const config = getConfig();
+  const { config, registry } = getValidatedPostgresPoolRegistry();
+  if (registry.business) return registry.business;
   const databaseUrl = config.databaseUrl;
   if (!databaseUrl) {
     throw new Error("DATABASE_URL is required when TOKENINSIDE_STORE_BACKEND=postgres");
   }
-  pool = new Pool({
+  registry.business = new Pool({
     connectionString: databaseUrl,
     max: config.postgres.poolMax,
     idleTimeoutMillis: config.postgres.poolIdleTimeoutMs,
     connectionTimeoutMillis: config.postgres.poolConnectionTimeoutMs,
   });
-  return pool;
+  return registry.business;
 }
 
 function getControlPool() {
-  if (controlPool) return controlPool;
-  const config = getConfig();
+  const { config, registry } = getValidatedPostgresPoolRegistry();
+  if (registry.control) return registry.control;
   const databaseUrl = config.databaseUrl;
   if (!databaseUrl) {
     throw new Error("DATABASE_URL is required when TOKENINSIDE_STORE_BACKEND=postgres");
   }
-  controlPool = new Pool({
+  registry.control = new Pool({
     connectionString: databaseUrl,
     max: config.postgres.controlPoolMax,
     idleTimeoutMillis: config.postgres.poolIdleTimeoutMs,
     connectionTimeoutMillis: config.postgres.poolConnectionTimeoutMs,
   });
-  return controlPool;
+  return registry.control;
 }
 
-function getAdvisoryLockPool() {
-  if (advisoryLockPool) return advisoryLockPool;
-  const config = getConfig();
+function getSettlementPool() {
+  const { config, registry } = getValidatedPostgresPoolRegistry();
+  if (registry.settlement) return registry.settlement;
   const databaseUrl = config.databaseUrl;
   if (!databaseUrl) {
     throw new Error("DATABASE_URL is required when TOKENINSIDE_STORE_BACKEND=postgres");
   }
-  advisoryLockPool = new Pool({
+  registry.settlement = new Pool({
+    connectionString: databaseUrl,
+    max: config.postgres.settlementPoolMax,
+    idleTimeoutMillis: config.postgres.poolIdleTimeoutMs,
+    connectionTimeoutMillis: config.postgres.poolConnectionTimeoutMs,
+  });
+  return registry.settlement;
+}
+
+function getAdvisoryLockPool() {
+  const { config, registry } = getValidatedPostgresPoolRegistry();
+  if (registry.advisoryLock) return registry.advisoryLock;
+  const databaseUrl = config.databaseUrl;
+  if (!databaseUrl) {
+    throw new Error("DATABASE_URL is required when TOKENINSIDE_STORE_BACKEND=postgres");
+  }
+  registry.advisoryLock = new Pool({
     connectionString: databaseUrl,
     max: config.postgres.lockPoolMax,
     idleTimeoutMillis: config.postgres.poolIdleTimeoutMs,
     connectionTimeoutMillis: config.postgres.poolConnectionTimeoutMs,
   });
-  return advisoryLockPool;
+  return registry.advisoryLock;
 }
 
 async function readDataRows<T>(client: PoolClient, table: string, orderBy: string) {
@@ -160,6 +247,17 @@ async function withControlClient<T>(fn: (client: PoolClient) => Promise<T>) {
   }
 }
 
+async function withSettlementClient<T>(fn: (client: PoolClient) => Promise<T>) {
+  const client = await getSettlementPool().connect();
+  try {
+    return await fn(client);
+  } finally {
+    client.release();
+  }
+}
+
+export { withControlClient as withPostgresControlClient };
+
 async function withAdvisoryLockClient<T>(fn: (client: PoolClient) => Promise<T>) {
   const client = await getAdvisoryLockPool().connect();
   try {
@@ -185,6 +283,22 @@ async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>) {
 
 async function withControlTransaction<T>(fn: (client: PoolClient) => Promise<T>) {
   return withControlClient(async (client) => {
+    try {
+      await client.query("begin");
+      const result = await fn(client);
+      await client.query("commit");
+      return result;
+    } catch (err) {
+      await client.query("rollback");
+      throw err;
+    }
+  });
+}
+
+async function withSettlementTransaction<T>(
+  fn: (client: PoolClient) => Promise<T>,
+) {
+  return withSettlementClient(async (client) => {
     try {
       await client.query("begin");
       const result = await fn(client);
@@ -1459,22 +1573,220 @@ export async function readPostgresStore(): Promise<StoreShape> {
 }
 
 export async function getPostgresAppSettings() {
-  return withClient((client) => readSettingsRow(client));
+  return withControlClient((client) => readSettingsRow(client));
 }
 
 export async function getPostgresAppSettingsForQuotaOperation() {
   return withControlClient((client) => readSettingsRow(client));
 }
 
-export async function readPostgresUsageMatchingSnapshot(input: {
-  newapiTokenIds: string[];
-  proxyLogIds: string[];
-  proxyCreatedAfter?: string;
-  proxyCreatedBefore?: string;
-}) {
-  const newapiTokenIds = [...new Set(input.newapiTokenIds.filter(Boolean))];
-  const proxyLogIds = [...new Set(input.proxyLogIds.filter(Boolean))];
+export async function getPostgresUsageSyncCheckpoint(
+  scope: UsageSyncCheckpoint["scope"] = "newapi_usage_logs",
+) {
+  return withControlClient(async (client) => {
+    const result = await client.query<{ data: UsageSyncCheckpoint }>(
+      "select data from usage_sync_checkpoints where scope = $1 limit 1",
+      [scope],
+    );
+    return result.rows[0]?.data ?? null;
+  });
+}
+
+export type PostgresBillingMaterializationTarget = {
+  feishuUserId: string;
+  billingPeriod: string;
+};
+
+/**
+ * Enumerates the durable user-period obligations implied by matched NewAPI
+ * source facts. The JSON record owns the billing-period snapshot; legacy rows
+ * without it fall back to the NewAPI occurrence month in Hong Kong time.
+ */
+export async function listPostgresMatchedUsageBillingMaterializationTargets() {
   return withClient(async (client) => {
+    const result = await client.query<PostgresBillingMaterializationTarget>(
+      `with matched_targets as (
+         select
+           coalesce(
+             nullif(data->>'feishuUserId', ''),
+             nullif(feishu_user_id, '')
+           ) as "feishuUserId",
+           case
+             when coalesce(data->>'billingPeriod', '') ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'
+               then data->>'billingPeriod'
+             when newapi_created_at is not null
+               then to_char(newapi_created_at at time zone 'Asia/Hong_Kong', 'YYYY-MM')
+             else null
+           end as "billingPeriod"
+         from newapi_usage_records
+         where match_status = 'matched'
+       )
+       select distinct "feishuUserId", "billingPeriod"
+       from matched_targets
+       where "feishuUserId" is not null
+         and "billingPeriod" is not null
+       order by "feishuUserId", "billingPeriod"`,
+    );
+    return result.rows;
+  });
+}
+
+export type PostgresPendingUsageSettlementHorizon = {
+  count: number;
+  transitionedToManualReviewCount: number;
+  requiredThrough?: string;
+  nextDueAt?: string;
+  oldestFinishedAt?: string;
+};
+
+/**
+ * Rebuilds the usage tail wake-up from durable terminal proxy facts. This is
+ * deliberately an aggregate query: the scheduler needs one horizon, not one
+ * in-memory waiter per request.
+ */
+export async function getPostgresPendingUsageSettlementHorizon(
+  settlementLagMinutes: number,
+): Promise<PostgresPendingUsageSettlementHorizon> {
+  return withControlClient(async (client) => {
+    const transitionedToManualReview = await client.query(
+      `update proxy_request_logs
+          set data = data || jsonb_build_object(
+            'usageSettlementStatus', 'manual_review',
+            'usageSettlementLastError',
+              'Authoritative NewAPI usage was not matched within 24 hours',
+            'updatedAt', $1::text
+          )
+        where data->>'usageSettlementStatus' in ('pending', 'retrying')
+          and coalesce(data->>'terminalStatus', data->>'status', '')
+            in ('completed', 'failed', 'cancelled')
+          and coalesce(
+            nullif(data->>'responseTimeUpdatedAt', '')::timestamptz,
+            created_at
+          ) < $1::timestamptz - interval '24 hours'`,
+      [nowIso()],
+    );
+    const result = await client.query<{
+      pending_count: string;
+      required_through: Date | string | null;
+      next_due_at: Date | string | null;
+      oldest_finished_at: Date | string | null;
+    }>(
+      `with pending as (
+         select
+           coalesce(
+             nullif(data->>'responseTimeUpdatedAt', '')::timestamptz,
+             created_at
+           ) as finished_at,
+           nullif(data->>'usageSettlementNextRetryAt', '')::timestamptz as next_retry_at
+         from proxy_request_logs
+         where data->>'usageSettlementStatus' in ('pending', 'retrying')
+           and coalesce(data->>'terminalStatus', data->>'status', '')
+             in ('completed', 'failed', 'cancelled')
+       )
+       select
+         count(*)::text as pending_count,
+         max(finished_at) as required_through,
+         min(
+           greatest(
+             finished_at + ($1::double precision * interval '1 minute'),
+             coalesce(next_retry_at, '-infinity'::timestamptz)
+           )
+         ) as next_due_at,
+         min(finished_at) as oldest_finished_at
+       from pending`,
+      [Math.max(settlementLagMinutes, 0)],
+    );
+    const row = result.rows[0];
+    const iso = (value: Date | string | null | undefined) => {
+      if (!value) return undefined;
+      const parsed = value instanceof Date ? value : new Date(value);
+      return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : undefined;
+    };
+    return {
+      count: Number(row?.pending_count ?? 0),
+      transitionedToManualReviewCount: transitionedToManualReview.rowCount ?? 0,
+      requiredThrough: iso(row?.required_through),
+      nextDueAt: iso(row?.next_due_at),
+      oldestFinishedAt: iso(row?.oldest_finished_at),
+    };
+  });
+}
+
+export async function deferPostgresCoveredPendingUsageSettlements(
+  scanStart: string,
+  scanEnd: string,
+) {
+  return withControlClient(async (client) => {
+    const updatedAt = nowIso();
+    const result = await client.query(
+      `with due as (
+         select id,
+                greatest(
+                  coalesce((data->>'usageSettlementScanAttempts')::integer, 0),
+                  0
+                ) as scan_attempts,
+                greatest(
+                  coalesce(
+                    (data->>'usageSettlementImmediateAttempts')::integer,
+                    (data->>'usageSettlementAttempts')::integer,
+                    0
+                  ),
+                  0
+                ) as immediate_attempts
+         from proxy_request_logs
+         where data->>'usageSettlementStatus' in ('pending', 'retrying')
+           and coalesce(data->>'terminalStatus', data->>'status', '')
+             in ('completed', 'failed', 'cancelled')
+           and coalesce(
+             nullif(data->>'responseTimeUpdatedAt', '')::timestamptz,
+             created_at
+           ) between $1::timestamptz and $2::timestamptz
+           and coalesce(
+             nullif(data->>'usageSettlementNextRetryAt', '')::timestamptz,
+             '-infinity'::timestamptz
+           ) <= $3::timestamptz
+         for update
+       )
+       update proxy_request_logs target
+          set data = target.data || jsonb_build_object(
+            'usageSettlementStatus', 'retrying',
+            'usageSettlementAttempts',
+              due.immediate_attempts + due.scan_attempts + 1,
+            'usageSettlementScanAttempts', due.scan_attempts + 1,
+            'usageSettlementLastError',
+              'Authoritative source was not visible after a nearby completed scan',
+            'usageSettlementNextRetryAt',
+              ($3::timestamptz + case
+                when due.scan_attempts < 1 then interval '15 seconds'
+                when due.scan_attempts < 2 then interval '1 minute'
+                when due.scan_attempts < 3 then interval '5 minutes'
+                else interval '15 minutes'
+              end),
+            'updatedAt', $3::text
+          )
+         from due
+        where target.id = due.id`,
+      [scanStart, scanEnd, updatedAt],
+    );
+    return result.rowCount ?? 0;
+  });
+}
+
+export async function readPostgresUsageMatchingSnapshot(input: {
+  usageSources: Array<{
+    recordId: string;
+    usageLog: NormalizedNewApiUsageLog;
+  }>;
+  proxyLogIds: string[];
+  fallbackWindowMs: number;
+}) {
+  const newapiTokenIds = [
+    ...new Set(
+      input.usageSources.map((source) => source.usageLog.newapiTokenId).filter(Boolean),
+    ),
+  ] as string[];
+  const proxyLogIds = [...new Set(input.proxyLogIds.filter(Boolean))];
+  return withSettlementClient(async (client) => {
     const accounts = newapiTokenIds.length
       ? await client.query<{ data: TokenAccount }>(
           "select data from token_accounts where newapi_token_id = any($1::text[])",
@@ -1489,37 +1801,205 @@ export async function readPostgresUsageMatchingSnapshot(input: {
         )
       : { rows: [] as Array<{ data: FeishuUser }> };
     const accountIds = accounts.rows.map((row) => row.data.id);
-    const proxyLogs = proxyLogIds.length
+    const accountIdByTokenId = new Map(
+      accounts.rows
+        .filter((row) => row.data.newapiTokenId)
+        .map((row) => [row.data.newapiTokenId as string, row.data.id] as const),
+    );
+    const exactRequestIds = [
+      ...new Set(
+        input.usageSources
+          .flatMap((source) => [
+            source.usageLog.newapiRequestId,
+            source.usageLog.newapiUpstreamRequestId,
+          ])
+          .filter(Boolean),
+      ),
+    ] as string[];
+    const exactLogIds = [
+      ...new Set(
+        input.usageSources.map((source) => source.usageLog.newapiLogId).filter(Boolean),
+      ),
+    ] as string[];
+    const exactProxyLogs = proxyLogIds.length
       ? await client.query<{ data: ProxyRequestLog }>(
           "select data from proxy_request_logs where id = any($1::text[])",
           [proxyLogIds],
         )
-      : accountIds.length
+      : accountIds.length && (exactRequestIds.length || exactLogIds.length)
         ? await client.query<{ data: ProxyRequestLog }>(
             `select data
-             from proxy_request_logs
-             where token_account_id = any($1::text[])
-               and ($2::timestamptz is null or created_at >= $2::timestamptz)
-               and ($3::timestamptz is null or created_at <= $3::timestamptz)
-             order by created_at, id`,
-            [
-              accountIds,
-              input.proxyCreatedAfter ?? null,
-              input.proxyCreatedBefore ?? null,
-            ],
+               from proxy_request_logs
+              where (
+                  token_account_id = any($1::text[])
+                  or data->>'providerKeyName' = any($2::text[])
+                )
+                and (
+                  data->>'newapiRequestId' = any($3::text[])
+                  or data->>'newapiResponseRequestId' = any($3::text[])
+                  or data->>'newapiUpstreamRequestId' = any($3::text[])
+                  or data->>'newapiLogId' = any($4::text[])
+                )
+              order by created_at, id`,
+            [accountIds, newapiTokenIds, exactRequestIds, exactLogIds],
           )
-      : { rows: [] as Array<{ data: ProxyRequestLog }> };
-    const usageRecords = newapiTokenIds.length
+        : { rows: [] as Array<{ data: ProxyRequestLog }> };
+    const exactProxyRows = exactProxyLogs.rows.map((row) => row.data);
+    const sourceRecordIds = [...new Set(input.usageSources.map((source) => source.recordId))];
+    const sourceRequestIds = [
+      ...new Set(
+        input.usageSources
+          .map((source) => source.usageLog.newapiRequestId)
+          .filter(Boolean),
+      ),
+    ] as string[];
+    const sourceLogIds = [
+      ...new Set(
+        input.usageSources.map((source) => source.usageLog.newapiLogId).filter(Boolean),
+      ),
+    ] as string[];
+    const exactProxyIds = exactProxyRows.map((proxyLog) => proxyLog.id);
+    const initialUsageRecords = sourceRecordIds.length || exactProxyIds.length
       ? await client.query<{ data: NewApiUsageRecord }>(
-          "select data from newapi_usage_records where newapi_token_id = any($1::text[])",
-          [newapiTokenIds],
+          `select data
+             from newapi_usage_records
+            where id = any($1::text[])
+               or (
+                 newapi_token_id = any($2::text[])
+                 and (
+                   newapi_request_id = any($3::text[])
+                   or newapi_log_id = any($4::text[])
+                 )
+               )
+               or (
+                 match_status = 'matched'
+                 and data->>'matchedProxyLogId' = any($5::text[])
+               )`,
+          [sourceRecordIds, newapiTokenIds, sourceRequestIds, sourceLogIds, exactProxyIds],
         )
       : { rows: [] as Array<{ data: NewApiUsageRecord }> };
+    const initialUsageRows = initialUsageRecords.rows.map((row) => row.data);
+    const reservedExactProxyIds = new Set(
+      initialUsageRows
+        .filter((record) => record.matchStatus === "matched")
+        .map((record) => record.matchedProxyLogId)
+        .filter((proxyLogId): proxyLogId is string => Boolean(proxyLogId)),
+    );
+    const accountByTokenId = new Map(
+      accounts.rows
+        .filter((row) => row.data.newapiTokenId)
+        .map((row) => [row.data.newapiTokenId as string, row.data] as const),
+    );
+    const sourceHasExactCandidate = (source: (typeof input.usageSources)[number]) => {
+      const account = source.usageLog.newapiTokenId
+        ? accountByTokenId.get(source.usageLog.newapiTokenId)
+        : undefined;
+      if (!account) return false;
+      const existingRecord = initialUsageRows.find((record) =>
+        sameNewApiUsageSource(record, source.usageLog),
+      );
+      return Boolean(
+        findProxyLogForNewApiUsage({
+          proxyLogs: exactProxyRows,
+          usageLog: source.usageLog,
+          account,
+          matchWindowMs: 30_000,
+          reservedProxyLogIds: reservedExactProxyIds,
+          allowReservedProxyLogId: existingRecord?.matchedProxyLogId,
+        }),
+      );
+    };
+    const fallbackSources = proxyLogIds.length
+      ? []
+      : input.usageSources.filter((source) => !sourceHasExactCandidate(source));
+    const fallbackWindowMs = Math.min(Math.max(input.fallbackWindowMs, 0), 30_000);
+    const fallbackRanges = fallbackSources.flatMap((source) => {
+      const createdAt = source.usageLog.createdAt
+        ? new Date(source.usageLog.createdAt).getTime()
+        : Number.NaN;
+      const newapiTokenId = source.usageLog.newapiTokenId;
+      const tokenAccountId = newapiTokenId
+        ? accountIdByTokenId.get(newapiTokenId)
+        : undefined;
+      if (!tokenAccountId || !Number.isFinite(createdAt)) return [];
+      return [{
+        tokenAccountId,
+        newapiTokenId,
+        finishedAfter: new Date(createdAt - fallbackWindowMs).toISOString(),
+        finishedBefore: new Date(createdAt + fallbackWindowMs).toISOString(),
+      }];
+    });
+    const fallbackProxyLogs = fallbackRanges.length
+      ? await client.query<{ data: ProxyRequestLog }>(
+          `with fallback_ranges as materialized (
+             select *
+             from jsonb_to_recordset($1::jsonb) as ranges(
+               "tokenAccountId" text,
+               "newapiTokenId" text,
+               "finishedAfter" timestamptz,
+               "finishedBefore" timestamptz
+             )
+           )
+           select distinct on (proxy.id) proxy.data
+             from fallback_ranges ranges
+             join proxy_request_logs proxy
+               on (
+                 proxy.token_account_id = ranges."tokenAccountId"
+                 or proxy.data->>'providerKeyName' = ranges."newapiTokenId"
+               )
+              and coalesce(
+                (proxy.data->>'responseTimeUpdatedAt')::timestamptz,
+                (proxy.data->>'updatedAt')::timestamptz,
+                proxy.created_at
+              ) >= ranges."finishedAfter"
+              and coalesce(
+                (proxy.data->>'responseTimeUpdatedAt')::timestamptz,
+                (proxy.data->>'updatedAt')::timestamptz,
+                proxy.created_at
+              ) <= ranges."finishedBefore"
+            order by proxy.id, proxy.created_at`,
+          [JSON.stringify(fallbackRanges)],
+        )
+      : { rows: [] as Array<{ data: ProxyRequestLog }> };
+    const proxyById = new Map(
+      [...exactProxyRows, ...fallbackProxyLogs.rows.map((row) => row.data)].map((proxyLog) => [
+        proxyLog.id,
+        proxyLog,
+      ]),
+    );
+    const candidateProxyIds = [...proxyById.keys()];
+    const fallbackProxyIds = fallbackProxyLogs.rows
+      .map((row) => row.data.id)
+      .filter((proxyLogId) => !exactProxyIds.includes(proxyLogId));
+    const fallbackOccupancy = fallbackProxyIds.length
+      ? await client.query<{ data: NewApiUsageRecord }>(
+          `select data
+             from newapi_usage_records
+            where match_status = 'matched'
+              and data->>'matchedProxyLogId' = any($1::text[])`,
+          [fallbackProxyIds],
+        )
+      : { rows: [] as Array<{ data: NewApiUsageRecord }> };
+    const usageRecordById = new Map(
+      [...initialUsageRows, ...fallbackOccupancy.rows.map((row) => row.data)].map((record) => [
+        record.id,
+        record,
+      ]),
+    );
     return {
       users: users.rows.map((row) => row.data),
       tokenAccounts: accounts.rows.map((row) => row.data),
-      proxyRequestLogs: proxyLogs.rows.map((row) => row.data),
-      newapiUsageRecords: usageRecords.rows.map((row) => row.data),
+      proxyRequestLogs: [...proxyById.values()],
+      newapiUsageRecords: [...usageRecordById.values()],
+      stats: {
+        usageSources: input.usageSources.length,
+        tokenAccounts: accounts.rows.length,
+        exactProxyCandidates: exactProxyRows.length,
+        fallbackSources: fallbackSources.length,
+        fallbackProxyCandidates: fallbackProxyLogs.rows.length,
+        proxyCandidates: proxyById.size,
+        usageRecords: usageRecordById.size,
+      },
     };
   });
 }
@@ -1561,6 +2041,49 @@ export async function getPostgresActiveAdminScopeForUser(feishuUserId: string) {
       [feishuUserId],
     );
     return result.rows[0]?.data ?? null;
+  });
+}
+
+export async function getPostgresAdminScopeFallbackData(
+  feishuUserId: string,
+  approvalTargetOpenId: string,
+) {
+  return withControlClient(async (client) => {
+    const result = await client.query<{
+      assigned_request: TokenRequest | null;
+      scopes: AdminScope[];
+    }>(
+      `select
+         (select data
+          from token_requests
+          where approval_target_open_id = $2
+          order by updated_at desc, id
+          limit 1) as assigned_request,
+         coalesce(
+           (select jsonb_agg(data order by updated_at desc, id)
+            from admin_scopes
+            where feishu_user_id = $1),
+           '[]'::jsonb
+         ) as scopes`,
+      [feishuUserId, approvalTargetOpenId],
+    );
+    return {
+      assignedRequest: result.rows[0]?.assigned_request ?? null,
+      scopes: result.rows[0]?.scopes ?? [],
+    };
+  });
+}
+
+export async function listPostgresTokenRequestsForUser(feishuUserId: string) {
+  return withControlClient(async (client) => {
+    const result = await client.query<{ data: TokenRequest }>(
+      `select data
+       from token_requests
+       where feishu_user_id = $1
+       order by created_at desc, id`,
+      [feishuUserId],
+    );
+    return result.rows.map((row) => row.data);
   });
 }
 
@@ -1666,13 +2189,13 @@ export async function getPostgresUserQuotaState(feishuUserId: string) {
 }
 
 export async function savePostgresAppSettings(settings: AppSettings) {
-  return withTransaction((client) => saveSettingsRow(client, settings));
+  return withControlTransaction((client) => saveSettingsRow(client, settings));
 }
 
 export async function mutatePostgresAppSettings<T>(
   fn: (settings: AppSettings) => T | Promise<T>,
 ) {
-  return withTransaction(async (client) => {
+  return withControlTransaction(async (client) => {
     await client.query(
       `insert into app_settings (id, data)
        values ('default', $1)
@@ -1686,8 +2209,12 @@ export async function mutatePostgresAppSettings<T>(
       defaultMonthlyQuota: 200,
       billingOperations: [],
     };
+    const before = JSON.stringify(settings);
     const result = await fn(settings);
-    await saveSettingsRow(client, settings);
+    // Deduplicated enqueue, failed claims and lease CAS misses are reads, not
+    // writes. Avoid rewriting the single settings row when the mutation did
+    // not change it; this removes needless row/WAL contention.
+    if (JSON.stringify(settings) !== before) await saveSettingsRow(client, settings);
     return result;
   });
 }
@@ -2143,6 +2670,7 @@ async function transitionPostgresTokenRequestWithClient(
   id: string,
   patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
   allowedStatuses?: RequestStatus[],
+  options: { syncBillingPeriod?: boolean } = {},
 ) {
   const result = await client.query<{ data: TokenRequest }>(
     "select data from token_requests where id = $1 for update",
@@ -2158,7 +2686,7 @@ async function transitionPostgresTokenRequestWithClient(
     updatedAt: nowIso(),
   };
   const stored = await saveTokenRequestRow(client, updated);
-  if (stored.tokenAccountId) {
+  if (options.syncBillingPeriod !== false && stored.tokenAccountId) {
     const accountResult = await client.query<{ data: TokenAccount }>(
       "select data from token_accounts where id = $1",
       [stored.tokenAccountId],
@@ -2192,6 +2720,22 @@ export async function transitionPostgresTokenRequestForQuotaOperation(
 ) {
   return withControlTransaction((client) =>
     transitionPostgresTokenRequestWithClient(client, id, patch, allowedStatuses),
+  );
+}
+
+export async function transitionPostgresTokenRequestAfterQuotaMaterialization(
+  id: string,
+  patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
+  allowedStatuses?: RequestStatus[],
+) {
+  return withControlTransaction((client) =>
+    transitionPostgresTokenRequestWithClient(
+      client,
+      id,
+      patch,
+      allowedStatuses,
+      { syncBillingPeriod: false },
+    ),
   );
 }
 
@@ -3212,27 +3756,102 @@ export async function beginPostgresQuotaAwareProxyRequest(
 export async function updatePostgresProxyLog(
   id: string,
   patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">>,
+  options: {
+    allowedUsageSettlementStatuses?: Array<"pending" | "retrying">;
+  } = {},
 ) {
-  return withTransaction(async (client) => {
+  const has = (key: keyof typeof patch) =>
+    Object.prototype.hasOwnProperty.call(patch, key);
+  const removedKeys = Object.entries(patch)
+    .filter(([, value]) => value === undefined)
+    .map(([key]) => key);
+  const definedPatch = Object.fromEntries(
+    Object.entries(patch).filter(([, value]) => value !== undefined),
+  );
+  const updatedAt = nowIso();
+
+  return withClient(async (client) => {
     const result = await client.query<{ data: ProxyRequestLog }>(
-      "select data from proxy_request_logs where id = $1 for update",
-      [id],
+      `with merged as (
+         select id,
+                (data - $2::text[]) || $3::jsonb ||
+                  jsonb_build_object('updatedAt', $4::text) as data
+         from proxy_request_logs
+         where id = $1
+           and (
+             not $23::boolean
+             or data->>'usageSettlementStatus' = any($24::text[])
+           )
+       ), normalized as (
+         select id,
+                case
+                  when not (data ? 'totalTokens')
+                    and data ? 'promptTokens'
+                    and data ? 'completionTokens'
+                  then data || jsonb_build_object(
+                    'totalTokens',
+                    (data->>'promptTokens')::bigint +
+                      (data->>'completionTokens')::bigint
+                  )
+                  else data
+                end as data
+         from merged
+       )
+       update proxy_request_logs as target
+       set feishu_user_id = case when $5::boolean then $6::text else target.feishu_user_id end,
+           token_account_id = case when $7::boolean then $8::text else target.token_account_id end,
+           request_path = case when $9::boolean then $10::text else target.request_path end,
+           method = case when $11::boolean then $12::text else target.method end,
+           status_code = case when $13::boolean then $14::integer else target.status_code end,
+           billing_period = case when $15::boolean then $16::text else target.billing_period end,
+           operation_generation = case when $17::boolean then $18::integer else target.operation_generation end,
+           lease_expires_at = case when $19::boolean then $20::timestamptz else target.lease_expires_at end,
+           heartbeat_at = case when $21::boolean then $22::timestamptz else target.heartbeat_at end,
+           data = normalized.data
+       from normalized
+       where target.id = normalized.id
+         and (
+           not $23::boolean
+           or target.data->>'usageSettlementStatus' = any($24::text[])
+         )
+       returning target.data`,
+      [
+        id,
+        removedKeys,
+        definedPatch,
+        updatedAt,
+        has("feishuUserId"),
+        patch.feishuUserId ?? null,
+        has("tokenAccountId"),
+        patch.tokenAccountId ?? null,
+        has("requestPath") && patch.requestPath !== undefined,
+        patch.requestPath ?? null,
+        has("method") && patch.method !== undefined,
+        patch.method ?? null,
+        has("statusCode") && patch.statusCode !== undefined,
+        patch.statusCode ?? null,
+        has("billingPeriod"),
+        patch.billingPeriod ?? null,
+        has("operationGeneration"),
+        patch.operationGeneration ?? null,
+        has("leaseExpiresAt"),
+        patch.leaseExpiresAt ?? null,
+        has("heartbeatAt"),
+        patch.heartbeatAt ?? null,
+        options.allowedUsageSettlementStatuses !== undefined,
+        options.allowedUsageSettlementStatuses ?? [],
+      ],
     );
-    const existing = result.rows[0]?.data;
-    if (!existing) return null;
-    const updated: ProxyRequestLog = {
-      ...existing,
-      ...patch,
-      updatedAt: nowIso(),
-    };
-    if (
-      updated.totalTokens === undefined &&
-      updated.promptTokens !== undefined &&
-      updated.completionTokens !== undefined
-    ) {
-      updated.totalTokens = updated.promptTokens + updated.completionTokens;
-    }
-    return saveProxyLogRow(client, updated);
+    return result.rows[0]?.data ?? null;
+  });
+}
+
+export async function updatePostgresProxyUsageSettlementRetryIfUnsettled(
+  id: string,
+  patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">>,
+) {
+  return updatePostgresProxyLog(id, patch, {
+    allowedUsageSettlementStatuses: ["pending", "retrying"],
   });
 }
 
@@ -3346,73 +3965,152 @@ export async function reservePostgresQuotaOperationDepartmentBudget(
   throw new QuotaOperationBusyError();
 }
 
+type PostgresUsageSettlementBatchSource = {
+  recordId: string;
+  usageLog: NormalizedNewApiUsageLog;
+};
+
+type PostgresUsageSettlementBatchState = {
+  usageRecords: NewApiUsageRecord[];
+  proxyLogsById: Map<string, ProxyRequestLog>;
+};
+
+export type PostgresUsageSettlementLockedSnapshot = {
+  newapiUsageRecords: NewApiUsageRecord[];
+  proxyRequestLogs: ProxyRequestLog[];
+};
+
+function findBatchUsageRecord(
+  state: PostgresUsageSettlementBatchState,
+  record: NewApiUsageRecord,
+) {
+  return (
+    state.usageRecords.find((candidate) => candidate.id === record.id) ??
+    state.usageRecords.find((candidate) => sameNewApiUsageSource(candidate, record))
+  );
+}
+
+function rememberBatchUsageRecord(
+  state: PostgresUsageSettlementBatchState,
+  record: NewApiUsageRecord,
+) {
+  const index = state.usageRecords.findIndex(
+    (candidate) =>
+      candidate.id === record.id || sameNewApiUsageSource(candidate, record),
+  );
+  if (index >= 0) state.usageRecords[index] = record;
+  else state.usageRecords.push(record);
+}
+
 async function upsertPostgresNewApiUsageRecordWithClient(
   client: PoolClient,
   record: NewApiUsageRecord,
+  options: {
+    locksAlreadyHeld?: boolean;
+    batchState?: PostgresUsageSettlementBatchState;
+  } = {},
 ) {
   const lockKeys = newApiUsageIdentityLockKeys(record);
   if (record.matchStatus === "matched" && record.matchedProxyLogId) {
     lockKeys.push(`newapi_usage:proxy:${record.matchedProxyLogId}`);
     lockKeys.sort();
   }
-  for (const lockKey of lockKeys) {
-    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [lockKey]);
+  if (!options.locksAlreadyHeld) {
+    await acquirePostgresUsageAdvisoryLocks(client, lockKeys);
   }
   if (record.matchStatus === "matched" && record.matchedProxyLogId) {
-    const proxyMatchResult = await client.query<{ data: NewApiUsageRecord }>(
-      `select data
-       from newapi_usage_records
-       where match_status = 'matched'
-         and data->>'matchedProxyLogId' = $1
-       order by last_synced_at desc, first_seen_at, id
-       limit 1
-       for update`,
-      [record.matchedProxyLogId],
-    );
-    const proxyMatch = proxyMatchResult.rows[0]?.data;
+    const proxyMatch = options.batchState
+      ? options.batchState.usageRecords.find(
+          (candidate) =>
+            candidate.matchStatus === "matched" &&
+            candidate.matchedProxyLogId === record.matchedProxyLogId,
+        )
+      : (
+          await client.query<{ data: NewApiUsageRecord }>(
+            `select data
+             from newapi_usage_records
+             where match_status = 'matched'
+               and data->>'matchedProxyLogId' = $1
+             order by last_synced_at desc, first_seen_at, id
+             limit 1
+             for update`,
+            [record.matchedProxyLogId],
+          )
+        ).rows[0]?.data;
     if (proxyMatch && !sameNewApiUsageSource(proxyMatch, record)) {
       return proxyMatch;
     }
   }
-  const existingResult = await client.query<{ data: NewApiUsageRecord }>(
-    `select data
-     from newapi_usage_records
-     where id = $1
-        or (
-          newapi_token_id is not distinct from $2
-          and (
-            ($3::text is not null and newapi_request_id = $3)
-            or (
-              ($3::text is null or newapi_request_id is null)
-              and $4::text is not null
-              and newapi_log_id = $4
-            )
-          )
+  const existing = options.batchState
+    ? findBatchUsageRecord(options.batchState, record)
+    : (
+        await client.query<{ data: NewApiUsageRecord }>(
+          `select data
+           from newapi_usage_records
+           where id = $1
+              or (
+                newapi_token_id is not distinct from $2
+                and (
+                  ($3::text is not null and newapi_request_id = $3)
+                  or (
+                    ($3::text is null or newapi_request_id is null)
+                    and $4::text is not null
+                    and newapi_log_id = $4
+                  )
+                )
+              )
+           order by case
+             when id = $1 then 0
+             when $3::text is not null and newapi_request_id = $3 then 1
+             else 2
+           end
+           limit 1
+           for update`,
+          [
+            record.id,
+            record.newapiTokenId ?? null,
+            record.newapiRequestId ?? null,
+            record.newapiLogId ?? null,
+          ],
         )
-     order by case
-       when id = $1 then 0
-       when $3::text is not null and newapi_request_id = $3 then 1
-       else 2
-     end
-     limit 1
-     for update`,
-    [record.id, record.newapiTokenId ?? null, record.newapiRequestId ?? null, record.newapiLogId ?? null],
-  );
-  const existing = existingResult.rows[0]?.data;
-  if (hasConflictingProxyMatch(existing, record)) {
+      ).rows[0]?.data;
+  if (existing && hasConflictingProxyMatch(existing, record)) {
     return existing;
   }
-  return saveNewApiUsageRecordRow(client, {
+  if (
+    existing?.matchStatus === "matched" &&
+    existing.matchedProxyLogId &&
+    (record.matchStatus !== "matched" || !record.matchedProxyLogId)
+  ) {
+    // An authoritative source-to-proxy binding is an absorbing state. A later
+    // targeted/partial scan may not have loaded that proxy and can therefore
+    // propose no_proxy_match for the same source; never let such a retry
+    // silently release the unique binding. Unbinding requires an explicit,
+    // separately audited repair operation.
+    return existing;
+  }
+  const stored = await saveNewApiUsageRecordRow(client, {
     ...existing,
     ...record,
     id: existing?.id ?? record.id,
     firstSeenAt: existing?.firstSeenAt ?? record.firstSeenAt,
   });
+  if (options.batchState) rememberBatchUsageRecord(options.batchState, stored);
+  return stored;
 }
 
 export async function upsertPostgresNewApiUsageRecord(record: NewApiUsageRecord) {
-  return withTransaction((client) => upsertPostgresNewApiUsageRecordWithClient(client, record));
+  return withSettlementTransaction((client) =>
+    upsertPostgresNewApiUsageRecordWithClient(client, record),
+  );
 }
+
+type MatchedNewApiUsageSettlementInput = {
+  record: NewApiUsageRecord;
+  proxyLogId: string;
+  patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">>;
+  syncedAt: string;
+};
 
 async function closePostgresResolvedNoProxyMatchIssues(
   client: PoolClient,
@@ -3449,14 +4147,80 @@ async function closePostgresResolvedNoProxyMatchIssues(
   }
 }
 
-export async function settlePostgresMatchedNewApiUsage(input: {
-  record: NewApiUsageRecord;
-  proxyLogId: string;
-  patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">>;
-  syncedAt: string;
-}) {
-  return withTransaction(async (client) => {
-    const usageRecord = await upsertPostgresNewApiUsageRecordWithClient(client, input.record);
+async function closePostgresResolvedNoProxyMatchIssuesBatch(
+  client: PoolClient,
+  records: NewApiUsageRecord[],
+) {
+  if (!records.length) return;
+  const sourceIdentities = records.map((record) => ({
+    newapi_token_id: record.newapiTokenId ?? null,
+    newapi_request_id: record.newapiRequestId ?? null,
+    newapi_log_id: record.newapiLogId ?? null,
+  }));
+  const issues = await client.query<{ data: UsageSyncIssue }>(
+    `with source_identities as (
+       select distinct
+              source.newapi_token_id,
+              source.newapi_request_id,
+              source.newapi_log_id
+         from jsonb_to_recordset($1::jsonb) as source(
+           newapi_token_id text,
+           newapi_request_id text,
+           newapi_log_id text
+         )
+     )
+     select issue.data
+       from usage_sync_issues issue
+      where issue.issue_type = 'no_proxy_match'
+        and issue.status = 'open'
+        and exists (
+          select 1
+            from source_identities source
+           where issue.newapi_token_id is not distinct from source.newapi_token_id
+             and (
+               (source.newapi_request_id is not null
+                 and issue.newapi_request_id = source.newapi_request_id)
+               or (
+                 (source.newapi_request_id is null or issue.newapi_request_id is null)
+                 and source.newapi_log_id is not null
+                 and issue.newapi_log_id = source.newapi_log_id
+               )
+             )
+        )
+      order by issue.id
+      for update of issue`,
+    [JSON.stringify(sourceIdentities)],
+  );
+  for (const row of issues.rows) {
+    const record = records.find((candidate) => sameNewApiUsageSource(row.data, candidate));
+    if (!record?.matchedProxyLogId) continue;
+    await saveUsageSyncIssueRow(client, {
+      ...row.data,
+      status: "closed",
+      matchedProxyLogId: record.matchedProxyLogId,
+      lastSyncedAt: record.lastSyncedAt,
+      closedAt: record.lastSyncedAt,
+    });
+  }
+}
+
+async function settlePostgresMatchedNewApiUsageWithClient(
+  client: PoolClient,
+  input: MatchedNewApiUsageSettlementInput,
+  options: {
+    closeResolvedIssues?: boolean;
+    locksAlreadyHeld?: boolean;
+    batchState?: PostgresUsageSettlementBatchState;
+  } = {},
+) {
+    const usageRecord = await upsertPostgresNewApiUsageRecordWithClient(
+      client,
+      input.record,
+      {
+        locksAlreadyHeld: options.locksAlreadyHeld,
+        batchState: options.batchState,
+      },
+    );
     if (
       !sameNewApiUsageSource(usageRecord, input.record) ||
       usageRecord.matchStatus !== "matched" ||
@@ -3465,11 +4229,14 @@ export async function settlePostgresMatchedNewApiUsage(input: {
       return { usageRecord, proxyLog: null };
     }
 
-    const result = await client.query<{ data: ProxyRequestLog }>(
-      "select data from proxy_request_logs where id = $1 for update",
-      [input.proxyLogId],
-    );
-    const existing = result.rows[0]?.data;
+    const existing = options.batchState
+      ? options.batchState.proxyLogsById.get(input.proxyLogId)
+      : (
+          await client.query<{ data: ProxyRequestLog }>(
+            "select data from proxy_request_logs where id = $1 for update",
+            [input.proxyLogId],
+          )
+        ).rows[0]?.data;
     if (!existing) {
       throw new Error(`Matched proxy log ${input.proxyLogId} disappeared during settlement`);
     }
@@ -3506,62 +4273,299 @@ export async function settlePostgresMatchedNewApiUsage(input: {
       updated.totalTokens = updated.promptTokens + updated.completionTokens;
     }
     const proxyLog = await saveProxyLogRow(client, updated);
-    await closePostgresResolvedNoProxyMatchIssues(
-      client,
-      usageRecord,
-      proxyLog.id,
-      input.syncedAt,
-    );
+    if (options.batchState) {
+      options.batchState.proxyLogsById.set(proxyLog.id, proxyLog);
+    }
+    if (options.closeResolvedIssues !== false) {
+      await closePostgresResolvedNoProxyMatchIssues(
+        client,
+        usageRecord,
+        proxyLog.id,
+        input.syncedAt,
+      );
+    }
     return { usageRecord, proxyLog };
+}
+
+export async function settlePostgresMatchedNewApiUsage(
+  input: MatchedNewApiUsageSettlementInput,
+) {
+  return withSettlementTransaction((client) =>
+    settlePostgresMatchedNewApiUsageWithClient(client, input),
+  );
+}
+
+async function upsertPostgresUsageSyncIssueWithClient(
+  client: PoolClient,
+  issue: UsageSyncIssue,
+  options: { locksAlreadyHeld?: boolean } = {},
+) {
+  if (!options.locksAlreadyHeld) {
+    await acquirePostgresUsageAdvisoryLocks(
+      client,
+      newApiUsageIdentityLockKeys(issue),
+    );
+  }
+  const resolvedResult =
+    issue.issueType === "no_proxy_match"
+      ? await client.query<{ data: NewApiUsageRecord }>(
+          `select data
+             from newapi_usage_records
+            where match_status = 'matched'
+              and newapi_token_id is not distinct from $1
+              and (
+                ($2::text is not null and newapi_request_id = $2)
+                or (
+                  ($2::text is null or newapi_request_id is null)
+                  and $3::text is not null
+                  and newapi_log_id = $3
+                )
+              )
+            order by last_synced_at desc, first_seen_at, id
+            limit 1`,
+          [issue.newapiTokenId ?? null, issue.newapiRequestId ?? null, issue.newapiLogId ?? null],
+        )
+      : undefined;
+  const resolved = resolvedResult?.rows[0]?.data;
+  const existingResult = await client.query<{ data: UsageSyncIssue }>(
+    "select data from usage_sync_issues where id = $1 for update",
+    [issue.id],
+  );
+  const existing = existingResult.rows[0]?.data;
+  return saveUsageSyncIssueRow(client, {
+    ...existing,
+    ...issue,
+    id: existing?.id ?? issue.id,
+    firstSeenAt: existing?.firstSeenAt ?? issue.firstSeenAt,
+    occurrences: existing ? existing.occurrences + 1 : issue.occurrences,
+    status: resolved ? "closed" : "open",
+    matchedProxyLogId: resolved?.matchedProxyLogId ?? issue.matchedProxyLogId,
+    closedAt: resolved ? issue.lastSyncedAt : undefined,
   });
 }
 
 export async function upsertPostgresUsageSyncIssue(issue: UsageSyncIssue) {
-  return withTransaction(async (client) => {
-    for (const lockKey of newApiUsageIdentityLockKeys(issue)) {
-      await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [lockKey]);
-    }
-    const resolvedResult =
-      issue.issueType === "no_proxy_match"
-        ? await client.query<{ data: NewApiUsageRecord }>(
-            `select data
-               from newapi_usage_records
-              where match_status = 'matched'
-                and newapi_token_id is not distinct from $1
-                and (
-                  ($2::text is not null and newapi_request_id = $2)
-                  or (
-                    ($2::text is null or newapi_request_id is null)
-                    and $3::text is not null
-                    and newapi_log_id = $3
-                  )
-                )
-              order by last_synced_at desc, first_seen_at, id
-              limit 1`,
-            [issue.newapiTokenId ?? null, issue.newapiRequestId ?? null, issue.newapiLogId ?? null],
-          )
+  return withSettlementTransaction((client) =>
+    upsertPostgresUsageSyncIssueWithClient(client, issue),
+  );
+}
+
+async function loadPostgresUsageSettlementBatchState(
+  client: PoolClient,
+  input: {
+    usageSources: PostgresUsageSettlementBatchSource[];
+    proxyLogIds: string[];
+  },
+): Promise<PostgresUsageSettlementBatchState> {
+  const sourceRecordIds = [
+    ...new Set(input.usageSources.map((source) => source.recordId).filter(Boolean)),
+  ];
+  const sourceTokenIds = [
+    ...new Set(
+      input.usageSources
+        .map((source) => source.usageLog.newapiTokenId)
+        .filter((value): value is string => Boolean(value)),
+    ),
+  ];
+  const sourceRequestIds = [
+    ...new Set(
+      input.usageSources
+        .map((source) => source.usageLog.newapiRequestId)
+        .filter((value): value is string => Boolean(value)),
+    ),
+  ];
+  const sourceLogIds = [
+    ...new Set(
+      input.usageSources
+        .map((source) => source.usageLog.newapiLogId)
+        .filter((value): value is string => Boolean(value)),
+    ),
+  ];
+  const proxyLogIds = [...new Set(input.proxyLogIds.filter(Boolean))];
+  const usageRecords =
+    sourceRecordIds.length || proxyLogIds.length
+      ? await client.query<{ data: NewApiUsageRecord }>(
+          `select data
+             from newapi_usage_records
+            where id = any($1::text[])
+               or (
+                 newapi_token_id = any($2::text[])
+                 and (
+                   newapi_request_id = any($3::text[])
+                   or newapi_log_id = any($4::text[])
+                 )
+               )
+               or (
+                 match_status = 'matched'
+                 and data->>'matchedProxyLogId' = any($5::text[])
+               )
+            order by id
+            for update`,
+          [
+            sourceRecordIds,
+            sourceTokenIds,
+            sourceRequestIds,
+            sourceLogIds,
+            proxyLogIds,
+          ],
+        )
+      : { rows: [] as Array<{ data: NewApiUsageRecord }> };
+  const proxyLogs = proxyLogIds.length
+    ? await client.query<{ data: ProxyRequestLog }>(
+        `select data
+           from proxy_request_logs
+          where id = any($1::text[])
+          order by id
+          for update`,
+        [proxyLogIds],
+      )
+    : { rows: [] as Array<{ data: ProxyRequestLog }> };
+  return {
+    usageRecords: usageRecords.rows.map((row) => row.data),
+    proxyLogsById: new Map(
+      proxyLogs.rows.map((row) => [row.data.id, row.data] as const),
+    ),
+  };
+}
+
+export type PostgresUsageSettlementBatchWriter = {
+  upsertUsageRecord(record: NewApiUsageRecord): Promise<NewApiUsageRecord>;
+  upsertUsageIssue(issue: UsageSyncIssue): Promise<UsageSyncIssue>;
+  settleMatchedUsage(input: MatchedNewApiUsageSettlementInput): Promise<{
+    usageRecord: NewApiUsageRecord;
+    proxyLog: ProxyRequestLog | null;
+  }>;
+};
+
+async function acquirePostgresUsageAdvisoryLocks(
+  client: PoolClient,
+  lockKeys: string[],
+) {
+  const uniqueLockKeys = [...new Set(lockKeys)].sort();
+  if (!uniqueLockKeys.length) return;
+  // Every participant uses the same lexical lock order. The page worker takes
+  // all source and candidate-proxy locks in one round trip, eliminating both
+  // hundreds of per-record lock queries and batch/immediate lock-order cycles.
+  await client.query(
+    `select pg_advisory_xact_lock(hashtext(ordered.lock_key)::bigint)
+       from (
+         select distinct lock_key
+           from unnest($1::text[]) as keys(lock_key)
+          order by lock_key
+       ) ordered`,
+    [uniqueLockKeys],
+  );
+}
+
+export async function withPostgresUsageSettlementBatch<T>(
+  run: (
+    writer: PostgresUsageSettlementBatchWriter,
+    lockedSnapshot?: PostgresUsageSettlementLockedSnapshot,
+  ) => Promise<T>,
+  options: {
+    lockKeys?: string[];
+    usageSources?: PostgresUsageSettlementBatchSource[];
+    proxyLogIds?: string[];
+  } = {},
+) {
+  return withSettlementTransaction(async (client) => {
+    const usageSources = options.usageSources ?? [];
+    const proxyLogIds = [...new Set((options.proxyLogIds ?? []).filter(Boolean))];
+    const derivedLockKeys = [
+      ...(options.lockKeys ?? []),
+      ...usageSources.flatMap((source) =>
+        newApiUsageIdentityLockKeys({
+          ...source.usageLog,
+          id: source.recordId,
+        }),
+      ),
+      ...proxyLogIds.map((proxyLogId) => `newapi_usage:proxy:${proxyLogId}`),
+    ];
+    await acquirePostgresUsageAdvisoryLocks(client, derivedLockKeys);
+    // The matching snapshot is deliberately read before the transaction so it
+    // does not hold row locks while evaluating up to 100 candidates. Once all
+    // deterministic source/proxy advisory locks are held, refresh the rows in
+    // two bounded queries and reuse that locked state for every item in the
+    // page. This removes three read round trips per matched record without
+    // weakening source identity or one-to-one proxy conflict checks.
+    const batchState =
+      options.usageSources || options.proxyLogIds
+        ? await loadPostgresUsageSettlementBatchState(client, {
+            usageSources,
+            proxyLogIds,
+          })
         : undefined;
-    const resolved = resolvedResult?.rows[0]?.data;
-    const existingResult = await client.query<{ data: UsageSyncIssue }>(
-      "select data from usage_sync_issues where id = $1 for update",
-      [issue.id],
+    const resolvedRecords: NewApiUsageRecord[] = [];
+    const result = await run(
+      {
+        upsertUsageRecord: (record) =>
+          upsertPostgresNewApiUsageRecordWithClient(client, record, {
+            locksAlreadyHeld: true,
+            batchState,
+          }),
+        upsertUsageIssue: (issue) =>
+          upsertPostgresUsageSyncIssueWithClient(client, issue, {
+            locksAlreadyHeld: true,
+          }),
+        settleMatchedUsage: async (input) => {
+          const settled = await settlePostgresMatchedNewApiUsageWithClient(
+            client,
+            input,
+            {
+              closeResolvedIssues: false,
+              locksAlreadyHeld: true,
+              batchState,
+            },
+          );
+          if (settled.proxyLog) resolvedRecords.push(settled.usageRecord);
+          return settled;
+        },
+      },
+      batchState
+        ? {
+            // The usage array is intentionally shared with batchState so each
+            // RETURNING row becomes visible to later ordered matches in this
+            // same page.
+            newapiUsageRecords: batchState.usageRecords,
+            proxyRequestLogs: [...batchState.proxyLogsById.values()],
+          }
+        : undefined,
     );
-    const existing = existingResult.rows[0]?.data;
-    return saveUsageSyncIssueRow(client, {
-      ...existing,
-      ...issue,
-      id: existing?.id ?? issue.id,
-      firstSeenAt: existing?.firstSeenAt ?? issue.firstSeenAt,
-      occurrences: existing ? existing.occurrences + 1 : issue.occurrences,
-      status: resolved ? "closed" : "open",
-      matchedProxyLogId: resolved?.matchedProxyLogId ?? issue.matchedProxyLogId,
-      closedAt: resolved ? issue.lastSyncedAt : undefined,
-    });
+    // Closing resolved issues is derived from the same authoritative page and
+    // stays in its transaction, but uses one page query instead of one query
+    // for every matched usage record.
+    await closePostgresResolvedNoProxyMatchIssuesBatch(client, resolvedRecords);
+    return result;
   });
 }
 
 export async function upsertPostgresUsageSyncCheckpoint(checkpoint: UsageSyncCheckpoint) {
-  return withTransaction(async (client) => saveUsageSyncCheckpointRow(client, checkpoint));
+  return withSettlementTransaction(async (client) =>
+    saveUsageSyncCheckpointRow(client, checkpoint),
+  );
+}
+
+export class PostgresAdvisoryLockBusyError extends Error {
+  readonly code = "POSTGRES_ADVISORY_LOCK_BUSY";
+  readonly lockKey: string;
+
+  constructor(lockKey: string) {
+    super(`${lockKey} is already running`);
+    this.name = "PostgresAdvisoryLockBusyError";
+    this.lockKey = lockKey;
+  }
+}
+
+export function isPostgresAdvisoryLockBusyError(
+  error: unknown,
+): error is PostgresAdvisoryLockBusyError {
+  return (
+    error instanceof PostgresAdvisoryLockBusyError ||
+    (typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "POSTGRES_ADVISORY_LOCK_BUSY")
+  );
 }
 
 export async function withPostgresAdvisoryLock<T>(
@@ -3578,7 +4582,7 @@ export async function withPostgresAdvisoryLock<T>(
         [key],
       );
       if (!lockResult.rows[0]?.locked) {
-        throw new Error(`${key} is already running`);
+        throw new PostgresAdvisoryLockBusyError(key);
       }
     }
     try {

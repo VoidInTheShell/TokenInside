@@ -177,6 +177,8 @@ export type ProxyRequestLog = {
   usageSyncedAt?: string;
   usageSettlementStatus?: "pending" | "retrying" | "matched" | "manual_review";
   usageSettlementAttempts?: number;
+  usageSettlementImmediateAttempts?: number;
+  usageSettlementScanAttempts?: number;
   usageSettlementLastError?: string;
   usageSettlementNextRetryAt?: string;
   usageSettledAt?: string;
@@ -296,6 +298,13 @@ export type UsageSyncCheckpoint = {
   runStartedAt?: string;
   scanStart?: string;
   scanEnd?: string;
+  scanTargetEnd?: string;
+  scanMode?: "forward" | "repair";
+  scanExpectedTotal?: number;
+  scanFirstIdentity?: string;
+  repairCursorThrough?: string;
+  repairWindowStart?: string;
+  repairWindowEnd?: string;
   settledThrough?: string;
   cursorPage?: number;
   failureCount?: number;
@@ -577,7 +586,13 @@ export type QuotaReconciliationRecord = {
 
 export type BillingOperationKind = "usage_sync" | "monthly_reset" | "settings_update";
 
-export type BillingOperationStatus = "dry_run" | "applied" | "partial_failed" | "failed";
+export type BillingOperationStatus =
+  | "pending"
+  | "running"
+  | "dry_run"
+  | "applied"
+  | "partial_failed"
+  | "failed";
 
 export type BillingOperationRecord = {
   id: string;
@@ -589,6 +604,11 @@ export type BillingOperationRecord = {
   input?: Record<string, unknown>;
   summary: Record<string, string | number | boolean | undefined>;
   errorMessage?: string;
+  attemptCount?: number;
+  leaseId?: string;
+  leaseExpiresAt?: string;
+  startedAt?: string;
+  completedAt?: string;
   createdAt: string;
   updatedAt: string;
 };

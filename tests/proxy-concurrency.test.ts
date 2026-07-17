@@ -161,20 +161,17 @@ test("proxy persistence bounded priority cannot starve terminal writes", async (
       }));
 
     firstRelease();
-    for (let index = 0; index < 4; index += 1) {
+    for (let index = 0; index < 1; index += 1) {
       const release = await acceptances[index];
       release();
     }
     const terminalRelease = await terminal;
     assert.deepEqual(order, [
       "acceptance-0",
-      "acceptance-1",
-      "acceptance-2",
-      "acceptance-3",
       "terminal",
     ]);
     terminalRelease();
-    for (let index = 4; index < acceptances.length; index += 1) {
+    for (let index = 1; index < acceptances.length; index += 1) {
       const release = await acceptances[index];
       release();
     }

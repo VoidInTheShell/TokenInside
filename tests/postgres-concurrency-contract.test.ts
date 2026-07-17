@@ -14,11 +14,19 @@ const quotaOperationRoutePath = new URL(
 const quotaSagaPath = new URL("../lib/quota-saga.ts", import.meta.url);
 const rerunSingleFlightPath = new URL("../lib/rerun-single-flight.ts", import.meta.url);
 const quotaGuardPath = new URL("../lib/quota-guard.ts", import.meta.url);
+const quotaOperationSubmitPath = new URL(
+  "../lib/quota-operation-submit.ts",
+  import.meta.url,
+);
 const quotaDecisionRoutePath = new URL(
   "../app/api/admin/token-requests/[id]/decision/route.ts",
   import.meta.url,
 );
 const keyResetRoutePath = new URL("../app/api/token/reset/route.ts", import.meta.url);
+const pendingUsageTailMigrationPath = new URL(
+  "../scripts/migrations/20260717_002_pending_usage_tail_index.mjs",
+  import.meta.url,
+);
 
 function functionBody(source: string, startMarker: string, endMarker: string) {
   const start = source.indexOf(startMarker);
@@ -211,8 +219,6 @@ test("quota control work uses a dedicated bounded pool while proxy admission sta
     ["export async function recordPostgresMonthlyResetApplied", "export async function upsertPostgresFeishuEvent"],
     ["export async function updatePostgresUserAccessStatus", "export async function revokePostgresAdminScopesForUser"],
     ["export async function enablePostgresUserAccess", "export async function insertPostgresProxyLog"],
-    ["export async function settlePostgresMatchedNewApiUsage(", "export async function upsertPostgresUsageSyncIssue("],
-    ["export async function upsertPostgresUsageSyncIssue(", "export async function upsertPostgresUsageSyncCheckpoint("],
   ]) {
     const body = functionBody(source, startMarker, endMarker);
     assert.match(body, /withTransaction/);
@@ -220,13 +226,86 @@ test("quota control work uses a dedicated bounded pool while proxy admission sta
   }
 });
 
+test("all PostgreSQL lanes share one versioned process-wide registry across Next chunks", async () => {
+  const source = await readFile(postgresStorePath, "utf8");
+  const registry = functionBody(
+    source,
+    "const POSTGRES_POOL_REGISTRY_VERSION = 1;",
+    "export const REQUIRED_POSTGRES_TABLES",
+  );
+
+  assert.match(registry, /__tokenInsidePostgresPoolRegistry/);
+  assert.match(registry, /globalThis as PostgresPoolGlobal/);
+  assert.match(registry, /existing\.version !== POSTGRES_POOL_REGISTRY_VERSION/);
+  assert.match(registry, /configFingerprint/);
+  assert.match(registry, /PostgreSQL pool configuration changed at runtime/);
+  assert.match(registry, /poolRuntimeSnapshot\(registry\.business\)/);
+  assert.match(registry, /poolRuntimeSnapshot\(registry\.settlement\)/);
+  assert.doesNotMatch(source, /let (?:pool|settlementPool|controlPool|advisoryLockPool): Pool/);
+  for (const lane of ["business", "settlement", "control", "advisoryLock"]) {
+    assert.match(source, new RegExp(`registry\\.${lane} = new Pool`));
+  }
+});
+
+test("authoritative settlement uses a dedicated bounded pool instead of the proxy business pool", async () => {
+  const source = await readFile(postgresStorePath, "utf8");
+  const settlementPool = functionBody(
+    source,
+    "function getSettlementPool()",
+    "function getAdvisoryLockPool()",
+  );
+  assert.match(settlementPool, /max: config\.postgres\.settlementPoolMax/);
+  assert.match(settlementPool, /connectionTimeoutMillis/);
+
+  for (const [startMarker, endMarker, expected] of [
+    [
+      "export async function readPostgresUsageMatchingSnapshot(",
+      "export async function getPostgresUserById(",
+      /withSettlementClient/,
+    ],
+    [
+      "export async function settlePostgresMatchedNewApiUsage(",
+      "async function upsertPostgresUsageSyncIssueWithClient(",
+      /withSettlementTransaction/,
+    ],
+    [
+      "export async function upsertPostgresUsageSyncIssue(",
+      "async function loadPostgresUsageSettlementBatchState(",
+      /withSettlementTransaction/,
+    ],
+    [
+      "export async function withPostgresUsageSettlementBatch<",
+      "export async function upsertPostgresUsageSyncCheckpoint(",
+      /withSettlementTransaction/,
+    ],
+    [
+      "export async function upsertPostgresUsageSyncCheckpoint(",
+      "export async function withPostgresAdvisoryLock<",
+      /withSettlementTransaction/,
+    ],
+  ] as const) {
+    const body = functionBody(source, startMarker, endMarker);
+    assert.match(body, expected);
+    assert.doesNotMatch(body, /return withTransaction/);
+  }
+});
+
 test("quota restore and key rotation isolate their targeted Postgres work from the business pool", async () => {
-  const [postgresSource, storeSource, sagaSource, guardSource, decisionSource, resetSource] =
+  const [
+    postgresSource,
+    storeSource,
+    sagaSource,
+    guardSource,
+    submitSource,
+    decisionSource,
+    resetSource,
+  ] =
     await Promise.all([
       readFile(postgresStorePath, "utf8"),
       readFile(storePath, "utf8"),
       readFile(quotaSagaPath, "utf8"),
       readFile(quotaGuardPath, "utf8"),
+      readFile(quotaOperationSubmitPath, "utf8"),
       readFile(quotaDecisionRoutePath, "utf8"),
       readFile(keyResetRoutePath, "utf8"),
     ]);
@@ -246,6 +325,10 @@ test("quota restore and key rotation isolate their targeted Postgres work from t
     ],
     [
       "export async function transitionPostgresTokenRequestForQuotaOperation(",
+      "export async function transitionPostgresTokenRequestAfterQuotaMaterialization(",
+    ],
+    [
+      "export async function transitionPostgresTokenRequestAfterQuotaMaterialization(",
       "export async function upsertPostgresUserBillingPeriod(",
     ],
     [
@@ -290,15 +373,27 @@ test("quota restore and key rotation isolate their targeted Postgres work from t
       "export async function finalizePostgresTokenRotation(",
       "export async function finalizePostgresTokenRotationForQuotaOperation(",
     ],
-    [
-      "export async function getPostgresAppSettings()",
-      "export async function getPostgresAppSettingsForQuotaOperation()",
-    ],
   ]) {
     const body = functionBody(postgresSource, startMarker, endMarker);
     assert.match(body, /with(?:Client|Transaction)/, `${startMarker} must keep business`);
     assert.doesNotMatch(body, /withControl/, `${startMarker} must not move globally to control`);
   }
+
+  const settingsRead = functionBody(
+    postgresSource,
+    "export async function getPostgresAppSettings()",
+    "export async function getPostgresAppSettingsForQuotaOperation()",
+  );
+  assert.match(settingsRead, /withControlClient/);
+  assert.doesNotMatch(settingsRead, /withClient\(/);
+
+  const settingsMutation = functionBody(
+    postgresSource,
+    "export async function mutatePostgresAppSettings<",
+    "export async function upsertPostgresUserQuotaPolicy(",
+  );
+  assert.match(settingsMutation, /withControlTransaction/);
+  assert.match(settingsMutation, /JSON\.stringify\(settings\) !== before/);
 
   const sagaRouting = functionBody(
     sagaSource,
@@ -309,6 +404,13 @@ test("quota restore and key rotation isolate their targeted Postgres work from t
     sagaRouting,
     /operation\.operationType === "quota_restore" \|\| operation\.operationType === "key_rotation"/,
   );
+  const lightweightRequestUpdate = functionBody(
+    postgresSource,
+    "export async function transitionPostgresTokenRequestAfterQuotaMaterialization(",
+    "export async function upsertPostgresUserBillingPeriod(",
+  );
+  assert.match(lightweightRequestUpdate, /syncBillingPeriod: false/);
+  assert.match(sagaSource, /updateOperationTokenRequestAfterMaterialization/);
   for (const explicitPath of [
     "updateTokenAccountForQuotaOperation",
     "updateTokenRequestForQuotaOperation",
@@ -363,6 +465,13 @@ test("quota restore and key rotation isolate their targeted Postgres work from t
   assert.match(decisionSource, /const updateDecisionRequest =/);
   assert.match(decisionSource, /updateTokenRequestForQuotaOperation\(approved\.id/);
   assert.match(resetSource, /updateTokenRequestForQuotaOperation\(tokenRequest\.id/);
+  assert.match(submitSource, /max: config\.postgres\.quotaSubmitPoolMax/);
+  assert.match(submitSource, /connectionTimeoutMillis: config\.postgres\.quotaSubmitConnectionTimeoutMs/);
+  assert.match(decisionSource, /await submitPostgresQuotaRestoreDecision\(/);
+  assert.match(resetSource, /await submitPostgresKeyRotation\(/);
+  assert.doesNotMatch(decisionSource, /after\(\(\) => runQuotaOperation/);
+  assert.doesNotMatch(resetSource, /after\(\(\) => runQuotaOperation/);
+  assert.match(sagaSource, /ensureQuotaOperationWorker\(\)/);
 });
 
 test("quota operation materialization avoids control-pool amplification and redundant key snapshots", async () => {
@@ -422,17 +531,17 @@ test("authoritative usage settlement closes transient no-proxy-match issues with
   const closeIssues = functionBody(
     postgresSource,
     "async function closePostgresResolvedNoProxyMatchIssues(",
-    "export async function settlePostgresMatchedNewApiUsage(",
+    "async function closePostgresResolvedNoProxyMatchIssuesBatch(",
   );
   const settlement = functionBody(
     postgresSource,
+    "async function settlePostgresMatchedNewApiUsageWithClient(",
     "export async function settlePostgresMatchedNewApiUsage(",
-    "export async function upsertPostgresUsageSyncIssue(",
   );
   const issueUpsert = functionBody(
     postgresSource,
+    "async function upsertPostgresUsageSyncIssueWithClient(",
     "export async function upsertPostgresUsageSyncIssue(",
-    "export async function upsertPostgresUsageSyncCheckpoint(",
   );
 
   assert.match(closeIssues, /issue_type = 'no_proxy_match'/);
@@ -544,6 +653,130 @@ test("proxy response persistence is observed before a long stream can outlive it
   assert.match(responseLifecycle, /tokeninside\.proxy\.upstream_persistence_failed/);
 });
 
+test("accepted proxy responses retain their concurrency slot until terminal persistence settles", async () => {
+  const routeSource = await readFile(proxyRoutePath, "utf8");
+  const releaseObserver = functionBody(
+    routeSource,
+    "function releaseUpstreamSlotAfterTerminalPersistence(",
+    "function createSettlementReadiness(logId: string)",
+  );
+  const streamLifecycle = functionBody(
+    routeSource,
+    "function streamWithProxyLog(input:",
+    "async function readResponseBody(upstream: Response)",
+  );
+  const acceptedBodyResponses = functionBody(
+    routeSource,
+    "    if (upstream.body) {",
+    "    const reason = sanitizedErrorMessage(err);",
+  );
+  const noBodyStart = acceptedBodyResponses.lastIndexOf(
+    "const releaseAcceptedUpstreamSlot = releaseUpstreamSlot;",
+  );
+  assert.notEqual(noBodyStart, -1);
+  const bodyResponseLifecycle = acceptedBodyResponses.slice(0, noBodyStart);
+  const noBodyResponseLifecycle = acceptedBodyResponses.slice(noBodyStart);
+
+  assert.match(
+    releaseObserver,
+    /terminalPersistence\s*\.then\(releaseUpstreamSlot, releaseUpstreamSlot\)\s*\.catch\(\(\) => undefined\)/,
+  );
+  assert.doesNotMatch(releaseObserver, /\.finally\(/);
+
+  assert.match(
+    streamLifecycle,
+    /input\.finishSettlementReadiness\(work\);\s*releaseUpstreamSlotAfterTerminalPersistence\(work, input\.releaseUpstreamSlot\);/,
+  );
+  assert.doesNotMatch(streamLifecycle, /input\.releaseUpstreamSlot\(\)/);
+  assert.doesNotMatch(streamLifecycle, /await persistTerminal\(/);
+  assert.ok(
+    streamLifecycle.indexOf("persistTerminal({") < streamLifecycle.indexOf("controller.close()"),
+    "the stream must schedule terminal persistence before closing without awaiting it",
+  );
+
+  assert.match(bodyResponseLifecycle, /const releaseAcceptedUpstreamSlot = releaseUpstreamSlot/);
+  assert.match(bodyResponseLifecycle, /settlement\.finish\(terminalPersistence!\)/);
+  assert.match(
+    bodyResponseLifecycle,
+    /releaseUpstreamSlotAfterTerminalPersistence\(\s*terminalPersistence!,\s*releaseAcceptedUpstreamSlot,\s*\)/,
+  );
+  assert.doesNotMatch(bodyResponseLifecycle, /await recordResponse/);
+  assert.doesNotMatch(bodyResponseLifecycle, /releaseUpstreamSlot\?\.\(\)/);
+  assert.ok(
+    bodyResponseLifecycle.indexOf("after(recordResponse.catch(() => undefined))") <
+      bodyResponseLifecycle.indexOf("const response = new Response(clientBody"),
+    "the client body response must be returned while recorder persistence remains background work",
+  );
+
+  assert.match(noBodyResponseLifecycle, /settlement\.finish\(terminalPersistence\)/);
+  assert.match(
+    noBodyResponseLifecycle,
+    /releaseUpstreamSlotAfterTerminalPersistence\(\s*terminalPersistence,\s*releaseAcceptedUpstreamSlot,\s*\)/,
+  );
+  assert.doesNotMatch(noBodyResponseLifecycle, /await terminalPersistence/);
+  assert.doesNotMatch(noBodyResponseLifecycle, /releaseUpstreamSlot\(\)/);
+  assert.match(noBodyResponseLifecycle, /const response = new Response\(null/);
+  assert.match(noBodyResponseLifecycle, /releaseUpstreamSlot = undefined;\s*return response;/);
+});
+
+test("proxy failures before a successful accepted response keep their direct slot release", async () => {
+  const routeSource = await readFile(proxyRoutePath, "utf8");
+  const outerRelease = routeSource.lastIndexOf("releaseUpstreamSlot?.();");
+  const failurePersistence = routeSource.indexOf("await recordFailedProxyLog({", outerRelease);
+
+  assert.notEqual(outerRelease, -1);
+  assert.notEqual(failurePersistence, -1);
+  assert.ok(outerRelease < failurePersistence);
+});
+
+test("deferred immediate usage settlement leaves the durable pending log for the scheduler", async () => {
+  const routeSource = await readFile(proxyRoutePath, "utf8");
+  const settlementLifecycle = functionBody(
+    routeSource,
+    "function settleNewApiUsageAfterResponse(",
+    "function startProxyLeaseHeartbeat(logId: string)",
+  );
+  const deferredReturn = settlementLifecycle.indexOf(
+    'if (result.reason === "deferred") return result;',
+  );
+  const retryPersistence = settlementLifecycle.indexOf(
+    "await updateProxyUsageSettlementRetryReliably(context.proxyLogId",
+  );
+
+  assert.notEqual(deferredReturn, -1);
+  assert.notEqual(retryPersistence, -1);
+  assert.ok(
+    deferredReturn < retryPersistence,
+    "capacity deferral must return before scheduling another per-request database write",
+  );
+  assert.match(settlementLifecycle, /usageSettlementImmediateAttempts: result\.attempts/);
+  assert.match(settlementLifecycle, /usageSettlementScanAttempts: 0/);
+  assert.match(
+    settlementLifecycle,
+    /updateProxyUsageSettlementRetryReliably\(context\.proxyLogId/,
+  );
+  assert.doesNotMatch(
+    settlementLifecycle,
+    /updateProxyLogReliably\(context\.proxyLogId, \{\s*usageSettlementStatus: "retrying"/,
+  );
+});
+
+test("proxy lifecycle persistence uses one atomic JSON merge statement", async () => {
+  const source = await readFile(postgresStorePath, "utf8");
+  const lifecycle = functionBody(
+    source,
+    "export async function updatePostgresProxyLog(",
+    "export async function reservePostgresQuotaOperationDepartmentBudget(",
+  );
+
+  assert.match(lifecycle, /return withClient\(async \(client\) =>/);
+  assert.equal(lifecycle.match(/await client\.query/g)?.length, 1);
+  assert.match(lifecycle, /\(data - \$2::text\[\]\) \|\| \$3::jsonb/);
+  assert.match(lifecycle, /update proxy_request_logs as target/);
+  assert.doesNotMatch(lifecycle, /for update/i);
+  assert.doesNotMatch(lifecycle, /saveProxyLogRow/);
+});
+
 test("proxy lease heartbeats share the bounded lifecycle persistence gate", async () => {
   const routeSource = await readFile(proxyRoutePath, "utf8");
   const heartbeatLifecycle = functionBody(
@@ -613,6 +846,77 @@ test("proxy stream read aborts are classified as client cancellation", async () 
   assert.match(streamLifecycle, /err instanceof DOMException && err\.name === "AbortError"/);
   assert.match(streamLifecycle, /status: cancelled \? "cancelled" : "failed"/);
   assert.match(streamLifecycle, /statusCode: cancelled \? 499/);
+});
+
+test("pending usage tail backoff stays anchored to the immutable terminal time", async () => {
+  const [source, migration] = await Promise.all([
+    readFile(postgresStorePath, "utf8"),
+    readFile(pendingUsageTailMigrationPath, "utf8"),
+  ]);
+  const horizon = functionBody(
+    source,
+    "export async function getPostgresPendingUsageSettlementHorizon(",
+    "export async function deferPostgresCoveredPendingUsageSettlements(",
+  );
+  const backoff = functionBody(
+    source,
+    "export async function deferPostgresCoveredPendingUsageSettlements(",
+    "export async function readPostgresUsageMatchingSnapshot(",
+  );
+
+  for (const query of [horizon, backoff]) {
+    assert.match(
+      query,
+      /coalesce\(\s*nullif\(data->>'responseTimeUpdatedAt', ''\)::timestamptz,\s*created_at\s*\)/,
+    );
+  }
+  assert.match(horizon, /withControlClient/);
+  assert.match(horizon, /interval '24 hours'/);
+  assert.match(horizon, /greatest\([\s\S]*finished_at \+ \(\$1::double precision \* interval '1 minute'\)[\s\S]*next_retry_at/);
+  assert.match(backoff, /for update/);
+  assert.match(backoff, /usageSettlementScanAttempts'\)::integer, 0/);
+  assert.match(backoff, /usageSettlementImmediateAttempts/);
+  assert.match(backoff, /usageSettlementScanAttempts', due\.scan_attempts \+ 1/);
+  assert.match(backoff, /between \$1::timestamptz and \$2::timestamptz/);
+  assert.match(backoff, /when due\.scan_attempts < 1 then interval '15 seconds'/);
+  assert.match(backoff, /when due\.scan_attempts < 2 then interval '1 minute'/);
+  assert.match(backoff, /when due\.scan_attempts < 3 then interval '5 minutes'/);
+  assert.match(backoff, /else interval '15 minutes'/);
+
+  assert.match(migration, /proxy_request_logs_usage_pending_terminal_idx/);
+  assert.match(migration, /export const migration =/);
+  assert.match(migration, /version: "20260717_002_pending_usage_tail_index"/);
+  assert.match(migration, /statements: \[/);
+  assert.match(migration, /on proxy_request_logs \(created_at\)/);
+  assert.match(migration, /usageSettlementStatus' in \('pending', 'retrying'\)/);
+  assert.match(migration, /in \('completed', 'failed', 'cancelled'\)/);
+});
+
+test("matched usage is an absorbing terminal state for late immediate retry patches", async () => {
+  const [postgresSource, storeSource] = await Promise.all([
+    readFile(postgresStorePath, "utf8"),
+    readFile(storePath, "utf8"),
+  ]);
+  const postgresCas = functionBody(
+    postgresSource,
+    "export async function updatePostgresProxyUsageSettlementRetryIfUnsettled(",
+    "export async function reservePostgresQuotaOperationDepartmentBudget(",
+  );
+  const storeCas = functionBody(
+    storeSource,
+    "export async function updateProxyUsageSettlementRetryIfUnsettled(",
+    "export type NewApiUsageBackfillItem",
+  );
+
+  assert.match(postgresCas, /allowedUsageSettlementStatuses: \["pending", "retrying"\]/);
+  assert.match(postgresSource, /data->>'usageSettlementStatus' = any\(\$24::text\[\]\)/);
+  assert.match(
+    postgresSource,
+    /target\.data->>'usageSettlementStatus' = any\(\$24::text\[\]\)/,
+  );
+  assert.match(storeCas, /log\.usageSettlementStatus !== "pending"/);
+  assert.match(storeCas, /log\.usageSettlementStatus !== "retrying"/);
+  assert.match(storeCas, /return null/);
 });
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
@@ -975,7 +1279,11 @@ test(
     const userId = `test-department-budget-user-${suffix}`;
     const period = "2099-11";
     const lockKey = `department-quota:test-${suffix}:${period}`;
-    const retryDelaysMs = [2, 5, 10, 20, 40, 80, 160, 320];
+    // The full test suite runs several real-Postgres concurrency cases in
+    // parallel. Preserve the short first retries but allow enough tail for a
+    // heavily scheduled Windows/Docker runner; production itself already has
+    // a longer bounded retry window.
+    const retryDelaysMs = [2, 5, 10, 20, 40, 80, 160, 320, 640, 1_280];
 
     async function reserveOne(workerIndex: number) {
       for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {

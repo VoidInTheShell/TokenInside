@@ -31,6 +31,7 @@ import {
   addProxyLog,
   beginQuotaAwareProxyRequest,
   updateProxyLog,
+  updateProxyUsageSettlementRetryIfUnsettled,
 } from "@/lib/store";
 import {
   QuotaAdmissionClosedError,
@@ -204,6 +205,28 @@ async function updateProxyLogReliably(
   throw lastError instanceof Error ? lastError : new Error("Proxy log update failed");
 }
 
+async function updateProxyUsageSettlementRetryReliably(
+  logId: string,
+  patch: Partial<Omit<ProxyRequestLog, "id" | "createdAt">>,
+) {
+  let lastError: unknown;
+  for (const delayMs of proxyLogWriteRetryDelaysMs) {
+    if (delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    try {
+      // A concurrent authoritative match is an absorbing terminal state. A
+      // null result means the late retry patch intentionally lost that CAS.
+      return await updateProxyUsageSettlementRetryIfUnsettled(logId, patch);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Proxy usage settlement retry update failed");
+}
+
 async function withProxyPersistenceSlot<T>(
   priority: "acceptance" | "terminal",
   work: () => Promise<T>,
@@ -214,6 +237,15 @@ async function withProxyPersistenceSlot<T>(
   } finally {
     release();
   }
+}
+
+function releaseUpstreamSlotAfterTerminalPersistence(
+  terminalPersistence: Promise<unknown>,
+  releaseUpstreamSlot: () => void,
+) {
+  void terminalPersistence
+    .then(releaseUpstreamSlot, releaseUpstreamSlot)
+    .catch(() => undefined);
 }
 
 function createSettlementReadiness(logId: string) {
@@ -255,20 +287,23 @@ function settleNewApiUsageAfterResponse(
         requestStartedAt: context.requestStartedAt,
       });
       if (result.found > 0) return result;
-      const nextRetryAt = new Date(Date.now() + 5 * 60_000).toISOString();
-      await updateProxyLogReliably(context.proxyLogId, {
+      if (result.reason === "deferred") return result;
+      const nextRetryAt = new Date(Date.now() + 15_000).toISOString();
+      await updateProxyUsageSettlementRetryReliably(context.proxyLogId, {
         usageSettlementStatus: "retrying",
         usageSettlementAttempts: result.attempts,
+        usageSettlementImmediateAttempts: result.attempts,
+        usageSettlementScanAttempts: 0,
         usageSettlementLastError: result.reason ?? "NewAPI usage source is not visible yet",
         usageSettlementNextRetryAt: nextRetryAt,
       });
       return result;
     } catch (error) {
       const message = sanitizedErrorMessage(error);
-      await updateProxyLogReliably(context.proxyLogId, {
+      await updateProxyUsageSettlementRetryReliably(context.proxyLogId, {
         usageSettlementStatus: "retrying",
         usageSettlementLastError: message,
-        usageSettlementNextRetryAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+        usageSettlementNextRetryAt: new Date(Date.now() + 15_000).toISOString(),
       }).catch(() => undefined);
       console.error(JSON.stringify({
         event: "tokeninside.proxy.usage_settlement_failed",
@@ -375,6 +410,7 @@ function streamWithProxyLog(input: {
         () => updateProxyLogReliably(input.logId, patch),
       ));
     input.finishSettlementReadiness(work);
+    releaseUpstreamSlotAfterTerminalPersistence(work, input.releaseUpstreamSlot);
   };
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
@@ -402,7 +438,6 @@ function streamWithProxyLog(input: {
             ...usage,
             leaseExpiresAt: undefined,
           });
-          input.releaseUpstreamSlot();
           controller.close();
           return;
         }
@@ -415,7 +450,6 @@ function streamWithProxyLog(input: {
           err instanceof DOMException && err.name === "AbortError"
         );
         stopHeartbeat();
-        input.releaseUpstreamSlot();
         persistTerminal({
           status: cancelled ? "cancelled" : "failed",
           terminalStatus: cancelled ? "cancelled" : "failed",
@@ -454,7 +488,6 @@ function streamWithProxyLog(input: {
     async cancel(reason) {
       clientCancelled = true;
       stopHeartbeat();
-      input.releaseUpstreamSlot();
       persistTerminal({
         status: "cancelled",
         terminalStatus: "cancelled",
@@ -726,6 +759,8 @@ async function proxy(request: Request, context: RouteContext) {
       clientFamily: detectClientFamily(userAgent),
       usageSettlementStatus: "pending",
       usageSettlementAttempts: 0,
+      usageSettlementImmediateAttempts: 0,
+      usageSettlementScanAttempts: 0,
     });
     if (admission.status === "inactive_token") {
       void addProxyLog({
@@ -914,6 +949,8 @@ async function proxy(request: Request, context: RouteContext) {
       ...newApiResponseRequestIdPatch(newapiResponseRequestId),
       usageSettlementStatus: "pending",
       usageSettlementAttempts: 0,
+      usageSettlementImmediateAttempts: 0,
+      usageSettlementScanAttempts: 0,
       usageSettlementLastError: undefined,
       usageSettlementNextRetryAt: undefined,
       }),
@@ -962,6 +999,7 @@ async function proxy(request: Request, context: RouteContext) {
     }
 
     if (upstream.body) {
+      const releaseAcceptedUpstreamSlot = releaseUpstreamSlot;
       const [clientBody, recorderBody] = upstream.body.tee();
       const settlement = createSettlementReadiness(proxyLog.id);
       settleNewApiUsageAfterResponse(
@@ -1015,20 +1053,25 @@ async function proxy(request: Request, context: RouteContext) {
             ));
         } finally {
           stopRequestHeartbeat();
-          releaseUpstreamSlot?.();
-          releaseUpstreamSlot = undefined;
         }
         settlement.finish(terminalPersistence!);
+        releaseUpstreamSlotAfterTerminalPersistence(
+          terminalPersistence!,
+          releaseAcceptedUpstreamSlot,
+        );
         await terminalPersistence!;
       })();
       after(recordResponse.catch(() => undefined));
-      return new Response(clientBody, {
+      const response = new Response(clientBody, {
         status: upstream.status,
         statusText: upstream.statusText,
         headers: responseHeaders,
       });
+      releaseUpstreamSlot = undefined;
+      return response;
     }
 
+    const releaseAcceptedUpstreamSlot = releaseUpstreamSlot;
     const settlement = createSettlementReadiness(proxyLog.id);
     settleNewApiUsageAfterResponse(
       settlementContext,
@@ -1050,15 +1093,19 @@ async function proxy(request: Request, context: RouteContext) {
         responseJson: null,
       }));
     settlement.finish(terminalPersistence);
+    releaseUpstreamSlotAfterTerminalPersistence(
+      terminalPersistence,
+      releaseAcceptedUpstreamSlot,
+    );
     after(terminalPersistence.catch(() => undefined));
     stopRequestHeartbeat();
-    releaseUpstreamSlot();
-    releaseUpstreamSlot = undefined;
-    return new Response(null, {
+    const response = new Response(null, {
       status: upstream.status,
       statusText: upstream.statusText,
       headers: responseHeaders,
     });
+    releaseUpstreamSlot = undefined;
+    return response;
   } catch (err) {
     stopRequestHeartbeat();
     releaseUpstreamSlot?.();

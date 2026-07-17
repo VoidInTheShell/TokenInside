@@ -4,7 +4,7 @@ import {
   getFeishuDepartmentNameById,
 } from "@/lib/feishu";
 import {
-  getAdminScopeForUser,
+  getAdminScopeForKnownUser,
   syncDepartmentSupervisorAdminScope,
   upsertFeishuUser,
 } from "@/lib/store";
@@ -74,7 +74,7 @@ export async function syncDepartmentSupervisorScopeForUser(user: FeishuUser) {
 
 export async function getEffectiveAdminScopeForUser(user: FeishuUser) {
   if (isInactiveUser(user)) return null;
-  const storedScope = await getAdminScopeForUser(user.id);
+  const storedScope = await getAdminScopeForKnownUser(user);
   if (storedScope) return storedScope;
   return syncDepartmentSupervisorScopeForUser(user);
 }

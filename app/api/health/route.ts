@@ -2,10 +2,17 @@ import { constants } from "node:fs";
 import { access, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
+import { billingPeriodFinalizationSnapshot } from "@/lib/billing-period-finalizer";
 import { getConfig } from "@/lib/config";
 import { proxyConcurrencySnapshot } from "@/lib/proxy-concurrency";
-import { checkPostgresSchema } from "@/lib/postgres-store";
-import { ensureUsageSyncScheduler } from "@/lib/usage-sync";
+import { checkPostgresSchema, postgresPoolRuntimeSnapshot } from "@/lib/postgres-store";
+import { quotaOperationExecutionSnapshot } from "@/lib/quota-saga";
+import { quotaSubmitPoolRuntimeSnapshot } from "@/lib/quota-operation-submit";
+import {
+  billingMaterializationRecoverySnapshot,
+  ensureUsageSyncScheduler,
+  usageSettlementTailSnapshot,
+} from "@/lib/usage-sync";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -77,13 +84,23 @@ export async function GET() {
           config.storeBackend === "postgres"
               ? {
                 max: config.postgres.poolMax,
+                settlementMax: config.postgres.settlementPoolMax,
                 controlMax: config.postgres.controlPoolMax,
+                quotaSubmitMax: config.postgres.quotaSubmitPoolMax,
                 lockMax: config.postgres.lockPoolMax,
                 idleTimeoutMs: config.postgres.poolIdleTimeoutMs,
                 connectionTimeoutMs: config.postgres.poolConnectionTimeoutMs,
+                runtime: {
+                  ...postgresPoolRuntimeSnapshot(),
+                  quotaSubmit: quotaSubmitPoolRuntimeSnapshot(),
+                },
               }
             : undefined,
         proxyConcurrency: proxyConcurrencySnapshot(),
+        quotaOperations: quotaOperationExecutionSnapshot(),
+        billingMaterialization: billingPeriodFinalizationSnapshot(),
+        billingMaterializationRecovery: billingMaterializationRecoverySnapshot(),
+        usageSettlementTail: usageSettlementTailSnapshot(),
       },
       configuration: {
         sessionSecret: configured(config.sessionSecret),
@@ -103,6 +120,15 @@ export async function GET() {
         systemAdmins: config.admin.systemAdminOpenIds.length,
         environmentAdmins: config.admin.systemAdminOpenIds.length > 0,
         monthlyResetEnabled: config.billing.monthlyResetEnabled,
+        quotaOperationConcurrencyMax: config.billing.operationConcurrencyMax,
+        quotaSubmitConnectionTimeoutMs: config.postgres.quotaSubmitConnectionTimeoutMs,
+        quotaSubmitStatementTimeoutMs: config.postgres.quotaSubmitStatementTimeoutMs,
+        quotaSubmitLockTimeoutMs: config.postgres.quotaSubmitLockTimeoutMs,
+        usageSettlementConcurrencyMax: config.billing.settlementConcurrencyMax,
+        billingMaterializationConcurrencyMax:
+          config.billing.materializationConcurrencyMax,
+        usageSyncContinuationDelayMs:
+          config.billing.usageSyncContinuationDelayMs,
       },
     },
     {

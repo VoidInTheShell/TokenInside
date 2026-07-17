@@ -1,7 +1,10 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { z } from "zod";
 import { requireAdminScope } from "@/lib/admin";
-import { syncNewApiUsageLogs } from "@/lib/usage-sync";
+import {
+  enqueueManualUsageSyncOperation,
+  runManualUsageSyncOperation,
+} from "@/lib/usage-sync";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -37,17 +40,33 @@ export async function POST(request: Request) {
     );
   }
 
-  const result = await syncNewApiUsageLogs({
+  const queued = await enqueueManualUsageSyncOperation({
     dryRun: parsed.data.dryRun,
     page: parsed.data.page,
     size: parsed.data.size,
     maxPages: parsed.data.maxPages,
     overlapMinutes: parsed.data.overlapMinutes,
     settlementLagMinutes: parsed.data.settlementLagMinutes,
-    matchWindowMs: parsed.data.matchWindowMinutes * 60 * 1000,
+    matchWindowMinutes: parsed.data.matchWindowMinutes,
     retryBaseMinutes: parsed.data.retryBaseMinutes,
     operatedByFeishuUserId: auth.user.id,
-    trigger: "manual",
   });
-  return NextResponse.json(result);
+  const {
+    leaseId: _leaseId,
+    leaseExpiresAt: _leaseExpiresAt,
+    ...operation
+  } = queued.operation;
+  if (queued.conflicted) {
+    return NextResponse.json(
+      { error: "已有不同参数的用量同步任务正在执行", operation },
+      { status: 409 },
+    );
+  }
+  if (queued.created) {
+    after(() => runManualUsageSyncOperation(queued.operation.id).catch(() => undefined));
+  }
+  return NextResponse.json(
+    { operation, deduplicated: !queued.created },
+    { status: 202 },
+  );
 }

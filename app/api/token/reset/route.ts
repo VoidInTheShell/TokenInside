@@ -1,6 +1,11 @@
-import { after, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { z } from "zod";
-import { getCurrentUser } from "@/lib/session";
+import { getConfig } from "@/lib/config";
+import { getCurrentSessionIdentity, getCurrentUser } from "@/lib/session";
+import {
+  QuotaSubmissionError,
+  submitPostgresKeyRotation,
+} from "@/lib/quota-operation-submit";
 import {
   assertQuotaWriteActionEnabled,
   quotaFeatureErrorStatus,
@@ -13,7 +18,7 @@ import {
   getEffectiveUserGrantQuota,
   updateTokenRequestForQuotaOperation,
 } from "@/lib/store";
-import { enqueueKeyRotation, runQuotaOperation } from "@/lib/quota-saga";
+import { enqueueKeyRotation, ensureQuotaOperationWorker } from "@/lib/quota-saga";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,8 +30,8 @@ const resetSchema = z.object({
 
 export async function POST(request: Request) {
   try {
-    const user = await getCurrentUser();
-    if (!user) {
+    const identity = await getCurrentSessionIdentity();
+    if (!identity) {
       return NextResponse.json({ error: "Feishu OAuth session required" }, { status: 401 });
     }
 
@@ -36,13 +41,28 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Key 更换理由无效" }, { status: 400 });
     }
 
+    const clientRequestId =
+      parsed.data.clientRequestId ?? request.headers.get("idempotency-key") ?? randomId("reset");
+    if (getConfig().storeBackend === "postgres") {
+      const submitted = await submitPostgresKeyRotation({
+        feishuUserId: identity.userId,
+        reason: parsed.data.reason ?? "用户发起 Key 更换",
+        clientRequestId,
+      });
+      ensureQuotaOperationWorker();
+      return NextResponse.json(submitted, { status: 202 });
+    }
+
+    const user = await getCurrentUser();
+    if (!user) {
+      return NextResponse.json({ error: "Feishu OAuth session required" }, { status: 401 });
+    }
+
     await assertQuotaWriteActionEnabled("key_rotation");
     const activeToken = await getActiveTokenForUser(user.id);
     if (!activeToken) {
       return NextResponse.json({ error: "当前飞书用户没有可更换的 active NewAPI Key" }, { status: 409 });
     }
-    const clientRequestId =
-      parsed.data.clientRequestId ?? request.headers.get("idempotency-key") ?? randomId("reset");
     const idempotencyKey = `key-reset:${clientRequestId}`;
     const existing = await findQuotaOperationByIdempotencyKey(idempotencyKey);
     if (existing) {
@@ -79,9 +99,22 @@ export async function POST(request: Request) {
       });
       throw error;
     }
-    after(() => runQuotaOperation(operation.id).catch(() => undefined));
+    // The committed quota_operations row is the durable queue. The process
+    // worker started by instrumentation claims it independently, so the first
+    // accepted request cannot launch a long Saga that delays later 202 ACKs.
     return NextResponse.json({ request: tokenRequest, operation }, { status: 202 });
   } catch (err) {
+    if (err instanceof QuotaSubmissionError) {
+      return NextResponse.json(
+        { error: err.message, code: err.code },
+        {
+          status: err.status,
+          headers: err.retryAfterSeconds
+            ? { "Retry-After": String(err.retryAfterSeconds) }
+            : undefined,
+        },
+      );
+    }
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Reset NewAPI key failed" },
       { status: quotaFeatureErrorStatus(err) ?? 400 },
