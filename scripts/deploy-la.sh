@@ -14,6 +14,15 @@ require_value RELEASE_DIR
 require_value RELEASE_ID
 require_value TOKENINSIDE_IMAGE
 
+reset_staging_data="${RESET_STAGING_DATA:-false}"
+case "$reset_staging_data" in
+  true | false) ;;
+  *)
+    echo "RESET_STAGING_DATA must be true or false" >&2
+    exit 2
+    ;;
+esac
+
 case "$RELEASE_ID" in
   *[!A-Za-z0-9._-]* | "")
     echo "RELEASE_ID contains unsupported characters" >&2
@@ -69,7 +78,10 @@ record_failure() {
 rollback_application() {
   local exit_code="$1"
   set +e
-  if [ "$app_update_started" = true ] && [ -n "$previous" ]; then
+  if [ "$reset_staging_data" = true ]; then
+    echo "Clean rebuild failed; discarded staging data cannot be restored automatically" >&2
+    record_failure "clean_rebuild_failed"
+  elif [ "$app_update_started" = true ] && [ -n "$previous" ]; then
     echo "Deployment failed after application replacement; restoring ${previous}" >&2
     export TOKENINSIDE_IMAGE="$previous"
     compose pull tokeninside
@@ -87,7 +99,12 @@ rollback_application() {
 trap 'exit_code=$?; echo "Deployment command failed at line ${LINENO}: ${BASH_COMMAND}" >&2; rollback_application "$exit_code"' ERR
 
 compose config --quiet
-if ! compose ps --status running --services postgres | grep -qx postgres; then
+if [ "$reset_staging_data" = true ]; then
+  echo "Discarding LA staging application data, PostgreSQL data, and stored recovery dumps"
+  compose down --remove-orphans --volumes
+  find "$backup_dir" -mindepth 1 -maxdepth 1 -type f -delete
+  compose up -d --wait postgres
+elif ! compose ps --status running --services postgres | grep -qx postgres; then
   echo "PostgreSQL is not running; starting the existing service before creating a recovery point"
   compose up -d --wait postgres
 fi
@@ -97,11 +114,15 @@ POSTGRES_USER="$(compose exec -T postgres printenv POSTGRES_USER | tr -d '\r\n')
 require_value POSTGRES_DB
 require_value POSTGRES_USER
 
-printf 'Creating PostgreSQL recovery point: %s\n' "$backup_path"
-compose exec -T postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc > "$backup_tmp_path"
-test -s "$backup_tmp_path"
-mv "$backup_tmp_path" "$backup_path"
-sha256sum "$backup_path" > "${backup_path}.sha256"
+if [ "$reset_staging_data" = true ]; then
+  backup_path="discarded"
+else
+  printf 'Creating PostgreSQL recovery point: %s\n' "$backup_path"
+  compose exec -T postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc > "$backup_tmp_path"
+  test -s "$backup_tmp_path"
+  mv "$backup_tmp_path" "$backup_path"
+  sha256sum "$backup_path" > "${backup_path}.sha256"
+fi
 
 printf '%s\n' "$previous" > "${deploy_state_dir}/previous-image"
 export TOKENINSIDE_IMAGE

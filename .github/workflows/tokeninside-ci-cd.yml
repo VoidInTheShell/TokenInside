@@ -20,6 +20,11 @@ on:
         description: "Optional image tag to deploy, for example sha-abcdef1 or v2026.07.08-1"
         required: false
         type: string
+      reset_staging_data:
+        description: "Discard LA staging app/PostgreSQL volumes and backups before deploying"
+        required: false
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -149,6 +154,7 @@ jobs:
           TOKENINSIDE_IMAGE: ${{ needs.build-and-push.outputs.image }}
           DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
           APP_URL: ${{ vars.APP_URL }}
+          RESET_STAGING_DATA: ${{ github.event_name == 'workflow_dispatch' && inputs.reset_staging_data }}
         run: |
           set -euo pipefail
           : "${DEPLOY_DIR:?staging DEPLOY_DIR is required}"
