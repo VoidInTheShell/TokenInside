@@ -29,11 +29,12 @@ const pendingUsageTailMigrationPath = new URL(
 );
 
 function functionBody(source: string, startMarker: string, endMarker: string) {
-  const start = source.indexOf(startMarker);
-  const end = source.indexOf(endMarker, start + startMarker.length);
+  const normalizedSource = source.replace(/\r\n/g, "\n");
+  const start = normalizedSource.indexOf(startMarker);
+  const end = normalizedSource.indexOf(endMarker, start + startMarker.length);
   assert.notEqual(start, -1, `missing ${startMarker}`);
   assert.notEqual(end, -1, `missing ${endMarker}`);
-  return source.slice(start, end);
+  return normalizedSource.slice(start, end);
 }
 
 test("Postgres proxy admission uses a shared transaction fence without hot-row locks", async () => {
