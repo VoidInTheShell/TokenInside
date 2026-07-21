@@ -4,6 +4,7 @@ import test from "node:test";
 import { runInNewContext } from "node:vm";
 import ts from "typescript";
 import { createBillingPeriodFinalizer } from "../lib/billing-period-finalizer.ts";
+import { effectiveBillingMaterializationConcurrencyMax } from "../lib/config.ts";
 
 const billingPeriodFinalizerPath = new URL(
   "../lib/billing-period-finalizer.ts",
@@ -29,6 +30,8 @@ async function loadProductionFinalizerChunk(input: {
   sharedGlobal: Record<string, unknown>;
   reconcile: (feishuUserId: string, period: string) => Promise<void>;
   maxConcurrency?: number;
+  settlementPoolMax?: number;
+  storeBackend?: "json" | "postgres";
 }) {
   const source = await readFile(billingPeriodFinalizerPath, "utf8");
   const transpiled = ts.transpileModule(source, {
@@ -43,11 +46,15 @@ async function loadProductionFinalizerChunk(input: {
   const imports: Record<string, Record<string, unknown>> = {
     "./config.ts": {
       getConfig: () => ({
-        storeBackend: "postgres",
+        storeBackend: input.storeBackend ?? "postgres",
+        postgres: {
+          settlementPoolMax: input.settlementPoolMax ?? 3,
+        },
         billing: {
           materializationConcurrencyMax: input.maxConcurrency ?? 2,
         },
       }),
+      effectiveBillingMaterializationConcurrencyMax,
     },
     "./postgres-store.ts": {
       reconcilePostgresBillingPeriodForUser: input.reconcile,
@@ -310,6 +317,55 @@ test("materialization concurrency is bounded and drain waits for queued keys", a
   });
 });
 
+test("Postgres production finalizer reserves one settlement connection", async () => {
+  const starts = [deferred(), deferred()];
+  const releases = [deferred(), deferred()];
+  let runs = 0;
+  let active = 0;
+  let maxObserved = 0;
+  const chunk = await loadProductionFinalizerChunk({
+    sharedGlobal: {},
+    maxConcurrency: 4,
+    settlementPoolMax: 2,
+    reconcile: async () => {
+      const index = runs;
+      runs += 1;
+      active += 1;
+      maxObserved = Math.max(maxObserved, active);
+      starts[index]?.resolve();
+      await releases[index]?.promise;
+      active -= 1;
+    },
+  });
+
+  const batches = [
+    chunk.finalizeBillingPeriodAfterSettlements("fu_reserved_a", "2026-07", 0),
+    chunk.finalizeBillingPeriodAfterSettlements("fu_reserved_b", "2026-07", 0),
+  ];
+  await starts[0].promise;
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk.billingPeriodFinalizationSnapshot())), {
+    active: 1,
+    queued: 1,
+    pendingKeys: 2,
+    maxConcurrency: 1,
+  });
+
+  releases[0].resolve();
+  await starts[1].promise;
+  assert.equal(maxObserved, 1);
+  releases[1].resolve();
+  await Promise.all(batches);
+
+  assert.equal(runs, 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(chunk.billingPeriodFinalizationSnapshot())), {
+    active: 0,
+    queued: 0,
+    pendingKeys: 0,
+    maxConcurrency: 1,
+  });
+});
+
 test("independent production chunks share one versioned finalizer runtime", async () => {
   const starts = [deferred(), deferred(), deferred()];
   const releases = [deferred(), deferred(), deferred()];
@@ -330,10 +386,14 @@ test("independent production chunks share one versioned finalizer runtime", asyn
   const instrumentationChunk = await loadProductionFinalizerChunk({
     sharedGlobal,
     reconcile,
+    maxConcurrency: 8,
+    settlementPoolMax: 3,
   });
   const healthRouteChunk = await loadProductionFinalizerChunk({
     sharedGlobal,
     reconcile,
+    maxConcurrency: 8,
+    settlementPoolMax: 3,
   });
 
   const batches = [

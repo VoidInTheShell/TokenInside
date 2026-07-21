@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { getConfig } from "@/lib/config";
-import { getCurrentSessionIdentity, getCurrentUser } from "@/lib/session";
 import {
   QuotaSubmissionError,
   submitPostgresKeyRotation,
@@ -14,11 +13,11 @@ import { nowIso, randomId } from "@/lib/crypto";
 import {
   createTokenRequest,
   findQuotaOperationByIdempotencyKey,
-  getActiveTokenForUser,
   getEffectiveUserGrantQuota,
   updateTokenRequestForQuotaOperation,
 } from "@/lib/store";
 import { enqueueKeyRotation, ensureQuotaOperationWorker } from "@/lib/quota-saga";
+import { requireActiveWorkspaceAccess } from "@/lib/workspace-access";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -30,10 +29,9 @@ const resetSchema = z.object({
 
 export async function POST(request: Request) {
   try {
-    const identity = await getCurrentSessionIdentity();
-    if (!identity) {
-      return NextResponse.json({ error: "Feishu OAuth session required" }, { status: 401 });
-    }
+    const access = await requireActiveWorkspaceAccess();
+    if ("error" in access) return access.error;
+    const { user, activeToken } = access;
 
     const body = await request.json().catch(() => ({}));
     const parsed = resetSchema.safeParse(body);
@@ -43,9 +41,10 @@ export async function POST(request: Request) {
 
     const clientRequestId =
       parsed.data.clientRequestId ?? request.headers.get("idempotency-key") ?? randomId("reset");
+    await assertQuotaWriteActionEnabled("key_rotation");
     if (getConfig().storeBackend === "postgres") {
       const submitted = await submitPostgresKeyRotation({
-        feishuUserId: identity.userId,
+        feishuUserId: user.id,
         reason: parsed.data.reason ?? "用户发起 Key 更换",
         clientRequestId,
       });
@@ -53,16 +52,6 @@ export async function POST(request: Request) {
       return NextResponse.json(submitted, { status: 202 });
     }
 
-    const user = await getCurrentUser();
-    if (!user) {
-      return NextResponse.json({ error: "Feishu OAuth session required" }, { status: 401 });
-    }
-
-    await assertQuotaWriteActionEnabled("key_rotation");
-    const activeToken = await getActiveTokenForUser(user.id);
-    if (!activeToken) {
-      return NextResponse.json({ error: "当前飞书用户没有可更换的 active NewAPI Key" }, { status: 409 });
-    }
     const idempotencyKey = `key-reset:${clientRequestId}`;
     const existing = await findQuotaOperationByIdempotencyKey(idempotencyKey);
     if (existing) {

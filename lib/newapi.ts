@@ -1,6 +1,7 @@
 import { getConfig } from "@/lib/config";
 import { randomId } from "@/lib/crypto";
 import { getEffectiveNewApiConfig } from "@/lib/newapi-runtime";
+import { assertQuotaExecutionFenceHeld } from "@/lib/quota-execution-fence";
 import {
   extractUsageFromNewApiOther,
   mergeUsageMetrics,
@@ -146,6 +147,7 @@ function parseNewApiBody<T>(text: string, status: number) {
 }
 
 async function newApiFetch<T>(path: string, init: RequestInit = {}) {
+  assertQuotaExecutionFenceHeld();
   const newapi = await getEffectiveNewApiConfig();
   const timeoutSignal = AbortSignal.timeout(newapi.requestTimeoutMs);
   const res = await fetch(`${newapi.baseUrl}${path}`, {
@@ -156,6 +158,10 @@ async function newApiFetch<T>(path: string, init: RequestInit = {}) {
   });
 
   const body = parseNewApiBody<T>(await res.text(), res.status);
+  // A session advisory connection or worker lease may have been lost while
+  // the external request was in flight. Do not let that stale owner perform a
+  // subsequent local commit or another NewAPI action.
+  assertQuotaExecutionFenceHeld();
   if (!res.ok || body.success === false) {
     throw new Error(body.message ?? body.error ?? `NewAPI request failed: ${res.status}`);
   }
@@ -206,8 +212,8 @@ function getTokenId(record?: NewApiTokenRecord | null) {
   return String(record.id);
 }
 
-async function getNewApiToken(newapiTokenId: string) {
-  return newApiFetch<NewApiTokenRecord>(`/api/token/${newapiTokenId}`);
+async function getNewApiToken(newapiTokenId: string, signal?: AbortSignal) {
+  return newApiFetch<NewApiTokenRecord>(`/api/token/${newapiTokenId}`, { signal });
 }
 
 export async function searchNewApiTokens(keyword: string) {
@@ -394,10 +400,29 @@ export async function getNewApiTokenKey(newapiTokenId: string) {
   return data.key ?? data.token;
 }
 
-export async function getNewApiTokenRemainQuota(newapiTokenId: string) {
+export async function getNewApiTokenRemainQuota(
+  newapiTokenId: string,
+  options: { timeoutMs?: number; requireUsable?: boolean } = {},
+) {
   const newapi = await getEffectiveNewApiConfig();
   if (newapi.mock) return toNewApiQuota(200);
-  const record = await getNewApiToken(newapiTokenId);
+  const signal = options.timeoutMs
+    ? AbortSignal.timeout(Math.max(Math.trunc(options.timeoutMs), 1))
+    : undefined;
+  const record = await getNewApiToken(newapiTokenId, signal);
+  if (options.requireUsable) {
+    const expiredAtMs =
+      typeof record.expired_time === "number" && record.expired_time >= 0
+        ? record.expired_time * 1000
+        : undefined;
+    if (
+      record.status !== 1 ||
+      record.unlimited_quota === true ||
+      (expiredAtMs !== undefined && expiredAtMs <= Date.now())
+    ) {
+      throw new Error("NewAPI token is disabled, expired, or unexpectedly unlimited");
+    }
+  }
   return typeof record.remain_quota === "number" ? record.remain_quota : undefined;
 }
 
@@ -563,8 +588,56 @@ export async function enableNewApiToken(newapiTokenId: string) {
   await setNewApiTokenStatus(newapiTokenId, 1);
 }
 
+export async function enableNewApiTokenAndVerify(newapiTokenId: string) {
+  assertQuotaExecutionFenceHeld();
+  const newapi = await getEffectiveNewApiConfig();
+  await enableNewApiToken(newapiTokenId);
+  if (newapi.mock) {
+    assertQuotaExecutionFenceHeld();
+    return;
+  }
+
+  const retryDelaysMs = [0, 50, 100, 200, 400];
+  for (const delayMs of retryDelaysMs) {
+    if (delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    assertQuotaExecutionFenceHeld();
+    const state = await getNewApiTokenControlState(newapiTokenId);
+    if (state.status === 1) {
+      assertQuotaExecutionFenceHeld();
+      return;
+    }
+  }
+  throw new Error("NewAPI Key 启用状态写后校验失败");
+}
+
 export async function disableNewApiToken(newapiTokenId: string) {
   await setNewApiTokenStatus(newapiTokenId, 2);
+}
+
+export async function disableNewApiTokenAndVerify(newapiTokenId: string) {
+  assertQuotaExecutionFenceHeld();
+  const newapi = await getEffectiveNewApiConfig();
+  await disableNewApiToken(newapiTokenId);
+  if (newapi.mock) {
+    assertQuotaExecutionFenceHeld();
+    return;
+  }
+
+  const retryDelaysMs = [0, 50, 100, 200, 400];
+  for (const delayMs of retryDelaysMs) {
+    if (delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    assertQuotaExecutionFenceHeld();
+    const state = await getNewApiTokenControlState(newapiTokenId);
+    if (state.status === 2) {
+      assertQuotaExecutionFenceHeld();
+      return;
+    }
+  }
+  throw new Error("NewAPI Key 禁用状态写后校验失败");
 }
 
 export async function updateNewApiTokenQuota(input: {

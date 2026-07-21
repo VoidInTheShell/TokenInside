@@ -65,11 +65,8 @@ export type TokenRequest = {
   feishuUserId: string;
   requestType:
     | "first_apply"
-    | "quota_reset"
-    | "quota_restore"
     | "key_reset"
-    | "quota_adjust"
-    | "monthly_reset";
+    | "quota_adjust";
   status: RequestStatus;
   reason: string;
   requestedMonthlyQuota: number;
@@ -175,7 +172,12 @@ export type ProxyRequestLog = {
   actualCost?: number;
   usageSource?: "proxy_json" | "proxy_stream" | "newapi_log" | "missing";
   usageSyncedAt?: string;
-  usageSettlementStatus?: "pending" | "retrying" | "matched" | "manual_review";
+  usageSettlementStatus?:
+    | "pending"
+    | "retrying"
+    | "matched"
+    | "manual_review"
+    | "not_applicable";
   usageSettlementAttempts?: number;
   usageSettlementImmediateAttempts?: number;
   usageSettlementScanAttempts?: number;
@@ -290,7 +292,7 @@ export type UsageSyncCheckpoint = {
   lastSeenNewapiLogId?: string;
   lastSeenNewapiCreatedAt?: string;
   lastRunAt?: string;
-  lastRunStatus?: BillingOperationStatus;
+  lastRunStatus?: UsageSyncRunStatus;
   lastRunBy?: "manual" | "auto";
   lastRunSummary?: Record<string, string | number | boolean | undefined>;
   nextRunAfter?: string;
@@ -305,6 +307,11 @@ export type UsageSyncCheckpoint = {
   repairCursorThrough?: string;
   repairWindowStart?: string;
   repairWindowEnd?: string;
+  /** Highest stable forward-scan boundary, independent of integrity blockers. */
+  ingestedThrough?: string;
+  /** Earliest quarantined source fact that prevents a complete settlement watermark. */
+  integrityBlockedAt?: string;
+  integrityBlockedIssueId?: string;
   settledThrough?: string;
   cursorPage?: number;
   failureCount?: number;
@@ -328,6 +335,9 @@ export type UsageSyncIssue = {
   tokenAccountId?: string;
   feishuUserId?: string;
   matchedProxyLogId?: string;
+  severity?: "warning" | "critical";
+  blocksSettlement?: boolean;
+  occurredAt?: string;
   message: string;
   occurrences: number;
   raw?: unknown;
@@ -401,7 +411,7 @@ export type DepartmentQuotaRequest = {
   status: DepartmentQuotaRequestStatus;
   reason: string;
   currentQuotaLimit: number;
-  requestedQuotaLimit: number;
+  requestedQuotaLimit?: number;
   approvedQuotaLimit?: number;
   approvalTargetOpenId: string;
   approvalCardMessageId?: string;
@@ -452,10 +462,7 @@ export type QuotaOperationType =
   | "first_provision"
   | "quota_adjust"
   | "key_rotation"
-  | "quota_restore"
-  | "monthly_open"
-  | "reconcile"
-  | "migration";
+  | "monthly_open";
 
 export type QuotaOperationState =
   | "planned"
@@ -474,6 +481,7 @@ export type QuotaOperationState =
   | "retryable_failed"
   | "compensating"
   | "compensated"
+  | "cancelled"
   | "manual_review";
 
 export type UserQuotaPolicy = {
@@ -483,7 +491,7 @@ export type UserQuotaPolicy = {
   departmentId?: string;
   effectiveFromPeriod: string;
   effectiveToPeriod?: string;
-  sourceType: "first_apply" | "quota_adjust" | "department_allocate" | "migration" | "admin_correction";
+  sourceType: "first_apply" | "quota_adjust" | "department_allocate" | "admin_correction";
   sourceId: string;
   version: number;
   quotaPerUnitSnapshot: number;
@@ -531,10 +539,8 @@ export type QuotaLedgerEntryType =
   | "period_open_authorization"
   | "quota_adjust_grant"
   | "quota_adjust_release"
-  | "quota_restore_grant"
   | "admin_correction_debit"
   | "admin_correction_credit"
-  | "migration_opening"
   | "operation_compensation";
 
 export type QuotaLedgerEntry = {
@@ -558,6 +564,11 @@ export type UserQuotaState = {
   activeGeneration: number;
   operationId?: string;
   closedReason?: string;
+  upstreamDisabledAt?: string;
+  consumptionBarrierCutoffAt?: string;
+  resumeTokenAccountId?: string;
+  resumePreparedAt?: string;
+  resumeUpstreamEnableAttemptedAt?: string;
   updatedAt: string;
 };
 
@@ -584,11 +595,18 @@ export type QuotaReconciliationRecord = {
   updatedAt: string;
 };
 
-export type BillingOperationKind = "usage_sync" | "monthly_reset" | "settings_update";
+export type BillingOperationKind = "usage_sync" | "department_member_sync";
+
+export type UsageSyncRunStatus =
+  | "continuation_pending"
+  | "applied"
+  | "partial_failed"
+  | "failed";
 
 export type BillingOperationStatus =
   | "pending"
   | "running"
+  | "continuation_pending"
   | "dry_run"
   | "applied"
   | "partial_failed"
@@ -614,7 +632,6 @@ export type BillingOperationRecord = {
 };
 
 export type UsageSyncPolicy = {
-  enabled: boolean;
   intervalMinutes: number;
   pageSize: number;
   maxPagesPerRun: number;
@@ -631,15 +648,11 @@ export type UsageSyncPolicy = {
   nextRunAfter?: string;
 };
 
-export type QuotaFeatureFlags = {
-  legacyAbsoluteQuotaWritesEnabled: boolean;
-  quotaLedgerShadowRead: boolean;
-  quotaSagaWritesEnabled: boolean;
-  keyRotationSagaEnabled: boolean;
-  quotaRestoreEnabled: boolean;
-  monthlyPeriodOpenEnabled: boolean;
-  reconciliationAutoDecreaseEnabled: boolean;
-  reconciliationAutoIncreaseEnabled: boolean;
+export type PackageResetPolicy = {
+  enabled: boolean;
+  dayOfMonth: number;
+  updatedAt?: string;
+  updatedByFeishuUserId?: string;
 };
 
 export type AppSettings = {
@@ -652,22 +665,18 @@ export type AppSettings = {
     updatedByFeishuUserId?: string;
   };
   usageSyncPolicy?: UsageSyncPolicy;
-  quotaFeatureFlags?: QuotaFeatureFlags;
-  quotaMigration?: {
-    period: string;
-    appliedAt: string;
-    planHash: string;
-    users: number;
-    estimatedUsers: number;
-  };
-  billingOperations?: BillingOperationRecord[];
+  packageReset?: PackageResetPolicy;
   updatedAt?: string;
   updatedByFeishuUserId?: string;
 };
 
+export type JsonStoreSettings = AppSettings & {
+  billingOperations?: BillingOperationRecord[];
+};
+
 export type StoreShape = {
   version: 1;
-  settings: AppSettings;
+  settings: JsonStoreSettings;
   users: FeishuUser[];
   tokenRequests: TokenRequest[];
   tokenAccounts: TokenAccount[];

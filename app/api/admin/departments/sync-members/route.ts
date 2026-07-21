@@ -1,20 +1,40 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireAdminScope } from "@/lib/admin";
+import { isAdminUserActionAuthorizationError } from "@/lib/postgres-store";
 import {
-  getFeishuDepartmentNameById,
-  listFeishuDepartmentUsers,
-} from "@/lib/feishu";
-import { prewarmDepartmentMemberKeys } from "@/lib/key-prewarm";
-import { getUserByOpenId, upsertFeishuUser } from "@/lib/store";
+  enqueueDepartmentMemberSyncOperationAsActor,
+  listDepartmentMemberSyncOperations,
+} from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const syncSchema = z.object({
   departmentId: z.string().min(1).max(200).optional(),
-  prewarmKeys: z.boolean().optional().default(false),
 });
+
+function visibleOperation<T extends { leaseId?: string; leaseExpiresAt?: string }>(
+  operation: T,
+) {
+  const {
+    leaseId: _leaseId,
+    leaseExpiresAt: _leaseExpiresAt,
+    ...visible
+  } = operation;
+  return visible;
+}
+
+export async function GET() {
+  const auth = await requireAdminScope();
+  if (auth.error) return auth.error;
+  const operations = await listDepartmentMemberSyncOperations({
+    departmentId:
+      auth.scope.scopeType === "department" ? auth.scope.departmentId : undefined,
+    limit: 100,
+  });
+  return NextResponse.json({ operations: operations.map(visibleOperation) });
+}
 
 export async function POST(request: Request) {
   const auth = await requireAdminScope();
@@ -37,57 +57,37 @@ export async function POST(request: Request) {
   }
 
   try {
-    const departmentName =
-      departmentId === auth.user.departmentId && auth.user.departmentName
-        ? auth.user.departmentName
-        : await getFeishuDepartmentNameById(departmentId).catch(() => undefined);
-    const contacts = await listFeishuDepartmentUsers(departmentId);
-    let synced = 0;
-    let skipped = 0;
-    for (const contact of contacts) {
-      if (!contact.open_id) {
-        skipped += 1;
-        continue;
-      }
-      const existing = await getUserByOpenId(contact.open_id);
-      if (existing?.departmentId && existing.departmentId !== departmentId) {
-        skipped += 1;
-        continue;
-      }
-      await upsertFeishuUser({
-        tenantKey: auth.user.tenantKey,
-        openId: contact.open_id,
-        unionId: contact.union_id,
-        feishuUserIdFromFeishu: contact.user_id,
-        name: contact.name,
-        avatarUrl:
-          contact.avatar?.avatar_origin ??
-          contact.avatar?.avatar_640 ??
-          contact.avatar?.avatar_240 ??
-          contact.avatar?.avatar_72,
-        departmentId,
-        departmentName,
-      });
-      synced += 1;
+    const submitted = await enqueueDepartmentMemberSyncOperationAsActor({
+      actorFeishuUserId: auth.user.id,
+      departmentId,
+    });
+    if (submitted.conflicted) {
+      return NextResponse.json(
+        {
+          error: "该部门已有不同参数的成员同步任务正在执行，请等待任务结束后重试",
+          operation: visibleOperation(submitted.operation),
+        },
+        { status: 409 },
+      );
     }
-    let prewarm:
-      | Awaited<ReturnType<typeof prewarmDepartmentMemberKeys>>
-      | { error: string }
-      | undefined;
-    if (parsed.data.prewarmKeys) {
-      try {
-        prewarm = await prewarmDepartmentMemberKeys({ departmentId });
-      } catch (error) {
-        prewarm = {
-          error: error instanceof Error ? error.message : "部门成员 Key 预热失败",
-        };
-      }
-    }
-    return NextResponse.json({ departmentId, departmentName, synced, skipped, prewarm });
-  } catch (err) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "同步飞书部门成员失败" },
-      { status: 502 },
+      {
+        accepted: true,
+        created: submitted.created,
+        operation: visibleOperation(submitted.operation),
+      },
+      { status: 202 },
+    );
+  } catch (error) {
+    if (isAdminUserActionAuthorizationError(error)) {
+      return NextResponse.json(
+        { error: error.message, code: error.code },
+        { status: error.status },
+      );
+    }
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : "提交部门成员同步任务失败" },
+      { status: 400 },
     );
   }
 }

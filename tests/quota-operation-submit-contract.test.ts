@@ -105,10 +105,15 @@ test("quota request and durable operation commit atomically before submission re
     "async function withQuotaSubmitTransaction<",
     "async function saveTokenRequestRow(",
   );
-  const quotaRestore = section(
+  const firstProvision = section(
     source,
-    "export async function submitPostgresQuotaRestoreDecision(",
+    "export async function submitPostgresFirstProvisionDecision(",
     "export async function submitPostgresKeyRotation(",
+  );
+  const firstProvisionPersist = section(
+    source,
+    "async function persistFirstProvisionSubmission(",
+    "export type FirstProvisionDecisionSubmission",
   );
   const keyRotation = section(source, "export async function submitPostgresKeyRotation(");
   const requestRead = section(
@@ -128,17 +133,23 @@ test("quota request and durable operation commit atomically before submission re
   assert.match(transaction, /await client\.query\("rollback"\)/);
   assert.match(transaction, /finally[\s\S]*client\.release\(\)/);
 
-  for (const submission of [quotaRestore, keyRotation]) {
+  for (const submission of [firstProvision, keyRotation]) {
     assert.match(submission, /return withQuotaSubmitTransaction\(async \(client\) =>/);
     assert.match(submission, /pg_advisory_xact_lock/);
-    assertOrdered(submission, ["saveTokenRequestRow(client", "insertQuotaOperationRow(client"]);
-    assert.match(submission.slice(submission.indexOf("insertQuotaOperationRow(client")), /return/);
     assert.doesNotMatch(submission, /enqueueQuota|runQuotaOperation|ensureQuotaOperationWorker/);
   }
+  assert.match(firstProvision, /return persistFirstProvisionSubmission\(client/);
+  assertOrdered(firstProvisionPersist, [
+    "saveTokenRequestRow(client",
+    "insertQuotaOperationRow(client",
+  ]);
+  assertOrdered(keyRotation, ["saveTokenRequestRow(client", "insertQuotaOperationRow(client"]);
+  assert.match(keyRotation.slice(keyRotation.indexOf("insertQuotaOperationRow(client")), /return/);
 
-  assert.match(requestRead, /lock \? "for update of request" : ""/);
-  assert.match(quotaRestore, /readRequestAndUser\(client, input\.requestId, true\)/);
-  assert.match(quotaRestore, /idempotencyKey = `quota-operation:\$\{request\.id\}`/);
+  assert.match(requestRead, /lock \? "for update of request, request_user" : ""/);
+  assert.match(firstProvision, /readRequestAndUser\(client, input\.requestId, true\)/);
+  assert.match(firstProvisionPersist, /idempotencyKey = `quota-operation:\$\{input\.request\.id\}`/);
+  assert.match(firstProvisionPersist, /operationType: "first_provision"/);
   assert.match(keyRotation, /idempotencyKey = `key-reset:\$\{input\.clientRequestId\}`/);
   assert.match(source, /insert into quota_operations/);
   assert.match(source, /idempotency_key/);
@@ -182,12 +193,12 @@ test("Postgres routes await atomic commit, then wake the worker and return 202 w
   const resetFastPath = section(
     resetSource,
     'if (getConfig().storeBackend === "postgres")',
-    "const user = await getCurrentUser()",
+    "const idempotencyKey = `key-reset:${clientRequestId}`",
   );
 
   assertOrdered(decisionFastPath, [
-    "await submitPostgresQuotaRestoreDecision(",
-    "ensureQuotaOperationWorker()",
+    "await submitPostgresFirstProvisionDecision(",
+    "after(() => ensureQuotaOperationWorker())",
     "return NextResponse.json(",
     "{ status: 202 }",
   ]);
@@ -197,12 +208,14 @@ test("Postgres routes await atomic commit, then wake the worker and return 202 w
     "return NextResponse.json(submitted, { status: 202 })",
   ]);
 
-  for (const fastPath of [decisionFastPath, resetFastPath]) {
-    assert.doesNotMatch(
-      fastPath,
-      /\bafter\(|runQuotaOperation|enqueueQuotaRestoreForRequest|enqueueKeyRotation|await ensureQuotaOperationWorker/,
-    );
-  }
+  assert.doesNotMatch(
+    decisionFastPath,
+    /runQuotaOperation|enqueueQuotaAdjustment|enqueueFirstProvision|enqueueKeyRotation|await ensureQuotaOperationWorker/,
+  );
+  assert.doesNotMatch(
+    resetFastPath,
+    /\bafter\(|runQuotaOperation|enqueueQuotaAdjustment|enqueueFirstProvision|enqueueKeyRotation|await ensureQuotaOperationWorker/,
+  );
   assert.doesNotMatch(decisionFastPath, /requireAdminScope|getScopedTokenRequest|provisionTokenForRequest/);
   assert.doesNotMatch(resetFastPath, /getCurrentUser|getActiveTokenForUser|getEffectiveUserGrantQuota/);
 });

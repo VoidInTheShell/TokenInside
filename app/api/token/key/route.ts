@@ -1,17 +1,14 @@
 import { NextResponse } from "next/server";
 import { getNewApiTokenKey } from "@/lib/newapi";
-import { getCurrentUser } from "@/lib/session";
-import { getActiveTokenForUser } from "@/lib/store";
+import { requireActiveWorkspaceAccess } from "@/lib/workspace-access";
 
 export const runtime = "nodejs";
 
 export async function GET() {
   try {
-    const user = await getCurrentUser();
-    if (!user) {
-      return NextResponse.json({ error: "Feishu OAuth session required" }, { status: 401 });
-    }
-    const activeToken = await getActiveTokenForUser(user.id);
+    const access = await requireActiveWorkspaceAccess();
+    if ("error" in access) return access.error;
+    const activeToken = access.activeToken;
     if (!activeToken?.newapiTokenId) {
       return NextResponse.json({ error: "No active NewAPI token" }, { status: 404 });
     }

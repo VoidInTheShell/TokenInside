@@ -1,6 +1,7 @@
 import type { BillingOperationRecord, BillingOperationStatus } from "./types";
 
 const terminalBillingOperationStatuses = new Set<BillingOperationStatus>([
+  "continuation_pending",
   "dry_run",
   "applied",
   "partial_failed",

@@ -4,7 +4,6 @@ import {
   calculateKeyRotationTarget,
   calculateQuotaAdjustment,
   calculateFirstProvision,
-  calculateQuotaRestore,
   classifyQuotaReconciliation,
   conservativeRemainQuotaObservation,
   fixedUsageSyncWindow,
@@ -16,20 +15,10 @@ import {
   resolveUsageBillingPeriod,
 } from "../lib/quota-model.ts";
 
-test("ledger-migrated users start unassigned instead of inheriting the global grant", () => {
+test("unassigned users always start at zero instead of inheriting the global grant", () => {
   assert.equal(
-    initialUnassignedMonthlyQuota({
-      defaultMonthlyQuota: 200,
-      quotaMigrationApplied: true,
-    }),
+    initialUnassignedMonthlyQuota(),
     0,
-  );
-  assert.equal(
-    initialUnassignedMonthlyQuota({
-      defaultMonthlyQuota: 200,
-      quotaMigrationApplied: false,
-    }),
-    200,
   );
 });
 
@@ -73,22 +62,67 @@ test("key rotation accepts decreasing post-drain observations conservatively", (
   );
 });
 
-test("quota adjustment applies the policy delta to the observed balance", () => {
+test("quota adjustment derives ledger delta only from local authorization facts", () => {
   assert.deepEqual(
     calculateQuotaAdjustment({
       observedRemainBefore: 40,
-      assignedQuotaBefore: 100,
+      authorizedQuotaBefore: 100,
+      authoritativeConsumedQuota: 60,
       assignedQuotaAfter: 160,
     }),
-    { targetRemainQuota: 100, deltaAuthorizedQuota: 60 },
+    {
+      targetRemainQuota: 100,
+      deltaAuthorizedQuota: 60,
+      expectedAvailableQuota: 100,
+      overageQuota: 0,
+    },
   );
   assert.deepEqual(
     calculateQuotaAdjustment({
       observedRemainBefore: 30,
-      assignedQuotaBefore: 100,
+      authorizedQuotaBefore: 100,
+      authoritativeConsumedQuota: 80,
       assignedQuotaAfter: 20,
     }),
-    { targetRemainQuota: 0, deltaAuthorizedQuota: -30 },
+    {
+      targetRemainQuota: 0,
+      deltaAuthorizedQuota: -80,
+      expectedAvailableQuota: 0,
+      overageQuota: 60,
+    },
+  );
+
+  const localFacts = {
+    authorizedQuotaBefore: 100,
+    authoritativeConsumedQuota: 80,
+    assignedQuotaAfter: 50,
+  };
+  const healthyProjection = calculateQuotaAdjustment({
+    ...localFacts,
+    observedRemainBefore: 20,
+  });
+  const deficitProjection = calculateQuotaAdjustment({
+    ...localFacts,
+    observedRemainBefore: 10,
+  });
+  assert.equal(healthyProjection.deltaAuthorizedQuota, -50);
+  assert.equal(deficitProjection.deltaAuthorizedQuota, -50);
+  assert.equal(healthyProjection.targetRemainQuota, 0);
+  assert.equal(deficitProjection.targetRemainQuota, 0);
+
+  assert.deepEqual(
+    calculateQuotaAdjustment({
+      authorizedQuotaBefore: 100,
+      authoritativeConsumedQuota: 80,
+      assignedQuotaAfter: 150,
+      observedRemainBefore: 10,
+    }),
+    {
+      targetRemainQuota: 60,
+      deltaAuthorizedQuota: 50,
+      expectedAvailableQuota: 70,
+      overageQuota: 0,
+    },
   );
 });
 
@@ -108,6 +142,14 @@ test("first provision reuses a no-key ledger allocation instead of granting twic
       authoritativeConsumedQuota: 10,
     }),
     { authorizationDelta: 60, targetRemainQuota: 90 },
+  );
+  assert.deepEqual(
+    calculateFirstProvision({
+      assignedMonthlyQuota: 50,
+      authorizedQuotaBefore: 100,
+      authoritativeConsumedQuota: 20,
+    }),
+    { authorizationDelta: -50, targetRemainQuota: 30 },
   );
 });
 
@@ -135,17 +177,6 @@ test("settlement watermarks must be recent and cannot point into the future", ()
       maxLagMinutes: 10,
     }),
     false,
-  );
-});
-
-test("quota restore only grants the amount below the policy line", () => {
-  assert.deepEqual(
-    calculateQuotaRestore({ observedRemainBefore: 35, assignedMonthlyQuota: 100 }),
-    { targetRemainQuota: 100, grantDelta: 65 },
-  );
-  assert.deepEqual(
-    calculateQuotaRestore({ observedRemainBefore: 120, assignedMonthlyQuota: 100 }),
-    { targetRemainQuota: 120, grantDelta: 0 },
   );
 });
 

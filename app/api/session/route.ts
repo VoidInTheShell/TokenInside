@@ -17,6 +17,7 @@ import type {
   TokenRequest,
   UserBillingPeriod,
 } from "@/lib/types";
+import { resolveWorkspaceAccess, type WorkspaceAccess } from "@/lib/workspace-access";
 
 export const runtime = "nodejs";
 
@@ -38,6 +39,11 @@ function authenticatedSessionResponse(
 ) {
   return NextResponse.json({
     authenticated: true,
+    workspaceAccess: resolveWorkspaceAccess({
+      user,
+      activeToken: session.activeToken,
+      requests: session.requests,
+    }),
     baseUrl,
     settings: session.settings,
     user: {
@@ -75,6 +81,7 @@ export async function GET() {
     const store = await getSessionStoreSummary();
     return NextResponse.json({
       authenticated: false,
+      workspaceAccess: "application_only" satisfies WorkspaceAccess,
       baseUrl: config.publicBaseUrl,
       settings: store.settings,
       requests: [],

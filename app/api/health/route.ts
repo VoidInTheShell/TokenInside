@@ -4,14 +4,17 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 import { billingPeriodFinalizationSnapshot } from "@/lib/billing-period-finalizer";
 import { getConfig } from "@/lib/config";
-import { getEffectiveNewApiConfig } from "@/lib/newapi-runtime";
+import { verifyGreenfieldInstallationBinding } from "@/lib/greenfield-installation";
+import { getNewApiRuntimeBindingForHealth } from "@/lib/newapi-runtime";
 import { proxyConcurrencySnapshot } from "@/lib/proxy-concurrency";
-import { checkPostgresSchema, postgresPoolRuntimeSnapshot } from "@/lib/postgres-store";
+import {
+  checkPostgresSchema,
+  postgresPoolRuntimeSnapshot,
+} from "@/lib/postgres-store";
 import { quotaOperationExecutionSnapshot } from "@/lib/quota-saga";
 import { quotaSubmitPoolRuntimeSnapshot } from "@/lib/quota-operation-submit";
 import {
   billingMaterializationRecoverySnapshot,
-  ensureUsageSyncScheduler,
   usageSettlementTailSnapshot,
 } from "@/lib/usage-sync";
 
@@ -42,9 +45,12 @@ function configured(value: unknown) {
 }
 
 export async function GET() {
-  void ensureUsageSyncScheduler().catch(() => undefined);
   const config = getConfig();
-  const effectiveNewApi = await getEffectiveNewApiConfig();
+  const runtimeBinding = await getNewApiRuntimeBindingForHealth().catch(() => ({
+    value: config.newapi,
+    manifest: null,
+  }));
+  const effectiveNewApi = runtimeBinding.value;
   const postgresSchema =
     config.storeBackend === "postgres"
       ? await checkPostgresSchema().catch(() => ({
@@ -58,8 +64,19 @@ export async function GET() {
     config.storeBackend === "postgres"
       ? postgresSchema?.error !== "connection_failed"
       : await canWriteStoreDirectory(config.storePath);
+  const greenfieldManifest = runtimeBinding.manifest;
+  const greenfieldBinding =
+    config.storeBackend === "postgres"
+      ? verifyGreenfieldInstallationBinding({
+          manifest: greenfieldManifest,
+          upstreamBaseUrl: effectiveNewApi.baseUrl,
+          configuredControlUserId: effectiveNewApi.controlUserId,
+        })
+      : { ready: true as const, reason: undefined };
   const storeReady =
-    config.storeBackend === "postgres" ? storeWritable && postgresSchema?.ready : storeWritable;
+    config.storeBackend === "postgres"
+      ? storeWritable && postgresSchema?.ready && greenfieldBinding.ready
+      : storeWritable;
   const status = storeReady ? "ok" : "degraded";
 
   return NextResponse.json(
@@ -80,6 +97,15 @@ export async function GET() {
                 missingTables: postgresSchema?.missingTables ?? [],
                 tableCount: postgresSchema?.tableCount ?? 0,
                 error: postgresSchema?.error,
+              }
+            : undefined,
+        greenfieldInstallation:
+          config.storeBackend === "postgres"
+            ? {
+                ready: greenfieldBinding.ready,
+                reason: greenfieldBinding.reason,
+                checkedAt: greenfieldManifest?.checkedAt,
+                cutoverAt: greenfieldManifest?.cutoverAt,
               }
             : undefined,
         postgresPool:
@@ -121,7 +147,6 @@ export async function GET() {
         proxyQueueTimeoutMs: config.proxy.queueTimeoutMs,
         systemAdmins: config.admin.systemAdminOpenIds.length,
         environmentAdmins: config.admin.systemAdminOpenIds.length > 0,
-        monthlyResetEnabled: config.billing.monthlyResetEnabled,
         quotaOperationConcurrencyMax: config.billing.operationConcurrencyMax,
         quotaSubmitConnectionTimeoutMs: config.postgres.quotaSubmitConnectionTimeoutMs,
         quotaSubmitStatementTimeoutMs: config.postgres.quotaSubmitStatementTimeoutMs,

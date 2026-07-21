@@ -2,7 +2,12 @@ import { listNewApiUsageLogs } from "@/lib/newapi";
 import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
-import { fixedUsageSyncWindow, hongKongBillingPeriod } from "@/lib/quota-model";
+import { assertQuotaExecutionFenceHeld } from "@/lib/quota-execution-fence";
+import {
+  fixedUsageSyncWindow,
+  isSettlementWatermarkFresh,
+} from "@/lib/quota-model";
+import { packageBillingPeriod } from "@/lib/package-reset";
 import {
   drainBillingPeriodFinalizations,
   finalizeBillingPeriodAfterSettlements,
@@ -11,7 +16,7 @@ import {
   deferPostgresCoveredPendingUsageSettlements,
   getPostgresPendingUsageSettlementHorizon,
   isPostgresAdvisoryLockBusyError,
-  listPostgresMatchedUsageBillingMaterializationTargets,
+  listPostgresAuthoritativeUsageBillingMaterializationTargets,
   withPostgresAdvisoryLock,
 } from "@/lib/postgres-store";
 import {
@@ -21,6 +26,7 @@ import {
   enqueueBillingOperation,
   findBillingOperationById,
   getAppSettings,
+  getEarliestOpenBlockingUsageIssue,
   getUsageSyncCheckpoint,
   listRunnableBillingOperations,
   recordBillingOperation,
@@ -29,7 +35,11 @@ import {
   saveUsageSyncCheckpoint,
   type NewApiUsageBackfillResult,
 } from "@/lib/store";
-import type { BillingOperationRecord, UsageSyncPolicy } from "@/lib/types";
+import type {
+  BillingOperationRecord,
+  UsageSyncPolicy,
+  UsageSyncRunStatus,
+} from "@/lib/types";
 
 type UsageSyncTrigger = "manual" | "auto";
 
@@ -65,6 +75,7 @@ export type NewApiUsageSyncResult = {
   scanMode: "forward" | "repair";
   completedSlice: boolean;
   completedWindow: boolean;
+  status: UsageSyncRunStatus;
   pages: NewApiUsageSyncPageResult[];
   totals: {
     fetched: number;
@@ -81,10 +92,14 @@ export type NewApiUsageSyncResult = {
   };
   checkpoint?: {
     lastRunAt: string;
+    lastRunStatus?: UsageSyncRunStatus;
     nextRunAfter?: string;
     lastSeenNewapiLogId?: string;
     lastSeenNewapiCreatedAt?: string;
+    ingestedThrough?: string;
     settledThrough?: string;
+    integrityBlockedAt?: string;
+    integrityBlockedIssueId?: string;
     cursorPage?: number;
     scanExpectedTotal?: number;
     scanFirstIdentity?: string;
@@ -363,10 +378,23 @@ function statusFromError(pageCount: number) {
   return pageCount > 0 ? "partial_failed" : "failed";
 }
 
+function settlementWatermarkBeforeIntegrityBlock(
+  settledThrough: string | undefined,
+  integrityBlockedAt: string | undefined,
+) {
+  if (!settledThrough || !integrityBlockedAt) return settledThrough;
+  if (floorEpochSecond(settledThrough) < floorEpochSecond(integrityBlockedAt)) {
+    return settledThrough;
+  }
+  return epochSecondIso(floorEpochSecond(integrityBlockedAt) - 1);
+}
+
 async function withUsageSyncLock<T>(dryRun: boolean, fn: () => Promise<T>) {
   if (dryRun) return fn();
   if (getConfig().storeBackend === "postgres") {
-    return withPostgresAdvisoryLock(usageSyncLockKey, fn);
+    return withPostgresAdvisoryLock(usageSyncLockKey, fn, {
+      executionFence: true,
+    });
   }
   if (usageSyncRuntime.jsonUsageSyncRunning) {
     throw new Error(`${usageSyncLockKey} is already running`);
@@ -376,6 +404,237 @@ async function withUsageSyncLock<T>(dryRun: boolean, fn: () => Promise<T>) {
     return await fn();
   } finally {
     usageSyncRuntime.jsonUsageSyncRunning = false;
+  }
+}
+
+export type QuotaBarrierUsageIngestionResult = {
+  status:
+    | "not_mature"
+    | "checkpoint_behind"
+    | "busy"
+    | "unstable"
+    | "too_large"
+    | "integrity_blocked"
+    | "completed";
+  scanStart: string;
+  scanEnd: string;
+  matureAt: string;
+  total?: number;
+  firstIdentity?: string;
+  pages?: number;
+  affectedUsers?: number;
+  integrityBlockedAt?: string;
+  integrityBlockedIssueId?: string;
+};
+
+const quotaBarrierMaxRows = 50_000;
+
+/**
+ * Completes a bounded, stable NewAPI usage scan for an upstream-disable
+ * accounting barrier. Unlike the low-priority two-hour repair cursor, this
+ * scan is allowed to consume the complete relevant window in one control task
+ * so quota changes do not leave a user's Key disabled for ~95 minutes.
+ */
+export async function ingestQuotaBarrierUsage(input: {
+  upstreamDisabledAt: string;
+  cutoffAt: string;
+  billingPeriod: string;
+}): Promise<QuotaBarrierUsageIngestionResult> {
+  const settings = await getAppSettings();
+  const policy = settings.usageSyncPolicy ?? defaultUsageSyncPolicy();
+  const settlementLagMs =
+    Math.max(
+      policy.settlementLagMinutes ??
+        defaultUsageSyncPolicy().settlementLagMinutes ??
+        1,
+      0,
+    ) * 60_000;
+  const cutoffTime = Date.parse(input.cutoffAt);
+  const disabledTime = Date.parse(input.upstreamDisabledAt);
+  if (!Number.isFinite(cutoffTime) || !Number.isFinite(disabledTime)) {
+    throw new Error("额度操作消费结算屏障时间无效");
+  }
+  const matureAt = new Date(cutoffTime + settlementLagMs).toISOString();
+  const periodStart = Date.parse(`${input.billingPeriod}-01T00:00:00+08:00`);
+  const maxRequestWindowMs =
+    getConfig().billing.directConsumptionDrainGraceMs;
+  let scanStart = new Date(
+    Math.max(disabledTime - maxRequestWindowMs, periodStart),
+  ).toISOString();
+  const scanEnd = input.cutoffAt;
+  if (Date.now() < cutoffTime + settlementLagMs) {
+    return { status: "not_mature", scanStart, scanEnd, matureAt };
+  }
+  try {
+    return await withUsageSyncLock(false, async () => {
+      const checkpoint = await getUsageSyncCheckpoint("newapi_usage_logs");
+      if (checkpoint?.integrityBlockedAt) {
+        return {
+          status: "integrity_blocked",
+          scanStart,
+          scanEnd,
+          matureAt,
+          integrityBlockedAt: checkpoint.integrityBlockedAt,
+          integrityBlockedIssueId: checkpoint.integrityBlockedIssueId,
+        };
+      }
+      const checkpointFresh = isSettlementWatermarkFresh({
+        settledThrough: checkpoint?.settledThrough,
+        maxLagMinutes:
+          2 * Math.max(policy.intervalMinutes, 1) +
+          settlementLagMs / 60_000,
+      });
+      // A later global run may be continuation_pending even though its durable
+      // watermark is still trustworthy. The dedicated scan below runs under
+      // the same lock, includes any gap behind that watermark, and verifies the
+      // complete quota window after its own settlement lag. Do not wait for the
+      // low-priority global cursor to cover this operation's later cutoff.
+      if (!checkpointFresh) {
+        return {
+          status: "checkpoint_behind",
+          scanStart,
+          scanEnd,
+          matureAt,
+        };
+      }
+      const checkpointSettled = Date.parse(checkpoint!.settledThrough!);
+      scanStart = new Date(
+        Math.max(
+          Math.min(
+            disabledTime - maxRequestWindowMs,
+            checkpointSettled,
+          ),
+          periodStart,
+        ),
+      ).toISOString();
+      const pageSize = 100;
+      const startTimestamp = floorEpochSecond(scanStart);
+      const endTimestamp = floorEpochSecond(scanEnd);
+      const baseline = await listNewApiUsageLogs({
+        page: 0,
+        size: 1,
+        startTimestamp,
+        endTimestamp,
+      });
+      const expectedTotal = baseline.total;
+      const expectedFirstIdentity = scanFirstIdentity(baseline.items);
+      if (expectedTotal > quotaBarrierMaxRows) {
+        return {
+          status: "too_large",
+          scanStart,
+          scanEnd,
+          matureAt,
+          total: expectedTotal,
+          firstIdentity: expectedFirstIdentity,
+        };
+      }
+
+      const pageCount = Math.max(Math.ceil(expectedTotal / pageSize), 1);
+      const backfills: NewApiUsageBackfillResult[] = [];
+      const reservedProxyLogIds: string[] = [];
+      let integrityBlockedAt: string | undefined;
+      let integrityBlockedIssueId: string | undefined;
+      for (let page = 0; page < pageCount; page += 1) {
+        const logsPage = await listNewApiUsageLogs({
+          page,
+          size: pageSize,
+          startTimestamp,
+          endTimestamp,
+        });
+        if (
+          logsPage.total !== expectedTotal ||
+          (page === 0 &&
+            scanFirstIdentity(logsPage.items) !== expectedFirstIdentity)
+        ) {
+          return {
+            status: "unstable",
+            scanStart,
+            scanEnd,
+            matureAt,
+            total: logsPage.total,
+            firstIdentity: scanFirstIdentity(logsPage.items),
+            pages: page,
+          };
+        }
+        const backfill = await backfillProxyLogsFromNewApiUsage(
+          uniqueUsageLogs(logsPage.items),
+          {
+            dryRun: false,
+            matchWindowMs: policy.matchWindowMinutes * 60_000,
+            reservedProxyLogIds,
+          },
+        );
+        backfills.push(backfill);
+        for (const item of backfill.items) {
+          if (item.proxyLogId && !reservedProxyLogIds.includes(item.proxyLogId)) {
+            reservedProxyLogIds.push(item.proxyLogId);
+          }
+          if (!item.blocksSettlement) continue;
+          const blockedAt = item.newapiCreatedAt ?? scanStart;
+          if (!integrityBlockedAt || blockedAt < integrityBlockedAt) {
+            integrityBlockedAt = blockedAt;
+            integrityBlockedIssueId = item.issueId;
+          }
+        }
+      }
+
+      const verification = await listNewApiUsageLogs({
+        page: 0,
+        size: 1,
+        startTimestamp,
+        endTimestamp,
+      });
+      if (
+        verification.total !== expectedTotal ||
+        scanFirstIdentity(verification.items) !== expectedFirstIdentity
+      ) {
+        return {
+          status: "unstable",
+          scanStart,
+          scanEnd,
+          matureAt,
+          total: verification.total,
+          firstIdentity: scanFirstIdentity(verification.items),
+          pages: pageCount,
+        };
+      }
+      await finalizeBackfillBillingPeriods(backfills, 0);
+      if (integrityBlockedAt) {
+        return {
+          status: "integrity_blocked",
+          scanStart,
+          scanEnd,
+          matureAt,
+          total: expectedTotal,
+          firstIdentity: expectedFirstIdentity,
+          pages: pageCount,
+          integrityBlockedAt,
+          integrityBlockedIssueId,
+        };
+      }
+      const affectedUsers = new Set(
+        backfills.flatMap((backfill) =>
+          backfill.items
+            .filter((item) => item.feishuUserId && item.billingPeriod)
+            .map((item) => `${item.feishuUserId}\u0000${item.billingPeriod}`),
+        ),
+      ).size;
+      return {
+        status: "completed",
+        scanStart,
+        scanEnd,
+        matureAt,
+        total: expectedTotal,
+        firstIdentity: expectedFirstIdentity,
+        pages: pageCount,
+        affectedUsers,
+      };
+    });
+  } catch (error) {
+    if (isPostgresAdvisoryLockBusyError(error)) {
+      return { status: "busy", scanStart, scanEnd, matureAt };
+    }
+    throw error;
   }
 }
 
@@ -460,11 +719,14 @@ async function listUsageLogsForProxyRequest(input: {
     });
 }
 
-async function finalizeBackfillBillingPeriods(backfills: NewApiUsageBackfillResult[]) {
+async function finalizeBackfillBillingPeriods(
+  backfills: NewApiUsageBackfillResult[],
+  delayMs?: number,
+) {
   const affected = new Map<string, { feishuUserId: string; period: string }>();
   for (const backfill of backfills) {
     for (const item of backfill.items) {
-      if (!item.proxyLogId || !item.feishuUserId || !item.billingPeriod) continue;
+      if (!item.feishuUserId || !item.billingPeriod) continue;
       affected.set(`${item.feishuUserId}\n${item.billingPeriod}`, {
         feishuUserId: item.feishuUserId,
         period: item.billingPeriod,
@@ -473,7 +735,11 @@ async function finalizeBackfillBillingPeriods(backfills: NewApiUsageBackfillResu
   }
   await Promise.all(
     [...affected.values()].map((item) =>
-      finalizeBillingPeriodAfterSettlements(item.feishuUserId, item.period),
+      finalizeBillingPeriodAfterSettlements(
+        item.feishuUserId,
+        item.period,
+        delayMs,
+      ),
     ),
   );
 }
@@ -534,7 +800,7 @@ async function registerDurableBillingMaterializationTargets(
   usageSyncRuntime.recoveryRunning = true;
   let current!: Promise<number>;
   current = (async () => {
-    const targets = await listPostgresMatchedUsageBillingMaterializationTargets();
+    const targets = await listPostgresAuthoritativeUsageBillingMaterializationTargets();
     usageSyncRuntime.recoveryLastTargetCount = targets.length;
     for (const target of targets) observeRecoveredBillingMaterializationTarget(target);
     return targets.length;
@@ -726,27 +992,6 @@ function observeImmediateBillingPeriodFinalization(
   });
 }
 
-function observeUsageSyncBillingPeriodFinalization(
-  runId: string,
-  backfills: NewApiUsageBackfillResult[],
-) {
-  // Source records, proxy patches, and the checkpoint are authoritative. The
-  // keyed finalizer is a bounded derived read-model worker; observing rather
-  // than awaiting it lets a partial cursor continue while preserving a drain
-  // barrier for tests and shutdown/verification paths.
-  void finalizeBackfillBillingPeriods(backfills).catch((error) => {
-    requestBillingMaterializationRecoveryAfterFailure();
-    console.error(
-      JSON.stringify({
-        event: "tokeninside.usage_sync.materialization_failed",
-        runId,
-        errorMessage:
-          error instanceof Error ? error.message : "usage sync materialization failed",
-      }),
-    );
-  });
-}
-
 export type NewApiProxyUsageSettlementResult = {
   attempted: boolean;
   newapiRequestId?: string;
@@ -921,6 +1166,8 @@ async function syncNewApiUsageLogsUnlocked(input: {
 } = {}): Promise<NewApiUsageSyncResult> {
   const dryRun = input.dryRun ?? true;
   const previousCheckpoint = dryRun ? null : await getUsageSyncCheckpoint();
+  const previousIngestedThrough =
+    previousCheckpoint?.ingestedThrough ?? previousCheckpoint?.settledThrough;
   const resumableCheckpoint = Boolean(
     input.page === undefined &&
       isResumableUsageSyncCheckpoint(previousCheckpoint),
@@ -937,7 +1184,7 @@ async function syncNewApiUsageLogsUnlocked(input: {
   const freshRunStartedAt = nowIso();
   const freshForwardWindow = initialForwardUsageSyncWindow({
     runStartedAt: freshRunStartedAt,
-    settledThrough: previousCheckpoint?.settledThrough,
+    settledThrough: previousIngestedThrough,
     overlapMinutes: input.overlapMinutes ?? 120,
     settlementLagMinutes,
   });
@@ -958,9 +1205,9 @@ async function syncNewApiUsageLogsUnlocked(input: {
     : freshRunStartedAt;
   const runId = canResume ? previousCheckpoint?.runId ?? randomId("usr") : randomId("usr");
   const forwardWindow = canResume
-    ? initialForwardUsageSyncWindow({
+      ? initialForwardUsageSyncWindow({
         runStartedAt,
-        settledThrough: previousCheckpoint?.settledThrough,
+        settledThrough: previousIngestedThrough,
         overlapMinutes: input.overlapMinutes ?? 120,
         settlementLagMinutes,
       })
@@ -975,14 +1222,14 @@ async function syncNewApiUsageLogsUnlocked(input: {
         repairWindowEnd: previousCheckpoint!.repairWindowEnd,
       }
     : allowRepair &&
-        previousCheckpoint?.settledThrough &&
+        previousIngestedThrough &&
         floorEpochSecond(forwardWindow.scanStart) >=
           floorEpochSecond(forwardWindow.scanTargetEnd)
       ? nextRepairUsageSyncSlice({
-          settledThrough: previousCheckpoint.settledThrough,
-          repairCursorThrough: previousCheckpoint.repairCursorThrough,
-          repairWindowStart: previousCheckpoint.repairWindowStart,
-          repairWindowEnd: previousCheckpoint.repairWindowEnd,
+          settledThrough: previousIngestedThrough,
+          repairCursorThrough: previousCheckpoint?.repairCursorThrough,
+          repairWindowStart: previousCheckpoint?.repairWindowStart,
+          repairWindowEnd: previousCheckpoint?.repairWindowEnd,
           overlapMinutes: input.overlapMinutes ?? 120,
         })
       : forwardWindow;
@@ -1025,6 +1272,8 @@ async function syncNewApiUsageLogsUnlocked(input: {
   let stabilityReset = false;
   let sliceResized = false;
   let cursorPage = pageStart;
+  let integrityBlockedAt = previousCheckpoint?.integrityBlockedAt;
+  let integrityBlockedIssueId = previousCheckpoint?.integrityBlockedIssueId;
   try {
     if (scanExpectedTotal === undefined && pageStart > 0) {
       const baseline = await listNewApiUsageLogs({
@@ -1119,6 +1368,13 @@ async function syncNewApiUsageLogsUnlocked(input: {
         if (item.proxyLogId && !reservedProxyLogIds.includes(item.proxyLogId)) {
           reservedProxyLogIds.push(item.proxyLogId);
         }
+        if (item.blocksSettlement) {
+          const blockedAt = item.newapiCreatedAt ?? window.scanStart;
+          if (!integrityBlockedAt || blockedAt < integrityBlockedAt) {
+            integrityBlockedAt = blockedAt;
+            integrityBlockedIssueId = item.issueId;
+          }
+        }
       }
 
       pages.push({
@@ -1169,18 +1425,28 @@ async function syncNewApiUsageLogsUnlocked(input: {
       }
     }
 
+    if (!dryRun) {
+      const blockingIssue = await getEarliestOpenBlockingUsageIssue();
+      integrityBlockedAt = blockingIssue
+        ? blockingIssue.occurredAt ?? blockingIssue.firstSeenAt
+        : undefined;
+      integrityBlockedIssueId = blockingIssue?.id;
+    }
+
     const completedCurrentScan =
       completedSlice &&
       floorEpochSecond(window.scanEnd) >= floorEpochSecond(window.scanTargetEnd);
 
     const lastRunAt = nowIso();
     let checkpointWindow: UsageSyncScanWindow = window;
+    let ingestedThrough = previousIngestedThrough;
     let settledThrough = previousCheckpoint?.settledThrough;
     let repairCursorThrough = previousCheckpoint?.repairCursorThrough;
     let repairWindowStart = previousCheckpoint?.repairWindowStart;
     let repairWindowEnd = previousCheckpoint?.repairWindowEnd;
     if (completedSlice && window.scanMode === "forward") {
-      settledThrough = window.scanEnd;
+      ingestedThrough = window.scanEnd;
+      if (!integrityBlockedAt) settledThrough = window.scanEnd;
       const currentSliceSeconds =
         floorEpochSecond(window.scanEnd) - floorEpochSecond(window.scanStart) + 1;
       const nextSliceSeconds =
@@ -1212,7 +1478,13 @@ async function syncNewApiUsageLogsUnlocked(input: {
       repairWindowStart = checkpointWindow.repairWindowStart;
       repairWindowEnd = checkpointWindow.repairWindowEnd;
     }
-    const successfulStatus = completedWindow ? "applied" : "partial_failed";
+    settledThrough = settlementWatermarkBeforeIntegrityBlock(
+      settledThrough,
+      integrityBlockedAt,
+    );
+    const successfulStatus: UsageSyncRunStatus = completedWindow
+      ? "applied"
+      : "continuation_pending";
     const checkpointExpectedTotal = completedSlice ? undefined : scanExpectedTotal;
     const checkpointFirstIdentity = completedSlice
       ? undefined
@@ -1246,7 +1518,10 @@ async function syncNewApiUsageLogsUnlocked(input: {
           scanMode: checkpointWindow.scanMode,
           scanExpectedTotal: checkpointExpectedTotal,
           scanFirstIdentity: checkpointFirstIdentity,
+          ingestedThrough,
           settledThrough,
+          integrityBlockedAt,
+          integrityBlockedIssueId,
           repairCursorThrough,
           repairWindowStart,
           repairWindowEnd,
@@ -1275,15 +1550,19 @@ async function syncNewApiUsageLogsUnlocked(input: {
             scanStart: window.scanStart,
             scanEnd: window.scanEnd,
             scanTargetEnd: window.scanTargetEnd,
+            integrityBlocked: Boolean(integrityBlockedAt),
           },
           nextRunAfter: durableNextRunAfter,
         });
 
     if (!dryRun && getConfig().storeBackend === "postgres") {
-      observeUsageSyncBillingPeriodFinalization(
-        runId,
+      // The advisory lock owns an execution fence. Await derived finalizers so
+      // no timer continues with a closed/stale ALS fence after lock release.
+      await finalizeBackfillBillingPeriods(
         pages.map((page) => page.backfill),
+        0,
       );
+      assertQuotaExecutionFenceHeld();
       // Department availability is derived only from quota ledger grants and
       // live operation reservations, not usage. Affected-user finalizers cover
       // every user billing read model touched by this source page, so the PG
@@ -1292,9 +1571,10 @@ async function syncNewApiUsageLogsUnlocked(input: {
       // Preserve the JSON backend's existing synchronous materialization
       // semantics; the Postgres-only keyed finalizer is intentionally disabled
       // for this fallback store.
+      const settings = await getAppSettings();
       const affectedPeriods = new Set([
-        hongKongBillingPeriod(new Date(window.scanStart)),
-        hongKongBillingPeriod(new Date(window.scanEnd)),
+        packageBillingPeriod(settings.packageReset, new Date(window.scanStart)),
+        packageBillingPeriod(settings.packageReset, new Date(window.scanEnd)),
       ]);
       for (const affectedPeriod of affectedPeriods) {
         await rebuildQuotaMaterializedSnapshots(affectedPeriod);
@@ -1313,6 +1593,7 @@ async function syncNewApiUsageLogsUnlocked(input: {
       scanMode: window.scanMode,
       completedSlice,
       completedWindow,
+      status: successfulStatus,
       pages,
       totals,
       checkpoint: checkpoint
@@ -1321,7 +1602,11 @@ async function syncNewApiUsageLogsUnlocked(input: {
             nextRunAfter: checkpoint.nextRunAfter,
             lastSeenNewapiLogId: checkpoint.lastSeenNewapiLogId,
             lastSeenNewapiCreatedAt: checkpoint.lastSeenNewapiCreatedAt,
+            lastRunStatus: checkpoint.lastRunStatus,
+            ingestedThrough: checkpoint.ingestedThrough,
             settledThrough: checkpoint.settledThrough,
+            integrityBlockedAt: checkpoint.integrityBlockedAt,
+            integrityBlockedIssueId: checkpoint.integrityBlockedIssueId,
             cursorPage: checkpoint.cursorPage,
             scanExpectedTotal: checkpoint.scanExpectedTotal,
             scanFirstIdentity: checkpoint.scanFirstIdentity,
@@ -1372,6 +1657,9 @@ async function syncNewApiUsageLogsUnlocked(input: {
           snapshotFallbackProxyCandidates: totals.snapshotFallbackProxyCandidates,
           completedSlice,
           completedWindow,
+          runStatus: successfulStatus,
+          continuationPending: !completedWindow,
+          integrityBlocked: Boolean(integrityBlockedAt),
           stabilityReset,
           sliceResized,
           scanMode: window.scanMode,
@@ -1455,7 +1743,13 @@ async function syncNewApiUsageLogsUnlocked(input: {
           window.repairWindowStart ?? previousCheckpoint?.repairWindowStart,
         repairWindowEnd:
           window.repairWindowEnd ?? previousCheckpoint?.repairWindowEnd,
-        settledThrough: previousCheckpoint?.settledThrough,
+        ingestedThrough: previousIngestedThrough,
+        settledThrough: settlementWatermarkBeforeIntegrityBlock(
+          previousCheckpoint?.settledThrough,
+          integrityBlockedAt,
+        ),
+        integrityBlockedAt,
+        integrityBlockedIssueId,
         cursorPage,
         failureCount,
         nextRetryAt: addMinutes(failedAt, retryDelayMinutes),
@@ -1476,6 +1770,7 @@ async function syncNewApiUsageLogsUnlocked(input: {
           stabilityReset,
           sliceResized,
           failed: 1,
+          integrityBlocked: Boolean(integrityBlockedAt),
         },
         nextRunAfter: addMinutes(failedAt, retryDelayMinutes),
       }).catch(() => undefined);
@@ -1545,6 +1840,7 @@ export async function enqueueManualUsageSyncOperation(input: ManualUsageSyncOper
     kind: "usage_sync",
     dryRun: input.dryRun,
     operatedByFeishuUserId: input.operatedByFeishuUserId,
+    requireRootActor: true,
     input: {
       dryRun: input.dryRun,
       page: input.page,
@@ -1644,8 +1940,6 @@ export async function runDueNewApiUsageSync(
     ...defaultUsageSyncPolicy(),
     ...(await getAppSettings()).usageSyncPolicy,
   };
-  if (!policy.enabled) return { ran: false, reason: "disabled" as const };
-
   const checkpoint = await getUsageSyncCheckpoint();
   const lastRunAt = checkpoint?.lastRunAt ?? policy.lastRunAt;
   const nextRunAfter =
@@ -1664,14 +1958,15 @@ export async function runDueNewApiUsageSync(
       nextRunAfter: checkpoint?.nextRetryAt,
     };
   }
-  if (input.allowRepair === false && checkpoint?.settledThrough) {
+  const ingestedThrough = checkpoint?.ingestedThrough ?? checkpoint?.settledThrough;
+  if (input.allowRepair === false && ingestedThrough) {
     const hasPendingForwardCheckpoint = Boolean(
-      checkpoint.scanMode === "forward" &&
+      checkpoint?.scanMode === "forward" &&
         isResumableUsageSyncCheckpoint(checkpoint),
     );
     const forwardWindow = initialForwardUsageSyncWindow({
       runStartedAt: nowIso(),
-      settledThrough: checkpoint.settledThrough,
+      settledThrough: ingestedThrough,
       overlapMinutes: policy.overlapMinutes ?? 120,
       settlementLagMinutes: policy.settlementLagMinutes ?? 5,
     });
@@ -1762,25 +2057,17 @@ function scheduleNextUsageSyncTick(delayMs: number) {
         ...defaultUsageSyncPolicy(),
         ...schedulerSettings.usageSyncPolicy,
       };
-      if (schedulerPolicy.enabled) {
-        await refreshDurablePendingUsageTail(
-          schedulerPolicy.settlementLagMinutes ?? 5,
-        ).catch((error) => {
-          console.error(
-            JSON.stringify({
-              event: "tokeninside.usage_sync.pending_tail_scan_failed",
-              errorMessage:
-                error instanceof Error ? error.message : "pending tail scan failed",
-            }),
-          );
-        });
-      } else {
-        // A request may wake the coalesced tail scanner after an administrator
-        // disables automatic synchronization. Discard that wake explicitly;
-        // otherwise the dirty bit would keep the scheduler on its 250ms
-        // continuation cadence while source synchronization is disabled.
-        clearDurablePendingUsageTailState();
-      }
+      await refreshDurablePendingUsageTail(
+        schedulerPolicy.settlementLagMinutes ?? 5,
+      ).catch((error) => {
+        console.error(
+          JSON.stringify({
+            event: "tokeninside.usage_sync.pending_tail_scan_failed",
+            errorMessage:
+              error instanceof Error ? error.message : "pending tail scan failed",
+          }),
+        );
+      });
       if (
         usageSyncRuntime.schedulerRepairSlicesRemaining <= 0 &&
         usageSyncRuntime.schedulerRepairBudgetRefillNotBeforeEpochMs <= Date.now()
@@ -1829,12 +2116,18 @@ function scheduleNextUsageSyncTick(delayMs: number) {
         !automaticRun.ran &&
         automaticRun.reason === "repair_budget_exhausted"
       ) {
+        // The repair budget only throttles historical overlap scans. A mature
+        // durable settlement must not inherit the multi-minute repair refill.
+        // Give the safe forward watermark a short amount of wall-clock room to
+        // advance, then reread the inclusive boundary on the pending-tail timer.
         usageSyncRuntime.schedulerForceScanRequested = false;
-        if (usageSyncRuntime.durablePendingTailObserved) {
-          usageSyncRuntime.durablePendingTailNextDueEpochMs = Math.max(
-            usageSyncRuntime.durablePendingTailNextDueEpochMs,
-            usageSyncRuntime.schedulerRepairBudgetRefillNotBeforeEpochMs,
-          );
+        if (
+          usageSyncRuntime.durablePendingTailObserved &&
+          usageSyncRuntime.durablePendingTailCount > 0 &&
+          usageSyncRuntime.durablePendingTailNextDueEpochMs > 0 &&
+          usageSyncRuntime.durablePendingTailNextDueEpochMs <= Date.now()
+        ) {
+          usageSyncRuntime.durablePendingTailNextDueEpochMs = Date.now() + 15_000;
         }
       } else if (automaticRun.ran) {
         usageSyncRuntime.schedulerScanRetryNotBeforeEpochMs = 0;
@@ -1861,19 +2154,17 @@ function scheduleNextUsageSyncTick(delayMs: number) {
           usageSyncRuntime.durablePendingTailNextDueEpochMs = Date.now() + 15_000;
         }
       }
-      if (schedulerPolicy.enabled) {
-        await refreshDurablePendingUsageTail(
-          schedulerPolicy.settlementLagMinutes ?? 5,
-        ).catch((error) => {
-          console.error(
-            JSON.stringify({
-              event: "tokeninside.usage_sync.pending_tail_refresh_failed",
-              errorMessage:
-                error instanceof Error ? error.message : "pending tail refresh failed",
-            }),
-          );
-        });
-      }
+      await refreshDurablePendingUsageTail(
+        schedulerPolicy.settlementLagMinutes ?? 5,
+      ).catch((error) => {
+        console.error(
+          JSON.stringify({
+            event: "tokeninside.usage_sync.pending_tail_refresh_failed",
+            errorMessage:
+              error instanceof Error ? error.message : "pending tail refresh failed",
+          }),
+        );
+      });
       if (automaticRun.ran && automaticRun.result) {
         const result = automaticRun.result;
         const enteredRepair =
@@ -1948,10 +2239,6 @@ function scheduleNextUsageSyncTick(delayMs: number) {
         ...defaultUsageSyncPolicy(),
         ...settings?.usageSyncPolicy,
       };
-      if (!policy.enabled) {
-        // Clear a wake that arrived while this tick was awaiting other work.
-        clearDurablePendingUsageTailState();
-      }
       const intervalMs = Math.max(policy.intervalMinutes ?? 5, 1) * 60_000;
       const usageSyncDelayMs = usageSyncRuntime.schedulerForceScanRequested
         ? Math.max(
@@ -1960,12 +2247,8 @@ function scheduleNextUsageSyncTick(delayMs: number) {
           )
         : Math.min(intervalMs, 5 * 60_000);
       const recoveryDelayMs = billingMaterializationRecoveryDelayMs();
-      const tailDelayMs = policy.enabled
-        ? durablePendingUsageTailDelayMs()
-        : undefined;
-      const tailRefreshDelayMs = policy.enabled
-        ? durablePendingUsageTailRefreshDelayMs()
-        : undefined;
+      const tailDelayMs = durablePendingUsageTailDelayMs();
+      const tailRefreshDelayMs = durablePendingUsageTailRefreshDelayMs();
       const schedulerDelays = [
         usageSyncDelayMs,
         recoveryDelayMs,

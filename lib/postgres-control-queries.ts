@@ -1,7 +1,7 @@
 import { createAsyncSnapshotCache } from "@/lib/async-snapshot-cache";
 import { getConfig } from "@/lib/config";
-import { nowIso } from "@/lib/crypto";
 import { withPostgresControlClient } from "@/lib/postgres-store";
+import { hongKongBillingPeriod } from "@/lib/quota-model";
 import type {
   AdminScope,
   AppSettings,
@@ -237,6 +237,8 @@ export async function listPostgresAdminUsers(scope: AdminScope, currentPeriod: s
         departmentName: user.departmentName,
         status: user.status ?? "active",
         role: row.role_label,
+        isGlobalAdmin: row.role_label === "系统管理员",
+        isEnvironmentRoot: systemAdminOpenIds.includes(user.openId),
         activeTokenStatus: account?.status,
         activeTokenCreatedAt: account?.createdAt,
         billingPeriod,
@@ -570,6 +572,7 @@ export type PostgresUsageReportInput = {
   hideUnknownRecords?: boolean;
   startAt?: string;
   endAt?: string;
+  currentPeriod?: string;
   limit: number;
   offset: number;
 };
@@ -600,6 +603,7 @@ type PostgresUsageAggregateRow = {
 type PostgresUsageReportRow = {
   page: Array<{ log: ProxyRequestLog; user: FeishuUser | null }>;
   total: number;
+  usage_overview: UserBillingPeriod | null;
   filter_users: Array<{
     id: string;
     name?: string;
@@ -720,7 +724,12 @@ function postgresUsageReportQueryParts(input: PostgresUsageReportInput) {
       )) like ${search} escape '\\'`,
     );
   }
-  const currentPeriodParameter = parameter(nowIso().slice(0, 7));
+  const overviewUserParameter = input.feishuUserId
+    ? parameter(input.feishuUserId)
+    : undefined;
+  const currentPeriodParameter = parameter(
+    input.currentPeriod ?? hongKongBillingPeriod(),
+  );
   const limitParameter = parameter(input.limit);
   const offsetParameter = parameter(input.offset);
   return {
@@ -730,6 +739,7 @@ function postgresUsageReportQueryParts(input: PostgresUsageReportInput) {
     filteredWhere: filteredConditions.length
       ? `where ${filteredConditions.join(" and ")}`
       : "",
+    overviewUserParameter,
     currentPeriodParameter,
     limitParameter,
     offsetParameter,
@@ -879,6 +889,13 @@ export async function listPostgresUsageReport(input: PostgresUsageReportInput) {
            ) page
          ), '[]'::jsonb) as page,
          (select count(*)::integer from filtered) as total,
+         ${query.overviewUserParameter
+           ? `(select billing.data
+                 from user_billing_periods billing
+                where billing.feishu_user_id = ${query.overviewUserParameter}
+                  and billing.period = ${query.currentPeriodParameter}
+                limit 1)`
+           : "null::jsonb"} as usage_overview,
          coalesce((
            select jsonb_agg(user_filter.value order by coalesce(user_filter.value->>'name', user_filter.value->>'openId'))
            from (
@@ -940,6 +957,7 @@ export async function listPostgresUsageReport(input: PostgresUsageReportInput) {
     const row = result.rows[0] ?? {
       page: [],
       total: 0,
+      usage_overview: null,
       filter_users: [],
       filter_departments: [],
       filter_models: [],
@@ -958,6 +976,7 @@ export async function listPostgresUsageReport(input: PostgresUsageReportInput) {
     return {
       page: row.page,
       total: Number(row.total) || 0,
+      usageOverview: row.usage_overview ?? null,
       limit: input.limit,
       offset: input.offset,
       filters: {
@@ -985,5 +1004,349 @@ export async function listPostgresUsageReport(input: PostgresUsageReportInput) {
         .filter((aggregate) => aggregate.category === "apiFormat")
         .map((aggregate) => aggregate.stats),
     };
+  });
+}
+
+export async function getPostgresUserByOpenId(openId: string) {
+  return withPostgresControlClient(async (client) => {
+    const result = await client.query<{ data: FeishuUser }>(
+      `select data
+       from feishu_users
+       where open_id = $1
+       order by created_at, id
+       limit 1`,
+      [openId],
+    );
+    return result.rows[0]?.data ?? null;
+  });
+}
+
+export async function listPostgresPrewarmDepartmentCandidates(input: {
+  departmentId: string;
+  limit: number;
+}) {
+  return withPostgresControlClient(async (client) => {
+    const result = await client.query<{
+      candidates: FeishuUser[];
+      eligible_count: number;
+    }>(
+      `with eligible as materialized (
+         select candidate.id, candidate.data
+         from feishu_users candidate
+         where candidate.department_id = $1
+           and coalesce(candidate.data->>'status', 'active') = 'active'
+           and not exists (
+             select 1
+             from token_accounts account
+             where account.feishu_user_id = candidate.id
+               and account.status in ('pending_activation', 'active', 'draining', 'settling')
+           )
+           and not exists (
+             select 1
+             from quota_operations operation
+             where operation.feishu_user_id = candidate.id
+               and operation.state not in ('completed', 'compensated', 'cancelled')
+           )
+       ), candidate_page as materialized (
+         select eligible.id, eligible.data
+         from eligible
+         order by eligible.id
+         limit $2
+       )
+       select
+         coalesce(
+           (select jsonb_agg(candidate_page.data order by candidate_page.id)
+            from candidate_page),
+           '[]'::jsonb
+         ) as candidates,
+         (select count(*)::integer from eligible) as eligible_count`,
+      [input.departmentId, input.limit],
+    );
+    return {
+      candidates: result.rows[0]?.candidates ?? [],
+      eligible: Number(result.rows[0]?.eligible_count ?? 0),
+    };
+  });
+}
+
+export async function listPostgresAdminScopeProjections() {
+  return withPostgresControlClient(async (client) => {
+    const [storedResult, environmentUsersResult] = await Promise.all([
+      client.query<{
+        scope_data: AdminScope;
+        user_data: FeishuUser | null;
+        department_name: string | null;
+      }>(
+        `select
+           scope.data as scope_data,
+           scope_user.data as user_data,
+           coalesce(
+             scope_user.data->>'departmentName',
+             department_user.data->>'departmentName'
+           ) as department_name
+         from admin_scopes scope
+         left join feishu_users scope_user on scope_user.id = scope.feishu_user_id
+         left join lateral (
+           select candidate.data
+           from feishu_users candidate
+           where candidate.department_id = scope.department_id
+             and nullif(candidate.data->>'departmentName', '') is not null
+           order by candidate.updated_at desc, candidate.id
+           limit 1
+         ) department_user on true
+         order by scope.updated_at desc, scope.id`,
+      ),
+      client.query<{ data: FeishuUser }>(
+        `select data
+         from feishu_users
+         where open_id = any($1::text[])
+         order by created_at, id`,
+        [getConfig().admin.systemAdminOpenIds],
+      ),
+    ]);
+    const environmentUsersByOpenId = new Map(
+      environmentUsersResult.rows.map((row) => [row.data.openId, row.data] as const),
+    );
+    const stored = storedResult.rows.map((row) => ({
+      ...row.scope_data,
+      departmentName: row.department_name ?? undefined,
+      user: row.user_data,
+      readonly: false as const,
+    }));
+    const synthetic = getConfig().admin.systemAdminOpenIds.map((openId) => {
+      const user = environmentUsersByOpenId.get(openId) ?? null;
+      const now = new Date().toISOString();
+      return {
+        id: user ? `env-admin-${user.id}` : `env-admin-open-id-${openId}`,
+        feishuUserId: user?.id ?? "",
+        scopeType: "global" as const,
+        source: "environment" as const,
+        role: "root" as const,
+        status: "active" as const,
+        createdAt: user?.createdAt ?? now,
+        updatedAt: user?.updatedAt ?? now,
+        user,
+        configuredOpenId: openId,
+        readonly: true as const,
+      };
+    });
+    return [...synthetic, ...stored].sort((left, right) =>
+      right.updatedAt.localeCompare(left.updatedAt),
+    );
+  });
+}
+
+export async function getPostgresAdminScopeById(scopeId: string) {
+  return withPostgresControlClient(async (client) => {
+    const result = await client.query<{ data: AdminScope }>(
+      "select data from admin_scopes where id = $1 limit 1",
+      [scopeId],
+    );
+    return result.rows[0]?.data ?? null;
+  });
+}
+
+export async function listPostgresAdminTokenRequestRows(input: {
+  scope: AdminScope;
+  limit: number;
+  offset: number;
+  createdAfter?: string;
+  decisionRequired?: boolean;
+  decisionStatuses: string[];
+}) {
+  return withPostgresControlClient(async (client) => {
+    const result = await client.query<{
+      page: Array<{ request: TokenRequest; user: FeishuUser | null }>;
+      total: number;
+    }>(
+      `with scoped as materialized (
+         select request.data as request_data, requester.data as user_data,
+                request.updated_at, request.id
+         from token_requests request
+         left join feishu_users requester on requester.id = request.feishu_user_id
+         where (
+           $1::text = 'global'
+           or (
+             $2::text is not null
+             and coalesce(request.data->>'approvalTargetSource', '') <> 'system_admin_fallback'
+             and not (
+               requester.open_id = any($3::text[])
+               or exists (
+                 select 1
+                 from admin_scopes requester_scope
+                 where requester_scope.feishu_user_id = request.feishu_user_id
+                   and requester_scope.status = 'active'
+                   and requester_scope.scope_type = 'global'
+               )
+             )
+             and coalesce(request.approval_department_id, requester.department_id) = $2
+           )
+         )
+           and ($4::timestamptz is null or request.created_at >= $4)
+           and (
+             not $5::boolean
+             or (
+               request.request_type = 'first_apply'
+               and request.status = any($6::text[])
+             )
+           )
+       ), page as materialized (
+         select request_data, user_data, updated_at, id
+         from scoped
+         order by updated_at desc, id
+         limit $7 offset $8
+       )
+       select
+         coalesce(
+           (select jsonb_agg(
+             jsonb_build_object('request', page.request_data, 'user', page.user_data)
+             order by page.updated_at desc, page.id
+           ) from page),
+           '[]'::jsonb
+         ) as page,
+         (select count(*)::integer from scoped) as total`,
+      [
+        input.scope.scopeType,
+        input.scope.departmentId ?? null,
+        getConfig().admin.systemAdminOpenIds,
+        input.createdAfter ?? null,
+        input.decisionRequired ?? false,
+        input.decisionStatuses,
+        input.limit,
+        input.offset,
+      ],
+    );
+    return {
+      page: result.rows[0]?.page ?? [],
+      total: Number(result.rows[0]?.total ?? 0),
+    };
+  });
+}
+
+export async function listPostgresDepartmentStats(currentPeriod: string) {
+  return withPostgresControlClient(async (client) => {
+    const result = await client.query<{
+      department_id: string;
+      department_name: string | null;
+      member_count: number;
+      keyed_users: number;
+      monthly_quota: string;
+      remaining_quota: string;
+      quota_consumed: string;
+      cost: string;
+      prompt_tokens: string;
+      completion_tokens: string;
+      total_tokens: string;
+      proxy_log_count: number;
+      usage_record_count: number;
+      latest_proxy_log_at: string | null;
+    }>(
+      `with user_scope as materialized (
+         select
+           user_row.id,
+           coalesce(user_row.department_id, 'unknown') as department_id,
+           nullif(user_row.data->>'departmentName', '') as department_name
+         from feishu_users user_row
+         where coalesce(user_row.data->>'status', 'active') <> 'deleted'
+       ), members as materialized (
+         select department_id, max(department_name) as department_name,
+                count(*)::integer as member_count
+         from user_scope
+         group by department_id
+       ), keyed as materialized (
+         select user_scope.department_id,
+                count(distinct account.feishu_user_id)::integer as keyed_users
+         from token_accounts account
+         join user_scope on user_scope.id = account.feishu_user_id
+         where account.status = 'active'
+         group by user_scope.department_id
+       ), billing as materialized (
+         select
+           user_scope.department_id,
+           sum(coalesce((period.data->>'monthlyQuota')::bigint, 0))::text as monthly_quota,
+           sum(coalesce((period.data->>'remainingQuota')::bigint, 0))::text as remaining_quota,
+           sum(coalesce((period.data->>'quotaConsumed')::bigint, 0))::text as quota_consumed,
+           sum(coalesce((period.data->>'cost')::numeric, 0))::text as cost,
+           sum(coalesce((period.data->>'usageRecordCount')::integer, 0))::integer
+             as usage_record_count
+         from user_billing_periods period
+         join user_scope on user_scope.id = period.feishu_user_id
+         where period.period = $1
+         group by user_scope.department_id
+       ), logs as materialized (
+         select
+           coalesce(user_scope.department_id, log.data->>'departmentId', 'unknown')
+             as department_id,
+           sum(coalesce((log.data->>'promptTokens')::bigint, 0))::text as prompt_tokens,
+           sum(coalesce((log.data->>'completionTokens')::bigint, 0))::text
+             as completion_tokens,
+           sum(coalesce((log.data->>'totalTokens')::bigint, 0))::text as total_tokens,
+           count(*)::integer as proxy_log_count,
+           max(log.created_at)::text as latest_proxy_log_at
+         from proxy_request_logs log
+         left join user_scope on user_scope.id = log.feishu_user_id
+         where log.billing_period = $1
+         group by coalesce(user_scope.department_id, log.data->>'departmentId', 'unknown')
+       ), department_ids as materialized (
+         select department_id from members
+         union select department_id from keyed
+         union select department_id from billing
+         union select department_id from logs
+       )
+       select
+         department_ids.department_id,
+         members.department_name,
+         coalesce(members.member_count, 0)::integer as member_count,
+         coalesce(keyed.keyed_users, 0)::integer as keyed_users,
+         coalesce(billing.monthly_quota, '0') as monthly_quota,
+         coalesce(billing.remaining_quota, '0') as remaining_quota,
+         coalesce(billing.quota_consumed, '0') as quota_consumed,
+         coalesce(billing.cost, '0') as cost,
+         coalesce(logs.prompt_tokens, '0') as prompt_tokens,
+         coalesce(logs.completion_tokens, '0') as completion_tokens,
+         coalesce(logs.total_tokens, '0') as total_tokens,
+         coalesce(logs.proxy_log_count, 0)::integer as proxy_log_count,
+         coalesce(billing.usage_record_count, 0)::integer as usage_record_count,
+         logs.latest_proxy_log_at
+       from department_ids
+       left join members using (department_id)
+       left join keyed using (department_id)
+       left join billing using (department_id)
+       left join logs using (department_id)`,
+      [currentPeriod],
+    );
+    const rows = result.rows.map((row) => ({
+      departmentId: row.department_id,
+      departmentName: row.department_name ?? undefined,
+      memberCount: Number(row.member_count) || 0,
+      keyedUsers: Number(row.keyed_users) || 0,
+      monthlyQuota: Number(row.monthly_quota) || 0,
+      remainingQuota: Number(row.remaining_quota) || 0,
+      quotaConsumed: Number(row.quota_consumed) || 0,
+      cost: Number(row.cost) || 0,
+      promptTokens: Number(row.prompt_tokens) || 0,
+      completionTokens: Number(row.completion_tokens) || 0,
+      totalTokens: Number(row.total_tokens) || 0,
+      proxyLogCount: Number(row.proxy_log_count) || 0,
+      usageRecordCount: Number(row.usage_record_count) || 0,
+      latestProxyLogAt: row.latest_proxy_log_at ?? undefined,
+    }));
+    const totalQuotaConsumed = rows.reduce(
+      (sum, row) => sum + row.quotaConsumed,
+      0,
+    );
+    return rows
+      .map((row) => ({
+        ...row,
+        usageShare:
+          totalQuotaConsumed > 0 ? row.quotaConsumed / totalQuotaConsumed : 0,
+        quotaUsageRate:
+          row.monthlyQuota > 0 ? row.quotaConsumed / row.monthlyQuota : 0,
+      }))
+      .sort(
+        (left, right) =>
+          right.quotaConsumed - left.quotaConsumed ||
+          right.totalTokens - left.totalTokens,
+      );
   });
 }

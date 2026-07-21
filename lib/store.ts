@@ -11,7 +11,7 @@ import {
   sameBillingOperationInput,
 } from "@/lib/billing-operation-state";
 import { getConfig } from "@/lib/config";
-import { nowIso, randomId } from "@/lib/crypto";
+import { nowIso, randomId, sha256Hex } from "@/lib/crypto";
 import { isAtOrAfterIsoTimestamp } from "@/lib/iso-time";
 import { createRerunSingleFlight } from "@/lib/rerun-single-flight";
 import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
@@ -22,24 +22,51 @@ import {
 import { findProxyLogForNewApiUsage, isBillableProxyLog } from "@/lib/usage-matching";
 import { isUsageRecordRequest } from "@/lib/usage-record-visibility";
 import { normalizedInputTokensTotal } from "@/lib/usage-metrics";
+import { preserveUserAccessRevocationBarrier } from "@/lib/user-access-state";
 import {
+  getPostgresAdminScopeById,
   getPostgresAdminOverview,
   getPostgresAdminOverviewMetadata,
   getPostgresAuthenticatedSessionProjection,
   getPostgresSessionStoreSummary,
+  getPostgresUserByOpenId,
+  listPostgresAdminScopeProjections,
+  listPostgresAdminTokenRequestRows,
   listPostgresAdminUsers,
+  listPostgresDepartmentStats,
+  listPostgresPrewarmDepartmentCandidates,
   listPostgresUsageReport,
 } from "@/lib/postgres-control-queries";
 import { assertQuotaAdmission } from "@/lib/quota-admission";
 import {
   hongKongBillingPeriod,
   initialUnassignedMonthlyQuota,
+  isSettlementWatermarkFresh,
   materializeDepartmentQuota,
   materializeUserQuota,
   resolveUsageBillingPeriod,
 } from "@/lib/quota-model";
-import { assertQuotaOperationTransition } from "@/lib/quota-saga-state";
-import { tokenRequestRequiresAdminDecision } from "@/lib/token-request-policy";
+import {
+  assertPackageResetExecutionAllowed,
+  defaultPackageResetPolicy,
+  normalizePackageResetPolicy,
+  PACKAGE_RESET_SYSTEM_ACTOR,
+  packageBillingPeriod,
+} from "@/lib/package-reset";
+import {
+  assertQuotaOperationTransition,
+  canAutoResumeKeyRotationObservationFailure,
+  canCancelQuotaOperationForAccessRevoke,
+  canReopenFirstProvisionAfterAccessRevoke,
+  canReopenMonthlyOpenAfterAccessRevoke,
+  reopenFirstProvisionAfterAccessRevoke,
+  reopenMonthlyOpenAfterAccessRevoke,
+} from "@/lib/quota-saga-state";
+import {
+  adminDecidableRequestStatuses,
+  tokenRequestAllowsQuotaEdit,
+  tokenRequestRequiresAdminDecision,
+} from "@/lib/token-request-policy";
 import {
   currentQuotaPeriod,
   initialDepartmentQuotaLimit,
@@ -48,17 +75,29 @@ import {
   validateDepartmentQuotaLimit,
 } from "@/lib/department-quota";
 import {
+  AdminUserActionAuthorizationError,
+  assertAdminScopeAllowsUserTarget,
+  authorizePostgresAdminUserActionUnderScopeLocks,
   enablePostgresUserAccess,
+  enablePostgresUserAccessUnderUserFence,
+  claimPostgresBillingOperationExecution,
+  claimPostgresPrewarmedTokenAccount,
   claimPostgresQuotaOperationExecution,
   beginPostgresQuotaAwareProxyRequest,
+  batchUpsertPostgresDepartmentMembersForSync,
   createPostgresMonthlyOpenOperations,
   createPostgresQuotaOperation,
+  createPostgresUserQuotaPolicyVersion,
+  enqueuePostgresBillingOperation,
+  enqueuePostgresDepartmentMemberSyncOperationAsActor,
+  findPostgresBillingOperationById,
   findPostgresQuotaOperationById,
   findPostgresQuotaOperationByIdempotencyKey,
   findPostgresActiveTokenByHash,
   finalizePostgresTokenProvision,
   finalizePostgresTokenRotation,
   finalizePostgresTokenRotationForQuotaOperation,
+  finalizePostgresUserAccessResumeUnderUserFence,
   getPostgresDisabledTokenForUser,
   getPostgresActiveTokenForUser,
   getPostgresActiveAdminScopeForUser,
@@ -66,15 +105,20 @@ import {
   getPostgresAppSettings,
   getPostgresAppSettingsForQuotaOperation,
   getPostgresFeishuEventByUuid,
+  getPostgresGreenfieldInstallationManifest,
+  getPostgresNewApiRuntimeBindingSnapshot,
   getPostgresEffectiveUserQuotaPolicy,
   getPostgresTokenRequestById,
   getPostgresUserBillingPeriod,
   getPostgresUserById,
   getPostgresUserQuotaState,
   getPostgresUsageSyncCheckpoint,
+  getPostgresEarliestOpenBlockingUsageIssue,
+  getPostgresDepartmentQuotaOverview,
   insertPostgresQuotaAwareProxyLog,
   insertPostgresProxyLog,
   insertPostgresQuotaLedgerEntry,
+  insertPostgresPrewarmedTokenAccountIfEligible,
   insertPostgresTokenAccount,
   insertPostgresTokenAccountForQuotaOperation,
   insertPostgresTokenRequest,
@@ -82,22 +126,31 @@ import {
   invalidatePostgresOpenFirstApplyRequests,
   listPostgresInflightProxyRequests,
   listPostgresInflightProxyRequestsForQuotaOperation,
+  listPostgresStaleUserAccessResumeCandidates,
+  listPostgresDueQuotaOperations,
+  listPostgresBillingOperations,
+  listPostgresDepartmentMemberSyncOperations,
   listPostgresQuotaOperations,
+  listPostgresRunnableBillingOperations,
   listPostgresTokenRequestsForUser,
   listPostgresTokenAccountsForUser,
   mutatePostgresAppSettings,
-  recordPostgresMonthlyResetApplied,
+  preparePostgresPackageResetPeriod,
+  markPostgresUserAccessResumeEnableAttemptUnderUserFence,
   rebuildPostgresDepartmentQuotaMaterializedSnapshot,
   rebuildPostgresDepartmentQuotaMaterializedSnapshotForQuotaOperation,
   rebuildPostgresQuotaMaterializedUsers,
   replacePostgresActiveTokenAccount,
+  rollbackPostgresUserAccessResumeUnderUserFence,
   readPostgresStore,
   readPostgresUsageMatchingSnapshot,
+  recordPostgresBillingOperation,
   reconcilePostgresBillingPeriodForUser,
   reconcilePostgresBillingPeriodForQuotaOperation,
   refreshPostgresBillingPeriodTokenMetadataForQuotaOperation,
   releasePostgresQuotaOperationExecution,
   renewPostgresQuotaOperationExecution,
+  renewPostgresBillingOperationExecution,
   reservePostgresQuotaOperationDepartmentBudget,
   revokePostgresAdminScopesForUser,
   syncPostgresDepartmentSupervisorAdminScope,
@@ -105,6 +158,8 @@ import {
   transitionPostgresTokenRequest,
   transitionPostgresTokenRequestAfterQuotaMaterialization,
   updatePostgresManualAdminScope,
+  updatePostgresManualAdminScopeAsActor,
+  updatePostgresAppSettingsAsActor,
   updatePostgresProxyLog,
   updatePostgresProxyUsageSettlementRetryIfUnsettled,
   updatePostgresTokenRequest,
@@ -112,18 +167,23 @@ import {
   updatePostgresTokenAccount,
   updatePostgresTokenAccountForQuotaOperation,
   updatePostgresDepartmentQuotaRequest,
+  updatePostgresDepartmentQuotaPolicyAsActor,
+  decidePostgresDepartmentQuotaRequestAsActor,
+  createPostgresDepartmentQuotaRequestAsActor,
   updatePostgresUserAccessStatus,
+  updatePostgresUserAccessStatusUnderUserFence,
   updatePostgresQuotaOperation,
   upsertPostgresFeishuEvent,
   upsertPostgresFeishuUser,
   upsertPostgresDepartmentQuotaPeriod,
   upsertPostgresQuotaChangeEvent,
   upsertPostgresQuotaReconciliationRecord,
-  upsertPostgresUserQuotaPolicy,
   upsertPostgresUserQuotaState,
   upsertPostgresUserBillingPeriod,
   upsertPostgresUsageSyncCheckpoint,
   upsertPostgresManualAdminScope,
+  upsertPostgresManualAdminScopeAsActor,
+  assertPostgresDepartmentMemberSyncExecutionAuthorized,
   withPostgresAdvisoryLock,
   withPostgresUsageSettlementBatch,
 } from "@/lib/postgres-store";
@@ -142,7 +202,6 @@ import type {
   ProxyRequestLog,
   ProxyRequestAdmissionResult,
   QuotaChangeEvent,
-  QuotaFeatureFlags,
   QuotaLedgerEntry,
   QuotaOperation,
   QuotaReconciliationRecord,
@@ -159,13 +218,13 @@ import type {
   UsageSyncPolicy,
   UserBillingPeriod,
 } from "@/lib/types";
+import type { QuotaExecutionFence } from "@/lib/quota-execution-fence";
 
 export function defaultUsageSyncPolicy(): UsageSyncPolicy {
   return {
     // Authoritative NewAPI usage is the recovery source for process restarts,
     // delayed control-plane logs and downstream cancellations. New installs
     // must not silently run without that durable repair loop.
-    enabled: true,
     intervalMinutes: 5,
     pageSize: 100,
     maxPagesPerRun: 3,
@@ -176,25 +235,12 @@ export function defaultUsageSyncPolicy(): UsageSyncPolicy {
   };
 }
 
-export function defaultQuotaFeatureFlags(): QuotaFeatureFlags {
-  return {
-    legacyAbsoluteQuotaWritesEnabled: false,
-    quotaLedgerShadowRead: true,
-    quotaSagaWritesEnabled: false,
-    keyRotationSagaEnabled: false,
-    quotaRestoreEnabled: false,
-    monthlyPeriodOpenEnabled: false,
-    reconciliationAutoDecreaseEnabled: false,
-    reconciliationAutoIncreaseEnabled: false,
-  };
-}
-
 const initialStore: StoreShape = {
   version: 1,
   settings: {
     defaultMonthlyQuota: 200,
     usageSyncPolicy: defaultUsageSyncPolicy(),
-    quotaFeatureFlags: defaultQuotaFeatureFlags(),
+    packageReset: defaultPackageResetPolicy(),
     billingOperations: [],
   },
   users: [],
@@ -326,7 +372,6 @@ function normalizeUsageSyncPolicy(policy?: Partial<UsageSyncPolicy>): UsageSyncP
   return {
     ...defaults,
     ...policy,
-    enabled: policy?.enabled ?? defaults.enabled,
     intervalMinutes: Math.min(Math.max(Math.trunc(policy?.intervalMinutes ?? defaults.intervalMinutes), 1), 24 * 60),
     pageSize: Math.min(Math.max(Math.trunc(policy?.pageSize ?? defaults.pageSize), 1), 100),
     maxPagesPerRun: Math.min(Math.max(Math.trunc(policy?.maxPagesPerRun ?? defaults.maxPagesPerRun), 1), 20),
@@ -343,14 +388,6 @@ function normalizeUsageSyncPolicy(policy?: Partial<UsageSyncPolicy>): UsageSyncP
   };
 }
 
-function normalizeQuotaFeatureFlags(flags?: Partial<QuotaFeatureFlags>): QuotaFeatureFlags {
-  return {
-    ...defaultQuotaFeatureFlags(),
-    ...flags,
-    reconciliationAutoIncreaseEnabled: false,
-  };
-}
-
 function normalizeStore(store: StoreShape) {
   let changed = false;
   if (!store.settings) {
@@ -362,12 +399,14 @@ function normalizeStore(store: StoreShape) {
     store.settings.usageSyncPolicy = normalizedPolicy;
     changed = true;
   }
-  const normalizedQuotaFlags = normalizeQuotaFeatureFlags(store.settings.quotaFeatureFlags);
+  const normalizedPackageReset = normalizePackageResetPolicy(
+    store.settings.packageReset,
+  );
   if (
-    JSON.stringify(store.settings.quotaFeatureFlags ?? null) !==
-    JSON.stringify(normalizedQuotaFlags)
+    JSON.stringify(store.settings.packageReset ?? null) !==
+    JSON.stringify(normalizedPackageReset)
   ) {
-    store.settings.quotaFeatureFlags = normalizedQuotaFlags;
+    store.settings.packageReset = normalizedPackageReset;
     changed = true;
   }
   if (!Array.isArray(store.settings.billingOperations)) {
@@ -502,6 +541,14 @@ function usageRecordQuotaConsumed(record: NewApiUsageRecord) {
   return finiteUsageAmount(record.cost ?? record.quota);
 }
 
+function isAuthoritativeUsageRecord(record: NewApiUsageRecord) {
+  return Boolean(
+    record.feishuUserId &&
+      record.tokenAccountId &&
+      (record.matchStatus === "matched" || record.matchStatus === "no_proxy_match"),
+  );
+}
+
 function usageRecordPeriod(record: NewApiUsageRecord) {
   return resolveUsageBillingPeriod({
     billingPeriod: record.billingPeriod,
@@ -511,18 +558,13 @@ function usageRecordPeriod(record: NewApiUsageRecord) {
 
 function syncBillingPeriods(store: StoreShape) {
   let changed = false;
-  const initialMonthlyQuota = initialUnassignedMonthlyQuota({
-    defaultMonthlyQuota: store.settings.defaultMonthlyQuota,
-    quotaMigrationApplied: Boolean(store.settings.quotaMigration?.appliedAt),
-  });
+  const initialMonthlyQuota = initialUnassignedMonthlyQuota();
   const existingByKey = new Map(
     store.userBillingPeriods.map((period) => [
       billingKey(period.feishuUserId, period.period),
       period,
     ]),
   );
-  const requestById = new Map(store.tokenRequests.map((request) => [request.id, request]));
-  const accountById = new Map(store.tokenAccounts.map((account) => [account.id, account]));
   const computed = new Map<
     string,
     UserBillingPeriod & { quotaUpdatedAt?: string; sourceUpdatedAt?: string }
@@ -559,14 +601,6 @@ function syncBillingPeriods(store: StoreShape) {
     return summary;
   }
 
-  function setQuota(summary: UserBillingPeriod & { quotaUpdatedAt?: string }, quota: number, at: string) {
-    if (!Number.isFinite(quota) || quota <= 0) return;
-    if (!summary.quotaUpdatedAt || at.localeCompare(summary.quotaUpdatedAt) >= 0) {
-      summary.monthlyQuota = quota;
-      summary.quotaUpdatedAt = at;
-    }
-  }
-
   for (const account of store.tokenAccounts) {
     // A prewarmed account is inventory, not an issued entitlement. It must not
     // create a user billing row or inherit the default application quota.
@@ -585,46 +619,19 @@ function syncBillingPeriods(store: StoreShape) {
     }
     summary.sourceUpdatedAt = latestIso(summary.sourceUpdatedAt, account.createdAt, account.disabledAt);
 
-    const request = requestById.get(account.tokenRequestId);
-    if (
-      request &&
-      request.requestType !== "key_reset" &&
-      request.requestType !== "quota_reset" &&
-      request.requestType !== "quota_restore"
-    ) {
-      setQuota(
-        summary,
-        request.approvedMonthlyQuota ?? request.requestedMonthlyQuota,
-        request.updatedAt,
-      );
-      summary.sourceUpdatedAt = latestIso(summary.sourceUpdatedAt, request.updatedAt);
-    }
   }
 
-  for (const request of store.tokenRequests) {
-    if (
-      request.status !== "provisioned" ||
-      (request.requestType !== "quota_adjust" &&
-        request.requestType !== "monthly_reset") ||
-      !request.tokenAccountId
-    ) {
-      continue;
-    }
-    const account = accountById.get(request.tokenAccountId);
-    if (!account) continue;
-    const summary = ensure(account.feishuUserId, account.billingPeriod || periodFromIso(account.createdAt));
-    setQuota(
-      summary,
-      request.approvedMonthlyQuota ?? request.requestedMonthlyQuota,
-      request.updatedAt,
-    );
-    summary.sourceUpdatedAt = latestIso(summary.sourceUpdatedAt, request.updatedAt);
+  for (const policy of store.userQuotaPolicies) {
+    ensure(policy.feishuUserId, policy.effectiveFromPeriod);
+  }
+  for (const entry of store.quotaLedgerEntries) {
+    ensure(entry.feishuUserId, entry.period);
   }
 
   const proxyLogIdsBackedByNewApiRecords = new Set<string>();
   for (const record of store.newapiUsageRecords) {
-    if (record.matchStatus !== "matched") continue;
-    if (record.matchedProxyLogId) {
+    if (!isAuthoritativeUsageRecord(record)) continue;
+    if (record.matchStatus === "matched" && record.matchedProxyLogId) {
       proxyLogIdsBackedByNewApiRecords.add(record.matchedProxyLogId);
     }
     if (!record.feishuUserId) continue;
@@ -672,9 +679,46 @@ function syncBillingPeriods(store: StoreShape) {
 
   for (const summary of computed.values()) {
     summary.tokenAccountIds = [...new Set(summary.tokenAccountIds)].sort();
-    summary.quotaConsumed = Number(summary.quotaConsumed.toFixed(8));
-    summary.cost = Number(summary.cost.toFixed(8));
-    summary.remainingQuota = Math.max(Number((summary.monthlyQuota - summary.quotaConsumed).toFixed(8)), 0);
+    const policy = store.userQuotaPolicies
+      .filter(
+        (item) =>
+          item.feishuUserId === summary.feishuUserId &&
+          item.effectiveFromPeriod <= summary.period &&
+          (!item.effectiveToPeriod || item.effectiveToPeriod >= summary.period),
+      )
+      .sort((left, right) => right.version - left.version)[0];
+    const ledgerEntries = store.quotaLedgerEntries.filter(
+      (item) =>
+        item.feishuUserId === summary.feishuUserId && item.period === summary.period,
+    );
+    const quotaPerUnit = getConfig().newapi.quotaPerUnit;
+    const authoritativeConsumedQuota = store.newapiUsageRecords
+      .filter(
+        (item) =>
+          item.feishuUserId === summary.feishuUserId &&
+          usageRecordPeriod(item) === summary.period &&
+          isAuthoritativeUsageRecord(item),
+      )
+      .reduce(
+        (total, item) => total + authoritativeQuotaFromRecord(item, quotaPerUnit),
+        0,
+      );
+    const materialized = materializeUserQuota({
+      assignedMonthlyQuota: policy?.assignedMonthlyQuota ?? 0,
+      authoritativeConsumedQuota,
+      ledgerEntries,
+    });
+    summary.monthlyQuota = (policy?.assignedMonthlyQuota ?? 0) / quotaPerUnit;
+    summary.quotaConsumed = authoritativeConsumedQuota / quotaPerUnit;
+    summary.cost = summary.quotaConsumed;
+    summary.remainingQuota = materialized.expectedAvailableQuota / quotaPerUnit;
+    Object.assign(summary, materialized, {
+      settledThrough: store.usageSyncCheckpoints.find(
+        (item) => item.scope === "newapi_usage_logs",
+      )?.settledThrough,
+      sourceVersion: `${policy?.version ?? 0}:${ledgerEntries.length}:${summary.usageRecordCount}`,
+      materializedAt: nowIso(),
+    });
     summary.updatedAt = summary.sourceUpdatedAt ?? summary.updatedAt;
     delete summary.quotaUpdatedAt;
     delete summary.sourceUpdatedAt;
@@ -720,58 +764,6 @@ function syncBillingPeriods(store: StoreShape) {
     if (existing.updatedAt !== summary.updatedAt) patch.updatedAt = summary.updatedAt;
     if (Object.keys(patch).length) {
       Object.assign(existing, patch);
-      changed = true;
-    }
-  }
-
-  for (const billing of store.userBillingPeriods) {
-    if (billing.assignedQuotaUpdatedAt) continue;
-    const periodAccounts = store.tokenAccounts.filter(
-      (account) =>
-        account.feishuUserId === billing.feishuUserId &&
-        (account.billingPeriod || periodFromIso(account.createdAt)) === billing.period,
-    );
-    const prewarmOnly =
-      periodAccounts.length > 0 &&
-      periodAccounts.every(
-        (account) =>
-          account.status === "pending_activation" &&
-          Boolean(account.prewarmedAt) &&
-          account.tokenRequestId.startsWith("prewarm:"),
-      );
-    const hasIssuedRequest = store.tokenRequests.some(
-      (request) => {
-        if (
-          request.feishuUserId !== billing.feishuUserId ||
-          request.status !== "provisioned"
-        ) {
-          return false;
-        }
-        const issuedAccount = store.tokenAccounts.find(
-          (account) =>
-            account.id === request.tokenAccountId || account.tokenRequestId === request.id,
-        );
-        return Boolean(
-          issuedAccount &&
-            (issuedAccount.billingPeriod || periodFromIso(issuedAccount.createdAt)) ===
-              billing.period,
-        );
-      },
-    );
-    const hasLedgerGrant = store.quotaLedgerEntries.some(
-      (entry) =>
-        entry.feishuUserId === billing.feishuUserId &&
-        entry.period === billing.period &&
-        entry.signedQuota !== 0,
-    );
-    const hasUsage =
-      (billing.quotaConsumed ?? 0) > 0 ||
-      (billing.proxyLogCount ?? 0) > 0 ||
-      (billing.usageRecordCount ?? 0) > 0;
-    if (!prewarmOnly || hasIssuedRequest || hasLedgerGrant || hasUsage) continue;
-    if (billing.monthlyQuota !== 0 || billing.remainingQuota !== 0) {
-      billing.monthlyQuota = 0;
-      billing.remainingQuota = 0;
       changed = true;
     }
   }
@@ -856,12 +848,16 @@ export async function getAppSettings() {
     return {
       ...settings,
       usageSyncPolicy: normalizeUsageSyncPolicy(settings.usageSyncPolicy),
-      quotaFeatureFlags: normalizeQuotaFeatureFlags(settings.quotaFeatureFlags),
-      billingOperations: settings.billingOperations ?? [],
+      packageReset: normalizePackageResetPolicy(settings.packageReset),
     };
   }
   const store = await readStore();
   return store.settings;
+}
+
+export async function getCurrentPackageBillingPeriod(now = new Date()) {
+  const settings = await getAppSettings();
+  return packageBillingPeriod(settings.packageReset, now);
 }
 
 export async function getAppSettingsForQuotaOperation() {
@@ -870,8 +866,7 @@ export async function getAppSettingsForQuotaOperation() {
     return {
       ...settings,
       usageSyncPolicy: normalizeUsageSyncPolicy(settings.usageSyncPolicy),
-      quotaFeatureFlags: normalizeQuotaFeatureFlags(settings.quotaFeatureFlags),
-      billingOperations: settings.billingOperations ?? [],
+      packageReset: normalizePackageResetPolicy(settings.packageReset),
     };
   }
   return getAppSettings();
@@ -880,12 +875,12 @@ export async function getAppSettingsForQuotaOperation() {
 export async function getAdminOverviewMetadata() {
   if (isPostgresBackend()) {
     const metadata = await getPostgresAdminOverviewMetadata();
+    const { billingOperations: _legacyBillingOperations, ...settings } = metadata.settings as
+      typeof metadata.settings & { billingOperations?: unknown };
     return {
       settings: {
-        ...metadata.settings,
-        usageSyncPolicy: normalizeUsageSyncPolicy(metadata.settings.usageSyncPolicy),
-        quotaFeatureFlags: normalizeQuotaFeatureFlags(metadata.settings.quotaFeatureFlags),
-        billingOperations: metadata.settings.billingOperations ?? [],
+        ...settings,
+        usageSyncPolicy: normalizeUsageSyncPolicy(settings.usageSyncPolicy),
       },
       usageSyncCheckpoint: metadata.usageSyncCheckpoint,
     };
@@ -936,15 +931,27 @@ function upsertBillingOperation(
   return record;
 }
 
-function prependBillingOperation(store: StoreShape, input: BillingOperationWrite) {
-  return upsertBillingOperation(store.settings, input);
-}
-
 async function mutateBillingOperations<T>(
   fn: (settings: StoreShape["settings"]) => T | Promise<T>,
 ) {
-  if (isPostgresBackend()) return mutatePostgresAppSettings(fn);
   return mutate((store) => fn(store.settings));
+}
+
+export async function getGreenfieldInstallationManifest() {
+  if (isPostgresBackend()) {
+    return getPostgresGreenfieldInstallationManifest();
+  }
+  return null;
+}
+
+export async function getNewApiRuntimeBindingSnapshot() {
+  if (isPostgresBackend()) {
+    return getPostgresNewApiRuntimeBindingSnapshot();
+  }
+  return {
+    settings: await getAppSettings(),
+    manifest: null,
+  };
 }
 
 export async function enqueueBillingOperation(input: {
@@ -953,53 +960,342 @@ export async function enqueueBillingOperation(input: {
   operatedByFeishuUserId: string;
   period?: string;
   input?: Record<string, unknown>;
+  requireRootActor?: boolean;
 }) {
-  return mutateBillingOperations((settings) => {
+  const { requireRootActor = false, ...operationInput } = input;
+  if (isPostgresBackend()) {
+    const now = nowIso();
+    const submitted = await enqueuePostgresBillingOperation({
+      ...operationInput,
+      id: randomId("bo"),
+      status: "pending",
+      summary: {},
+      createdAt: now,
+      updatedAt: now,
+    }, { requireRootActor });
+    const sameInput =
+      submitted.operation.dryRun === operationInput.dryRun &&
+      sameBillingOperationInput(submitted.operation.input, operationInput.input);
+    return {
+      operation: submitted.operation,
+      created: submitted.created,
+      conflicted: !submitted.created && !sameInput,
+    };
+  }
+  const enqueueJson = (settings: StoreShape["settings"]) => {
     const existing = (settings.billingOperations ?? []).find(
       (operation) =>
-        operation.kind === input.kind && !isTerminalBillingOperationStatus(operation.status),
+        operation.kind === operationInput.kind &&
+        !isTerminalBillingOperationStatus(operation.status),
     );
     if (existing) {
       const sameInput =
-        existing.dryRun === input.dryRun &&
-        sameBillingOperationInput(existing.input, input.input);
+        existing.dryRun === operationInput.dryRun &&
+        sameBillingOperationInput(existing.input, operationInput.input);
       return { operation: existing, created: false, conflicted: !sameInput };
     }
     return {
       operation: upsertBillingOperation(settings, {
-        ...input,
+        ...operationInput,
         status: "pending",
         summary: {},
       }),
       created: true,
       conflicted: false,
     };
+  };
+  if (!requireRootActor) return mutateBillingOperations(enqueueJson);
+  return withAdminScopeUserLocks([operationInput.operatedByFeishuUserId], () =>
+    mutate(async (store) => {
+      const actor = store.users.find(
+        (user) => user.id === operationInput.operatedByFeishuUserId,
+      );
+      const actorScope = actor
+        ? await resolveAdminScopeForKnownUser(actor, store)
+        : null;
+      if (
+        !actorScope ||
+        actorScope.scopeType !== "global" ||
+        actorScope.source !== "environment" ||
+        actorScope.role !== "root"
+      ) {
+        throw new AdminUserActionAuthorizationError(
+          "root_required",
+          403,
+          "该维护操作仅允许 root 执行",
+        );
+      }
+      return enqueueJson(store.settings);
+    }),
+  );
+}
+
+async function assertJsonDepartmentMemberSyncScope(
+  store: StoreShape,
+  input: { actorFeishuUserId: string; departmentId: string },
+) {
+  const actor = store.users.find((user) => user.id === input.actorFeishuUserId);
+  const actorScope = actor
+    ? await resolveAdminScopeForKnownUser(actor, store)
+    : null;
+  if (!actor || actor.status !== "active" || !actorScope) {
+    throw new AdminUserActionAuthorizationError(
+      "actor_scope_missing",
+      403,
+      "当前管理员用户或管理范围已变化，同步任务已安全停止",
+    );
+  }
+  if (
+    actorScope.scopeType === "department" &&
+    actorScope.departmentId !== input.departmentId
+  ) {
+    throw new AdminUserActionAuthorizationError(
+      "target_out_of_scope",
+      403,
+      "当前管理员已无权同步该部门",
+    );
+  }
+  const departmentPresent =
+    store.users.some((user) => user.departmentId === input.departmentId) ||
+    store.departmentQuotaPeriods.some(
+      (period) => period.departmentId === input.departmentId,
+    );
+  if (!departmentPresent) {
+    throw new AdminUserActionAuthorizationError(
+      "target_out_of_scope",
+      403,
+      "目标部门已不存在或不在 TokenInside 管理范围内",
+    );
+  }
+  return { actor, actorScope };
+}
+
+export async function enqueueDepartmentMemberSyncOperationAsActor(input: {
+  actorFeishuUserId: string;
+  departmentId: string;
+}) {
+  const now = nowIso();
+  const operation: BillingOperationRecord = {
+    id: randomId("bo"),
+    kind: "department_member_sync",
+    status: "pending",
+    dryRun: false,
+    operatedByFeishuUserId: input.actorFeishuUserId,
+    input: {
+      departmentId: input.departmentId,
+    },
+    summary: {},
+    createdAt: now,
+    updatedAt: now,
+  };
+  if (isPostgresBackend()) {
+    const submitted = await enqueuePostgresDepartmentMemberSyncOperationAsActor(
+      operation,
+    );
+    return {
+      operation: submitted.operation,
+      created: submitted.created,
+      conflicted:
+        !submitted.created &&
+        !sameBillingOperationInput(submitted.operation.input, operation.input),
+    };
+  }
+  return withAdminScopeUserLocks([input.actorFeishuUserId], () =>
+    withJsonDepartmentQuotaLock(
+      `department-member-sync-submit:${input.departmentId}`,
+      () =>
+        mutate(async (store) => {
+          await assertJsonDepartmentMemberSyncScope(store, input);
+          const existing = (store.settings.billingOperations ?? []).find(
+            (candidate) =>
+              candidate.kind === "department_member_sync" &&
+              candidate.input?.departmentId === input.departmentId &&
+              !isTerminalBillingOperationStatus(candidate.status),
+          );
+          if (existing) {
+            return {
+              operation: existing,
+              created: false,
+              conflicted: !sameBillingOperationInput(existing.input, operation.input),
+            };
+          }
+          return {
+            operation: upsertBillingOperation(store.settings, {
+              ...operation,
+              status: "pending",
+              summary: {},
+            }),
+            created: true,
+            conflicted: false,
+          };
+        }),
+    ),
+  );
+}
+
+function runningJsonDepartmentMemberSyncOperation(
+  store: StoreShape,
+  input: { operationId: string; leaseId: string },
+) {
+  const operation = (store.settings.billingOperations ?? []).find(
+    (candidate) => candidate.id === input.operationId,
+  );
+  const departmentId = String(operation?.input?.departmentId ?? "");
+  if (
+    !operation ||
+    operation.kind !== "department_member_sync" ||
+    operation.status !== "running" ||
+    operation.leaseId !== input.leaseId ||
+    !operation.leaseExpiresAt ||
+    new Date(operation.leaseExpiresAt).getTime() <= Date.now() ||
+    !departmentId
+  ) {
+    throw new Error(`department member sync lease lost: ${input.operationId}`);
+  }
+  return { operation, departmentId };
+}
+
+export async function assertDepartmentMemberSyncExecutionAuthorized(input: {
+  operationId: string;
+  leaseId: string;
+}) {
+  if (isPostgresBackend()) {
+    return assertPostgresDepartmentMemberSyncExecutionAuthorized(input);
+  }
+  return mutate(async (store) => {
+    const running = runningJsonDepartmentMemberSyncOperation(store, input);
+    await assertJsonDepartmentMemberSyncScope(store, {
+      actorFeishuUserId: running.operation.operatedByFeishuUserId,
+      departmentId: running.departmentId,
+    });
+    return running;
   });
+}
+
+export async function batchUpsertDepartmentMembersForSync(input: {
+  operationId: string;
+  leaseId: string;
+  tenantKey: string;
+  departmentName?: string;
+  contacts: Array<{
+    openId: string;
+    unionId?: string;
+    feishuUserIdFromFeishu?: string;
+    name?: string;
+    avatarUrl?: string;
+  }>;
+}) {
+  if (input.contacts.length > 50) {
+    throw new Error("单批部门成员导入不得超过 50 人");
+  }
+  const contacts = input.contacts.map((contact) => ({
+    ...contact,
+    id: randomId("fu"),
+  }));
+  if (isPostgresBackend()) {
+    return batchUpsertPostgresDepartmentMembersForSync({
+      ...input,
+      contacts,
+      now: nowIso(),
+    });
+  }
+  return mutate(async (store) => {
+    const running = runningJsonDepartmentMemberSyncOperation(store, input);
+    await assertJsonDepartmentMemberSyncScope(store, {
+      actorFeishuUserId: running.operation.operatedByFeishuUserId,
+      departmentId: running.departmentId,
+    });
+    const now = nowIso();
+    let synced = 0;
+    let skipped = 0;
+    for (const contact of contacts) {
+      const existing = store.users.find(
+        (user) => user.tenantKey === input.tenantKey && user.openId === contact.openId,
+      );
+      if (existing?.departmentId && existing.departmentId !== running.departmentId) {
+        skipped += 1;
+        continue;
+      }
+      if (existing) {
+        Object.assign(existing, {
+          unionId: contact.unionId ?? existing.unionId,
+          feishuUserIdFromFeishu:
+            contact.feishuUserIdFromFeishu ?? existing.feishuUserIdFromFeishu,
+          name: contact.name ?? existing.name,
+          avatarUrl: contact.avatarUrl ?? existing.avatarUrl,
+          departmentId: running.departmentId,
+          departmentName: input.departmentName ?? existing.departmentName,
+          updatedAt: now,
+        });
+      } else {
+        store.users.push({
+          id: contact.id,
+          tenantKey: input.tenantKey,
+          openId: contact.openId,
+          unionId: contact.unionId,
+          feishuUserIdFromFeishu: contact.feishuUserIdFromFeishu,
+          name: contact.name,
+          avatarUrl: contact.avatarUrl,
+          departmentId: running.departmentId,
+          departmentName: input.departmentName,
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+      synced += 1;
+    }
+    return { synced, skipped };
+  });
+}
+
+export async function listDepartmentMemberSyncOperations(input: {
+  departmentId?: string;
+  limit?: number;
+}) {
+  if (isPostgresBackend()) {
+    return listPostgresDepartmentMemberSyncOperations(input);
+  }
+  const store = await readStore();
+  return (store.settings.billingOperations ?? [])
+    .filter(
+      (operation) =>
+        operation.kind === "department_member_sync" &&
+        (!input.departmentId || operation.input?.departmentId === input.departmentId),
+    )
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.id.localeCompare(a.id))
+    .slice(0, Math.min(Math.max(Math.trunc(input.limit ?? 100), 1), 100));
+}
+
+export function withDepartmentMemberSyncWorkerFence<T>(fn: () => Promise<T>) {
+  const key = "department-member-sync-worker";
+  if (isPostgresBackend()) {
+    return withPostgresAdvisoryLock(key, fn, { wait: false });
+  }
+  return withJsonDepartmentQuotaLock(key, fn);
+}
+
+export function withPackageResetSchedulerFence<T>(fn: () => Promise<T>) {
+  const key = "package-reset-scheduler";
+  if (isPostgresBackend()) {
+    return withPostgresAdvisoryLock(key, fn, { wait: false });
+  }
+  return withJsonDepartmentQuotaLock(key, fn);
 }
 
 export async function updateAppSettings(input: {
   defaultMonthlyQuota?: number;
   newapiControl?: StoreShape["settings"]["newapiControl"];
   usageSyncPolicy?: Partial<UsageSyncPolicy>;
-  quotaFeatureFlags?: Partial<QuotaFeatureFlags>;
+  packageReset?: StoreShape["settings"]["packageReset"];
   updatedByFeishuUserId: string;
 }) {
   if (isPostgresBackend()) {
     return mutatePostgresAppSettings((settings) => {
-      const store = {
-        ...structuredClone(initialStore),
-        settings: {
-          ...initialStore.settings,
-          ...settings,
-        },
-      };
-      const previousDefaultMonthlyQuota = store.settings.defaultMonthlyQuota;
-      const previousUsageSyncPolicy = normalizeUsageSyncPolicy(store.settings.usageSyncPolicy);
-      const previousQuotaFeatureFlags = normalizeQuotaFeatureFlags(
-        store.settings.quotaFeatureFlags,
-      );
+      const previousDefaultMonthlyQuota = settings.defaultMonthlyQuota;
+      const previousUsageSyncPolicy = normalizeUsageSyncPolicy(settings.usageSyncPolicy);
       const nextDefaultMonthlyQuota =
-        input.defaultMonthlyQuota ?? store.settings.defaultMonthlyQuota;
+        input.defaultMonthlyQuota ?? settings.defaultMonthlyQuota;
       const nextUsageSyncPolicy = input.usageSyncPolicy
         ? normalizeUsageSyncPolicy({
             ...previousUsageSyncPolicy,
@@ -1008,52 +1304,32 @@ export async function updateAppSettings(input: {
             updatedByFeishuUserId: input.updatedByFeishuUserId,
           })
         : previousUsageSyncPolicy;
-      const nextQuotaFeatureFlags = input.quotaFeatureFlags
-        ? normalizeQuotaFeatureFlags({
-            ...previousQuotaFeatureFlags,
-            ...input.quotaFeatureFlags,
-          })
-        : previousQuotaFeatureFlags;
-      store.settings = {
-        ...store.settings,
+      const now = nowIso();
+      const nextSettings = {
+        ...settings,
         defaultMonthlyQuota: nextDefaultMonthlyQuota,
-        newapiControl: input.newapiControl ?? store.settings.newapiControl,
+        newapiControl: input.newapiControl ?? settings.newapiControl,
         usageSyncPolicy: nextUsageSyncPolicy,
-        quotaFeatureFlags: nextQuotaFeatureFlags,
-        updatedAt: nowIso(),
+        packageReset: input.packageReset
+          ? normalizePackageResetPolicy({
+              ...input.packageReset,
+              updatedAt: now,
+              updatedByFeishuUserId: input.updatedByFeishuUserId,
+            })
+          : normalizePackageResetPolicy(settings.packageReset),
+        updatedAt: now,
         updatedByFeishuUserId: input.updatedByFeishuUserId,
       };
-      prependBillingOperation(store, {
-        kind: "settings_update",
-        status: "applied",
-        dryRun: false,
-        operatedByFeishuUserId: input.updatedByFeishuUserId,
-        input: {
-          previousDefaultMonthlyQuota,
-          defaultMonthlyQuota: nextDefaultMonthlyQuota,
-          usageSyncPolicyUpdated: Boolean(input.usageSyncPolicy),
-          quotaFeatureFlagsUpdated: Boolean(input.quotaFeatureFlags),
-          newapiControlUpdated: Boolean(input.newapiControl),
-        },
-        summary: {
-          previousDefaultMonthlyQuota,
-          defaultMonthlyQuota: nextDefaultMonthlyQuota,
-          usageSyncPolicyUpdated: Boolean(input.usageSyncPolicy),
-          quotaFeatureFlagsUpdated: Boolean(input.quotaFeatureFlags),
-          newapiControlUpdated: Boolean(input.newapiControl),
-        },
-      });
-      Object.assign(settings, store.settings);
-      return store.settings;
+      delete (nextSettings as typeof nextSettings & { billingOperations?: unknown })
+        .billingOperations;
+      Object.assign(settings, nextSettings);
+      return nextSettings;
     });
   }
 
   return mutate((store) => {
     const previousDefaultMonthlyQuota = store.settings.defaultMonthlyQuota;
     const previousUsageSyncPolicy = normalizeUsageSyncPolicy(store.settings.usageSyncPolicy);
-    const previousQuotaFeatureFlags = normalizeQuotaFeatureFlags(
-      store.settings.quotaFeatureFlags,
-    );
     const nextDefaultMonthlyQuota = input.defaultMonthlyQuota ?? store.settings.defaultMonthlyQuota;
     const nextUsageSyncPolicy = input.usageSyncPolicy
       ? normalizeUsageSyncPolicy({
@@ -1063,43 +1339,94 @@ export async function updateAppSettings(input: {
           updatedByFeishuUserId: input.updatedByFeishuUserId,
         })
       : previousUsageSyncPolicy;
-    const nextQuotaFeatureFlags = input.quotaFeatureFlags
-      ? normalizeQuotaFeatureFlags({
-          ...previousQuotaFeatureFlags,
-          ...input.quotaFeatureFlags,
-        })
-      : previousQuotaFeatureFlags;
     store.settings = {
       ...store.settings,
       defaultMonthlyQuota: nextDefaultMonthlyQuota,
       newapiControl: input.newapiControl ?? store.settings.newapiControl,
       usageSyncPolicy: nextUsageSyncPolicy,
-      quotaFeatureFlags: nextQuotaFeatureFlags,
+      packageReset: input.packageReset
+        ? normalizePackageResetPolicy({
+            ...input.packageReset,
+            updatedAt: nowIso(),
+            updatedByFeishuUserId: input.updatedByFeishuUserId,
+          })
+        : normalizePackageResetPolicy(store.settings.packageReset),
       updatedAt: nowIso(),
       updatedByFeishuUserId: input.updatedByFeishuUserId,
     };
-    prependBillingOperation(store, {
-      kind: "settings_update",
-      status: "applied",
-      dryRun: false,
-      operatedByFeishuUserId: input.updatedByFeishuUserId,
-      input: {
-        previousDefaultMonthlyQuota,
-        defaultMonthlyQuota: nextDefaultMonthlyQuota,
-        usageSyncPolicyUpdated: Boolean(input.usageSyncPolicy),
-        quotaFeatureFlagsUpdated: Boolean(input.quotaFeatureFlags),
-        newapiControlUpdated: Boolean(input.newapiControl),
-      },
-      summary: {
-        previousDefaultMonthlyQuota,
-        defaultMonthlyQuota: nextDefaultMonthlyQuota,
-        usageSyncPolicyUpdated: Boolean(input.usageSyncPolicy),
-        quotaFeatureFlagsUpdated: Boolean(input.quotaFeatureFlags),
-        newapiControlUpdated: Boolean(input.newapiControl),
-      },
-    });
     return store.settings;
   });
+}
+
+export async function updateAppSettingsAsActor(input: {
+  actorFeishuUserId: string;
+  defaultMonthlyQuota?: number;
+  newapiControl?: StoreShape["settings"]["newapiControl"];
+  packageReset?: StoreShape["settings"]["packageReset"];
+}) {
+  if (isPostgresBackend()) return updatePostgresAppSettingsAsActor(input);
+
+  return withAdminScopeUserLocks([input.actorFeishuUserId], () =>
+    mutate(async (store) => {
+      const actor = store.users.find(
+        (user) => user.id === input.actorFeishuUserId,
+      );
+      const actorScope = actor
+        ? await resolveAdminScopeForKnownUser(actor, store)
+        : null;
+      if (!actorScope || actorScope.scopeType !== "global") {
+        throw new AdminUserActionAuthorizationError(
+          "actor_scope_missing",
+          403,
+          "当前全局管理员权限已变化，请刷新后重试",
+        );
+      }
+      if (
+        input.newapiControl &&
+        !(actorScope.source === "environment" && actorScope.role === "root")
+      ) {
+        throw new AdminUserActionAuthorizationError(
+          "root_required",
+          403,
+          "NewAPI 上游连接只能由 root 管理员修改",
+        );
+      }
+      const now = nowIso();
+      let newapiControl = store.settings.newapiControl;
+      if (input.newapiControl) {
+        const accessTokenCiphertext =
+          input.newapiControl.accessTokenCiphertext ??
+          store.settings.newapiControl?.accessTokenCiphertext;
+        if (!accessTokenCiphertext) {
+          const error = new Error("首次保存 NewAPI 上游连接时必须填写用户 AK");
+          error.name = "NewApiControlSecretRequiredError";
+          throw error;
+        }
+        newapiControl = {
+          ...input.newapiControl,
+          accessTokenCiphertext,
+          updatedAt: now,
+          updatedByFeishuUserId: input.actorFeishuUserId,
+        };
+      }
+      store.settings = {
+        ...store.settings,
+        defaultMonthlyQuota:
+          input.defaultMonthlyQuota ?? store.settings.defaultMonthlyQuota,
+        newapiControl,
+        packageReset: input.packageReset
+          ? normalizePackageResetPolicy({
+              ...input.packageReset,
+              updatedAt: now,
+              updatedByFeishuUserId: input.actorFeishuUserId,
+            })
+          : normalizePackageResetPolicy(store.settings.packageReset),
+        updatedAt: now,
+        updatedByFeishuUserId: input.actorFeishuUserId,
+      };
+      return store.settings;
+    }),
+  );
 }
 
 export async function recordBillingOperation(input: {
@@ -1114,6 +1441,7 @@ export async function recordBillingOperation(input: {
   summary: BillingOperationRecord["summary"];
   errorMessage?: string;
 }) {
+  if (isPostgresBackend()) return recordPostgresBillingOperation(input);
   const { expectedLeaseId, ...write } = input;
   return mutateBillingOperations((settings) => {
     if (expectedLeaseId) {
@@ -1123,16 +1451,36 @@ export async function recordBillingOperation(input: {
       if (
         !current ||
         current.status !== "running" ||
-        current.leaseId !== expectedLeaseId
+        current.leaseId !== expectedLeaseId ||
+        !current.leaseExpiresAt ||
+        new Date(current.leaseExpiresAt).getTime() <= Date.now()
       ) {
         throw new Error(`billing operation lease lost: ${input.id ?? "unknown"}`);
       }
+      if (!isTerminalBillingOperationStatus(input.status)) {
+        throw new Error("billing operation completion requires a terminal status");
+      }
+      return upsertBillingOperation(settings, {
+        id: current.id,
+        kind: current.kind,
+        status: input.status,
+        dryRun: current.dryRun,
+        operatedByFeishuUserId: current.operatedByFeishuUserId,
+        period: current.period,
+        input: current.input,
+        summary: input.summary,
+        errorMessage: input.errorMessage,
+      });
+    }
+    if (input.id || !isTerminalBillingOperationStatus(input.status)) {
+      throw new Error("billing operation records require a terminal status without an id");
     }
     return upsertBillingOperation(settings, write);
   });
 }
 
 export async function findBillingOperationById(operationId: string) {
+  if (isPostgresBackend()) return findPostgresBillingOperationById(operationId);
   const settings = await getAppSettings();
   return (settings.billingOperations ?? []).find((item) => item.id === operationId) ?? null;
 }
@@ -1142,6 +1490,13 @@ export async function listRunnableBillingOperations(input: {
   limit?: number;
   now?: Date;
 }) {
+  if (isPostgresBackend()) {
+    return listPostgresRunnableBillingOperations({
+      kind: input.kind,
+      limit: input.limit,
+      now: (input.now ?? new Date()).toISOString(),
+    });
+  }
   const settings = await getAppSettings();
   const now = input.now ?? new Date();
   return (settings.billingOperations ?? [])
@@ -1159,6 +1514,14 @@ export async function claimBillingOperationExecution(input: {
   leaseExpiresAt: string;
   now?: Date;
 }) {
+  if (isPostgresBackend()) {
+    return claimPostgresBillingOperationExecution({
+      operationId: input.operationId,
+      kind: input.kind,
+      leaseId: input.leaseId,
+      leaseExpiresAt: input.leaseExpiresAt,
+    });
+  }
   return mutateBillingOperations((settings) => {
     const records = settings.billingOperations ?? [];
     const operation = records.find((item) => item.id === input.operationId);
@@ -1192,6 +1555,9 @@ export async function renewBillingOperationExecution(input: {
   leaseId: string;
   leaseExpiresAt: string;
 }) {
+  if (isPostgresBackend()) {
+    return renewPostgresBillingOperationExecution(input);
+  }
   return mutateBillingOperations((settings) => {
     const records = settings.billingOperations ?? [];
     const operation = records.find((item) => item.id === input.operationId);
@@ -1216,10 +1582,7 @@ export async function renewBillingOperationExecution(input: {
 }
 
 export async function listBillingOperations(limit = 20) {
-  if (isPostgresBackend()) {
-    const settings = await getPostgresAppSettings();
-    return (settings.billingOperations ?? []).slice(0, Math.max(limit, 0));
-  }
+  if (isPostgresBackend()) return listPostgresBillingOperations(limit);
   const store = await readStore();
   return (store.settings.billingOperations ?? []).slice(0, Math.max(limit, 0));
 }
@@ -1320,8 +1683,25 @@ export async function getUserById(id: string) {
 }
 
 export async function getUserByOpenId(openId: string) {
+  if (isPostgresBackend()) return getPostgresUserByOpenId(openId);
   const store = await readStore();
   return store.users.find((user) => user.openId === openId) ?? null;
+}
+
+export async function getEarliestOpenBlockingUsageIssue() {
+  if (isPostgresBackend()) {
+    return getPostgresEarliestOpenBlockingUsageIssue();
+  }
+  const store = await readStore();
+  return (
+    store.usageSyncIssues
+      .filter((issue) => issue.status === "open" && issue.blocksSettlement)
+      .sort((left, right) =>
+        (left.occurredAt ?? left.firstSeenAt).localeCompare(
+          right.occurredAt ?? right.firstSeenAt,
+        ),
+      )[0] ?? null
+  );
 }
 
 export async function createTokenRequest(input: {
@@ -1584,6 +1964,12 @@ async function withJsonDepartmentQuotaLock<T>(key: string, fn: () => Promise<T>)
   }
 }
 
+function withJsonQuotaLocks<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
+  const [key, ...remaining] = keys;
+  if (!key) return fn();
+  return withJsonDepartmentQuotaLock(key, () => withJsonQuotaLocks(remaining, fn));
+}
+
 function withDepartmentQuotaLock<T>(
   departmentId: string,
   period: string,
@@ -1629,22 +2015,32 @@ export async function updateTokenAccountForQuotaOperation(
 
 export function withUserQuotaOperationLock<T>(
   feishuUserId: string,
-  fn: () => Promise<T>,
+  fn: (fence?: QuotaExecutionFence) => Promise<T>,
+  options: { wait?: boolean } = {},
 ) {
   // This session-level fence is intentionally distinct from the short
   // transaction lock used by user_quota_states. Reusing the same advisory key
   // across two pooled connections would make the outer callback wait on itself.
   const key = `user-quota-fence:${feishuUserId}`;
   if (isPostgresBackend()) {
-    return withPostgresAdvisoryLock(key, fn, { wait: true });
+    return withPostgresAdvisoryLock(key, fn, {
+      wait: options.wait ?? true,
+      executionFence: true,
+    });
+  }
+  if (options.wait === false && jsonDepartmentQuotaLocks.has(key)) {
+    const error = new Error(`额度操作执行栅栏正忙: ${key}`);
+    error.name = "QuotaOperationFenceBusyError";
+    throw error;
   }
   return withJsonDepartmentQuotaLock(key, fn);
 }
 
 export async function getEffectiveUserQuotaPolicy(
   feishuUserId: string,
-  period = currentQuotaPeriod(),
+  period?: string,
 ) {
+  period ??= await getCurrentPackageBillingPeriod();
   if (isPostgresBackend()) {
     return getPostgresEffectiveUserQuotaPolicy(feishuUserId, period);
   }
@@ -1670,7 +2066,17 @@ export async function createUserQuotaPolicyVersion(input: {
   sourceId: string;
   updatedByOpenId?: string;
 }) {
-  const period = input.effectiveFromPeriod ?? currentQuotaPeriod();
+  const period =
+    input.effectiveFromPeriod ?? (await getCurrentPackageBillingPeriod());
+  const assignedMonthlyQuota = Math.max(Math.trunc(input.assignedMonthlyQuota), 0);
+  if (isPostgresBackend()) {
+    return createPostgresUserQuotaPolicyVersion({
+      ...input,
+      assignedMonthlyQuota,
+      effectiveFromPeriod: period,
+      quotaPerUnitSnapshot: getConfig().newapi.quotaPerUnit,
+    });
+  }
   const store = await readStore();
   const idempotent = store.userQuotaPolicies.find(
     (item) => item.sourceType === input.sourceType && item.sourceId === input.sourceId,
@@ -1683,7 +2089,7 @@ export async function createUserQuotaPolicyVersion(input: {
   const policy: UserQuotaPolicy = {
     id: randomId("uqp"),
     feishuUserId: input.feishuUserId,
-    assignedMonthlyQuota: Math.max(Math.trunc(input.assignedMonthlyQuota), 0),
+    assignedMonthlyQuota,
     departmentId: input.departmentId,
     effectiveFromPeriod: period,
     sourceType: input.sourceType,
@@ -1694,7 +2100,6 @@ export async function createUserQuotaPolicyVersion(input: {
     updatedAt: now,
     updatedByOpenId: input.updatedByOpenId,
   };
-  if (isPostgresBackend()) return upsertPostgresUserQuotaPolicy(policy);
   return mutate((current) => {
     const existing = current.userQuotaPolicies.find(
       (item) => item.sourceType === policy.sourceType && item.sourceId === policy.sourceId,
@@ -1735,6 +2140,391 @@ export async function saveUserQuotaState(state: UserQuotaState) {
   });
 }
 
+export class JsonQuotaSubmissionError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "JsonQuotaSubmissionError";
+  }
+}
+
+export async function updateJsonTokenRequestQuotaAsActor(input: {
+  actorUserId: string;
+  requestId: string;
+  approvedMonthlyQuota: number;
+}) {
+  if (isPostgresBackend()) {
+    throw new JsonQuotaSubmissionError(
+      500,
+      "json_submission_backend_mismatch",
+      "JSON 申请额度更新不能用于 PostgreSQL 后端",
+    );
+  }
+  if (
+    !Number.isInteger(input.approvedMonthlyQuota) ||
+    input.approvedMonthlyQuota <= 0 ||
+    input.approvedMonthlyQuota > 1_000_000
+  ) {
+    throw new JsonQuotaSubmissionError(400, "quota_invalid", "最终额度必须是正整数");
+  }
+  const snapshot = await readStore();
+  const targetUserId = snapshot.tokenRequests.find(
+    (request) => request.id === input.requestId,
+  )?.feishuUserId;
+  if (!targetUserId) {
+    throw new JsonQuotaSubmissionError(
+      404,
+      "token_request_not_found",
+      "申请单不存在或不在当前管理范围内",
+    );
+  }
+  return withAdminScopeUserLocks([input.actorUserId, targetUserId], () =>
+    withUserQuotaOperationLock(targetUserId, () =>
+      mutate(async (store) => {
+        const request = store.tokenRequests.find(
+          (item) => item.id === input.requestId,
+        );
+        const actor = store.users.find((user) => user.id === input.actorUserId);
+        const actorScope = actor
+          ? await resolveAdminScopeForKnownUser(actor, store)
+          : null;
+        if (!request || !actorScope) {
+          throw new JsonQuotaSubmissionError(
+            404,
+            "token_request_not_found",
+            "申请单不存在或不在当前管理范围内",
+          );
+        }
+        const usersById = new Map(store.users.map((user) => [user.id, user]));
+        if (
+          !tokenRequestInScope(
+            request,
+            actorScope,
+            usersById,
+            globalAdminOpenIds(store, usersById),
+          )
+        ) {
+          throw new JsonQuotaSubmissionError(
+            404,
+            "token_request_not_found",
+            "申请单不存在或不在当前管理范围内",
+          );
+        }
+        if (!tokenRequestAllowsQuotaEdit(request)) {
+          throw new JsonQuotaSubmissionError(
+            409,
+            "token_request_quota_not_editable",
+            "当前记录不是可修改额度的审批申请",
+          );
+        }
+        if (
+          store.quotaOperations.some(
+            (operation) => operation.idempotencyKey === `quota-operation:${request.id}`,
+          )
+        ) {
+          throw new JsonQuotaSubmissionError(
+            409,
+            "token_request_operation_exists",
+            "额度操作已经受理，不能再修改申请额度",
+          );
+        }
+        request.approvedMonthlyQuota = input.approvedMonthlyQuota;
+        request.updatedAt = nowIso();
+        return request;
+      }),
+    ),
+  );
+}
+
+export async function rejectJsonTokenRequestAsActor(input: {
+  actorUserId: string;
+  requestId: string;
+}) {
+  if (isPostgresBackend()) {
+    throw new JsonQuotaSubmissionError(
+      500,
+      "json_submission_backend_mismatch",
+      "JSON 申请拒绝不能用于 PostgreSQL 后端",
+    );
+  }
+  const snapshot = await readStore();
+  const targetUserId = snapshot.tokenRequests.find(
+    (request) => request.id === input.requestId,
+  )?.feishuUserId;
+  if (!targetUserId) {
+    throw new JsonQuotaSubmissionError(
+      404,
+      "token_request_not_found",
+      "申请单不存在或不在当前管理范围内",
+    );
+  }
+  return withAdminScopeUserLocks([input.actorUserId, targetUserId], () =>
+    withUserQuotaOperationLock(targetUserId, () =>
+      mutate(async (store) => {
+        const request = store.tokenRequests.find(
+          (item) => item.id === input.requestId,
+        );
+        const actor = store.users.find((user) => user.id === input.actorUserId);
+        const actorScope = actor
+          ? await resolveAdminScopeForKnownUser(actor, store)
+          : null;
+        if (!request || !actor || !actorScope) {
+          throw new JsonQuotaSubmissionError(
+            404,
+            "token_request_not_found",
+            "申请单不存在或不在当前管理范围内",
+          );
+        }
+        const usersById = new Map(store.users.map((user) => [user.id, user]));
+        if (
+          !tokenRequestInScope(
+            request,
+            actorScope,
+            usersById,
+            globalAdminOpenIds(store, usersById),
+          )
+        ) {
+          throw new JsonQuotaSubmissionError(
+            404,
+            "token_request_not_found",
+            "申请单不存在或不在当前管理范围内",
+          );
+        }
+        if (!tokenRequestRequiresAdminDecision(request)) {
+          throw new JsonQuotaSubmissionError(
+            409,
+            "token_request_not_actionable",
+            "当前记录不是可人工处理的审批申请",
+          );
+        }
+        if (
+          store.quotaOperations.some(
+            (operation) => operation.idempotencyKey === `quota-operation:${request.id}`,
+          )
+        ) {
+          throw new JsonQuotaSubmissionError(
+            409,
+            "token_request_operation_exists",
+            "额度操作已经受理，不能再拒绝该申请",
+          );
+        }
+        const now = nowIso();
+        request.status = "rejected";
+        request.approvalOperatorOpenId = actor.openId;
+        request.approvalOperatedAt = now;
+        request.updatedAt = now;
+        return request;
+      }),
+    ),
+  );
+}
+
+/**
+ * JSON-store fallback for administrator quota adjustment acceptance.
+ *
+ * The production greenfield backend is PostgreSQL, but the fallback preserves
+ * the same all-or-nothing authorization/request/operation contract for local
+ * development and tests.
+ */
+export async function submitJsonAdminQuotaAdjustment(input: {
+  actorUserId: string;
+  targetUserId: string;
+  approvedMonthlyQuota: number;
+  reason: string;
+  clientRequestId: string;
+}) {
+  if (isPostgresBackend()) {
+    throw new JsonQuotaSubmissionError(
+      500,
+      "json_submission_backend_mismatch",
+      "JSON 调额提交不能用于 PostgreSQL 后端",
+    );
+  }
+  if (!Number.isInteger(input.approvedMonthlyQuota) || input.approvedMonthlyQuota <= 0) {
+    throw new JsonQuotaSubmissionError(400, "quota_invalid", "调额额度必须为正整数");
+  }
+
+  return withAdminScopeUserLocks(
+    [input.actorUserId, input.targetUserId],
+    () =>
+      withUserQuotaOperationLock(input.targetUserId, () =>
+        mutate(async (store) => {
+          let authorized: Awaited<ReturnType<typeof authorizeJsonAdminUserAction>>;
+          try {
+            authorized = await authorizeJsonAdminUserAction(store, {
+              actorFeishuUserId: input.actorUserId,
+              targetFeishuUserId: input.targetUserId,
+            });
+          } catch (error) {
+            if (error instanceof AdminUserActionAuthorizationError) {
+              throw new JsonQuotaSubmissionError(
+                error.status,
+                error.code,
+                error.message,
+              );
+            }
+            throw error;
+          }
+          const targetUser = authorized?.targetUser;
+          if (!targetUser) {
+            throw new JsonQuotaSubmissionError(
+              404,
+              "target_user_not_found",
+              "用户不存在或不在当前管理范围内",
+            );
+          }
+          if (targetUser.status && targetUser.status !== "active") {
+            throw new JsonQuotaSubmissionError(
+              409,
+              "target_user_inactive",
+              "目标用户当前不是启用状态",
+            );
+          }
+          const targetAdminScope = targetUser.departmentId
+            ? null
+            : await resolveAdminScopeForKnownUser(targetUser, store);
+          if (!targetUser.departmentId && targetAdminScope?.scopeType !== "global") {
+            throw new JsonQuotaSubmissionError(
+              409,
+              "target_department_missing",
+              "目标用户必须先归属部门，或拥有有效的全局管理员身份",
+            );
+          }
+
+          const idempotencyKey = `quota-adjust:${input.clientRequestId}`;
+          const requestedAssignedQuota = Math.round(
+            input.approvedMonthlyQuota * getConfig().newapi.quotaPerUnit,
+          );
+          const idempotent = store.quotaOperations.find(
+            (operation) => operation.idempotencyKey === idempotencyKey,
+          );
+          if (idempotent) {
+            if (
+              idempotent.feishuUserId !== targetUser.id ||
+              idempotent.operationType !== "quota_adjust" ||
+              idempotent.requestedAssignedQuota !== requestedAssignedQuota
+            ) {
+              throw new JsonQuotaSubmissionError(
+                409,
+                "idempotency_conflict",
+                "调额幂等键已被其他用户、操作或额度使用",
+              );
+            }
+            const existingRequest = idempotent.requestId
+              ? store.tokenRequests.find((request) => request.id === idempotent.requestId)
+              : undefined;
+            if (
+              !existingRequest ||
+              existingRequest.feishuUserId !== targetUser.id ||
+              existingRequest.requestType !== "quota_adjust"
+            ) {
+              throw new JsonQuotaSubmissionError(
+                409,
+                "idempotency_conflict",
+                "调额幂等操作缺少匹配申请记录",
+              );
+            }
+            return {
+              request: existingRequest,
+              operation: idempotent,
+              deduplicated: true,
+            };
+          }
+
+          const openOperation = store.quotaOperations.find(
+            (operation) =>
+              operation.feishuUserId === targetUser.id &&
+              !["completed", "compensated", "cancelled"].includes(operation.state),
+          );
+          if (openOperation) {
+            throw new JsonQuotaSubmissionError(
+              409,
+              "quota_operation_open",
+              `用户已有未完成额度操作: ${openOperation.id}`,
+            );
+          }
+          const activeAccount = [...store.tokenAccounts]
+            .filter(
+              (account) =>
+                account.feishuUserId === targetUser.id &&
+                account.status === "active" &&
+                Boolean(account.newapiTokenId),
+            )
+            .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+          if (!activeAccount?.newapiTokenId) {
+            throw new JsonQuotaSubmissionError(
+              409,
+              "active_token_required",
+              "目标用户没有可调额的 active NewAPI Key",
+            );
+          }
+
+          const now = nowIso();
+          const digest = sha256Hex(`${targetUser.id}:${input.clientRequestId}`).slice(0, 28);
+          const actorUser = store.users.find((user) => user.id === input.actorUserId);
+          if (!actorUser) {
+            throw new JsonQuotaSubmissionError(
+              403,
+              "admin_scope_required",
+              "当前管理员权限已变化，请刷新后重试",
+            );
+          }
+          const request: TokenRequest = {
+            id: `tr_admin_adjust_${digest}`,
+            feishuUserId: targetUser.id,
+            requestType: "quota_adjust",
+            status: "approved_provisioning",
+            reason: input.reason,
+            requestedMonthlyQuota: input.approvedMonthlyQuota,
+            approvedMonthlyQuota: input.approvedMonthlyQuota,
+            approvalUuid: `approval_admin_adjust_${digest}`,
+            approvalDepartmentId: targetUser.departmentId,
+            approvalMode: "manual",
+            approvalOperatorOpenId: actorUser.openId,
+            approvalOperatedAt: now,
+            createdAt: now,
+            updatedAt: now,
+          };
+          const operationGeneration =
+            Math.max(
+              0,
+              store.userQuotaStates.find(
+                (state) => state.feishuUserId === targetUser.id,
+              )?.activeGeneration ?? 0,
+              ...store.tokenAccounts
+                .filter((account) => account.feishuUserId === targetUser.id)
+                .map((account) => account.operationGeneration ?? 0),
+            ) + 1;
+          const operation: QuotaOperation = {
+            id: randomId("qo"),
+            operationType: "quota_adjust",
+            idempotencyKey,
+            feishuUserId: targetUser.id,
+            departmentId: targetUser.departmentId,
+            billingPeriod: activeAccount.billingPeriod,
+            requestedAssignedQuota,
+            reservedDepartmentQuota: 0,
+            operationGeneration,
+            state: "planned",
+            attemptCount: 0,
+            upstreamTokenIdBefore: activeAccount.newapiTokenId,
+            tokenAccountIdBefore: activeAccount.id,
+            requestId: request.id,
+            createdByOpenId: request.approvalOperatorOpenId,
+            createdAt: now,
+            updatedAt: now,
+          };
+          store.tokenRequests.push(request);
+          store.quotaOperations.push(operation);
+          return { request, operation, deduplicated: false };
+        }),
+      ),
+  );
+}
+
 export async function createQuotaOperation(input: {
   operationType: QuotaOperation["operationType"];
   idempotencyKey: string;
@@ -1754,13 +2544,15 @@ export async function createQuotaOperation(input: {
 }) {
   const state = await getUserQuotaState(input.feishuUserId);
   const now = nowIso();
+  const billingPeriod =
+    input.billingPeriod ?? (await getCurrentPackageBillingPeriod());
   const operation: QuotaOperation = {
     id: randomId("qo"),
     operationType: input.operationType,
     idempotencyKey: input.idempotencyKey,
     feishuUserId: input.feishuUserId,
     departmentId: input.departmentId,
-    billingPeriod: input.billingPeriod ?? currentQuotaPeriod(),
+    billingPeriod,
     requestedAssignedQuota: input.requestedAssignedQuota,
     assignedQuotaBefore: input.assignedQuotaBefore,
     observedRemainBefore: input.observedRemainBefore,
@@ -1780,6 +2572,10 @@ export async function createQuotaOperation(input: {
   if (isPostgresBackend()) return createPostgresQuotaOperation(operation);
   return withUserQuotaOperationLock(input.feishuUserId, () =>
     mutate((store) => {
+      const user = store.users.find((item) => item.id === input.feishuUserId);
+      if (!user || (user.status && user.status !== "active")) {
+        throw new Error("额度操作目标用户已禁用、删除或不存在");
+      }
       const idempotent = store.quotaOperations.find(
         (item) => item.idempotencyKey === input.idempotencyKey,
       );
@@ -1788,7 +2584,8 @@ export async function createQuotaOperation(input: {
         (item) =>
           item.feishuUserId === input.feishuUserId &&
           item.state !== "completed" &&
-          item.state !== "compensated",
+          item.state !== "compensated" &&
+          item.state !== "cancelled",
       );
       if (open) throw new Error(`用户已有未完成额度操作: ${open.id}`);
       store.quotaOperations.push(operation);
@@ -1797,56 +2594,382 @@ export async function createQuotaOperation(input: {
   );
 }
 
+export async function reopenJsonAdminDefaultProvisioningAfterAccessRevoke(input: {
+  feishuUserId: string;
+  billingPeriod: string;
+  idempotencyKey: string;
+}) {
+  if (isPostgresBackend()) {
+    throw new Error("JSON administrator provisioning reopen cannot run on PostgreSQL");
+  }
+  return withAdminScopeUserLocks([input.feishuUserId], () =>
+    withUserQuotaOperationLock(input.feishuUserId, () =>
+      mutate(async (store) => {
+        const user = store.users.find((item) => item.id === input.feishuUserId);
+        if (!user || (user.status && user.status !== "active")) return null;
+        const currentScope = await resolveAdminScopeForKnownUser(user, store);
+        if (!currentScope || currentScope.status !== "active") return null;
+        if (
+          store.tokenAccounts.some(
+            (account) =>
+              account.feishuUserId === user.id && account.status === "active",
+          )
+        ) {
+          return null;
+        }
+        const operation = store.quotaOperations.find(
+          (item) => item.idempotencyKey === input.idempotencyKey,
+        );
+        if (!operation || !canReopenFirstProvisionAfterAccessRevoke(operation)) {
+          return null;
+        }
+        const conflicting = store.quotaOperations.find(
+          (item) =>
+            item.id !== operation.id &&
+            item.feishuUserId === user.id &&
+            !["completed", "compensated", "cancelled"].includes(item.state),
+        );
+        if (conflicting) return null;
+
+        const departmentPeriod = store.departmentQuotaPeriods.find(
+          (item) =>
+            item.departmentId === user.departmentId &&
+            item.period === input.billingPeriod,
+        );
+        const monthlyQuota = Math.round(
+          departmentPeriod?.defaultGrantQuota ?? store.settings.defaultMonthlyQuota,
+        );
+        if (!Number.isFinite(monthlyQuota) || monthlyQuota <= 0) {
+          throw new Error("管理员默认发放额度未配置为正整数");
+        }
+        const request = operation.requestId
+          ? store.tokenRequests.find((item) => item.id === operation.requestId)
+          : undefined;
+        if (!request) {
+          throw new Error("管理员默认发放取消任务缺少原申请，拒绝自动恢复");
+        }
+        const now = nowIso();
+        Object.assign(request, {
+          status: "approved_provisioning" as const,
+          requestedMonthlyQuota: monthlyQuota,
+          approvedMonthlyQuota: monthlyQuota,
+          approvalDepartmentId: user.departmentId,
+          approvalMode: "manual" as const,
+          approvalOperatorOpenId: "system:admin-default",
+          approvalOperatedAt: now,
+          errorMessage: undefined,
+          updatedAt: now,
+        });
+        const operationGeneration =
+          Math.max(
+            0,
+            store.userQuotaStates.find(
+              (state) => state.feishuUserId === user.id,
+            )?.activeGeneration ?? 0,
+            ...store.tokenAccounts
+              .filter((account) => account.feishuUserId === user.id)
+              .map((account) => account.operationGeneration ?? 0),
+          ) + 1;
+        const reopened = reopenFirstProvisionAfterAccessRevoke(operation, {
+          departmentId: user.departmentId,
+          requestedAssignedQuota: Math.max(
+            Math.round(monthlyQuota * getConfig().newapi.quotaPerUnit),
+            0,
+          ),
+          operationGeneration,
+          requestId: request.id,
+          reopenedAt: now,
+        });
+        Object.assign(operation, reopened);
+        return { request, operation };
+      }),
+    ),
+  );
+}
+
+export async function preparePackageResetPeriod(period: string) {
+  if (isPostgresBackend()) return preparePostgresPackageResetPeriod(period);
+
+  return mutate((store) => {
+    assertPackageResetExecutionAllowed({
+      policy: store.settings.packageReset,
+      period,
+    });
+    const policies = store.userQuotaPolicies
+      .filter(
+        (policy) =>
+          policy.effectiveFromPeriod <= period &&
+          (!policy.effectiveToPeriod || policy.effectiveToPeriod >= period),
+      )
+      .sort((a, b) => b.version - a.version || b.id.localeCompare(a.id));
+    const latestPolicyByUser = new Map<string, UserQuotaPolicy>();
+    for (const policy of policies) {
+      if (!latestPolicyByUser.has(policy.feishuUserId)) {
+        latestPolicyByUser.set(policy.feishuUserId, policy);
+      }
+    }
+
+    const departments = new Map<
+      string,
+      { departmentName?: string; assignedQuota: number }
+    >();
+    for (const user of store.users) {
+      if (user.status && user.status !== "active") continue;
+      const policy = latestPolicyByUser.get(user.id);
+      if (!policy?.departmentId) continue;
+      const current = departments.get(policy.departmentId) ?? {
+        departmentName: user.departmentName,
+        assignedQuota: 0,
+      };
+      current.departmentName ??= user.departmentName;
+      current.assignedQuota += Math.max(policy.assignedMonthlyQuota, 0);
+      departments.set(policy.departmentId, current);
+    }
+
+    const created: DepartmentQuotaPeriod[] = [];
+    for (const [departmentId, department] of [...departments].sort(([a], [b]) =>
+      a.localeCompare(b),
+    )) {
+      if (
+        store.departmentQuotaPeriods.some(
+          (item) => item.departmentId === departmentId && item.period === period,
+        )
+      ) {
+        continue;
+      }
+      const previous = store.departmentQuotaPeriods
+        .filter((item) => item.departmentId === departmentId && item.period < period)
+        .sort((a, b) => b.period.localeCompare(a.period) || b.id.localeCompare(a.id))[0];
+      const assignedUnits = Math.ceil(
+        department.assignedQuota / getConfig().newapi.quotaPerUnit,
+      );
+      const now = nowIso();
+      const quotaPeriod: DepartmentQuotaPeriod = {
+        id: randomId("dqp"),
+        departmentId,
+        departmentName: previous?.departmentName ?? department.departmentName,
+        period,
+        quotaLimit:
+          previous?.quotaLimit ?? initialDepartmentQuotaLimit(assignedUnits),
+        defaultGrantQuota:
+          previous?.defaultGrantQuota ?? store.settings.defaultMonthlyQuota,
+        createdAt: now,
+        updatedAt: now,
+        updatedByFeishuUserId: PACKAGE_RESET_SYSTEM_ACTOR,
+      };
+      store.departmentQuotaPeriods.push(quotaPeriod);
+      created.push(quotaPeriod);
+    }
+    return created;
+  });
+}
+
 export async function createMonthlyOpenQuotaOperations(
   inputs: Array<{
     feishuUserId: string;
-    departmentId: string;
+    departmentId?: string;
     billingPeriod: string;
     assignedMonthlyQuota: number;
     createdByOpenId?: string;
   }>,
+  options: { executionSource?: "root" | "package_reset" } = {},
 ) {
   if (!inputs.length) return [];
-  if (isPostgresBackend()) return createPostgresMonthlyOpenOperations(inputs);
-  return withJsonDepartmentQuotaLock(
-    `monthly-open-batch:${inputs.map((item) => item.billingPeriod).sort().join(":")}`,
+  if (isPostgresBackend()) {
+    return createPostgresMonthlyOpenOperations(inputs, options);
+  }
+  const uniqueInputs = [
+    ...new Map(
+      inputs.map((input) => [
+        `${input.feishuUserId}\u0000${input.billingPeriod}`,
+        input,
+      ]),
+    ).values(),
+  ];
+  const userLockKeys = [
+    ...new Set(uniqueInputs.map((item) => `user-quota:${item.feishuUserId}`)),
+  ].sort();
+  return withJsonQuotaLocks(
+    userLockKeys,
     () =>
       mutate((store) => {
+        if (options.executionSource === "package_reset") {
+          if (
+            uniqueInputs.some(
+              (item) => item.createdByOpenId !== PACKAGE_RESET_SYSTEM_ACTOR,
+            )
+          ) {
+            throw new Error("套餐重置自动任务的审计身份无效");
+          }
+          for (const period of new Set(uniqueInputs.map((item) => item.billingPeriod))) {
+            assertPackageResetExecutionAllowed({
+              policy: store.settings.packageReset,
+              period,
+            });
+          }
+        } else {
+          const creatorOpenIds = [
+            ...new Set(uniqueInputs.map((item) => item.createdByOpenId).filter(Boolean)),
+          ] as string[];
+          const rootActor =
+            creatorOpenIds.length === 1 &&
+            getConfig().admin.systemAdminOpenIds.includes(creatorOpenIds[0])
+              ? store.users.find(
+                  (user) =>
+                    user.openId === creatorOpenIds[0] &&
+                    (!user.status || user.status === "active"),
+                )
+              : undefined;
+          if (!rootActor) {
+            throw new AdminUserActionAuthorizationError(
+              "root_required",
+              403,
+              "套餐重置仅允许有效 root 用户执行",
+            );
+          }
+        }
         const operations: QuotaOperation[] = [];
-        const newInputs: typeof inputs = [];
-        for (const input of inputs) {
+        const resolvedInputs: Array<{
+          feishuUserId: string;
+          departmentId?: string;
+          billingPeriod: string;
+          assignedMonthlyQuota: number;
+          createdByOpenId?: string;
+          reopenOperation?: QuotaOperation;
+        }> = [];
+        const systemAdminOpenIds = new Set(getConfig().admin.systemAdminOpenIds);
+        for (const input of uniqueInputs) {
           const idempotencyKey = `monthly-open:${input.billingPeriod}:${input.feishuUserId}`;
           const idempotent = store.quotaOperations.find(
             (item) => item.idempotencyKey === idempotencyKey,
           );
-          if (idempotent) {
-            if (
-              idempotent.requestedAssignedQuota !== input.assignedMonthlyQuota ||
-              idempotent.departmentId !== input.departmentId
-            ) {
-              throw new Error(`月度开账幂等记录与当前策略不一致: ${idempotent.id}`);
-            }
+          if (idempotent && idempotent.state !== "cancelled") {
             operations.push(idempotent);
             continue;
+          }
+          if (
+            store.quotaLedgerEntries.some(
+              (entry) =>
+                entry.feishuUserId === input.feishuUserId &&
+                entry.period === input.billingPeriod &&
+                entry.entryType === "period_open_authorization",
+            )
+          ) {
+            continue;
+          }
+          const user = store.users.find((item) => item.id === input.feishuUserId);
+          if (!user || (user.status && user.status !== "active")) {
+            throw new Error(
+              `月度开账用户已禁用、删除或不存在: ${input.feishuUserId}`,
+            );
+          }
+          const currentPolicy = store.userQuotaPolicies
+            .filter(
+              (policy) =>
+                policy.feishuUserId === input.feishuUserId &&
+                policy.effectiveFromPeriod <= input.billingPeriod &&
+                (!policy.effectiveToPeriod ||
+                  policy.effectiveToPeriod >= input.billingPeriod),
+            )
+            .sort((a, b) => b.version - a.version || b.id.localeCompare(a.id))[0];
+          if (!currentPolicy) {
+            throw new Error(
+              `月度开账用户缺少当前有效额度策略: ${input.feishuUserId}`,
+            );
+          }
+          const activeTokenCount = store.tokenAccounts.filter(
+            (account) =>
+              account.feishuUserId === input.feishuUserId &&
+              account.status === "active",
+          ).length;
+          if (activeTokenCount > 1) {
+            throw new Error(`月度开账用户存在多个 active Key: ${input.feishuUserId}`);
+          }
+          const isGlobalAdmin =
+            systemAdminOpenIds.has(user.openId) ||
+            store.adminScopes.some(
+              (scope) =>
+                scope.feishuUserId === input.feishuUserId &&
+                scope.scopeType === "global" &&
+                scope.status === "active",
+            );
+          if (!currentPolicy.departmentId && !isGlobalAdmin) {
+            throw new Error(`月度开账用户缺少部门归属: ${input.feishuUserId}`);
           }
           const open = store.quotaOperations.find(
             (item) =>
               item.feishuUserId === input.feishuUserId &&
               item.state !== "completed" &&
-              item.state !== "compensated",
+              item.state !== "compensated" &&
+              item.state !== "cancelled",
           );
           if (open) throw new Error(`用户已有未完成额度操作: ${open.id}`);
-          newInputs.push(input);
+          if (
+            idempotent &&
+            !canReopenMonthlyOpenAfterAccessRevoke(idempotent)
+          ) {
+            throw new Error(
+              `已取消的月度开账操作存在不安全副作用，禁止自动恢复: ${idempotent.id}`,
+            );
+          }
+          const assignedMonthlyQuota = Number(currentPolicy.assignedMonthlyQuota);
+          if (
+            !Number.isSafeInteger(assignedMonthlyQuota) ||
+            assignedMonthlyQuota < 0
+          ) {
+            throw new Error(`月度开账用户当前额度策略无效: ${input.feishuUserId}`);
+          }
+          resolvedInputs.push({
+            feishuUserId: input.feishuUserId,
+            departmentId: currentPolicy.departmentId,
+            billingPeriod: input.billingPeriod,
+            assignedMonthlyQuota,
+            createdByOpenId: input.createdByOpenId,
+            reopenOperation: idempotent,
+          });
         }
-        for (const departmentId of [...new Set(newInputs.map((item) => item.departmentId))]) {
+        if (!resolvedInputs.length) return operations;
+
+        const checkpoint = store.usageSyncCheckpoints.find(
+          (item) => item.scope === "newapi_usage_logs",
+        );
+        const syncPolicy = store.settings.usageSyncPolicy;
+        const blockingIssue = store.usageSyncIssues.some(
+          (issue) =>
+            issue.status === "open" &&
+            (issue.blocksSettlement ?? false),
+        );
+        if (
+          !checkpoint ||
+          checkpoint.lastRunStatus !== "applied" ||
+          checkpoint.integrityBlockedAt ||
+          checkpoint.integrityBlockedIssueId ||
+          blockingIssue ||
+          !isSettlementWatermarkFresh({
+            settledThrough: checkpoint.settledThrough,
+            maxLagMinutes:
+              2 * (syncPolicy?.intervalMinutes ?? 60) +
+              (syncPolicy?.settlementLagMinutes ?? 5),
+          })
+        ) {
+          throw new Error("月度开账结算状态不安全：稳定水位或完整性门禁未通过");
+        }
+
+        for (const departmentId of [
+          ...new Set(
+            resolvedInputs
+              .map((item) => item.departmentId)
+              .filter((item): item is string => Boolean(item)),
+          ),
+        ]) {
           for (const period of [
             ...new Set(
-              newInputs
+              resolvedInputs
                 .filter((item) => item.departmentId === departmentId)
                 .map((item) => item.billingPeriod),
             ),
           ]) {
-            const requested = newInputs
+            const requested = resolvedInputs
               .filter(
                 (item) =>
                   item.departmentId === departmentId && item.billingPeriod === period,
@@ -1871,7 +2994,8 @@ export async function createMonthlyOpenQuotaOperations(
                   item.departmentId === departmentId &&
                   item.billingPeriod === period &&
                   item.state !== "completed" &&
-                  item.state !== "compensated",
+                  item.state !== "compensated" &&
+                  item.state !== "cancelled",
               )
               .reduce(
                 (sum, item) => sum + Math.max(item.reservedDepartmentQuota, 0),
@@ -1886,7 +3010,7 @@ export async function createMonthlyOpenQuotaOperations(
             }
           }
         }
-        for (const input of newInputs) {
+        for (const input of resolvedInputs) {
           const state =
             store.userQuotaStates.find(
               (item) => item.feishuUserId === input.feishuUserId,
@@ -1898,6 +3022,21 @@ export async function createMonthlyOpenQuotaOperations(
                 .map((item) => item.operationGeneration ?? 0),
             );
           const now = nowIso();
+          if (input.reopenOperation) {
+            const reopened = reopenMonthlyOpenAfterAccessRevoke(
+              input.reopenOperation,
+              {
+                departmentId: input.departmentId,
+                assignedMonthlyQuota: input.assignedMonthlyQuota,
+                operationGeneration: state + 1,
+                createdByOpenId: input.createdByOpenId,
+                reopenedAt: now,
+              },
+            );
+            Object.assign(input.reopenOperation, reopened);
+            operations.push(input.reopenOperation);
+            continue;
+          }
           const operation: QuotaOperation = {
             id: randomId("qo"),
             operationType: "monthly_open",
@@ -1906,9 +3045,11 @@ export async function createMonthlyOpenQuotaOperations(
             departmentId: input.departmentId,
             billingPeriod: input.billingPeriod,
             requestedAssignedQuota: input.assignedMonthlyQuota,
-            reservedDepartmentQuota: input.assignedMonthlyQuota,
+            reservedDepartmentQuota: input.departmentId
+              ? input.assignedMonthlyQuota
+              : 0,
             operationGeneration: state + 1,
-            state: "budget_reserved",
+            state: input.departmentId ? "budget_reserved" : "planned",
             attemptCount: 0,
             createdByOpenId: input.createdByOpenId,
             createdAt: now,
@@ -1959,12 +3100,13 @@ export async function updateQuotaOperation(
 export async function claimQuotaOperationExecution(input: {
   operationId: string;
   leaseId: string;
-  leaseExpiresAt: string;
+  leaseDurationMs: number;
 }) {
   if (isPostgresBackend()) return claimPostgresQuotaOperationExecution(input);
   return mutate((store) => {
     const operation = store.quotaOperations.find((item) => item.id === input.operationId);
     if (!operation) return null;
+    if (["completed", "compensated", "cancelled"].includes(operation.state)) return null;
     if (
       operation.workerLeaseId &&
       operation.workerLeaseId !== input.leaseId &&
@@ -1974,7 +3116,9 @@ export async function claimQuotaOperationExecution(input: {
       return null;
     }
     operation.workerLeaseId = input.leaseId;
-    operation.workerLeaseExpiresAt = input.leaseExpiresAt;
+    operation.workerLeaseExpiresAt = new Date(
+      Date.now() + Math.max(Math.trunc(input.leaseDurationMs), 1),
+    ).toISOString();
     return operation;
   });
 }
@@ -1982,13 +3126,19 @@ export async function claimQuotaOperationExecution(input: {
 export async function renewQuotaOperationExecution(input: {
   operationId: string;
   leaseId: string;
-  leaseExpiresAt: string;
+  leaseDurationMs: number;
 }) {
   if (isPostgresBackend()) return renewPostgresQuotaOperationExecution(input);
   return mutate((store) => {
     const operation = store.quotaOperations.find((item) => item.id === input.operationId);
-    if (!operation || operation.workerLeaseId !== input.leaseId) return null;
-    operation.workerLeaseExpiresAt = input.leaseExpiresAt;
+    if (
+      !operation ||
+      ["completed", "compensated", "cancelled"].includes(operation.state) ||
+      operation.workerLeaseId !== input.leaseId
+    ) return null;
+    operation.workerLeaseExpiresAt = new Date(
+      Date.now() + Math.max(Math.trunc(input.leaseDurationMs), 1),
+    ).toISOString();
     return operation;
   });
 }
@@ -2024,7 +3174,9 @@ export async function transitionQuotaOperation(
       ...patch,
       state,
       completedAt:
-        state === "completed" || state === "compensated" ? nowIso() : patch.completedAt,
+        state === "completed" || state === "compensated" || state === "cancelled"
+          ? nowIso()
+          : patch.completedAt,
     },
     [current.state],
   );
@@ -2037,7 +3189,13 @@ export async function reserveQuotaOperationDepartmentBudget(
   const initial = await findQuotaOperationById(operationId);
   if (!initial) throw new Error("额度操作不存在");
   if (reservedDepartmentQuota <= 0) return initial;
-  if (!initial.departmentId) throw new Error("额度操作缺少部门，无法预占部门预算");
+  // Global administrators can legitimately have no Feishu department. Their
+  // default grant uses the global policy and must not invent a fake department.
+  if (!initial.departmentId) return initial;
+  await ensureDepartmentQuotaPeriod({
+    departmentId: initial.departmentId,
+    period: initial.billingPeriod,
+  });
   if (isPostgresBackend()) {
     return reservePostgresQuotaOperationDepartmentBudget(
       operationId,
@@ -2074,7 +3232,8 @@ export async function reserveQuotaOperationDepartmentBudget(
             item.departmentId === operation.departmentId &&
             item.billingPeriod === operation.billingPeriod &&
             item.state !== "completed" &&
-            item.state !== "compensated",
+            item.state !== "compensated" &&
+            item.state !== "cancelled",
         )
         .reduce((sum, item) => sum + Math.max(item.reservedDepartmentQuota, 0), 0);
       const availableQuota = Math.max(
@@ -2106,6 +3265,33 @@ export async function listQuotaOperations(input: {
     )
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     .slice(0, input.limit ?? 100);
+}
+
+export async function listDueQuotaOperations(input: {
+  now: string;
+  limit?: number;
+}) {
+  if (isPostgresBackend()) return listPostgresDueQuotaOperations(input);
+  const store = await readStore();
+  const nowMs = new Date(input.now).getTime();
+  return store.quotaOperations
+    .filter(
+      (item) =>
+        item.state !== "completed" &&
+        item.state !== "compensated" &&
+        item.state !== "cancelled" &&
+        (item.state !== "manual_review" ||
+          canAutoResumeKeyRotationObservationFailure(item)) &&
+        (!item.nextRetryAt || new Date(item.nextRetryAt).getTime() <= nowMs) &&
+        (!item.workerLeaseExpiresAt ||
+          new Date(item.workerLeaseExpiresAt).getTime() <= nowMs),
+    )
+    .sort((a, b) => {
+      const nextRetryOrder = (a.nextRetryAt ?? "").localeCompare(b.nextRetryAt ?? "");
+      if (nextRetryOrder !== 0) return nextRetryOrder;
+      return a.updatedAt.localeCompare(b.updatedAt) || a.id.localeCompare(b.id);
+    })
+    .slice(0, Math.max(Math.trunc(input.limit ?? 100), 0));
 }
 
 export async function appendQuotaLedgerEntry(
@@ -2195,7 +3381,8 @@ async function rebuildDepartmentQuotaMaterializedSnapshots(
           item.departmentId === existing.departmentId &&
           item.billingPeriod === period &&
           item.state !== "completed" &&
-          item.state !== "compensated",
+          item.state !== "compensated" &&
+          item.state !== "cancelled",
       )
       .reduce((sum, item) => sum + Math.max(item.reservedDepartmentQuota, 0), 0);
     const materialized = materializeDepartmentQuota({
@@ -2245,14 +3432,11 @@ async function rebuildQuotaMaterializedSnapshotsNow(
   }
 
   const store = await readStore();
-  const ledgerAuthoritative = Boolean(store.settings.quotaMigration?.appliedAt);
   const now = nowIso();
   const userRows: UserBillingPeriod[] = [];
-  const shadowUsers: Array<{
+  const materializedUsers: Array<{
     feishuUserId: string;
     period: string;
-    legacyMonthlyQuota: number;
-    legacyConsumedQuota: number;
     assignedMonthlyQuota: number;
     authorizedQuota: number;
     authoritativeConsumedQuota: number;
@@ -2292,17 +3476,9 @@ async function rebuildQuotaMaterializedSnapshotsNow(
       (item) =>
         item.feishuUserId === feishuUserId &&
         quotaRecordPeriod(item) === period &&
-        item.matchStatus === "matched",
+        isAuthoritativeUsageRecord(item),
     );
-    const assignedMonthlyQuota = policy?.assignedMonthlyQuota ??
-      (ledgerAuthoritative
-        ? 0
-        : Math.max(
-            Math.round(
-              (existing?.monthlyQuota ?? store.settings.defaultMonthlyQuota) * quotaPerUnit,
-            ),
-            0,
-          ));
+    const assignedMonthlyQuota = policy?.assignedMonthlyQuota ?? 0;
     const authoritativeConsumedQuota = usageRecords.reduce(
       (sum, item) => sum + authoritativeQuotaFromRecord(item, quotaPerUnit),
       0,
@@ -2316,14 +3492,10 @@ async function rebuildQuotaMaterializedSnapshotsNow(
       id: existing?.id ?? randomId("bp"),
       feishuUserId,
       period,
-      monthlyQuota: ledgerAuthoritative
-        ? assignedMonthlyQuota / quotaPerUnit
-        : existing?.monthlyQuota ?? assignedMonthlyQuota / quotaPerUnit,
-      quotaConsumed: existing?.quotaConsumed ?? authoritativeConsumedQuota / quotaPerUnit,
-      cost: existing?.cost ?? authoritativeConsumedQuota / quotaPerUnit,
-      remainingQuota: ledgerAuthoritative
-        ? materialized.expectedAvailableQuota / quotaPerUnit
-        : existing?.remainingQuota ?? materialized.expectedAvailableQuota / quotaPerUnit,
+      monthlyQuota: assignedMonthlyQuota / quotaPerUnit,
+      quotaConsumed: authoritativeConsumedQuota / quotaPerUnit,
+      cost: authoritativeConsumedQuota / quotaPerUnit,
+      remainingQuota: materialized.expectedAvailableQuota / quotaPerUnit,
       promptTokens: existing?.promptTokens ?? 0,
       completionTokens: existing?.completionTokens ?? 0,
       totalTokens: existing?.totalTokens ?? 0,
@@ -2342,11 +3514,9 @@ async function rebuildQuotaMaterializedSnapshotsNow(
       updatedAt: existing?.updatedAt ?? now,
     };
     userRows.push(row);
-    shadowUsers.push({
+    materializedUsers.push({
       feishuUserId,
       period,
-      legacyMonthlyQuota: Math.round((existing?.monthlyQuota ?? 0) * quotaPerUnit),
-      legacyConsumedQuota: Math.round((existing?.quotaConsumed ?? 0) * quotaPerUnit),
       assignedMonthlyQuota,
       authorizedQuota: materialized.authorizedQuota,
       authoritativeConsumedQuota,
@@ -2367,7 +3537,7 @@ async function rebuildQuotaMaterializedSnapshotsNow(
   return {
     period,
     materializedAt: now,
-    users: shadowUsers,
+    users: materializedUsers,
     departments: departmentRows.map((item) => ({
       departmentId: item.departmentId,
       budgetQuota: item.budgetQuota ?? 0,
@@ -2573,7 +3743,7 @@ export async function ensureDepartmentQuotaPeriod(input: {
   departmentName?: string;
   period?: string;
 }) {
-  const period = input.period ?? currentQuotaPeriod();
+  const period = input.period ?? (await getCurrentPackageBillingPeriod());
   return withDepartmentQuotaLock(input.departmentId, period, () =>
     ensureDepartmentQuotaPeriodUnlocked(input.departmentId, period, input.departmentName),
   );
@@ -2625,15 +3795,19 @@ function mapDepartmentQuotaSummary(store: StoreShape, policy: DepartmentQuotaPer
   };
 }
 
-export async function listDepartmentQuotaOverview(scope: AdminScope, period = currentQuotaPeriod()) {
-  const firstStore = await readStore();
+export async function listDepartmentQuotaOverview(scope: AdminScope, period?: string) {
+  period ??= await getCurrentPackageBillingPeriod();
+  if (isPostgresBackend()) {
+    return getPostgresDepartmentQuotaOverview(scope, period);
+  }
+  const store = await readStore();
   const departmentIds =
     scope.scopeType === "global"
       ? [
           ...new Set(
             [
-              ...firstStore.users.map((user) => user.departmentId),
-              ...firstStore.departmentQuotaPeriods
+              ...store.users.map((user) => user.departmentId),
+              ...store.departmentQuotaPeriods
                 .filter((item) => item.period === period)
                 .map((item) => item.departmentId),
             ].filter((item): item is string => Boolean(item)),
@@ -2643,12 +3817,27 @@ export async function listDepartmentQuotaOverview(scope: AdminScope, period = cu
         ? [scope.departmentId]
         : [];
 
-  for (const departmentId of departmentIds) {
-    await ensureDepartmentQuotaPeriod({ departmentId, period });
-  }
-  const store = await readStore();
-  const departments = store.departmentQuotaPeriods
-    .filter((item) => item.period === period && departmentIds.includes(item.departmentId))
+  const departments = departmentIds
+    .map((departmentId) => {
+      const existing = store.departmentQuotaPeriods.find(
+        (item) => item.departmentId === departmentId && item.period === period,
+      );
+      if (existing) return existing;
+      const allocatedQuota = allocatedDepartmentQuota(store, departmentId, period);
+      const now = nowIso();
+      return {
+        id: `virtual:${departmentId}:${period}`,
+        departmentId,
+        departmentName: store.users.find(
+          (user) => user.departmentId === departmentId,
+        )?.departmentName,
+        period,
+        quotaLimit: initialDepartmentQuotaLimit(allocatedQuota),
+        defaultGrantQuota: store.settings.defaultMonthlyQuota,
+        createdAt: now,
+        updatedAt: now,
+      } satisfies DepartmentQuotaPeriod;
+    })
     .map((item) => mapDepartmentQuotaSummary(store, item))
     .sort((a, b) =>
       (a.departmentName ?? a.departmentId).localeCompare(
@@ -2680,7 +3869,7 @@ export async function listDepartmentQuotaOverview(scope: AdminScope, period = cu
   return { period, departments, requests, recentEvents };
 }
 
-export async function updateDepartmentQuotaPolicy(input: {
+async function updateDepartmentQuotaPolicy(input: {
   departmentId: string;
   departmentName?: string;
   period?: string;
@@ -2688,7 +3877,7 @@ export async function updateDepartmentQuotaPolicy(input: {
   defaultGrantQuota?: number;
   operatedByFeishuUserId: string;
 }) {
-  const period = input.period ?? currentQuotaPeriod();
+  const period = input.period ?? (await getCurrentPackageBillingPeriod());
   return withDepartmentQuotaLock(input.departmentId, period, async () => {
     const policy = await ensureDepartmentQuotaPeriodUnlocked(
       input.departmentId,
@@ -2770,24 +3959,160 @@ export async function updateDepartmentQuotaPolicy(input: {
   });
 }
 
+export async function updateDepartmentQuotaPolicyAsActor(input: {
+  actorFeishuUserId: string;
+  departmentId: string;
+  departmentName?: string;
+  period?: string;
+  quotaLimit?: number;
+  defaultGrantQuota?: number;
+}) {
+  const period = input.period ?? (await getCurrentPackageBillingPeriod());
+  if (isPostgresBackend()) {
+    return updatePostgresDepartmentQuotaPolicyAsActor({ ...input, period });
+  }
+  return withAdminScopeUserLocks([input.actorFeishuUserId], () =>
+    withDepartmentQuotaLock(input.departmentId, period, () =>
+      mutate(async (store) => {
+        const actor = store.users.find((user) => user.id === input.actorFeishuUserId);
+        const actorScope = actor
+          ? await resolveAdminScopeForKnownUser(actor, store)
+          : null;
+        if (!actorScope) {
+          throw new AdminUserActionAuthorizationError(
+            "actor_scope_missing",
+            403,
+            "当前管理员权限已变化，请刷新后重试",
+          );
+        }
+        if (
+          actorScope.scopeType === "department" &&
+          actorScope.departmentId !== input.departmentId
+        ) {
+          throw new AdminUserActionAuthorizationError(
+            "target_out_of_scope",
+            403,
+            "不能修改其他部门的额度设置",
+          );
+        }
+        if (actorScope.scopeType === "department" && input.quotaLimit !== undefined) {
+          throw new AdminUserActionAuthorizationError(
+            "target_out_of_scope",
+            403,
+            "部门总额度上限只能由系统管理员直接设置",
+          );
+        }
+        const allocatedQuota = allocatedDepartmentQuota(store, input.departmentId, period);
+        const now = nowIso();
+        let policy = store.departmentQuotaPeriods.find(
+          (item) => item.departmentId === input.departmentId && item.period === period,
+        );
+        if (!policy) {
+          policy = {
+            id: randomId("dqp"),
+            departmentId: input.departmentId,
+            departmentName:
+              input.departmentName ??
+              store.users.find((user) => user.departmentId === input.departmentId)
+                ?.departmentName,
+            period,
+            quotaLimit: initialDepartmentQuotaLimit(allocatedQuota),
+            defaultGrantQuota: store.settings.defaultMonthlyQuota,
+            createdAt: now,
+            updatedAt: now,
+          };
+          store.departmentQuotaPeriods.push(policy);
+        }
+        const pendingReservedQuota = summarizeDepartmentQuota({
+          policy,
+          allocatedQuota,
+          events: store.quotaChangeEvents.filter(
+            (event) =>
+              event.departmentId === input.departmentId && event.period === period,
+          ),
+        }).pendingReservedQuota;
+        if (input.quotaLimit !== undefined) {
+          const error = validateDepartmentQuotaLimit(
+            input.quotaLimit,
+            allocatedQuota + pendingReservedQuota,
+          );
+          if (error) throw new Error(error);
+        }
+        if (
+          input.defaultGrantQuota !== undefined &&
+          (!Number.isInteger(input.defaultGrantQuota) ||
+            input.defaultGrantQuota <= 0 ||
+            input.defaultGrantQuota > 1_000_000)
+        ) {
+          throw new Error("部门默认发放额度必须是 1 到 1000000 之间的整数");
+        }
+        const previous = { ...policy };
+        Object.assign(policy, {
+          departmentName: input.departmentName ?? policy.departmentName,
+          quotaLimit: input.quotaLimit ?? policy.quotaLimit,
+          defaultGrantQuota: input.defaultGrantQuota ?? policy.defaultGrantQuota,
+          updatedAt: now,
+          updatedByFeishuUserId: input.actorFeishuUserId,
+        });
+        if (input.quotaLimit !== undefined && input.quotaLimit !== previous.quotaLimit) {
+          store.quotaChangeEvents.push({
+            id: randomId("qce"),
+            departmentId: input.departmentId,
+            departmentName: policy.departmentName,
+            period,
+            operatedByFeishuUserId: input.actorFeishuUserId,
+            kind: "department_limit_set",
+            status: "applied",
+            previousValue: previous.quotaLimit,
+            nextValue: input.quotaLimit,
+            delta: input.quotaLimit - previous.quotaLimit,
+            createdAt: now,
+            updatedAt: now,
+          });
+        }
+        if (
+          input.defaultGrantQuota !== undefined &&
+          input.defaultGrantQuota !== previous.defaultGrantQuota
+        ) {
+          store.quotaChangeEvents.push({
+            id: randomId("qce"),
+            departmentId: input.departmentId,
+            departmentName: policy.departmentName,
+            period,
+            operatedByFeishuUserId: input.actorFeishuUserId,
+            kind: "department_default_set",
+            status: "applied",
+            previousValue: previous.defaultGrantQuota,
+            nextValue: input.defaultGrantQuota,
+            delta: input.defaultGrantQuota - previous.defaultGrantQuota,
+            createdAt: now,
+            updatedAt: now,
+          });
+        }
+        return mapDepartmentQuotaSummary(store, policy);
+      }),
+    ),
+  );
+}
+
 const pendingDepartmentQuotaRequestStatuses = new Set<DepartmentQuotaRequest["status"]>([
   "pending_card_send",
   "pending_card_approval",
   "approval_card_send_failed",
 ]);
 
-export async function createDepartmentQuotaRequest(input: {
+async function createDepartmentQuotaRequest(input: {
   departmentId: string;
   departmentName?: string;
   period?: string;
   requesterFeishuUserId: string;
   action: DepartmentQuotaRequest["action"];
   reason: string;
-  requestedQuotaLimit: number;
+  requestedQuotaLimit?: number;
   approvalTargetOpenId: string;
   approvalActionNonceHash: string;
 }) {
-  const period = input.period ?? currentQuotaPeriod();
+  const period = input.period ?? (await getCurrentPackageBillingPeriod());
   return withDepartmentQuotaLock(input.departmentId, period, async () => {
     const policy = await ensureDepartmentQuotaPeriodUnlocked(
       input.departmentId,
@@ -2803,10 +4128,18 @@ export async function createDepartmentQuotaRequest(input: {
     );
     if (duplicate) throw new Error("当前部门已有总额度申请正在处理");
     const allocatedQuota = allocatedDepartmentQuota(store, input.departmentId, period);
-    const limitError = validateDepartmentQuotaLimit(input.requestedQuotaLimit, allocatedQuota);
-    if (limitError) throw new Error(limitError);
-    if (input.action === "increase" && input.requestedQuotaLimit <= policy.quotaLimit) {
-      throw new Error("提高额度申请必须大于当前部门额度上限");
+    if (input.action === "increase") {
+      if (input.requestedQuotaLimit === undefined) {
+        throw new Error("提高额度申请必须填写目标额度上限");
+      }
+      const limitError = validateDepartmentQuotaLimit(
+        input.requestedQuotaLimit,
+        allocatedQuota,
+      );
+      if (limitError) throw new Error(limitError);
+      if (input.requestedQuotaLimit <= policy.quotaLimit) {
+        throw new Error("提高额度申请必须大于当前部门额度上限");
+      }
     }
     const now = nowIso();
     return persistDepartmentQuotaRequest({
@@ -2826,6 +4159,106 @@ export async function createDepartmentQuotaRequest(input: {
       updatedAt: now,
     });
   });
+}
+
+export async function createDepartmentQuotaRequestAsActor(input: {
+  actorFeishuUserId: string;
+  departmentId: string;
+  departmentName?: string;
+  period?: string;
+  action: DepartmentQuotaRequest["action"];
+  reason: string;
+  requestedQuotaLimit?: number;
+  approvalTargetOpenId: string;
+  approvalActionNonceHash: string;
+}) {
+  if (isPostgresBackend()) {
+    throw new Error(
+      "PostgreSQL 部门额度申请必须使用 actor-aware 原子事务入口",
+    );
+  }
+  const period = input.period ?? (await getCurrentPackageBillingPeriod());
+  if (isPostgresBackend()) {
+    return createPostgresDepartmentQuotaRequestAsActor({ ...input, period });
+  }
+  return withAdminScopeUserLocks([input.actorFeishuUserId], () =>
+    withDepartmentQuotaLock(input.departmentId, period, () =>
+      mutate(async (store) => {
+        const actor = store.users.find((user) => user.id === input.actorFeishuUserId);
+        const actorScope = actor
+          ? await resolveAdminScopeForKnownUser(actor, store)
+          : null;
+        if (
+          !actor ||
+          !actorScope ||
+          actorScope.scopeType !== "department" ||
+          actorScope.departmentId !== input.departmentId
+        ) {
+          throw new AdminUserActionAuthorizationError(
+            "target_out_of_scope",
+            403,
+            "当前部门管理员权限已变化，请刷新后重试",
+          );
+        }
+        const duplicate = store.departmentQuotaRequests.find(
+          (request) =>
+            request.departmentId === input.departmentId &&
+            request.period === period &&
+            pendingDepartmentQuotaRequestStatuses.has(request.status),
+        );
+        if (duplicate) throw new Error("当前部门已有总额度申请正在处理");
+        const allocatedQuota = allocatedDepartmentQuota(store, input.departmentId, period);
+        const now = nowIso();
+        let policy = store.departmentQuotaPeriods.find(
+          (item) => item.departmentId === input.departmentId && item.period === period,
+        );
+        if (!policy) {
+          policy = {
+            id: randomId("dqp"),
+            departmentId: input.departmentId,
+            departmentName: input.departmentName ?? actor.departmentName,
+            period,
+            quotaLimit: initialDepartmentQuotaLimit(allocatedQuota),
+            defaultGrantQuota: store.settings.defaultMonthlyQuota,
+            createdAt: now,
+            updatedAt: now,
+          };
+          store.departmentQuotaPeriods.push(policy);
+        }
+        if (input.action === "increase") {
+          if (input.requestedQuotaLimit === undefined) {
+            throw new Error("提高额度申请必须填写目标额度上限");
+          }
+          const error = validateDepartmentQuotaLimit(
+            input.requestedQuotaLimit,
+            allocatedQuota,
+          );
+          if (error) throw new Error(error);
+          if (input.requestedQuotaLimit <= policy.quotaLimit) {
+            throw new Error("提高额度申请必须大于当前部门额度上限");
+          }
+        }
+        const request: DepartmentQuotaRequest = {
+          id: randomId("dqr"),
+          departmentId: input.departmentId,
+          departmentName: input.departmentName ?? policy.departmentName,
+          period,
+          requesterFeishuUserId: actor.id,
+          action: input.action,
+          status: "pending_card_send",
+          reason: input.reason,
+          currentQuotaLimit: policy.quotaLimit,
+          requestedQuotaLimit: input.requestedQuotaLimit,
+          approvalTargetOpenId: input.approvalTargetOpenId,
+          approvalActionNonceHash: input.approvalActionNonceHash,
+          createdAt: now,
+          updatedAt: now,
+        };
+        store.departmentQuotaRequests.push(request);
+        return request;
+      }),
+    ),
+  );
 }
 
 export async function findDepartmentQuotaRequestById(id: string) {
@@ -2849,7 +4282,7 @@ export async function updateDepartmentQuotaRequest(
   });
 }
 
-export async function decideDepartmentQuotaRequest(input: {
+async function decideDepartmentQuotaRequest(input: {
   requestId: string;
   action: "approve" | "reject";
   approvedQuotaLimit?: number;
@@ -2891,6 +4324,9 @@ export async function decideDepartmentQuotaRequest(input: {
       ),
     }).pendingReservedQuota;
     const approvedQuotaLimit = input.approvedQuotaLimit ?? request.requestedQuotaLimit;
+    if (approvedQuotaLimit === undefined) {
+      throw new Error("重置额度申请需要系统管理员填写审批额度");
+    }
     const limitError = validateDepartmentQuotaLimit(
       approvedQuotaLimit,
       allocatedQuota + pendingReservedQuota,
@@ -2935,8 +4371,136 @@ export async function decideDepartmentQuotaRequest(input: {
   });
 }
 
+export async function decideDepartmentQuotaRequestAsActor(input: {
+  requestId: string;
+  action: "approve" | "reject";
+  approvedQuotaLimit?: number;
+  actorFeishuUserId: string;
+}) {
+  if (isPostgresBackend()) {
+    throw new Error(
+      "PostgreSQL 部门额度审批必须使用 actor-aware 原子事务入口",
+    );
+  }
+  if (isPostgresBackend()) {
+    const result = await decidePostgresDepartmentQuotaRequestAsActor(input);
+    return result && "request" in result ? result.request : result;
+  }
+  const snapshot = await readStore();
+  const identity = snapshot.departmentQuotaRequests.find(
+    (request) => request.id === input.requestId,
+  );
+  if (!identity) return null;
+  return withAdminScopeUserLocks([input.actorFeishuUserId], () =>
+    withDepartmentQuotaLock(identity.departmentId, identity.period, () =>
+      mutate(async (store) => {
+        const actor = store.users.find((user) => user.id === input.actorFeishuUserId);
+        const actorScope = actor
+          ? await resolveAdminScopeForKnownUser(actor, store)
+          : null;
+        if (!actor || !actorScope || actorScope.scopeType !== "global") {
+          throw new AdminUserActionAuthorizationError(
+            "actor_scope_missing",
+            403,
+            "只有当前有效的系统管理员可以审批部门额度申请",
+          );
+        }
+        const request = store.departmentQuotaRequests.find(
+          (item) => item.id === input.requestId,
+        );
+        if (!request || !pendingDepartmentQuotaRequestStatuses.has(request.status)) {
+          return null;
+        }
+        const now = nowIso();
+        if (input.action === "reject") {
+          Object.assign(request, {
+            status: "rejected" as const,
+            approvalOperatorOpenId: actor.openId,
+            approvalOperatedAt: now,
+            errorMessage: undefined,
+            updatedAt: now,
+          });
+          return request;
+        }
+        const allocatedQuota = allocatedDepartmentQuota(
+          store,
+          request.departmentId,
+          request.period,
+        );
+        let policy = store.departmentQuotaPeriods.find(
+          (item) =>
+            item.departmentId === request.departmentId && item.period === request.period,
+        );
+        if (!policy) {
+          policy = {
+            id: randomId("dqp"),
+            departmentId: request.departmentId,
+            departmentName: request.departmentName,
+            period: request.period,
+            quotaLimit: initialDepartmentQuotaLimit(allocatedQuota),
+            defaultGrantQuota: store.settings.defaultMonthlyQuota,
+            createdAt: now,
+            updatedAt: now,
+          };
+          store.departmentQuotaPeriods.push(policy);
+        }
+        const pendingReservedQuota = summarizeDepartmentQuota({
+          policy,
+          allocatedQuota,
+          events: store.quotaChangeEvents.filter(
+            (event) =>
+              event.departmentId === request.departmentId &&
+              event.period === request.period,
+          ),
+        }).pendingReservedQuota;
+        const approvedQuotaLimit =
+          input.approvedQuotaLimit ?? request.requestedQuotaLimit;
+        if (approvedQuotaLimit === undefined) {
+          throw new Error("重置额度申请需要系统管理员填写审批额度");
+        }
+        const error = validateDepartmentQuotaLimit(
+          approvedQuotaLimit,
+          allocatedQuota + pendingReservedQuota,
+        );
+        if (error) throw new Error(error);
+        if (request.action === "increase" && approvedQuotaLimit <= policy.quotaLimit) {
+          throw new Error("提高额度审批值必须大于当前部门额度上限");
+        }
+        const previousValue = policy.quotaLimit;
+        policy.quotaLimit = approvedQuotaLimit;
+        policy.updatedAt = now;
+        policy.updatedByFeishuUserId = input.actorFeishuUserId;
+        store.quotaChangeEvents.push({
+          id: `qce_department_request_${request.id}`,
+          departmentId: request.departmentId,
+          departmentName: request.departmentName,
+          period: request.period,
+          operatedByFeishuUserId: input.actorFeishuUserId,
+          kind: "department_limit_set",
+          status: "applied",
+          previousValue,
+          nextValue: approvedQuotaLimit,
+          delta: approvedQuotaLimit - previousValue,
+          relatedDepartmentQuotaRequestId: request.id,
+          createdAt: now,
+          updatedAt: now,
+        });
+        Object.assign(request, {
+          status: "approved" as const,
+          approvedQuotaLimit,
+          approvalOperatorOpenId: actor.openId,
+          approvalOperatedAt: now,
+          errorMessage: undefined,
+          updatedAt: now,
+        });
+        return request;
+      }),
+    ),
+  );
+}
+
 export async function getEffectiveUserGrantQuota(feishuUserId: string) {
-  const period = currentQuotaPeriod();
+  const period = await getCurrentPackageBillingPeriod();
   if (isPostgresBackend()) {
     // Existing users almost always have a current billing row. Read it first
     // so a key-reset submit consumes one control checkout instead of two.
@@ -2978,7 +4542,7 @@ export async function assertFirstProvisionDepartmentCapacity(input: {
   const initialStore = await readStore();
   const user = initialStore.users.find((item) => item.id === input.feishuUserId);
   if (!user?.departmentId) return;
-  const period = currentQuotaPeriod();
+  const period = await getCurrentPackageBillingPeriod();
   await ensureDepartmentQuotaPeriod({
     departmentId: user.departmentId,
     departmentName: user.departmentName,
@@ -3014,7 +4578,8 @@ export async function assertFirstProvisionDepartmentCapacity(input: {
         item.departmentId === user.departmentId &&
         item.billingPeriod === period &&
         item.state !== "completed" &&
-        item.state !== "compensated",
+        item.state !== "compensated" &&
+        item.state !== "cancelled",
     )
     .reduce((sum, item) => sum + Math.max(item.reservedDepartmentQuota, 0), 0);
   const availableQuota = Math.max(
@@ -3035,7 +4600,7 @@ export async function reserveDepartmentQuotaForTokenRequest(request: TokenReques
   const initialStore = await readStore();
   const user = initialStore.users.find((item) => item.id === request.feishuUserId);
   if (!user?.departmentId) return null;
-  const period = currentQuotaPeriod();
+  const period = await getCurrentPackageBillingPeriod();
   return withDepartmentQuotaLock(user.departmentId, period, async () => {
     const policy = await ensureDepartmentQuotaPeriodUnlocked(
       user.departmentId!,
@@ -3163,7 +4728,7 @@ export async function assignDepartmentUserQuota(input: {
   operatedByFeishuUserId: string;
   period?: string;
 }) {
-  const period = input.period ?? currentQuotaPeriod();
+  const period = input.period ?? (await getCurrentPackageBillingPeriod());
   return withDepartmentQuotaLock(input.departmentId, period, async () => {
     const policy = await ensureDepartmentQuotaPeriodUnlocked(
       input.departmentId,
@@ -3247,6 +4812,119 @@ export async function findActiveTokenByHash(keyHash: string) {
   );
 }
 
+const prewarmTokenReservationStatuses = new Set<TokenStatus>([
+  "pending_activation",
+  "active",
+  "draining",
+  "settling",
+]);
+
+function userHasPrewarmReservation(store: StoreShape, feishuUserId: string) {
+  return store.tokenAccounts.some(
+    (account) =>
+      account.feishuUserId === feishuUserId &&
+      prewarmTokenReservationStatuses.has(account.status),
+  );
+}
+
+function userHasOpenPrewarmQuotaOperation(
+  store: StoreShape,
+  feishuUserId: string,
+) {
+  return store.quotaOperations.some(
+    (operation) =>
+      operation.feishuUserId === feishuUserId &&
+      !["completed", "compensated", "cancelled"].includes(operation.state),
+  );
+}
+
+export async function listDepartmentPrewarmCandidates(input: {
+  departmentId: string;
+  limit: number;
+}) {
+  const limit = Math.min(Math.max(Math.trunc(input.limit), 1), 100);
+  if (isPostgresBackend()) {
+    return listPostgresPrewarmDepartmentCandidates({
+      departmentId: input.departmentId,
+      limit,
+    });
+  }
+  const store = await readStore();
+  const eligibleUsers = store.users
+    .filter(
+      (user) =>
+        user.departmentId === input.departmentId &&
+        (!user.status || user.status === "active") &&
+        !userHasPrewarmReservation(store, user.id) &&
+        !userHasOpenPrewarmQuotaOperation(store, user.id),
+    )
+    .sort((left, right) => left.id.localeCompare(right.id));
+  return {
+    candidates: eligibleUsers.slice(0, limit),
+    eligible: eligibleUsers.length,
+  };
+}
+
+export async function reservePrewarmedTokenAccountUnderUserFence(input: {
+  departmentId: string;
+  account: TokenAccount;
+}) {
+  if (
+    input.account.status !== "pending_activation" ||
+    input.account.prewarmDepartmentId !== input.departmentId ||
+    !input.account.newapiTokenId ||
+    !input.account.prewarmedCredentialCiphertext
+  ) {
+    throw new Error("预热 Key 本地账户不完整");
+  }
+  if (isPostgresBackend()) {
+    return insertPostgresPrewarmedTokenAccountIfEligible(input);
+  }
+  return mutate((store) => {
+    const user = store.users.find(
+      (candidate) =>
+        candidate.id === input.account.feishuUserId &&
+        candidate.departmentId === input.departmentId &&
+        (!candidate.status || candidate.status === "active"),
+    );
+    if (
+      !user ||
+      userHasPrewarmReservation(store, user.id) ||
+      userHasOpenPrewarmQuotaOperation(store, user.id)
+    ) {
+      return null;
+    }
+    store.tokenAccounts.push(input.account);
+    return input.account;
+  });
+}
+
+export async function claimStoredPrewarmedTokenAccountUnderUserFence(input: {
+  feishuUserId: string;
+  tokenRequestId: string;
+  billingPeriod: string;
+  operationGeneration?: number;
+}) {
+  if (isPostgresBackend()) return claimPostgresPrewarmedTokenAccount(input);
+  return mutate((store) => {
+    const account = store.tokenAccounts.find(
+      (candidate) =>
+        candidate.feishuUserId === input.feishuUserId &&
+        candidate.status === "pending_activation" &&
+        Boolean(candidate.newapiTokenId) &&
+        Boolean(candidate.prewarmedCredentialCiphertext),
+    );
+    if (!account?.newapiTokenId || !account.prewarmedCredentialCiphertext) return null;
+    Object.assign(account, {
+      tokenRequestId: input.tokenRequestId,
+      billingPeriod: input.billingPeriod,
+      operationGeneration:
+        input.operationGeneration ?? account.operationGeneration,
+    });
+    return account;
+  });
+}
+
 type AddTokenAccountInput = {
   feishuUserId: string;
   tokenRequestId: string;
@@ -3297,76 +4975,6 @@ export async function addTokenAccountForQuotaOperation(input: AddTokenAccountInp
     return insertPostgresTokenAccountForQuotaOperation(tokenAccountFromInput(input));
   }
   return addTokenAccount(input);
-}
-
-export async function recordMonthlyResetApplied(input: {
-  tokenAccountId: string;
-  feishuUserId: string;
-  period: string;
-  monthlyQuota: number;
-  operatedByFeishuUserId: string;
-  approvalOperatorOpenId: string;
-}) {
-  if (isPostgresBackend()) {
-    const now = nowIso();
-    return recordPostgresMonthlyResetApplied({
-      ...input,
-      now,
-      requestId: randomId("tr"),
-      approvalUuid: randomId("approval"),
-    });
-  }
-
-  return mutate((store) => {
-    const account = store.tokenAccounts.find(
-      (item) =>
-        item.id === input.tokenAccountId &&
-        item.feishuUserId === input.feishuUserId &&
-        item.status === "active",
-    );
-    if (!account) {
-      return {
-        applied: false,
-        reason: "active_token_not_found",
-        account: null,
-        request: null,
-      };
-    }
-    if (account.billingPeriod === input.period) {
-      return {
-        applied: false,
-        reason: "already_current_period",
-        account,
-        request: null,
-      };
-    }
-
-    const now = nowIso();
-    const request: TokenRequest = {
-      id: randomId("tr"),
-      feishuUserId: input.feishuUserId,
-      requestType: "monthly_reset",
-      status: "provisioned",
-      reason: `monthly billing reset ${input.period}`,
-      requestedMonthlyQuota: input.monthlyQuota,
-      approvedMonthlyQuota: input.monthlyQuota,
-      approvalUuid: randomId("approval"),
-      approvalMode: "manual",
-      approvalOperatorOpenId: input.approvalOperatorOpenId,
-      approvalOperatedAt: now,
-      tokenAccountId: account.id,
-      createdAt: now,
-      updatedAt: now,
-    };
-    account.billingPeriod = input.period;
-    store.tokenRequests.push(request);
-    return {
-      applied: true,
-      reason: "applied",
-      account,
-      request,
-    };
-  });
 }
 
 export async function replaceActiveTokenAccount(input: {
@@ -3762,7 +5370,11 @@ export async function updateProxyUsageSettlementRetryIfUnsettled(
 }
 
 export type NewApiUsageBackfillItem = {
-  action: "updated" | "matched_no_change" | "skipped_unknown_token" | "skipped_no_match";
+  action:
+    | "updated"
+    | "matched_no_change"
+    | "quarantined_unknown_token"
+    | "skipped_no_match";
   newapiLogId?: string;
   newapiRequestId?: string;
   newapiTokenId?: string;
@@ -3772,6 +5384,8 @@ export type NewApiUsageBackfillItem = {
   billingPeriod?: string;
   usageRecordId?: string;
   issueId?: string;
+  newapiCreatedAt?: string;
+  blocksSettlement?: boolean;
   cost?: number;
   quota?: number;
   reason?: string;
@@ -3945,7 +5559,13 @@ function buildNewApiUsageRecord(input: {
     departmentId: input.proxyLog?.departmentId ?? user?.departmentId,
     departmentName: input.proxyLog?.departmentName ?? user?.departmentName,
     matchedProxyLogId: input.proxyLog?.id,
-    billingPeriod: input.proxyLog?.billingPeriod,
+    billingPeriod:
+      input.proxyLog?.billingPeriod ??
+      input.account?.billingPeriod ??
+      resolveUsageBillingPeriod({
+        occurredAt:
+          input.usageLog.createdAt ?? input.syncedAt,
+      }),
     matchStatus: input.matchStatus,
     model: input.usageLog.model,
     promptTokens: input.usageLog.promptTokens,
@@ -3976,6 +5596,8 @@ function buildUsageSyncIssue(input: {
   usageLog: NormalizedNewApiUsageLog;
   syncedAt: string;
   message: string;
+  severity?: "warning" | "critical";
+  blocksSettlement?: boolean;
   account?: TokenAccount;
   proxyLog?: ProxyRequestLog;
 }): UsageSyncIssue {
@@ -3989,6 +5611,9 @@ function buildUsageSyncIssue(input: {
     tokenAccountId: input.proxyLog?.tokenAccountId ?? input.account?.id,
     feishuUserId: input.proxyLog?.feishuUserId ?? input.account?.feishuUserId,
     matchedProxyLogId: input.proxyLog?.id,
+    severity: input.severity ?? "warning",
+    blocksSettlement: input.blocksSettlement ?? false,
+    occurredAt: input.usageLog.createdAt,
     message: input.message,
     occurrences: 1,
     raw: input.usageLog,
@@ -4006,6 +5631,7 @@ function upsertUsageRecordInStore(store: StoreShape, record: NewApiUsageRecord) 
   const index = store.newapiUsageRecords.findIndex((item) => sameUsageSourceRecord(item, record));
   if (index === -1) {
     store.newapiUsageRecords.push(record);
+    closeResolvedMissingCostIssuesInStore(store, record);
     return record;
   }
   const existing = store.newapiUsageRecords[index];
@@ -4017,7 +5643,27 @@ function upsertUsageRecordInStore(store: StoreShape, record: NewApiUsageRecord) 
     lastSyncedAt: record.lastSyncedAt,
   };
   store.newapiUsageRecords[index] = updated;
+  closeResolvedMissingCostIssuesInStore(store, updated);
   return updated;
+}
+
+function closeResolvedMissingCostIssuesInStore(
+  store: StoreShape,
+  record: NewApiUsageRecord,
+) {
+  if (!hasAuthoritativeBillingAmount(record)) return;
+  for (const issue of store.usageSyncIssues) {
+    if (
+      issue.issueType !== "missing_cost" ||
+      issue.status !== "open" ||
+      !sameNewApiUsageSource(issue, record)
+    ) {
+      continue;
+    }
+    issue.status = "closed";
+    issue.lastSyncedAt = record.lastSyncedAt;
+    issue.closedAt = record.lastSyncedAt;
+  }
 }
 
 function upsertUsageIssueInStore(store: StoreShape, issue: UsageSyncIssue) {
@@ -4162,15 +5808,36 @@ export async function backfillProxyLogsFromNewApiUsage(
           ? undefined
           : accountByNewApiTokenId.get(usageLog.newapiTokenId);
       if (!account) {
+        const record = buildNewApiUsageRecord({
+          store,
+          usageLog,
+          matchStatus: "unknown_token",
+          syncedAt,
+        });
+        const issue = buildUsageSyncIssue({
+          issueType: "unknown_token",
+          usageLog,
+          syncedAt,
+          severity: "critical",
+          blocksSettlement: true,
+          message: "NewAPI token_id is outside the dedicated TokenInside account boundary",
+        });
+        await persistRecord(record);
+        await persistSyncIssue(issue);
         result.skippedUnknownToken += 1;
         result.items.push({
-          action: "skipped_unknown_token",
+          action: "quarantined_unknown_token",
           newapiLogId: usageLog.newapiLogId,
           newapiRequestId: usageLog.newapiRequestId,
           newapiTokenId: usageLog.newapiTokenId,
+          billingPeriod: record.billingPeriod,
+          usageRecordId: record.id,
+          issueId: issue.id,
+          newapiCreatedAt: record.newapiCreatedAt,
+          blocksSettlement: true,
           cost: usageLog.cost,
           quota: usageLog.quota,
-          reason: "NewAPI token_id is outside the TokenInside account boundary",
+          reason: "NewAPI token_id is outside the dedicated TokenInside account boundary",
         });
         continue;
       }
@@ -4215,10 +5882,26 @@ export async function backfillProxyLogsFromNewApiUsage(
           usageLog,
           syncedAt,
           account,
+          severity: "warning",
+          blocksSettlement: false,
           message: "No successful one-to-one proxy request matched token, model, stream flag, usage and completion time",
         });
+        const missingBillingAmount = !hasAuthoritativeBillingAmount(usageLog);
+        const billingIssue = missingBillingAmount
+          ? buildUsageSyncIssue({
+              issueType: "missing_cost",
+              usageLog,
+              syncedAt,
+              account,
+              severity: "critical",
+              blocksSettlement: true,
+              message:
+                "Known NewAPI token usage has no valid quota/cost field; authoritative consumption is incomplete",
+            })
+          : undefined;
         await persistRecord(record);
         await persistSyncIssue(issue);
+        if (billingIssue) await persistSyncIssue(billingIssue);
         result.skippedNoMatch += 1;
         result.items.push({
           action: "skipped_no_match",
@@ -4227,8 +5910,11 @@ export async function backfillProxyLogsFromNewApiUsage(
           newapiTokenId: usageLog.newapiTokenId,
           feishuUserId: account.feishuUserId,
           tokenAccountId: account.id,
+          billingPeriod: record.billingPeriod,
           usageRecordId: record.id,
-          issueId: issue.id,
+          issueId: billingIssue?.id ?? issue.id,
+          newapiCreatedAt: record.newapiCreatedAt,
+          blocksSettlement: missingBillingAmount,
           cost: usageLog.cost,
           quota: usageLog.quota,
           reason: "No successful one-to-one proxy request matched token, model, stream flag, usage and completion time",
@@ -4292,16 +5978,20 @@ export async function backfillProxyLogsFromNewApiUsage(
       }
       result.matched += 1;
       if (!dryRun) result.recordsUpserted += persistMatched ? 1 : 0;
-      if (usageLog.cost === undefined && usageLog.quota === undefined) {
-        const issue = buildUsageSyncIssue({
+      let billingIssue: UsageSyncIssue | undefined;
+      if (!hasAuthoritativeBillingAmount(usageLog)) {
+        billingIssue = buildUsageSyncIssue({
           issueType: "missing_cost",
           usageLog,
           syncedAt,
           account,
           proxyLog,
-          message: "NewAPI log has no quota/cost field, so billing consumption cannot be corrected",
+          severity: "critical",
+          blocksSettlement: true,
+          message:
+            "Known NewAPI token usage has no valid quota/cost field; authoritative consumption is incomplete",
         });
-        await persistSyncIssue(issue);
+        await persistSyncIssue(billingIssue);
       }
       if (changed) {
         result.updated += 1;
@@ -4329,6 +6019,8 @@ export async function backfillProxyLogsFromNewApiUsage(
         billingPeriod:
           proxyLog.billingPeriod ?? resolveUsageBillingPeriod({ occurredAt: proxyLog.createdAt }),
         usageRecordId: storedRecord.id,
+        issueId: billingIssue?.id,
+        blocksSettlement: Boolean(billingIssue),
         cost: usageLog.cost,
         quota: usageLog.quota,
       });
@@ -4469,7 +6161,107 @@ export async function getAdminScopeForUser(feishuUserId: string) {
   return resolveAdminScopeForKnownUser(user, store);
 }
 
+type AdminScopeLockGlobal = typeof globalThis & {
+  __tokenInsideJsonAdminScopeLocks?: Map<string, Promise<void>>;
+};
+
+const adminScopeLockGlobal = globalThis as AdminScopeLockGlobal;
+const jsonAdminScopeLocks =
+  (adminScopeLockGlobal.__tokenInsideJsonAdminScopeLocks ??= new Map());
+
+async function withJsonAdminScopeLock<T>(key: string, fn: () => Promise<T>) {
+  const previous = jsonAdminScopeLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.then(() => current);
+  jsonAdminScopeLocks.set(key, queued);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (jsonAdminScopeLocks.get(key) === queued) {
+      jsonAdminScopeLocks.delete(key);
+    }
+  }
+}
+
+export async function withAdminScopeUserLocks<T>(
+  feishuUserIds: string[],
+  fn: () => Promise<T>,
+) {
+  const ids = [...new Set(feishuUserIds)].sort();
+  const run = (index: number): Promise<T> => {
+    if (index >= ids.length) return fn();
+    const key = `admin-scope-user:${ids[index]}`;
+    if (isPostgresBackend()) {
+      return withPostgresAdvisoryLock(
+        key,
+        () => run(index + 1),
+        { wait: true },
+      );
+    }
+    return withJsonAdminScopeLock(key, () => run(index + 1));
+  };
+  return run(0);
+}
+
+async function authorizeJsonAdminUserAction(
+  store: StoreShape,
+  input: {
+    actorFeishuUserId: string;
+    targetFeishuUserId: string;
+    destructiveAccessRevoke?: boolean;
+  },
+) {
+  const targetUser = store.users.find(
+    (user) => user.id === input.targetFeishuUserId,
+  );
+  if (!targetUser) return null;
+  const actorUser = store.users.find(
+    (user) => user.id === input.actorFeishuUserId,
+  );
+  const actorScope = actorUser
+    ? await resolveAdminScopeForKnownUser(actorUser, store)
+    : null;
+  const configuredRootOpenIds = new Set(getConfig().admin.systemAdminOpenIds);
+  const activeEnvironmentRootCount = store.users.filter(
+    (user) =>
+      configuredRootOpenIds.has(user.openId) &&
+      (!user.status || user.status === "active"),
+  ).length;
+  assertAdminScopeAllowsUserTarget(actorScope, targetUser, {
+    actorFeishuUserId: input.actorFeishuUserId,
+    destructiveAccessRevoke: input.destructiveAccessRevoke,
+    activeEnvironmentRootCount,
+    targetHasActiveGlobalAdminScope:
+      configuredRootOpenIds.has(targetUser.openId) ||
+      store.adminScopes.some(
+        (scope) =>
+          scope.feishuUserId === targetUser.id &&
+          scope.status === "active" &&
+          scope.scopeType === "global",
+      ),
+  });
+  return { actorScope, targetUser };
+}
+
+export async function authorizeAdminUserActionUnderScopeLocks(input: {
+  actorFeishuUserId: string;
+  targetFeishuUserId: string;
+  destructiveAccessRevoke?: boolean;
+}) {
+  if (isPostgresBackend()) {
+    return authorizePostgresAdminUserActionUnderScopeLocks(input);
+  }
+  const store = await readStore();
+  return authorizeJsonAdminUserAction(store, input);
+}
+
 export async function listAdminScopes() {
+  if (isPostgresBackend()) return listPostgresAdminScopeProjections();
   const store = await readStore();
   const usersById = new Map(store.users.map((user) => [user.id, user]));
   const stored = store.adminScopes.map((scope) => ({
@@ -4506,7 +6298,17 @@ export async function upsertManualAdminScope(input: {
 }) {
   if (isPostgresBackend()) return upsertPostgresManualAdminScope(input);
 
-  return mutate((store) => {
+  const snapshot = await readStore();
+  const targetUserId = snapshot.users.find(
+    (user) => user.openId === input.targetOpenId,
+  )?.id;
+  if (!targetUserId) {
+    return {
+      scope: null,
+      error: "target_user_not_found" as const,
+    };
+  }
+  return withAdminScopeUserLocks([targetUserId], () => mutate((store) => {
     const targetUser = store.users.find((user) => user.openId === input.targetOpenId);
     if (!targetUser) {
       return {
@@ -4514,16 +6316,14 @@ export async function upsertManualAdminScope(input: {
         error: "target_user_not_found" as const,
       };
     }
+    if (isInactiveUser(targetUser)) {
+      return {
+        scope: null,
+        error: "target_user_inactive" as const,
+      };
+    }
 
     const now = nowIso();
-    if (isInactiveUser(targetUser)) {
-      targetUser.status = "active";
-      targetUser.disabledAt = undefined;
-      targetUser.disabledReason = undefined;
-      targetUser.deletedAt = undefined;
-      targetUser.deletedReason = undefined;
-      targetUser.updatedAt = now;
-    }
     const existing = store.adminScopes.find(
       (scope) =>
         scope.feishuUserId === targetUser.id &&
@@ -4550,7 +6350,102 @@ export async function upsertManualAdminScope(input: {
     };
     store.adminScopes.push(scope);
     return { scope, error: null };
-  });
+  }));
+}
+
+export async function upsertManualAdminScopeAsActor(input: {
+  actorFeishuUserId: string;
+  targetOpenId: string;
+  scopeType: AdminScope["scopeType"];
+  departmentId?: string;
+}) {
+  if (isPostgresBackend()) return upsertPostgresManualAdminScopeAsActor(input);
+
+  const snapshot = await readStore();
+  const targetUserId = snapshot.users.find(
+    (user) => user.openId === input.targetOpenId,
+  )?.id;
+  if (!targetUserId) {
+    return { scope: null, error: "target_user_not_found" as const };
+  }
+  return withAdminScopeUserLocks(
+    [input.actorFeishuUserId, targetUserId],
+    () =>
+      mutate(async (store) => {
+        const actor = store.users.find(
+          (user) => user.id === input.actorFeishuUserId,
+        );
+        const actorScope = actor
+          ? await resolveAdminScopeForKnownUser(actor, store)
+          : null;
+        if (!actorScope || actorScope.scopeType !== "global") {
+          throw new AdminUserActionAuthorizationError(
+            "actor_scope_missing",
+            403,
+            "当前系统管理员权限已变化，请刷新后重试",
+          );
+        }
+        const actorIsRoot =
+          actorScope.source === "environment" && actorScope.role === "root";
+        if (input.scopeType === "global" && !actorIsRoot) {
+          throw new AdminUserActionAuthorizationError(
+            "root_required",
+            403,
+            "只有 root 管理员可以指派系统管理员",
+          );
+        }
+        if (
+          getConfig().admin.systemAdminOpenIds.includes(input.targetOpenId) &&
+          !actorIsRoot
+        ) {
+          throw new AdminUserActionAuthorizationError(
+            "root_required",
+            403,
+            "环境变量 root 用户仅允许 root 管理员操作",
+          );
+        }
+        const targetUser = store.users.find(
+          (user) => user.openId === input.targetOpenId,
+        );
+        if (!targetUser) {
+          return { scope: null, error: "target_user_not_found" as const };
+        }
+        if (isInactiveUser(targetUser)) {
+          return { scope: null, error: "target_user_inactive" as const };
+        }
+        if (input.scopeType === "department" && !input.departmentId) {
+          throw new Error("指派部门管理员需要 departmentId");
+        }
+        const now = nowIso();
+        const existing = store.adminScopes.find(
+          (scope) =>
+            scope.feishuUserId === targetUser.id &&
+            scope.source === "manual" &&
+            scope.scopeType === input.scopeType &&
+            (input.scopeType === "global" ||
+              scope.departmentId === input.departmentId),
+        );
+        if (existing) {
+          activateAdminScope(existing, now);
+          existing.departmentId =
+            input.scopeType === "department" ? input.departmentId : undefined;
+          return { scope: existing, error: null };
+        }
+        const scope: AdminScope = {
+          id: randomId("as"),
+          feishuUserId: targetUser.id,
+          scopeType: input.scopeType,
+          departmentId:
+            input.scopeType === "department" ? input.departmentId : undefined,
+          source: "manual",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+        };
+        store.adminScopes.push(scope);
+        return { scope, error: null };
+      }),
+  );
 }
 
 export async function updateManualAdminScope(input: {
@@ -4562,7 +6457,10 @@ export async function updateManualAdminScope(input: {
 }) {
   if (isPostgresBackend()) return updatePostgresManualAdminScope(input);
 
-  return mutate((store) => {
+  const snapshot = await readStore();
+  const targetScope = snapshot.adminScopes.find((item) => item.id === input.scopeId);
+  if (!targetScope || targetScope.source === "environment") return null;
+  return withAdminScopeUserLocks([targetScope.feishuUserId], () => mutate((store) => {
     const scope = store.adminScopes.find((item) => item.id === input.scopeId);
     if (!scope || scope.source === "environment") return null;
     const now = nowIso();
@@ -4580,10 +6478,70 @@ export async function updateManualAdminScope(input: {
     }
     scope.updatedAt = now;
     return scope;
-  });
+  }));
+}
+
+export async function updateManualAdminScopeAsActor(input: {
+  actorFeishuUserId: string;
+  scopeId: string;
+  status?: AdminScope["status"];
+  departmentId?: string;
+  disabledReason?: AdminScope["disabledReason"];
+}) {
+  if (isPostgresBackend()) return updatePostgresManualAdminScopeAsActor(input);
+
+  const snapshot = await readStore();
+  const targetScope = snapshot.adminScopes.find((item) => item.id === input.scopeId);
+  if (!targetScope || targetScope.source === "environment") return null;
+  return withAdminScopeUserLocks(
+    [input.actorFeishuUserId, targetScope.feishuUserId],
+    () =>
+      mutate(async (store) => {
+        const scope = store.adminScopes.find((item) => item.id === input.scopeId);
+        if (!scope || scope.source === "environment") return null;
+        const actor = store.users.find(
+          (user) => user.id === input.actorFeishuUserId,
+        );
+        const actorScope = actor
+          ? await resolveAdminScopeForKnownUser(actor, store)
+          : null;
+        if (!actorScope || actorScope.scopeType !== "global") {
+          throw new AdminUserActionAuthorizationError(
+            "actor_scope_missing",
+            403,
+            "当前系统管理员权限已变化，请刷新后重试",
+          );
+        }
+        const actorIsRoot =
+          actorScope.source === "environment" && actorScope.role === "root";
+        if (scope.scopeType === "global" && !actorIsRoot) {
+          throw new AdminUserActionAuthorizationError(
+            "root_required",
+            403,
+            "只有 root 管理员可以修改或取消系统管理员",
+          );
+        }
+        const now = nowIso();
+        if (input.status === "active") {
+          activateAdminScope(scope, now);
+        } else if (input.status === "disabled") {
+          disableAdminScope(scope, {
+            now,
+            reason: input.disabledReason ?? "manual_revoke",
+            disabledByFeishuUserId: input.actorFeishuUserId,
+          });
+        }
+        if (scope.scopeType === "department" && input.departmentId !== undefined) {
+          scope.departmentId = input.departmentId;
+        }
+        scope.updatedAt = now;
+        return scope;
+      }),
+  );
 }
 
 export async function getAdminScopeById(scopeId: string) {
+  if (isPostgresBackend()) return getPostgresAdminScopeById(scopeId);
   const store = await readStore();
   return store.adminScopes.find((item) => item.id === scopeId) ?? null;
 }
@@ -4595,7 +6553,7 @@ export async function syncDepartmentSupervisorAdminScope(input: {
 }) {
   if (isPostgresBackend()) return syncPostgresDepartmentSupervisorAdminScope(input);
 
-  return mutate((store) => {
+  return withAdminScopeUserLocks([input.feishuUserId], () => mutate((store) => {
     const now = nowIso();
     const user = store.users.find((item) => item.id === input.feishuUserId);
     if (!user || isInactiveUser(user)) return null;
@@ -4650,7 +6608,7 @@ export async function syncDepartmentSupervisorAdminScope(input: {
     };
     store.adminScopes.push(scope);
     return scope;
-  });
+  }));
 }
 
 function tokenAccountInScope(
@@ -4782,27 +6740,100 @@ export async function getScopedUser(scope: AdminScope, feishuUserId: string) {
   return userInAdminScope(user, scope) ? user : null;
 }
 
-export async function updateUserAccessStatus(input: {
+type UpdateUserAccessStatusInput = {
+  actorFeishuUserId: string;
   feishuUserId: string;
   status: "disabled" | "deleted";
   reason?: string;
   tokenStatus: Extract<TokenStatus, "disabled" | "revoked">;
   adminRevokedByFeishuUserId?: string;
-}) {
+  adminScopeLocksHeld?: boolean;
+  upstreamDisabledAt?: string;
+  consumptionBarrierCutoffAt?: string;
+};
+
+export async function updateUserAccessStatus(input: UpdateUserAccessStatusInput) {
   if (isPostgresBackend()) return updatePostgresUserAccessStatus(input);
 
-  return mutate((store) => {
+  return mutate(async (store) => {
+    const authorized = await authorizeJsonAdminUserAction(store, {
+      actorFeishuUserId: input.actorFeishuUserId,
+      targetFeishuUserId: input.feishuUserId,
+      destructiveAccessRevoke: true,
+    });
+    if (!authorized) return null;
     const now = nowIso();
-    const user = store.users.find((item) => item.id === input.feishuUserId);
-    if (!user) return null;
+    const user = authorized.targetUser;
 
-    const activeAccount =
-      store.tokenAccounts.find(
-        (account) => account.feishuUserId === input.feishuUserId && account.status === "active",
-      ) ?? null;
-    if (activeAccount) {
-      activeAccount.status = input.tokenStatus;
-      activeAccount.disabledAt = now;
+    const operationalAccounts = store.tokenAccounts.filter((account) => {
+      if (account.feishuUserId !== input.feishuUserId) return false;
+      if (input.tokenStatus === "revoked") return account.status !== "revoked";
+      return ["pending_activation", "active", "draining", "settling"].includes(
+        account.status,
+      );
+    });
+    for (const account of operationalAccounts) {
+      account.status =
+        input.tokenStatus === "disabled" && account.status === "pending_activation"
+          ? "orphaned"
+          : input.tokenStatus;
+      account.disabledAt = now;
+      if (account.status === "orphaned" || account.status === "revoked") {
+        account.prewarmedCredentialCiphertext = undefined;
+      }
+    }
+
+    const terminatedOperationIds: string[] = [];
+    const manualReviewOperationIds: string[] = [];
+    for (const operation of store.quotaOperations) {
+      if (operation.feishuUserId !== input.feishuUserId) continue;
+      if (operation.credentialCiphertext && !operation.credentialDeliveredAt) {
+        operation.credentialCiphertext = undefined;
+        operation.evidence = {
+          ...operation.evidence,
+          credentialRevokedAt: now,
+          userAccessStatus: input.status,
+        };
+      }
+      if (["completed", "compensated", "cancelled"].includes(operation.state)) continue;
+      const previousState = operation.state;
+      const cancellable = canCancelQuotaOperationForAccessRevoke(operation);
+      if (cancellable) terminatedOperationIds.push(operation.id);
+      else manualReviewOperationIds.push(operation.id);
+      Object.assign(operation, {
+        state: cancellable ? ("cancelled" as const) : ("manual_review" as const),
+        reservedDepartmentQuota: cancellable ? 0 : operation.reservedDepartmentQuota,
+        nextRetryAt: undefined,
+        workerLeaseId: undefined,
+        workerLeaseExpiresAt: undefined,
+        lastErrorCode: cancellable
+          ? "user_access_revoked"
+          : "user_access_revoked_manual_review",
+        lastErrorMessage:
+          input.reason ??
+          (input.status === "deleted" ? "用户已删除，额度操作已终止" : "用户已禁用，额度操作已终止"),
+        evidence: {
+          ...operation.evidence,
+          userAccessRevokedAt: now,
+          userAccessStatus: input.status,
+          ...(cancellable
+            ? { cancelledFromState: previousState }
+            : { manualReviewFromState: previousState }),
+        },
+        updatedAt: now,
+        completedAt: cancellable ? now : undefined,
+      });
+      const request = operation.requestId
+        ? store.tokenRequests.find((item) => item.id === operation.requestId)
+        : undefined;
+      if (request && request.status !== "provisioned") {
+        request.status = "approved_provision_failed";
+        request.errorMessage =
+          input.status === "deleted"
+            ? "用户已删除，原账务任务已终止；重新申请后将创建新任务"
+            : "用户已禁用，原账务任务已终止";
+        request.updatedAt = now;
+      }
     }
 
     user.status = input.status;
@@ -4823,8 +6854,53 @@ export async function updateUserAccessStatus(input: {
       });
     }
 
-    return { user, tokenAccount: activeAccount };
+    const quotaStateIndex = store.userQuotaStates.findIndex(
+      (state) => state.feishuUserId === input.feishuUserId,
+    );
+    const existingQuotaState = store.userQuotaStates[quotaStateIndex];
+    const revocationBarrier = preserveUserAccessRevocationBarrier(
+      input,
+      existingQuotaState,
+    );
+    const quotaState: UserQuotaState = {
+      feishuUserId: input.feishuUserId,
+      admission: "closed",
+      activeGeneration:
+        existingQuotaState?.activeGeneration ??
+        Math.max(
+          0,
+          ...store.tokenAccounts
+            .filter((account) => account.feishuUserId === input.feishuUserId)
+            .map((account) => account.operationGeneration ?? 0),
+        ),
+      operationId: undefined,
+      closedReason: "user_access_revoked",
+      ...revocationBarrier,
+      updatedAt: now,
+    };
+    if (quotaStateIndex === -1) store.userQuotaStates.push(quotaState);
+    else store.userQuotaStates[quotaStateIndex] = quotaState;
+
+    const resumableAccount = [...operationalAccounts]
+      .reverse()
+      .find((account) => account.status === input.tokenStatus) ?? null;
+    return {
+      user,
+      tokenAccount: resumableAccount,
+      tokenAccounts: operationalAccounts,
+      terminatedOperationIds,
+      manualReviewOperationIds,
+    };
   });
+}
+
+export async function updateUserAccessStatusUnderUserFence(
+  input: UpdateUserAccessStatusInput,
+) {
+  if (isPostgresBackend()) {
+    return updatePostgresUserAccessStatusUnderUserFence(input);
+  }
+  return updateUserAccessStatus(input);
 }
 
 export async function revokeAdminScopesForUser(input: {
@@ -4834,35 +6910,59 @@ export async function revokeAdminScopesForUser(input: {
 }) {
   if (isPostgresBackend()) return revokePostgresAdminScopesForUser(input);
 
-  return mutate((store) =>
-    revokeAdminScopesForUserInStore(store, {
-      ...input,
-      now: nowIso(),
-    }),
+  return withAdminScopeUserLocks(
+    [input.feishuUserId],
+    () => mutate((store) =>
+      revokeAdminScopesForUserInStore(store, {
+        ...input,
+        now: nowIso(),
+      }),
+    ),
   );
 }
 
-export async function enableUserAccess(input: {
+type EnableUserAccessInput = {
+  actorFeishuUserId: string;
   feishuUserId: string;
   reason?: string;
-}) {
+  expectedTokenAccountId?: string;
+  adminScopeLocksHeld?: boolean;
+};
+
+export async function enableUserAccess(input: EnableUserAccessInput) {
   if (isPostgresBackend()) return enablePostgresUserAccess(input);
 
-  return mutate((store) => {
+  return mutate(async (store) => {
+    const authorized = await authorizeJsonAdminUserAction(store, {
+      actorFeishuUserId: input.actorFeishuUserId,
+      targetFeishuUserId: input.feishuUserId,
+    });
+    if (!authorized) return null;
     const now = nowIso();
-    const user = store.users.find((item) => item.id === input.feishuUserId);
+    const user = authorized.targetUser;
     if (!user || user.status !== "disabled") return null;
 
     const disabledAccount =
       [...store.tokenAccounts]
         .filter(
           (account) =>
-            account.feishuUserId === input.feishuUserId && account.status === "disabled",
+            account.feishuUserId === input.feishuUserId &&
+            account.status === "disabled" &&
+            (!input.expectedTokenAccountId || account.id === input.expectedTokenAccountId),
         )
         .sort((a, b) =>
           (b.disabledAt ?? b.createdAt).localeCompare(a.disabledAt ?? a.createdAt),
         )[0] ?? null;
     if (!disabledAccount) return null;
+    if (
+      store.quotaOperations.some(
+        (operation) =>
+          operation.feishuUserId === input.feishuUserId &&
+          !["completed", "compensated", "cancelled"].includes(operation.state),
+      )
+    ) {
+      return null;
+    }
 
     disabledAccount.status = "active";
     disabledAccount.disabledAt = undefined;
@@ -4872,7 +6972,234 @@ export async function enableUserAccess(input: {
     user.disabledAt = undefined;
     user.disabledReason = undefined;
 
+    const quotaStateIndex = store.userQuotaStates.findIndex(
+      (state) => state.feishuUserId === input.feishuUserId,
+    );
+    const existingQuotaState = store.userQuotaStates[quotaStateIndex];
+    const quotaState: UserQuotaState = {
+      feishuUserId: input.feishuUserId,
+      admission: "closed",
+      activeGeneration: Math.max(
+        existingQuotaState?.activeGeneration ?? 0,
+        disabledAccount.operationGeneration ?? 0,
+      ),
+      operationId: undefined,
+      closedReason: "user_access_resume_pending",
+      resumeTokenAccountId: disabledAccount.id,
+      resumePreparedAt: now,
+      updatedAt: now,
+    };
+    if (quotaStateIndex === -1) store.userQuotaStates.push(quotaState);
+    else store.userQuotaStates[quotaStateIndex] = quotaState;
+
     return { user, tokenAccount: disabledAccount };
+  });
+}
+
+export async function enableUserAccessUnderUserFence(input: EnableUserAccessInput) {
+  if (isPostgresBackend()) return enablePostgresUserAccessUnderUserFence(input);
+  return enableUserAccess(input);
+}
+
+export async function markUserAccessResumeEnableAttemptUnderUserFence(input: {
+  feishuUserId: string;
+  expectedTokenAccountId: string;
+}) {
+  if (isPostgresBackend()) {
+    return markPostgresUserAccessResumeEnableAttemptUnderUserFence(input);
+  }
+  return mutate((store) => {
+    const user = store.users.find((item) => item.id === input.feishuUserId);
+    const account = store.tokenAccounts.find(
+      (item) =>
+        item.id === input.expectedTokenAccountId &&
+        item.feishuUserId === input.feishuUserId &&
+        item.status === "active",
+    );
+    const quotaState = store.userQuotaStates.find(
+      (state) => state.feishuUserId === input.feishuUserId,
+    );
+    if (
+      user?.status !== "active" ||
+      !account ||
+      quotaState?.admission !== "closed" ||
+      quotaState.closedReason !== "user_access_resume_pending" ||
+      (quotaState.resumeTokenAccountId &&
+        quotaState.resumeTokenAccountId !== input.expectedTokenAccountId)
+    ) {
+      return null;
+    }
+    const now = nowIso();
+    Object.assign(quotaState, {
+      operationId: undefined,
+      resumeTokenAccountId: input.expectedTokenAccountId,
+      resumePreparedAt: quotaState.resumePreparedAt ?? quotaState.updatedAt,
+      resumeUpstreamEnableAttemptedAt: now,
+      updatedAt: now,
+    });
+    return quotaState;
+  });
+}
+
+export async function listStaleUserAccessResumeCandidates(input: {
+  staleBefore: string;
+  limit?: number;
+}) {
+  const limit = Math.min(Math.max(Math.trunc(input.limit ?? 25), 1), 100);
+  if (isPostgresBackend()) {
+    return listPostgresStaleUserAccessResumeCandidates({
+      staleBefore: input.staleBefore,
+      limit,
+    });
+  }
+  const store = await readStore();
+  const usersById = new Map(store.users.map((user) => [user.id, user]));
+  const accountsById = new Map(
+    store.tokenAccounts.map((account) => [account.id, account]),
+  );
+  return store.userQuotaStates
+    .filter(
+      (state) =>
+        state.admission === "closed" &&
+        state.closedReason === "user_access_resume_pending" &&
+        state.updatedAt <= input.staleBefore,
+    )
+    .sort((a, b) =>
+      a.updatedAt.localeCompare(b.updatedAt) ||
+      a.feishuUserId.localeCompare(b.feishuUserId),
+    )
+    .flatMap((quotaState) => {
+      const user = usersById.get(quotaState.feishuUserId);
+      const tokenAccount = quotaState.resumeTokenAccountId
+        ? accountsById.get(quotaState.resumeTokenAccountId)
+        : [...store.tokenAccounts]
+            .filter(
+              (account) =>
+                account.feishuUserId === quotaState.feishuUserId &&
+                account.status === "active",
+            )
+            .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+      if (
+        user?.status !== "active" ||
+        tokenAccount?.status !== "active" ||
+        tokenAccount.feishuUserId !== quotaState.feishuUserId
+      ) {
+        return [];
+      }
+      return [{ user, tokenAccount, quotaState }];
+    })
+    .slice(0, limit);
+}
+
+export async function finalizeUserAccessResumeUnderUserFence(input: {
+  actorFeishuUserId: string;
+  feishuUserId: string;
+  expectedTokenAccountId: string;
+  adminScopeLocksHeld?: boolean;
+}) {
+  if (isPostgresBackend()) {
+    return finalizePostgresUserAccessResumeUnderUserFence(input);
+  }
+  return mutate(async (store) => {
+    const authorized = await authorizeJsonAdminUserAction(store, {
+      actorFeishuUserId: input.actorFeishuUserId,
+      targetFeishuUserId: input.feishuUserId,
+    });
+    if (!authorized) return null;
+    const user = authorized.targetUser;
+    const account = store.tokenAccounts.find(
+      (item) =>
+        item.id === input.expectedTokenAccountId &&
+        item.feishuUserId === input.feishuUserId &&
+        item.status === "active",
+    );
+    const openOperation = store.quotaOperations.find(
+      (operation) =>
+        operation.feishuUserId === input.feishuUserId &&
+        !["completed", "compensated", "cancelled"].includes(operation.state),
+    );
+    const quotaStateIndex = store.userQuotaStates.findIndex(
+      (state) => state.feishuUserId === input.feishuUserId,
+    );
+    const quotaState = store.userQuotaStates[quotaStateIndex];
+    if (
+      !user ||
+      user.status !== "active" ||
+      !account ||
+      openOperation ||
+      quotaState?.admission !== "closed" ||
+      quotaState.closedReason !== "user_access_resume_pending"
+    ) {
+      return null;
+    }
+    const opened: UserQuotaState = {
+      feishuUserId: input.feishuUserId,
+      admission: "open",
+      activeGeneration: Math.max(
+        quotaState.activeGeneration,
+        account.operationGeneration ?? 0,
+      ),
+      operationId: undefined,
+      closedReason: undefined,
+      updatedAt: nowIso(),
+    };
+    store.userQuotaStates[quotaStateIndex] = opened;
+    return { user, tokenAccount: account, quotaState: opened };
+  });
+}
+
+export async function rollbackUserAccessResumeUnderUserFence(input: {
+  feishuUserId: string;
+  expectedTokenAccountId: string;
+  upstreamDisabledAt: string;
+  consumptionBarrierCutoffAt: string;
+  reason: string;
+}) {
+  if (isPostgresBackend()) {
+    return rollbackPostgresUserAccessResumeUnderUserFence(input);
+  }
+  return mutate((store) => {
+    const user = store.users.find((item) => item.id === input.feishuUserId);
+    const account = store.tokenAccounts.find(
+      (item) =>
+        item.id === input.expectedTokenAccountId &&
+        item.feishuUserId === input.feishuUserId,
+    );
+    const quotaStateIndex = store.userQuotaStates.findIndex(
+      (state) => state.feishuUserId === input.feishuUserId,
+    );
+    const quotaState = store.userQuotaStates[quotaStateIndex];
+    if (
+      user?.status !== "active" ||
+      account?.status !== "active" ||
+      quotaState?.admission !== "closed" ||
+      quotaState.closedReason !== "user_access_resume_pending"
+    ) {
+      return null;
+    }
+
+    const now = input.upstreamDisabledAt;
+    user.status = "disabled";
+    user.updatedAt = now;
+    user.disabledAt = now;
+    user.disabledReason = input.reason;
+    account.status = "disabled";
+    account.disabledAt = now;
+    const rolledBackState: UserQuotaState = {
+      feishuUserId: input.feishuUserId,
+      admission: "closed",
+      activeGeneration: Math.max(
+        quotaState.activeGeneration,
+        account.operationGeneration ?? 0,
+      ),
+      operationId: undefined,
+      closedReason: "user_access_revoked",
+      upstreamDisabledAt: input.upstreamDisabledAt,
+      consumptionBarrierCutoffAt: input.consumptionBarrierCutoffAt,
+      updatedAt: now,
+    };
+    store.userQuotaStates[quotaStateIndex] = rolledBackState;
+    return { user, tokenAccount: account, quotaState: rolledBackState };
   });
 }
 
@@ -4918,6 +7245,10 @@ export async function listAdminUsers(scope: AdminScope) {
         departmentName: user.departmentName,
         status: user.status ?? "active",
         role: userRoleLabel(user, store),
+        isGlobalAdmin: activeAdminScopesForUser(user, store).some(
+          (adminScope) => adminScope.scopeType === "global",
+        ),
+        isEnvironmentRoot: getConfig().admin.systemAdminOpenIds.includes(user.openId),
         activeTokenStatus: latestAccount?.status,
         activeTokenCreatedAt: latestAccount?.createdAt,
         billingPeriod,
@@ -5401,8 +7732,10 @@ export async function listAdminUsageRecords(input: UsageRecordFilters & {
   if (isPostgresBackend()) {
     const limit = boundedLimit(input.limit, 100);
     const offset = boundedOffset(input.offset);
+    const currentPeriod = await getCurrentPackageBillingPeriod();
     const report = await listPostgresUsageReport({
       scope: input.scope,
+      currentPeriod,
       ...postgresUsageFilters(input),
       limit,
       offset,
@@ -5419,6 +7752,7 @@ export async function listAdminUsageRecords(input: UsageRecordFilters & {
     };
   }
   const store = await readStore();
+  const currentPeriod = packageBillingPeriod(store.settings.packageReset);
   const usersById = new Map(store.users.map((user) => [user.id, user]));
   const scopedLogs = store.proxyRequestLogs
     .filter((log) => proxyLogInScope(log, input.scope, usersById))
@@ -5431,7 +7765,6 @@ export async function listAdminUsageRecords(input: UsageRecordFilters & {
   const offset = boundedOffset(input.offset);
   const pageLogs = filteredLogs.slice(offset, offset + limit);
   const userIdsWithLogs = new Set(dateScopedLogs.map((log) => log.feishuUserId).filter(Boolean));
-  const currentPeriod = nowIso().slice(0, 7);
   const departmentQuotaById = new Map<string, { issuedQuota: number; usedQuota: number }>();
 
   for (const period of store.userBillingPeriods.filter((item) => item.period === currentPeriod)) {
@@ -5516,8 +7849,10 @@ export async function listAdminUsageRecords(input: UsageRecordFilters & {
 export async function listUserUsageRecords(feishuUserId: string, limit = 100) {
   if (isPostgresBackend()) {
     const bounded = boundedLimit(limit, 100);
+    const currentPeriod = await getCurrentPackageBillingPeriod();
     const report = await listPostgresUsageReport({
       feishuUserId,
+      currentPeriod,
       limit: bounded,
       offset: 0,
     });
@@ -5540,8 +7875,10 @@ export async function listUserUsageReport(input: UsageRecordFilters & {
   if (isPostgresBackend()) {
     const limit = boundedLimit(input.limit, 100);
     const offset = boundedOffset(input.offset);
+    const currentPeriod = await getCurrentPackageBillingPeriod();
     const report = await listPostgresUsageReport({
       feishuUserId: input.feishuUserId,
+      currentPeriod,
       ...postgresUsageFilters(input),
       limit,
       offset,
@@ -5560,9 +7897,11 @@ export async function listUserUsageReport(input: UsageRecordFilters & {
       },
       modelStats: report.modelStats,
       apiFormatStats: report.apiFormatStats,
+      usageOverview: report.usageOverview,
     };
   }
   const store = await readStore();
+  const currentPeriod = packageBillingPeriod(store.settings.packageReset);
   const usersById = new Map(store.users.map((user) => [user.id, user]));
   const scopedLogs = store.proxyRequestLogs
     .filter((log) => log.feishuUserId === input.feishuUserId)
@@ -5595,14 +7934,29 @@ export async function listUserUsageReport(input: UsageRecordFilters & {
       key: log.apiFormat ?? "unknown",
       label: log.apiFormat ?? "unknown",
     })),
+    usageOverview:
+      store.userBillingPeriods.find(
+        (period) =>
+          period.feishuUserId === input.feishuUserId &&
+          period.period === currentPeriod,
+      ) ?? null,
   };
+}
+
+function hasAuthoritativeBillingAmount(usageLog: NormalizedNewApiUsageLog) {
+  return [usageLog.quota, usageLog.cost].some(
+    (value) => Number.isFinite(value) && (value as number) >= 0,
+  );
 }
 
 export async function listDepartmentStats(scope: AdminScope) {
   if (scope.scopeType !== "global") return null;
+  const currentPeriod = await getCurrentPackageBillingPeriod();
+  if (isPostgresBackend()) {
+    return listPostgresDepartmentStats(currentPeriod);
+  }
 
   const store = await readStore();
-  const currentPeriod = nowIso().slice(0, 7);
   const usersById = new Map(store.users.map((user) => [user.id, user]));
   const activeAccounts = store.tokenAccounts.filter((account) => account.status === "active");
   const stats = new Map<
@@ -5736,6 +8090,26 @@ export async function listAdminTokenRequests(input: {
   createdAfter?: string;
   decisionRequired?: boolean;
 }) {
+  const limit = boundedLimit(input.limit, 50);
+  const offset = boundedOffset(input.offset);
+  if (isPostgresBackend()) {
+    const result = await listPostgresAdminTokenRequestRows({
+      scope: input.scope,
+      limit,
+      offset,
+      createdAfter: input.createdAfter,
+      decisionRequired: input.decisionRequired,
+      decisionStatuses: [...adminDecidableRequestStatuses],
+    });
+    return {
+      requests: result.page.map(({ request, user }) =>
+        mapAdminTokenRequest(request, user ?? undefined),
+      ),
+      total: result.total,
+      limit,
+      offset,
+    };
+  }
   const store = await readStore();
   const usersById = new Map(store.users.map((user) => [user.id, user]));
   const systemAdminOpenIds = globalAdminOpenIds(store, usersById);
@@ -5747,9 +8121,6 @@ export async function listAdminTokenRequests(input: {
         (!input.decisionRequired || tokenRequestRequiresAdminDecision(request)),
     )
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-  const limit = boundedLimit(input.limit, 50);
-  const offset = boundedOffset(input.offset);
-
   return {
     requests: scopedRequests
       .slice(offset, offset + limit)

@@ -32,6 +32,7 @@ const userId = `${runId}_user`;
 const ordinaryUserId = `${runId}_ordinary_user`;
 const tenantKey = `${runId}_tenant`;
 const openId = "ou_f_local_admin";
+const cleanupOpenId = "ou_f_local_cleanup_admin";
 const ordinaryOpenId = `${runId}_ordinary_open`;
 const departmentId = `${runId}_department`;
 const pool = new Pool({ connectionString: databaseUrl, max: 4 });
@@ -167,28 +168,11 @@ async function seedLocalScenario() {
       pageSize: 100,
       maxPagesPerRun: 3,
       overlapMinutes: 120,
-      settlementLagMinutes: 5,
+      settlementLagMinutes: 1,
       matchWindowMinutes: 30,
       retryBaseMinutes: 5,
       updatedAt: nowIso,
       updatedByFeishuUserId: userId,
-    },
-    quotaFeatureFlags: {
-      legacyAbsoluteQuotaWritesEnabled: false,
-      quotaLedgerShadowRead: true,
-      quotaSagaWritesEnabled: true,
-      keyRotationSagaEnabled: true,
-      quotaRestoreEnabled: true,
-      monthlyPeriodOpenEnabled: true,
-      reconciliationAutoDecreaseEnabled: false,
-      reconciliationAutoIncreaseEnabled: false,
-    },
-    quotaMigration: {
-      period,
-      appliedAt: nowIso,
-      planHash: `${runId}_local_only`,
-      users: 0,
-      estimatedUsers: 0,
     },
     billingOperations: [],
     updatedAt: nowIso,
@@ -316,6 +300,72 @@ async function seedLocalScenario() {
     client.release();
   }
   pass("isolated_seed", { period, user: "unique", department: "unique" });
+}
+
+async function revokeFixtureUser(feishuUserId, cookie, reason) {
+  const disabled = await appRequest(`/api/admin/users/${encodeURIComponent(feishuUserId)}/disable`, {
+    method: "POST",
+    cookie,
+    expectedStatus: [200, 409],
+    body: { reason },
+  });
+  if (disabled.status === 200) return "disabled";
+  if (disabled.json?.code !== "issued_token_required") {
+    throw new Error(`failed to revoke prior fixture ${feishuUserId}: ${disabled.text}`);
+  }
+  await appRequest(`/api/admin/users/${encodeURIComponent(feishuUserId)}`, {
+    method: "DELETE",
+    cookie,
+    body: { reason },
+  });
+  return "deleted_application_only";
+}
+
+async function cleanupPriorFStageUsers() {
+  const prior = await pool.query(
+    `select id from feishu_users
+     where id like 'fapp\\_%' escape '\\'
+       and id <> all($1::text[])
+       and coalesce(data->>'status', 'active') = 'active'
+     order by created_at`,
+    [[userId, ordinaryUserId]],
+  );
+  const results = [];
+  for (const row of prior.rows) {
+    results.push({
+      id: row.id,
+      action: await revokeFixtureUser(
+        row.id,
+        sessionCookie,
+        "F-stage prior failed fixture cleanup",
+      ),
+    });
+  }
+  pass("prior_fixture_cleanup", { users: results.length, results });
+}
+
+async function createCleanupRootSession() {
+  const cleanupUserId = `${runId}_cleanup_root`;
+  const now = new Date().toISOString();
+  const cleanupUser = {
+    id: cleanupUserId,
+    tenantKey,
+    openId: cleanupOpenId,
+    name: "F-stage cleanup root",
+    status: "active",
+    createdAt: now,
+    updatedAt: now,
+  };
+  await pool.query(
+    `insert into feishu_users
+      (id, tenant_key, open_id, data, created_at, updated_at)
+     values ($1,$2,$3,$4,$5,$5)`,
+    [cleanupUser.id, cleanupUser.tenantKey, cleanupUser.openId, cleanupUser, now],
+  );
+  return {
+    cleanupUserId,
+    cookie: createSessionCookie(cleanupUserId, cleanupOpenId),
+  };
 }
 
 async function operationByIdempotencyKey(idempotencyKey) {
@@ -483,8 +533,9 @@ async function insertSettledUsageForActiveToken(quota) {
   await pool.query(
     `insert into newapi_usage_records
       (id, newapi_log_id, newapi_request_id, newapi_token_id, token_account_id,
-       feishu_user_id, match_status, data, newapi_created_at, first_seen_at, last_synced_at)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+       feishu_user_id, billing_period, match_status, data, newapi_created_at,
+       first_seen_at, last_synced_at)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
     [
       record.id,
       record.newapiLogId,
@@ -492,6 +543,7 @@ async function insertSettledUsageForActiveToken(quota) {
       record.newapiTokenId,
       record.tokenAccountId,
       record.feishuUserId,
+      record.billingPeriod,
       record.matchStatus,
       record,
       record.newapiCreatedAt,
@@ -627,7 +679,7 @@ async function waitForTestOperationsToSettle(timeoutMs = 30_000) {
       `select count(*)::integer as count
        from quota_operations
        where feishu_user_id = any($1::text[])
-         and state not in ('completed', 'compensated', 'manual_review')`,
+         and state not in ('completed', 'compensated', 'cancelled', 'manual_review')`,
       [[userId, ordinaryUserId]],
     );
     if (result.rows[0]?.count === 0) return true;
@@ -640,6 +692,7 @@ async function run() {
   sessionCookie = createSessionCookie();
   ordinarySessionCookie = createSessionCookie(ordinaryUserId, ordinaryOpenId);
   await seedLocalScenario();
+  await cleanupPriorFStageUsers();
 
   const health = await appRequest("/api/health", { auth: false });
   assert(health.json?.status === "ok", "application health is not ok");
@@ -652,7 +705,7 @@ async function run() {
     `/api/admin/users/${encodeURIComponent(userId)}/quota-adjust`,
     {
       method: "POST",
-      expectedStatus: 502,
+      expectedStatus: 202,
       body: {
         approvedMonthlyQuota: 10,
         reason: "F-stage zero-budget allocation",
@@ -660,9 +713,12 @@ async function run() {
       },
     },
   );
+  const blockedOperationId = blockedAllocation.json?.operation?.id;
+  assert(blockedOperationId, "zero-budget allocation operation id is missing");
+  await waitForOperationPhase(blockedOperationId, ["retryable_failed"], 60_000);
   assert(
-    String(blockedAllocation.json?.error ?? "").includes("部门可用额度不足"),
-    "zero-budget allocation did not return the department budget error",
+    blockedAllocation.json?.mode === "first_provision",
+    "zero-budget allocation did not use durable first-provision submission",
   );
   const blockedRequests = await pool.query(
     `select data from token_requests
@@ -679,6 +735,7 @@ async function run() {
   assert(blockedAccounts.length === 0, "zero-budget allocation created a token account");
   pass("zero_budget_fails_without_false_success", {
     status: blockedAllocation.status,
+    operationState: "retryable_failed",
     requests: blockedRequests.rowCount,
     tokenAccounts: 0,
   });
@@ -692,7 +749,7 @@ async function run() {
     `/api/admin/users/${encodeURIComponent(userId)}/quota-adjust`,
     {
       method: "POST",
-      expectedStatus: [200, 502],
+      expectedStatus: 202,
       body: {
         approvedMonthlyQuota: 10,
         reason: "F-stage local first allocation",
@@ -700,15 +757,7 @@ async function run() {
       },
     },
   );
-  if (firstAllocation.status === 200) {
-    assert(firstAllocation.json?.mode === "first_provision", "no-key allocation used the wrong mode");
-    assert(firstAllocation.json?.account?.status === "active", "no-key allocation did not return an active account");
-  } else {
-    assert(
-      String(firstAllocation.json?.error ?? "").includes("NewAPI request failed"),
-      "transient first-provision failure was not reported as an upstream error",
-    );
-  }
+  assert(firstAllocation.json?.mode === "first_provision", "no-key allocation used the wrong mode");
   const firstRequestId = firstAllocation.json?.request?.id ?? blockedRequests.rows[0]?.data?.id;
   assert(firstRequestId, "first-provision request id is missing");
   assert(
@@ -728,6 +777,10 @@ async function run() {
     `quota-operation:${firstRequestId}`,
   );
   assert(firstOperation?.id, "first-provision operation was not created");
+  assert(
+    firstAllocation.json?.operation?.id === firstOperation.id && firstOperation.id === blockedOperationId,
+    "budget recovery did not reuse the durable first-provision operation",
+  );
   const firstResult = await waitForOperation(firstOperation.id);
   const firstKey = firstResult.key;
   assert(typeof firstKey === "string" && firstKey.length > 0, "first credential is unavailable");
@@ -761,7 +814,7 @@ async function run() {
   );
   pass("no_key_allocation_provisions_key", {
     allocationStatus: firstAllocation.status,
-    recoveredFromTransientUpstreamFailure: firstAllocation.status === 502,
+    recoveredFromRetryableBudgetFailure: true,
     authorizationDelta: 10 * quotaPerUnit,
     periodOpenMarker: true,
   });
@@ -774,9 +827,11 @@ async function run() {
     "select count(*)::integer as count from token_accounts where feishu_user_id = $1",
     [ordinaryUserId],
   );
+  const ordinaryBillingData = ordinaryBilling.rows[0]?.data;
   assert(
-    ordinaryBilling.rows[0]?.data?.monthlyQuota === 0 &&
-      ordinaryBilling.rows[0]?.data?.remainingQuota === 0,
+    !ordinaryBillingData ||
+      (ordinaryBillingData.monthlyQuota === 0 &&
+        ordinaryBillingData.remainingQuota === 0),
     "synced ordinary user inherited quota without approval",
   );
   assert(ordinaryAccounts.rows[0]?.count === 0, "synced ordinary user received a key");
@@ -1022,7 +1077,7 @@ async function run() {
     `/api/admin/users/${encodeURIComponent(ordinaryUserId)}/quota-adjust`,
     {
       method: "POST",
-      expectedStatus: [200, 502],
+      expectedStatus: 202,
       body: {
         approvedMonthlyQuota: 5,
         reason: "F-stage ordinary-user first approval",
@@ -1159,7 +1214,7 @@ async function run() {
     authorizationUnchanged: true,
   });
 
-  const monthly = await appRequest("/api/admin/billing/monthly-reset", {
+  const monthly = await appRequest("/api/admin/billing/period-open", {
     method: "POST",
     body: { period, dryRun: true },
   });
@@ -1179,28 +1234,30 @@ async function run() {
   assert(departmentPlan?.users?.length === 0, "monthly preflight would authorize the user twice");
   pass("monthly_open_idempotency", { alreadyOpenedUsers: 2, pendingUsers: 0 });
 
-  const reconciliation = await appRequest("/api/admin/quota-control?observe=true");
-  const row = reconciliation.json?.report?.rows?.find(
+  const billingAudit = await appRequest(`/api/admin/billing-health?period=${period}`);
+  const row = billingAudit.json?.periods?.find(
     (item) => item.feishuUserId === userId,
   );
-  assert(row?.status === "healthy", `reconciliation status is ${row?.status ?? "missing"}`);
-  assert(row?.observedStable === true, "reconciliation did not obtain two stable reads");
-  assert(row?.expectedAvailableQuota === 12 * quotaPerUnit, "reconciliation expected quota is wrong");
-  assert(row?.observedRemainQuota === 12 * quotaPerUnit, "reconciliation observed quota is wrong");
-  pass("shadow_reconciliation", {
-    status: "healthy",
-    stableReads: 2,
-    expectedQuota: row.expectedAvailableQuota,
+  assert(row, "billing audit did not return the target user period");
+  assert(billingAudit.json?.totals?.ledgerEntries > 0, "billing audit missed ledger entries");
+  pass("billing_audit_readonly", {
+    period,
+    ledgerEntries: billingAudit.json.totals.ledgerEntries,
+    remainingQuota: row.remainingQuota,
   });
 
-  await appRequest(`/api/admin/users/${encodeURIComponent(ordinaryUserId)}/disable`, {
-    method: "POST",
-    body: { reason: "F-stage ordinary-user local check cleanup" },
-  });
-  await appRequest(`/api/admin/users/${encodeURIComponent(userId)}/disable`, {
-    method: "POST",
-    body: { reason: "F-stage local check cleanup" },
-  });
+  const cleanupRoot = await createCleanupRootSession();
+  await revokeFixtureUser(
+    ordinaryUserId,
+    cleanupRoot.cookie,
+    "F-stage ordinary-user local check cleanup",
+  );
+  await revokeFixtureUser(
+    userId,
+    cleanupRoot.cookie,
+    "F-stage local check cleanup",
+  );
+  await pool.query("delete from feishu_users where id = $1", [cleanupRoot.cleanupUserId]);
   cleanupComplete = true;
   const activeAfterCleanup = await pool.query(
     `select count(*)::integer as count from token_accounts

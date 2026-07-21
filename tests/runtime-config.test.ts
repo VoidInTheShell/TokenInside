@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getConfig } from "../lib/config.ts";
+import {
+  effectiveBillingMaterializationConcurrencyMax,
+  getConfig,
+} from "../lib/config.ts";
 
 function withEnvironment(
   values: Record<string, string | undefined>,
@@ -26,6 +29,7 @@ function withEnvironment(
 test("uses bounded defaults for PostgreSQL pools and NewAPI control requests", () => {
   withEnvironment(
     {
+      TOKENINSIDE_STORE_BACKEND: "postgres",
       DATABASE_POOL_MAX: undefined,
       DATABASE_SETTLEMENT_POOL_MAX: undefined,
       DATABASE_LOCK_POOL_MAX: undefined,
@@ -44,6 +48,10 @@ test("uses bounded defaults for PostgreSQL pools and NewAPI control requests", (
       TOKENINSIDE_QUOTA_OPERATION_CONCURRENCY_MAX: undefined,
       TOKENINSIDE_BILLING_MATERIALIZATION_CONCURRENCY_MAX: undefined,
       TOKENINSIDE_USAGE_SYNC_CONTINUATION_DELAY_MS: undefined,
+      TOKENINSIDE_DIRECT_CONSUMPTION_DRAIN_GRACE_MS: undefined,
+      TOKENINSIDE_BALANCE_OBSERVATION_INTERVAL_MS: undefined,
+      TOKENINSIDE_BALANCE_OBSERVATION_BATCH_SIZE: undefined,
+      TOKENINSIDE_BALANCE_OBSERVATION_READ_TIMEOUT_MS: undefined,
     },
     () => {
       const config = getConfig();
@@ -64,7 +72,12 @@ test("uses bounded defaults for PostgreSQL pools and NewAPI control requests", (
       assert.equal(config.proxy.upstreamMaxAttempts, 2);
       assert.equal(config.billing.operationConcurrencyMax, 1);
       assert.equal(config.billing.materializationConcurrencyMax, 4);
+      assert.equal(effectiveBillingMaterializationConcurrencyMax(config), 1);
       assert.equal(config.billing.usageSyncContinuationDelayMs, 250);
+      assert.equal(config.billing.directConsumptionDrainGraceMs, 60_000);
+      assert.equal(config.billing.balanceObservationIntervalMs, 300_000);
+      assert.equal(config.billing.balanceObservationBatchSize, 20);
+      assert.equal(config.billing.balanceObservationReadTimeoutMs, 3_000);
     },
   );
 });
@@ -72,6 +85,7 @@ test("uses bounded defaults for PostgreSQL pools and NewAPI control requests", (
 test("reads explicit PostgreSQL pool and NewAPI timeout limits", () => {
   withEnvironment(
     {
+      TOKENINSIDE_STORE_BACKEND: "postgres",
       DATABASE_POOL_MAX: "11",
       DATABASE_SETTLEMENT_POOL_MAX: "4",
       DATABASE_LOCK_POOL_MAX: "7",
@@ -90,6 +104,10 @@ test("reads explicit PostgreSQL pool and NewAPI timeout limits", () => {
       TOKENINSIDE_QUOTA_OPERATION_CONCURRENCY_MAX: "2",
       TOKENINSIDE_BILLING_MATERIALIZATION_CONCURRENCY_MAX: "2",
       TOKENINSIDE_USAGE_SYNC_CONTINUATION_DELAY_MS: "125",
+      TOKENINSIDE_DIRECT_CONSUMPTION_DRAIN_GRACE_MS: "45000",
+      TOKENINSIDE_BALANCE_OBSERVATION_INTERVAL_MS: "180000",
+      TOKENINSIDE_BALANCE_OBSERVATION_BATCH_SIZE: "12",
+      TOKENINSIDE_BALANCE_OBSERVATION_READ_TIMEOUT_MS: "2200",
     },
     () => {
       const config = getConfig();
@@ -110,7 +128,52 @@ test("reads explicit PostgreSQL pool and NewAPI timeout limits", () => {
       assert.equal(config.proxy.upstreamMaxAttempts, 3);
       assert.equal(config.billing.operationConcurrencyMax, 2);
       assert.equal(config.billing.materializationConcurrencyMax, 2);
+      assert.equal(effectiveBillingMaterializationConcurrencyMax(config), 2);
       assert.equal(config.billing.usageSyncContinuationDelayMs, 125);
+      assert.equal(config.billing.directConsumptionDrainGraceMs, 45_000);
+      assert.equal(config.billing.balanceObservationIntervalMs, 180_000);
+      assert.equal(config.billing.balanceObservationBatchSize, 12);
+      assert.equal(config.billing.balanceObservationReadTimeoutMs, 2_200);
+    },
+  );
+});
+
+test("balance observation remains low-frequency and bounded by twenty accounts", () => {
+  withEnvironment(
+    {
+      TOKENINSIDE_BALANCE_OBSERVATION_INTERVAL_MS: "1000",
+      TOKENINSIDE_BALANCE_OBSERVATION_BATCH_SIZE: "999",
+    },
+    () => {
+      const config = getConfig();
+      assert.equal(config.billing.balanceObservationIntervalMs, 60_000);
+      assert.equal(config.billing.balanceObservationBatchSize, 20);
+    },
+  );
+});
+
+test("effective materialization concurrency preserves JSON behavior and caps PostgreSQL", () => {
+  withEnvironment(
+    {
+      TOKENINSIDE_STORE_BACKEND: "postgres",
+      DATABASE_SETTLEMENT_POOL_MAX: "4",
+      TOKENINSIDE_BILLING_MATERIALIZATION_CONCURRENCY_MAX: "9",
+    },
+    () => {
+      const config = getConfig();
+      assert.equal(effectiveBillingMaterializationConcurrencyMax(config), 3);
+    },
+  );
+
+  withEnvironment(
+    {
+      TOKENINSIDE_STORE_BACKEND: "json",
+      DATABASE_SETTLEMENT_POOL_MAX: "2",
+      TOKENINSIDE_BILLING_MATERIALIZATION_CONCURRENCY_MAX: "4",
+    },
+    () => {
+      const config = getConfig();
+      assert.equal(effectiveBillingMaterializationConcurrencyMax(config), 4);
     },
   );
 });

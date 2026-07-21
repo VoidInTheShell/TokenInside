@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireAdminScope } from "@/lib/admin";
+import { isAdminUserActionAuthorizationError } from "@/lib/postgres-store";
 import {
   listDepartmentQuotaOverview,
-  updateDepartmentQuotaPolicy,
+  updateDepartmentQuotaPolicyAsActor,
 } from "@/lib/store";
 
 export const runtime = "nodejs";
@@ -57,16 +58,22 @@ export async function PATCH(request: Request) {
   }
 
   try {
-    const department = await updateDepartmentQuotaPolicy({
+    const department = await updateDepartmentQuotaPolicyAsActor({
+      actorFeishuUserId: auth.user.id,
       departmentId,
       departmentName:
         departmentId === auth.user.departmentId ? auth.user.departmentName : undefined,
       quotaLimit: parsed.data.quotaLimit,
       defaultGrantQuota: parsed.data.defaultGrantQuota,
-      operatedByFeishuUserId: auth.user.id,
     });
     return NextResponse.json({ department });
   } catch (err) {
+    if (isAdminUserActionAuthorizationError(err)) {
+      return NextResponse.json(
+        { error: err.message, code: err.code },
+        { status: err.status },
+      );
+    }
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "保存部门额度设置失败" },
       { status: 409 },

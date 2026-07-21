@@ -1,5 +1,7 @@
 import { after, NextResponse } from "next/server";
+import { getConfig } from "@/lib/config";
 import { nowIso } from "@/lib/crypto";
+import { submitAndScheduleDurableQuotaWork } from "@/lib/durable-quota-submission";
 import {
   decryptFeishuEventPayload,
   hasFeishuEventVerificationToken,
@@ -8,9 +10,12 @@ import {
 } from "@/lib/feishu";
 import { sha256Hex } from "@/lib/crypto";
 import { provisionTokenForRequest } from "@/lib/provisioning";
+import { assertQuotaWriteActionEnabled } from "@/lib/quota-guard";
+import { submitPostgresFirstProvisionCardApproval } from "@/lib/quota-operation-submit";
+import { ensureQuotaOperationWorker } from "@/lib/quota-saga";
 import {
   addFeishuEvent,
-  decideDepartmentQuotaRequest,
+  decideDepartmentQuotaRequestAsActor,
   findDepartmentQuotaRequestById,
   findTokenRequestById,
   findTokenRequestByInstance,
@@ -18,7 +23,6 @@ import {
   getFeishuEventByUuid,
   transitionTokenRequestStatus,
 } from "@/lib/store";
-import type { TokenRequest } from "@/lib/types";
 
 export const runtime = "nodejs";
 
@@ -275,38 +279,6 @@ function isCardActionEventType(eventType?: string) {
   return eventType === "card.action.trigger" || eventType === "card.action.trigger_v1";
 }
 
-function scheduleTokenProvisionAfterResponse(input: {
-  request: TokenRequest;
-  eventUuid: string;
-  eventType?: string;
-  cardRequestId: string;
-  cardAction: string;
-  operatorOpenId: string;
-  messageId?: string;
-}) {
-  after(async () => {
-    try {
-      await provisionTokenForRequest(input.request);
-    } catch (err) {
-      await addFeishuEventBestEffort({
-        eventUuid: `${input.eventUuid}:provision`,
-        eventType: input.eventType,
-        cardRequestId: input.cardRequestId,
-        cardAction: input.cardAction,
-        operatorOpenId: input.operatorOpenId,
-        messageId: input.messageId,
-        processingStatus: "failed",
-        payloadJson: {
-          sourceEventUuid: input.eventUuid,
-          tokenRequestId: input.request.id,
-          source: "card_action_after_response_provisioning",
-        },
-        errorMessage: err instanceof Error ? err.message : "NewAPI token provisioning failed",
-      });
-    }
-  });
-}
-
 async function handleDepartmentQuotaCardAction(input: {
   encrypted: boolean;
   payload: FeishuEventPayload;
@@ -360,11 +332,13 @@ async function handleDepartmentQuotaCardAction(input: {
         : null;
   if (!action) return cardToast("不支持的审批动作", "error");
   const operator = await getUserByOpenId(input.operatorOpenId);
-  const decided = await decideDepartmentQuotaRequest({
+  if (!operator) {
+    return cardToast("请先登录 TokenInside 管理后台后再处理部门额度申请", "error");
+  }
+  const decided = await decideDepartmentQuotaRequestAsActor({
     requestId: quotaRequest.id,
     action,
-    operatedByFeishuUserId: operator?.id ?? `open_id:${input.operatorOpenId}`,
-    approvalOperatorOpenId: input.operatorOpenId,
+    actorFeishuUserId: operator.id,
   });
   if (!decided) return cardToast("该申请已处理", "success");
   await addFeishuEvent({
@@ -498,38 +472,44 @@ async function handleCardActionEvent(input: {
 
   const operatedAt = nowIso();
   if (isApproveAction) {
-    const approved = await transitionTokenRequestStatus(
-      tokenRequest.id,
-      {
-        status: "approved",
-        approvalOperatorOpenId: operatorOpenId,
-        approvalOperatedAt: operatedAt,
-      },
-      ["pending_card_approval", "approved_provision_failed"],
-    );
-    if (!approved) {
-      await addFeishuEvent({
-        eventUuid,
-        eventType,
-        cardRequestId,
-        cardAction,
-        operatorOpenId,
-        messageId,
-        processingStatus: "ignored",
-        payloadJson: { encrypted, payload },
-        errorMessage: "Token request was already handled before approve transition",
+    if (getConfig().storeBackend === "postgres") {
+      await assertQuotaWriteActionEnabled("first_provision");
+      await submitAndScheduleDurableQuotaWork({
+        submit: () =>
+          submitPostgresFirstProvisionCardApproval({
+            requestId: tokenRequest.id,
+            operatorOpenId,
+            nonce,
+          }),
+        scheduleAfter: after,
+        wakeWorker: ensureQuotaOperationWorker,
       });
-      return cardToast("该申请已处理", "success");
+    } else {
+      const approved = await transitionTokenRequestStatus(
+        tokenRequest.id,
+        {
+          status: "approved",
+          approvalOperatorOpenId: operatorOpenId,
+          approvalOperatedAt: operatedAt,
+        },
+        ["pending_card_approval", "approved_provision_failed"],
+      );
+      if (!approved) {
+        await addFeishuEvent({
+          eventUuid,
+          eventType,
+          cardRequestId,
+          cardAction,
+          operatorOpenId,
+          messageId,
+          processingStatus: "ignored",
+          payloadJson: { encrypted, payload },
+          errorMessage: "Token request was already handled before approve transition",
+        });
+        return cardToast("该申请已处理", "success");
+      }
+      after(() => provisionTokenForRequest(approved).catch(() => undefined));
     }
-    scheduleTokenProvisionAfterResponse({
-      request: approved,
-      eventUuid,
-      eventType,
-      cardRequestId,
-      cardAction,
-      operatorOpenId,
-      messageId,
-    });
   } else if (normalizedAction === "reject" || normalizedAction === "rejected") {
     const rejected = await transitionTokenRequestStatus(
       tokenRequest.id,

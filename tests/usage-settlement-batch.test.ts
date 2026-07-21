@@ -49,7 +49,7 @@ async function createPostgresBatchHarness(input: {
       const normalized = sql.trim().replace(/\s+/g, " ");
       queries.push(normalized);
       if (normalized.startsWith("insert into newapi_usage_records")) {
-        return { rows: [{ data: values[7] }] };
+        return { rows: [{ data: values[8] }] };
       }
       if (normalized.startsWith("insert into proxy_request_logs")) {
         return { rows: [{ data: values[10] }] };
@@ -118,6 +118,17 @@ async function createPostgresBatchHarness(input: {
   };
   const imports: Record<string, Record<string, unknown>> = {
     pg: { Pool: FakePool },
+    "@/lib/admin-scope": {
+      resolveSessionAdminScopeProjection: () => null,
+    },
+    "@/lib/user-access-state": {
+      preserveUserAccessRevocationBarrier: (
+        value: Record<string, unknown>,
+      ) => value,
+    },
+    "@/lib/user-access-recovery-sql": {
+      rollbackPendingUserAccessResumeSql: "select null where false",
+    },
     "@/lib/config": {
       getConfig: () => ({
         databaseUrl: "postgres://test",
@@ -136,6 +147,21 @@ async function createPostgresBatchHarness(input: {
       nowIso: () => "2026-07-17T00:00:00.000Z",
       randomId: () => "test-id",
     },
+    "@/lib/billing-operation-state": {
+      isTerminalBillingOperationStatus: (status: string) =>
+        ["dry_run", "applied", "partial_failed", "failed"].includes(status),
+    },
+    "@/lib/department-quota": {
+      initialDepartmentQuotaLimit: () => 1_000,
+      validateDepartmentQuotaLimit: () => null,
+    },
+    "@/lib/greenfield-installation": {
+      verifyGreenfieldInstallationBinding: () => ({ valid: true }),
+    },
+    "@/lib/department-member-sync-sql": {
+      lockDepartmentMemberSyncUsersSql: "select true",
+      upsertDepartmentMembersSql: "select true",
+    },
     "@/lib/newapi-usage-identity": {
       hasConflictingProxyMatch: () => false,
       newApiUsageIdentityLockKeys: () => ["usage-identity"],
@@ -149,7 +175,31 @@ async function createPostgresBatchHarness(input: {
       materializeUserQuota: () => ({}),
       resolveUsageBillingPeriod: () => "2026-07",
     },
+    "@/lib/package-reset": {
+      assertPackageResetExecutionAllowed: () => ({
+        period: "2026-07",
+        scheduledAt: "2026-06-30T16:00:00.000Z",
+      }),
+      normalizePackageResetPolicy: (policy: unknown) =>
+        policy ?? { enabled: false, dayOfMonth: 1 },
+      PACKAGE_RESET_SYSTEM_ACTOR: "system:package-reset",
+    },
     "@/lib/quota-saga-state": { assertQuotaOperationTransition: () => undefined },
+    "@/lib/quota-execution-fence": {
+      assertQuotaExecutionFenceHeld: () => undefined,
+      createQuotaExecutionFence: (key: string) => ({
+        key,
+        lost: false,
+        closed: false,
+        markLost: () => undefined,
+        close: () => undefined,
+        assertHeld: () => undefined,
+      }),
+      runWithQuotaExecutionFence: async (
+        _fence: unknown,
+        run: () => Promise<unknown>,
+      ) => run(),
+    },
     "@/lib/quota-admission": {
       assertQuotaAdmission: () => undefined,
       QuotaAdmissionClosedError: TestError,
@@ -580,4 +630,61 @@ test("a mid-page authoritative failure rolls back once and never commits", async
   assert.equal(harness.queries.filter((query) => query === "commit").length, 0);
   assert.equal(harness.queries.filter((query) => query === "rollback").length, 1);
   assert.equal(harness.releases, 1);
+});
+
+test("unknown dedicated-upstream tokens are quarantined durably and block settlement", async () => {
+  const store = await readFile(storePath, "utf8");
+  const backfill = functionBody(
+    store,
+    "export async function backfillProxyLogsFromNewApiUsage(",
+    "async function resolveAdminScopeForKnownUser(",
+  );
+  const unknownBranch = functionBody(
+    backfill,
+    "if (!account) {",
+    "const existingRecord = store.newapiUsageRecords.find",
+  );
+
+  assert.match(unknownBranch, /matchStatus: "unknown_token"/);
+  assert.match(unknownBranch, /issueType: "unknown_token"/);
+  assert.match(unknownBranch, /severity: "critical"/);
+  assert.match(unknownBranch, /blocksSettlement: true/);
+  assert.ok(
+    unknownBranch.indexOf("await persistRecord(record)") <
+      unknownBranch.indexOf("continue;"),
+  );
+  assert.ok(
+    unknownBranch.indexOf("await persistSyncIssue(issue)") <
+      unknownBranch.indexOf("continue;"),
+  );
+});
+
+test("known-token usage without a billing amount blocks both matched and unmatched settlement", async () => {
+  const store = await readFile(storePath, "utf8");
+  const backfill = functionBody(
+    store,
+    "export async function backfillProxyLogsFromNewApiUsage(",
+    "async function resolveAdminScopeForKnownUser(",
+  );
+  assert.match(backfill, /hasAuthoritativeBillingAmount/);
+  assert.match(backfill, /issueType: "missing_cost"/);
+  assert.match(backfill, /severity: "critical"/);
+  assert.match(backfill, /blocksSettlement: true/);
+  assert.match(backfill, /blocksSettlement: missingBillingAmount/);
+  assert.match(backfill, /blocksSettlement: Boolean\(billingIssue\)/);
+});
+
+test("a later authoritative amount closes the exact missing-cost issue in JSON and PostgreSQL", async () => {
+  const [store, postgres] = await Promise.all([
+    readFile(storePath, "utf8"),
+    readFile(postgresStorePath, "utf8"),
+  ]);
+  assert.match(store, /function closeResolvedMissingCostIssuesInStore/);
+  assert.match(store, /issue\.issueType !== "missing_cost"/);
+  assert.match(store, /sameNewApiUsageSource\(issue, record\)/);
+  assert.match(store, /issue\.status = "closed"/);
+  assert.match(postgres, /function closePostgresResolvedMissingCostIssues/);
+  assert.match(postgres, /where issue_type = 'missing_cost'/);
+  assert.match(postgres, /and status = 'open'/);
+  assert.match(postgres, /await closePostgresResolvedMissingCostIssues\(client, stored\)/);
 });

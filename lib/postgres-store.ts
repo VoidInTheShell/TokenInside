@@ -1,6 +1,22 @@
 import { Pool, type PoolClient } from "pg";
+import { resolveSessionAdminScopeProjection } from "@/lib/admin-scope";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
+import { isTerminalBillingOperationStatus } from "@/lib/billing-operation-state";
+import {
+  initialDepartmentQuotaLimit,
+  validateDepartmentQuotaLimit,
+} from "@/lib/department-quota";
+import {
+  verifyGreenfieldInstallationBinding,
+  type GreenfieldInstallationManifest,
+} from "@/lib/greenfield-installation";
+import {
+  assertQuotaExecutionFenceHeld,
+  createQuotaExecutionFence,
+  runWithQuotaExecutionFence,
+  type QuotaExecutionFence,
+} from "@/lib/quota-execution-fence";
 import type { NormalizedNewApiUsageLog } from "@/lib/newapi";
 import {
   hasConflictingProxyMatch,
@@ -9,11 +25,22 @@ import {
 } from "@/lib/newapi-usage-identity";
 import {
   initialUnassignedMonthlyQuota,
+  isSettlementWatermarkFresh,
   materializeDepartmentQuota,
   materializeUserQuota,
   resolveUsageBillingPeriod,
 } from "@/lib/quota-model";
-import { assertQuotaOperationTransition } from "@/lib/quota-saga-state";
+import {
+  assertPackageResetExecutionAllowed,
+  normalizePackageResetPolicy,
+  PACKAGE_RESET_SYSTEM_ACTOR,
+} from "@/lib/package-reset";
+import {
+  assertQuotaOperationTransition,
+  canCancelQuotaOperationForAccessRevoke,
+  canReopenMonthlyOpenAfterAccessRevoke,
+  reopenMonthlyOpenAfterAccessRevoke,
+} from "@/lib/quota-saga-state";
 import {
   assertQuotaAdmission,
   QuotaAdmissionClosedError,
@@ -25,9 +52,22 @@ import {
   isBillableProxyLog,
   isNewApiUsageMatchEligibleProxyLog,
 } from "@/lib/usage-matching";
+import { preserveUserAccessRevocationBarrier } from "@/lib/user-access-state";
+import {
+  lockDepartmentMemberSyncUsersSql,
+  upsertDepartmentMembersSql,
+} from "@/lib/department-member-sync-sql";
+import {
+  listStaleUserAccessResumeCandidatesSql,
+  markUserAccessResumeEnableAttemptSql,
+  rollbackPendingUserAccessResumeSql,
+} from "@/lib/user-access-recovery-sql";
 import type {
   AdminScope,
   AppSettings,
+  BillingOperationKind,
+  BillingOperationRecord,
+  BillingOperationStatus,
   DepartmentQuotaPeriod,
   DepartmentQuotaRequest,
   FeishuEvent,
@@ -128,6 +168,8 @@ export function postgresPoolRuntimeSnapshot() {
 export const REQUIRED_POSTGRES_TABLES = [
   "schema_migrations",
   "app_settings",
+  "greenfield_installation_manifest",
+  "billing_operations",
   "feishu_users",
   "token_requests",
   "token_accounts",
@@ -140,6 +182,7 @@ export const REQUIRED_POSTGRES_TABLES = [
   "quota_ledger_entries",
   "user_quota_states",
   "quota_reconciliation_records",
+  "quota_balance_observer_state",
   "feishu_events",
   "proxy_request_logs",
   "newapi_usage_records",
@@ -230,27 +273,36 @@ async function insertJsonRows<T>(
 }
 
 async function withClient<T>(fn: (client: PoolClient) => Promise<T>) {
+  assertQuotaExecutionFenceHeld();
   const client = await getPool().connect();
   try {
-    return await fn(client);
+    const result = await fn(client);
+    assertQuotaExecutionFenceHeld();
+    return result;
   } finally {
     client.release();
   }
 }
 
 async function withControlClient<T>(fn: (client: PoolClient) => Promise<T>) {
+  assertQuotaExecutionFenceHeld();
   const client = await getControlPool().connect();
   try {
-    return await fn(client);
+    const result = await fn(client);
+    assertQuotaExecutionFenceHeld();
+    return result;
   } finally {
     client.release();
   }
 }
 
 async function withSettlementClient<T>(fn: (client: PoolClient) => Promise<T>) {
+  assertQuotaExecutionFenceHeld();
   const client = await getSettlementPool().connect();
   try {
-    return await fn(client);
+    const result = await fn(client);
+    assertQuotaExecutionFenceHeld();
+    return result;
   } finally {
     client.release();
   }
@@ -258,12 +310,17 @@ async function withSettlementClient<T>(fn: (client: PoolClient) => Promise<T>) {
 
 export { withControlClient as withPostgresControlClient };
 
-async function withAdvisoryLockClient<T>(fn: (client: PoolClient) => Promise<T>) {
+async function withAdvisoryLockClient<T>(
+  fn: (client: PoolClient, destroyClient: () => void) => Promise<T>,
+) {
   const client = await getAdvisoryLockPool().connect();
+  let destroy = false;
   try {
-    return await fn(client);
+    return await fn(client, () => {
+      destroy = true;
+    });
   } finally {
-    client.release();
+    client.release(destroy);
   }
 }
 
@@ -272,6 +329,7 @@ async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>) {
     try {
       await client.query("begin");
       const result = await fn(client);
+      assertQuotaExecutionFenceHeld();
       await client.query("commit");
       return result;
     } catch (err) {
@@ -286,6 +344,7 @@ async function withControlTransaction<T>(fn: (client: PoolClient) => Promise<T>)
     try {
       await client.query("begin");
       const result = await fn(client);
+      assertQuotaExecutionFenceHeld();
       await client.query("commit");
       return result;
     } catch (err) {
@@ -302,6 +361,7 @@ async function withSettlementTransaction<T>(
     try {
       await client.query("begin");
       const result = await fn(client);
+      assertQuotaExecutionFenceHeld();
       await client.query("commit");
       return result;
     } catch (err) {
@@ -333,6 +393,14 @@ function usageRecordQuotaConsumed(record: NewApiUsageRecord) {
   return finiteUsageAmount(record.cost ?? record.quota);
 }
 
+function isAuthoritativeUsageRecord(record: NewApiUsageRecord) {
+  return Boolean(
+    record.feishuUserId &&
+      record.tokenAccountId &&
+      (record.matchStatus === "matched" || record.matchStatus === "no_proxy_match"),
+  );
+}
+
 function usageRecordPeriod(record: NewApiUsageRecord) {
   return resolveUsageBillingPeriod({
     billingPeriod: record.billingPeriod,
@@ -357,8 +425,6 @@ function authoritativeQuotaFromRecord(record: NewApiUsageRecord, quotaPerUnit: n
 type PostgresUserQuotaMaterialization = {
   feishuUserId: string;
   period: string;
-  legacyMonthlyQuota: number;
-  legacyConsumedQuota: number;
   assignedMonthlyQuota: number;
   authorizedQuota: number;
   authoritativeConsumedQuota: number;
@@ -369,21 +435,165 @@ type PostgresUserQuotaMaterialization = {
 };
 
 async function readSettingsRow(client: PoolClient) {
-  const result = await client.query<{ data: AppSettings }>(
+  const result = await client.query<{
+    data: AppSettings & { billingOperations?: unknown };
+  }>(
     "select data from app_settings where id = 'default'",
   );
-  return result.rows[0]?.data ?? { defaultMonthlyQuota: 200 };
+  const { billingOperations: _legacyBillingOperations, ...settings } =
+    result.rows[0]?.data ?? { defaultMonthlyQuota: 200 };
+  return {
+    ...settings,
+    packageReset: normalizePackageResetPolicy(settings.packageReset),
+  };
 }
 
 async function saveSettingsRow(client: PoolClient, settings: AppSettings) {
+  const { billingOperations: _legacyBillingOperations, ...safeSettings } = settings as
+    AppSettings & { billingOperations?: unknown };
   const result = await client.query<{ data: AppSettings }>(
     `insert into app_settings (id, data)
      values ('default', $1)
      on conflict (id) do update set data = excluded.data
      returning data`,
-    [settings],
+    [safeSettings],
   );
   return result.rows[0].data;
+}
+
+type PostgresTimestamp = string | Date;
+
+type PostgresBillingOperationRow = {
+  id: string;
+  kind: BillingOperationKind;
+  status: BillingOperationStatus;
+  dry_run: boolean;
+  operated_by_feishu_user_id: string;
+  period: string | null;
+  input: Record<string, unknown>;
+  summary: BillingOperationRecord["summary"];
+  error_message: string | null;
+  attempt_count: number;
+  lease_id: string | null;
+  lease_expires_at: PostgresTimestamp | null;
+  started_at: PostgresTimestamp | null;
+  completed_at: PostgresTimestamp | null;
+  created_at: PostgresTimestamp;
+  updated_at: PostgresTimestamp;
+};
+
+const billingOperationColumns = `
+  id, kind, status, dry_run, operated_by_feishu_user_id, period,
+  input, summary, error_message, attempt_count, lease_id,
+  lease_expires_at, started_at, completed_at, created_at, updated_at
+`;
+
+function postgresTimestampIso(value: PostgresTimestamp) {
+  return value instanceof Date ? value.toISOString() : value;
+}
+
+function billingOperationFromRow(row: PostgresBillingOperationRow): BillingOperationRecord {
+  return {
+    id: row.id,
+    kind: row.kind,
+    status: row.status,
+    dryRun: row.dry_run,
+    operatedByFeishuUserId: row.operated_by_feishu_user_id,
+    ...(row.period !== null ? { period: row.period } : {}),
+    ...(Object.keys(row.input ?? {}).length > 0 ? { input: row.input } : {}),
+    summary: row.summary ?? {},
+    ...(row.error_message !== null ? { errorMessage: row.error_message } : {}),
+    ...(row.attempt_count > 0 ? { attemptCount: row.attempt_count } : {}),
+    ...(row.lease_id !== null ? { leaseId: row.lease_id } : {}),
+    ...(row.lease_expires_at !== null
+      ? { leaseExpiresAt: postgresTimestampIso(row.lease_expires_at) }
+      : {}),
+    ...(row.started_at !== null
+      ? { startedAt: postgresTimestampIso(row.started_at) }
+      : {}),
+    ...(row.completed_at !== null
+      ? { completedAt: postgresTimestampIso(row.completed_at) }
+      : {}),
+    createdAt: postgresTimestampIso(row.created_at),
+    updatedAt: postgresTimestampIso(row.updated_at),
+  };
+}
+
+function billingOperationValues(operation: BillingOperationRecord) {
+  return [
+    operation.id,
+    operation.kind,
+    operation.status,
+    operation.dryRun,
+    operation.operatedByFeishuUserId,
+    operation.period ?? null,
+    operation.input ?? {},
+    operation.summary,
+    operation.errorMessage ?? null,
+    operation.attemptCount ?? 0,
+    operation.leaseId ?? null,
+    operation.leaseExpiresAt ?? null,
+    operation.startedAt ?? null,
+    operation.completedAt ?? null,
+    operation.createdAt,
+    operation.updatedAt,
+  ];
+}
+
+async function insertPostgresBillingOperationRow(
+  client: PoolClient,
+  operation: BillingOperationRecord,
+) {
+  const result = await client.query<PostgresBillingOperationRow>(
+    `insert into billing_operations
+      (id, kind, status, dry_run, operated_by_feishu_user_id, period,
+       input, summary, error_message, attempt_count, lease_id,
+       lease_expires_at, started_at, completed_at, created_at, updated_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+     returning ${billingOperationColumns}`,
+    billingOperationValues(operation),
+  );
+  return billingOperationFromRow(result.rows[0]);
+}
+
+async function updatePostgresBillingOperationRowWithLease(
+  client: PoolClient,
+  operation: BillingOperationRecord,
+  expectedLeaseId: string,
+) {
+  const result = await client.query<PostgresBillingOperationRow>(
+    `update billing_operations set
+       status = $3,
+       summary = $8,
+       error_message = $9,
+       lease_id = null,
+       lease_expires_at = null,
+       completed_at = statement_timestamp(),
+       updated_at = statement_timestamp()
+     where id = $1
+       and kind = $2
+       and dry_run = $4
+       and operated_by_feishu_user_id = $5
+       and period is not distinct from $6
+       and input = $7::jsonb
+       and status = 'running'
+       and lease_id = $10
+       and lease_expires_at > statement_timestamp()
+     returning ${billingOperationColumns}`,
+    [
+      operation.id,
+      operation.kind,
+      operation.status,
+      operation.dryRun,
+      operation.operatedByFeishuUserId,
+      operation.period ?? null,
+      operation.input ?? {},
+      operation.summary,
+      operation.errorMessage ?? null,
+      expectedLeaseId,
+    ],
+  );
+  return result.rows[0] ? billingOperationFromRow(result.rows[0]) : null;
 }
 
 async function saveFeishuUserRow(client: PoolClient, user: FeishuUser) {
@@ -491,13 +701,15 @@ async function saveUserQuotaPolicyRow(client: PoolClient, policy: UserQuotaPolic
   const result = await client.query<{ data: UserQuotaPolicy }>(
     `insert into user_quota_policies
       (id, feishu_user_id, department_id, effective_from_period, effective_to_period,
-       version, data, created_at, updated_at)
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       version, source_type, source_id, data, created_at, updated_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      on conflict (id) do update set
        department_id = excluded.department_id,
        effective_from_period = excluded.effective_from_period,
        effective_to_period = excluded.effective_to_period,
        version = excluded.version,
+       source_type = excluded.source_type,
+       source_id = excluded.source_id,
        data = excluded.data,
        updated_at = excluded.updated_at
      returning data`,
@@ -508,6 +720,8 @@ async function saveUserQuotaPolicyRow(client: PoolClient, policy: UserQuotaPolic
       policy.effectiveFromPeriod,
       policy.effectiveToPeriod ?? null,
       policy.version,
+      policy.sourceType,
+      policy.sourceId,
       policy,
       policy.createdAt,
       policy.updatedAt,
@@ -520,12 +734,15 @@ async function saveQuotaOperationRow(client: PoolClient, operation: QuotaOperati
   const result = await client.query<{ data: QuotaOperation }>(
     `insert into quota_operations
       (id, operation_type, idempotency_key, feishu_user_id, department_id,
-       billing_period, state, operation_generation, next_retry_at, data,
+       billing_period, state, operation_generation, next_retry_at,
+       worker_lease_id, worker_lease_expires_at, data,
        created_at, updated_at, completed_at)
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
      on conflict (id) do update set
        state = excluded.state,
        next_retry_at = excluded.next_retry_at,
+       worker_lease_id = excluded.worker_lease_id,
+       worker_lease_expires_at = excluded.worker_lease_expires_at,
        data = excluded.data,
        updated_at = excluded.updated_at,
        completed_at = excluded.completed_at
@@ -540,6 +757,8 @@ async function saveQuotaOperationRow(client: PoolClient, operation: QuotaOperati
       operation.state,
       operation.operationGeneration,
       operation.nextRetryAt ?? null,
+      operation.workerLeaseId ?? null,
+      operation.workerLeaseExpiresAt ?? null,
       operation,
       operation.createdAt,
       operation.updatedAt,
@@ -803,14 +1022,16 @@ async function saveNewApiUsageRecordRow(client: PoolClient, record: NewApiUsageR
   const result = await client.query<{ data: NewApiUsageRecord }>(
     `insert into newapi_usage_records
       (id, newapi_log_id, newapi_request_id, newapi_token_id, token_account_id,
-       feishu_user_id, match_status, data, newapi_created_at, first_seen_at, last_synced_at)
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       feishu_user_id, billing_period, match_status, data, newapi_created_at,
+       first_seen_at, last_synced_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      on conflict (id) do update set
        newapi_log_id = excluded.newapi_log_id,
        newapi_request_id = excluded.newapi_request_id,
        newapi_token_id = excluded.newapi_token_id,
        token_account_id = excluded.token_account_id,
        feishu_user_id = excluded.feishu_user_id,
+       billing_period = excluded.billing_period,
        match_status = excluded.match_status,
        data = excluded.data,
        newapi_created_at = excluded.newapi_created_at,
@@ -823,6 +1044,7 @@ async function saveNewApiUsageRecordRow(client: PoolClient, record: NewApiUsageR
       record.newapiTokenId ?? null,
       record.tokenAccountId ?? null,
       record.feishuUserId ?? null,
+      record.billingPeriod ?? null,
       record.matchStatus,
       record,
       record.newapiCreatedAt ?? null,
@@ -955,6 +1177,239 @@ function activeAdminScope(scope: AdminScope, now: string) {
   } satisfies AdminScope;
 }
 
+export type AdminUserActionAuthorizationCode =
+  | "actor_scope_missing"
+  | "target_out_of_scope"
+  | "root_required"
+  | "self_access_revoke_forbidden"
+  | "last_root_revoke_forbidden";
+
+export class AdminUserActionAuthorizationError extends Error {
+  constructor(
+    readonly code: AdminUserActionAuthorizationCode,
+    readonly status: 403 | 409,
+    message: string,
+  ) {
+    super(message);
+    this.name = "AdminUserActionAuthorizationError";
+  }
+}
+
+export function isAdminUserActionAuthorizationError(
+  error: unknown,
+): error is AdminUserActionAuthorizationError {
+  return (
+    error instanceof AdminUserActionAuthorizationError ||
+    (typeof error === "object" &&
+      error !== null &&
+      "name" in error &&
+      error.name === "AdminUserActionAuthorizationError" &&
+      "code" in error)
+  );
+}
+
+function adminScopeUserLockKey(feishuUserId: string) {
+  return `admin-scope-user:${feishuUserId}`;
+}
+
+async function lockAdminScopeUsersInTransaction(
+  client: PoolClient,
+  feishuUserIds: string[],
+) {
+  const uniqueIds = [...new Set(feishuUserIds)].sort();
+  for (const feishuUserId of uniqueIds) {
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      adminScopeUserLockKey(feishuUserId),
+    ]);
+  }
+}
+
+export function assertAdminScopeAllowsUserTarget(
+  scope: AdminScope | null,
+  targetUser: FeishuUser,
+  input: {
+    actorFeishuUserId: string;
+    destructiveAccessRevoke?: boolean;
+    activeEnvironmentRootCount?: number;
+    targetHasActiveGlobalAdminScope?: boolean;
+  },
+) {
+  if (!scope) {
+    throw new AdminUserActionAuthorizationError(
+      "actor_scope_missing",
+      403,
+      "当前管理员权限已变化，请刷新后重试",
+    );
+  }
+  const environmentRoot = getConfig().admin.systemAdminOpenIds.includes(targetUser.openId);
+  const actorIsRoot =
+    scope.scopeType === "global" &&
+    scope.source === "environment" &&
+    scope.role === "root";
+  if (input.targetHasActiveGlobalAdminScope && !actorIsRoot) {
+    throw new AdminUserActionAuthorizationError(
+      "root_required",
+      403,
+      "系统管理员用户仅允许 root 管理员操作",
+    );
+  }
+  if (environmentRoot && !actorIsRoot) {
+    throw new AdminUserActionAuthorizationError(
+      "root_required",
+      403,
+      "环境变量 root 用户仅允许 root 管理员操作",
+    );
+  }
+  if (
+    scope.scopeType !== "global" &&
+    (!targetUser.departmentId || targetUser.departmentId !== scope.departmentId)
+  ) {
+    throw new AdminUserActionAuthorizationError(
+      "target_out_of_scope",
+      403,
+      "目标用户当前已不在管理员管理范围内",
+    );
+  }
+  if (input.destructiveAccessRevoke && input.actorFeishuUserId === targetUser.id) {
+    throw new AdminUserActionAuthorizationError(
+      "self_access_revoke_forbidden",
+      409,
+      "不能禁用或删除当前登录的管理员账号",
+    );
+  }
+  if (
+    input.destructiveAccessRevoke &&
+    environmentRoot &&
+    (input.activeEnvironmentRootCount ?? 0) <= 1
+  ) {
+    throw new AdminUserActionAuthorizationError(
+      "last_root_revoke_forbidden",
+      409,
+      "不能禁用或删除最后一个可用的 root 管理员",
+    );
+  }
+}
+
+async function resolvePostgresActorScopeInTransaction(
+  client: PoolClient,
+  actorFeishuUserId: string,
+) {
+  const result = await client.query<{
+    user: FeishuUser;
+    active_scope: AdminScope | null;
+    assigned_request: TokenRequest | null;
+    scopes: AdminScope[];
+  }>(
+    `select
+       actor.data as user,
+       (select scope.data
+        from admin_scopes scope
+        where scope.feishu_user_id = actor.id
+          and scope.status = 'active'
+        order by case when scope.scope_type = 'global' then 0 else 1 end,
+                 scope.updated_at desc,
+                 scope.id
+        limit 1) as active_scope,
+       (select request.data
+        from token_requests request
+        where request.approval_target_open_id = actor.open_id
+        order by request.updated_at desc, request.id
+        limit 1) as assigned_request,
+       coalesce(
+         (select jsonb_agg(scope.data order by scope.updated_at desc, scope.id)
+          from admin_scopes scope
+          where scope.feishu_user_id = actor.id),
+         '[]'::jsonb
+       ) as scopes
+     from feishu_users actor
+     where actor.id = $1`,
+    [actorFeishuUserId],
+  );
+  const row = result.rows[0];
+  if (!row?.user) return null;
+  return resolveSessionAdminScopeProjection({
+    user: row.user,
+    systemAdminOpenIds: new Set(getConfig().admin.systemAdminOpenIds),
+    activeScope: row.active_scope,
+    assignedRequest: row.assigned_request,
+    scopes: row.scopes ?? [],
+  });
+}
+
+async function authorizePostgresAdminUserAction(
+  client: PoolClient,
+  input: {
+    actorFeishuUserId: string;
+    targetFeishuUserId: string;
+    adminScopeLocksHeld?: boolean;
+    destructiveAccessRevoke?: boolean;
+  },
+) {
+  if (!input.adminScopeLocksHeld) {
+    await lockAdminScopeUsersInTransaction(client, [
+      input.actorFeishuUserId,
+      input.targetFeishuUserId,
+    ]);
+  }
+  const targetResult = await client.query<{ data: FeishuUser }>(
+    "select data from feishu_users where id = $1 for update",
+    [input.targetFeishuUserId],
+  );
+  const targetUser = targetResult.rows[0]?.data;
+  if (!targetUser) return null;
+
+  const environmentRoot = getConfig().admin.systemAdminOpenIds.includes(targetUser.openId);
+  let activeEnvironmentRootCount: number | undefined;
+  if (input.destructiveAccessRevoke && environmentRoot) {
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      "admin-scope-root-membership",
+    ]);
+    const countResult = await client.query<{ count: number }>(
+      `select count(*)::integer as count
+       from feishu_users
+       where open_id = any($1::text[])
+         and coalesce(data->>'status', 'active') = 'active'`,
+      [getConfig().admin.systemAdminOpenIds],
+    );
+    activeEnvironmentRootCount = countResult.rows[0]?.count ?? 0;
+  }
+
+  const actorScope = await resolvePostgresActorScopeInTransaction(
+    client,
+    input.actorFeishuUserId,
+  );
+  const targetGlobalScope = await client.query<{ present: boolean }>(
+    `select exists (
+       select 1 from admin_scopes
+       where feishu_user_id = $1
+         and status = 'active'
+         and scope_type = 'global'
+     ) as present`,
+    [input.targetFeishuUserId],
+  );
+  assertAdminScopeAllowsUserTarget(actorScope, targetUser, {
+    actorFeishuUserId: input.actorFeishuUserId,
+    destructiveAccessRevoke: input.destructiveAccessRevoke,
+    activeEnvironmentRootCount,
+    targetHasActiveGlobalAdminScope:
+      environmentRoot || Boolean(targetGlobalScope.rows[0]?.present),
+  });
+  return { actorScope, targetUser };
+}
+
+export async function authorizePostgresAdminUserActionUnderScopeLocks(input: {
+  actorFeishuUserId: string;
+  targetFeishuUserId: string;
+  destructiveAccessRevoke?: boolean;
+}) {
+  return withControlTransaction((client) =>
+    authorizePostgresAdminUserAction(client, {
+      ...input,
+      adminScopeLocksHeld: true,
+    }),
+  );
+}
+
 async function revokeAdminScopesForUserInTransaction(
   client: PoolClient,
   input: {
@@ -962,8 +1417,12 @@ async function revokeAdminScopesForUserInTransaction(
     reason: NonNullable<AdminScope["disabledReason"]>;
     disabledByFeishuUserId?: string;
     now: string;
+    adminScopeLockHeld?: boolean;
   },
 ) {
+  if (!input.adminScopeLockHeld) {
+    await lockAdminScopeUsersInTransaction(client, [input.feishuUserId]);
+  }
   const result = await client.query<{ data: AdminScope }>(
     `select data from admin_scopes
      where feishu_user_id = $1 and source <> 'environment'
@@ -999,12 +1458,8 @@ async function syncPostgresBillingPeriodForUser(
     `billing-period-finalize:${feishuUserId}:${period}`,
   ]);
 
-  const settings = await readSettingsRow(client);
   const seededAt = materializedAt;
-  const initialMonthlyQuota = initialUnassignedMonthlyQuota({
-    defaultMonthlyQuota: settings.defaultMonthlyQuota,
-    quotaMigrationApplied: Boolean(settings.quotaMigration?.appliedAt),
-  });
+  const initialMonthlyQuota = initialUnassignedMonthlyQuota();
   const seed: UserBillingPeriod = {
     id: randomId("bp"),
     feishuUserId,
@@ -1038,28 +1493,26 @@ async function syncPostgresBillingPeriodForUser(
   const existing = existingResult.rows[0]?.data;
   const accounts = (
     await client.query<{ data: TokenAccount }>(
-      `select data from token_accounts where feishu_user_id = $1 order by created_at, id`,
-      [feishuUserId],
-    )
-  ).rows.map((row) => row.data);
-  const requests = (
-    await client.query<{ data: TokenRequest }>(
-      `select data from token_requests where feishu_user_id = $1 order by created_at, id`,
-      [feishuUserId],
+      `select data from token_accounts
+       where feishu_user_id = $1 and billing_period = $2
+       order by created_at, id`,
+      [feishuUserId, period],
     )
   ).rows.map((row) => row.data);
   const logs = (
     await client.query<{ data: ProxyRequestLog }>(
-      `select data from proxy_request_logs where feishu_user_id = $1 order by created_at, id`,
-      [feishuUserId],
+      `select data from proxy_request_logs
+       where feishu_user_id = $1 and billing_period = $2
+       order by created_at, id`,
+      [feishuUserId, period],
     )
   ).rows.map((row) => row.data);
   const usageRecords = (
     await client.query<{ data: NewApiUsageRecord }>(
       `select data from newapi_usage_records
-       where feishu_user_id = $1
+       where feishu_user_id = $1 and billing_period = $2
        order by coalesce(newapi_created_at, last_synced_at), id`,
-      [feishuUserId],
+      [feishuUserId, period],
     )
   ).rows.map((row) => row.data);
   const policy = (
@@ -1092,8 +1545,6 @@ async function syncPostgresBillingPeriodForUser(
     )
   ).rows[0]?.data;
 
-  const requestById = new Map(requests.map((request) => [request.id, request]));
-  const accountById = new Map(accounts.map((account) => [account.id, account]));
   const summary: UserBillingPeriod & { quotaUpdatedAt?: string; sourceUpdatedAt?: string } = {
     id: existing?.id ?? randomId("bp"),
     feishuUserId,
@@ -1116,14 +1567,6 @@ async function syncPostgresBillingPeriodForUser(
     sourceUpdatedAt: undefined,
   };
 
-  function setQuota(quota: number | undefined, at: string) {
-    if (!Number.isFinite(quota) || !quota || quota <= 0) return;
-    if (!summary.quotaUpdatedAt || at.localeCompare(summary.quotaUpdatedAt) >= 0) {
-      summary.monthlyQuota = quota;
-      summary.quotaUpdatedAt = at;
-    }
-  }
-
   for (const account of accounts) {
     const accountPeriod = account.billingPeriod || periodFromIso(account.createdAt);
     if (accountPeriod !== period) continue;
@@ -1135,39 +1578,14 @@ async function syncPostgresBillingPeriodForUser(
       account.disabledAt,
     );
 
-    const request = requestById.get(account.tokenRequestId);
-    if (
-      request &&
-      request.requestType !== "key_reset" &&
-      request.requestType !== "quota_reset" &&
-      request.requestType !== "quota_restore"
-    ) {
-      setQuota(request.approvedMonthlyQuota ?? request.requestedMonthlyQuota, request.updatedAt);
-      summary.sourceUpdatedAt = latestIso(summary.sourceUpdatedAt, request.updatedAt);
-    }
-  }
-
-  for (const request of requests) {
-    if (
-      request.status !== "provisioned" ||
-      (request.requestType !== "quota_adjust" &&
-        request.requestType !== "monthly_reset") ||
-      !request.tokenAccountId
-    ) {
-      continue;
-    }
-    const account = accountById.get(request.tokenAccountId);
-    if (!account || (account.billingPeriod || periodFromIso(account.createdAt)) !== period) {
-      continue;
-    }
-    setQuota(request.approvedMonthlyQuota ?? request.requestedMonthlyQuota, request.updatedAt);
-    summary.sourceUpdatedAt = latestIso(summary.sourceUpdatedAt, request.updatedAt);
   }
 
   const proxyLogIdsBackedByNewApiRecords = new Set<string>();
   for (const record of usageRecords) {
-    if (record.matchStatus !== "matched") continue;
-    if (record.matchedProxyLogId) proxyLogIdsBackedByNewApiRecords.add(record.matchedProxyLogId);
+    if (!isAuthoritativeUsageRecord(record)) continue;
+    if (record.matchStatus === "matched" && record.matchedProxyLogId) {
+      proxyLogIdsBackedByNewApiRecords.add(record.matchedProxyLogId);
+    }
     if (usageRecordPeriod(record) !== period) continue;
     summary.promptTokens += record.promptTokens ?? 0;
     summary.completionTokens += record.completionTokens ?? 0;
@@ -1214,17 +1632,13 @@ async function syncPostgresBillingPeriodForUser(
   summary.tokenAccountIds = [...new Set(summary.tokenAccountIds)].sort();
   summary.quotaConsumed = Number(summary.quotaConsumed.toFixed(8));
   summary.cost = Number(summary.cost.toFixed(8));
-  const legacyMonthlyQuota = summary.monthlyQuota;
-  const legacyConsumedQuota = summary.quotaConsumed;
   const quotaPerUnit = getConfig().newapi.quotaPerUnit;
-  const ledgerAuthoritative = Boolean(settings.quotaMigration?.appliedAt);
-  const assignedMonthlyQuota =
-    policy?.assignedMonthlyQuota ??
-    (ledgerAuthoritative
-      ? 0
-      : Math.max(Math.round(legacyMonthlyQuota * quotaPerUnit), 0));
+  const assignedMonthlyQuota = policy?.assignedMonthlyQuota ?? 0;
   const authoritativeConsumedQuota = usageRecords
-    .filter((record) => record.matchStatus === "matched" && usageRecordPeriod(record) === period)
+    .filter(
+      (record) =>
+        isAuthoritativeUsageRecord(record) && usageRecordPeriod(record) === period,
+    )
     .reduce(
       (total, record) => total + authoritativeQuotaFromRecord(record, quotaPerUnit),
       0,
@@ -1235,12 +1649,10 @@ async function syncPostgresBillingPeriodForUser(
     ledgerEntries,
   });
 
-  summary.monthlyQuota = ledgerAuthoritative
-    ? assignedMonthlyQuota / quotaPerUnit
-    : legacyMonthlyQuota;
-  summary.remainingQuota = ledgerAuthoritative
-    ? materialized.expectedAvailableQuota / quotaPerUnit
-    : Math.max(Number((legacyMonthlyQuota - legacyConsumedQuota).toFixed(8)), 0);
+  summary.monthlyQuota = assignedMonthlyQuota / quotaPerUnit;
+  summary.quotaConsumed = authoritativeConsumedQuota / quotaPerUnit;
+  summary.cost = authoritativeConsumedQuota / quotaPerUnit;
+  summary.remainingQuota = materialized.expectedAvailableQuota / quotaPerUnit;
   Object.assign(summary, materialized, {
     settledThrough: usageCheckpoint?.settledThrough,
     sourceVersion: `${policy?.version ?? 0}:${ledgerEntries.length}:${summary.usageRecordCount}`,
@@ -1254,8 +1666,6 @@ async function syncPostgresBillingPeriodForUser(
   const materialization: PostgresUserQuotaMaterialization = {
     feishuUserId,
     period,
-    legacyMonthlyQuota: Math.round(legacyMonthlyQuota * quotaPerUnit),
-    legacyConsumedQuota: Math.round(legacyConsumedQuota * quotaPerUnit),
     assignedMonthlyQuota,
     authorizedQuota: materialized.authorizedQuota,
     authoritativeConsumedQuota,
@@ -1271,7 +1681,7 @@ export async function reconcilePostgresBillingPeriodForUser(
   feishuUserId: string,
   period: string,
 ) {
-  const result = await withTransaction((client) =>
+  const result = await withSettlementTransaction((client) =>
     syncPostgresBillingPeriodForUser(client, feishuUserId, period),
   );
   return result.billingPeriod;
@@ -1370,7 +1780,7 @@ async function rebuildPostgresDepartmentQuotaMaterializedSnapshotWithClient(
      from quota_operations
      where department_id = $1
        and billing_period = $2
-       and state not in ('completed', 'compensated')`,
+       and state not in ('completed', 'compensated', 'cancelled')`,
     [departmentId, period],
   );
   const materialized = materializeDepartmentQuota({
@@ -1479,15 +1889,200 @@ export async function checkPostgresSchema() {
   }
 }
 
+export type PostgresMonthlyPeriodOpenCandidate = {
+  feishuUserId: string;
+  departmentId?: string;
+  assignedMonthlyQuota: number;
+  activeTokenCount: number;
+  isGlobalAdmin: boolean;
+  alreadyOpened: boolean;
+};
+
+type PostgresMonthlyPeriodOpenSnapshotRow = {
+  candidates: PostgresMonthlyPeriodOpenCandidate[];
+  department_quota_periods: Array<{
+    departmentId: string;
+    period: string;
+    quotaLimit: number;
+  }>;
+  quota_operations: Array<{
+    id: string;
+    feishuUserId: string;
+    departmentId?: string;
+  }>;
+  usage_sync_interval_minutes: number | null;
+  usage_sync_settlement_lag_minutes: number | null;
+  settled_through: string | null;
+  integrity_blocked_at: string | null;
+  last_run_status: UsageSyncCheckpoint["lastRunStatus"] | null;
+};
+
+/**
+ * Loads only the control facts needed to plan one monthly opening. In
+ * particular, the plan never needs request or authoritative-usage detail;
+ * settlement freshness is represented by the durable checkpoint.
+ */
+export async function getPostgresMonthlyPeriodOpenSnapshot(period: string) {
+  return withControlClient(async (client) => {
+    const result = await client.query<PostgresMonthlyPeriodOpenSnapshotRow>(
+      `with latest_policy as materialized (
+         select distinct on (policy.feishu_user_id)
+           policy.feishu_user_id,
+           policy.department_id,
+           coalesce((policy.data->>'assignedMonthlyQuota')::bigint, 0) as assigned_monthly_quota
+         from user_quota_policies policy
+         where policy.effective_from_period <= $1
+           and (
+             policy.effective_to_period is null
+             or policy.effective_to_period >= $1
+           )
+         order by policy.feishu_user_id, policy.version desc, policy.id desc
+       ),
+       eligible_users as materialized (
+         select
+           user_row.id as feishu_user_id,
+           latest_policy.department_id,
+           latest_policy.assigned_monthly_quota,
+           (
+             select count(*)::integer
+             from token_accounts account
+             where account.feishu_user_id = user_row.id
+               and account.status = 'active'
+           ) as active_token_count,
+           (
+             user_row.open_id = any($2::text[])
+             or exists (
+               select 1
+               from admin_scopes scope
+               where scope.feishu_user_id = user_row.id
+                 and scope.scope_type = 'global'
+                 and scope.status = 'active'
+             )
+           ) as is_global_admin,
+           exists (
+             select 1
+             from quota_ledger_entries entry
+             where entry.feishu_user_id = user_row.id
+               and entry.period = $1
+               and entry.entry_type = 'period_open_authorization'
+           ) as already_opened
+         from latest_policy
+         join feishu_users user_row
+           on user_row.id = latest_policy.feishu_user_id
+         where coalesce(user_row.data->>'status', 'active') = 'active'
+       )
+       select
+         coalesce(
+           (
+             select jsonb_agg(
+               jsonb_strip_nulls(jsonb_build_object(
+                 'feishuUserId', eligible.feishu_user_id,
+                 'departmentId', eligible.department_id,
+                 'assignedMonthlyQuota', eligible.assigned_monthly_quota,
+                 'activeTokenCount', eligible.active_token_count,
+                 'isGlobalAdmin', eligible.is_global_admin,
+                 'alreadyOpened', eligible.already_opened
+               ))
+               order by eligible.feishu_user_id
+             )
+             from eligible_users eligible
+           ),
+           '[]'::jsonb
+         ) as candidates,
+         coalesce(
+           (
+             select jsonb_agg(
+               jsonb_build_object(
+                 'departmentId', quota_period.department_id,
+                 'period', quota_period.period,
+                 'quotaLimit', coalesce((quota_period.data->>'quotaLimit')::numeric, 0)
+               )
+               order by quota_period.department_id, quota_period.id
+             )
+             from department_quota_periods quota_period
+             where quota_period.period = $1
+           ),
+           '[]'::jsonb
+         ) as department_quota_periods,
+         coalesce(
+           (
+             select jsonb_agg(
+               jsonb_strip_nulls(jsonb_build_object(
+                 'id', operation.id,
+                 'feishuUserId', operation.feishu_user_id,
+                 'departmentId', operation.department_id
+               ))
+               order by operation.created_at, operation.id
+             )
+             from quota_operations operation
+             where operation.state not in ('completed', 'compensated', 'cancelled')
+           ),
+           '[]'::jsonb
+         ) as quota_operations,
+         (
+           select nullif(settings.data #>> '{usageSyncPolicy,intervalMinutes}', '')::integer
+           from app_settings settings
+           where settings.id = 'default'
+         ) as usage_sync_interval_minutes,
+         (
+           select nullif(settings.data #>> '{usageSyncPolicy,settlementLagMinutes}', '')::integer
+           from app_settings settings
+           where settings.id = 'default'
+         ) as usage_sync_settlement_lag_minutes,
+         (
+           select nullif(checkpoint.data->>'settledThrough', '')
+           from usage_sync_checkpoints checkpoint
+           where checkpoint.scope = 'newapi_usage_logs'
+           limit 1
+         ) as settled_through,
+         (
+           select nullif(checkpoint.data->>'integrityBlockedAt', '')
+           from usage_sync_checkpoints checkpoint
+           where checkpoint.scope = 'newapi_usage_logs'
+           limit 1
+         ) as integrity_blocked_at,
+         (
+           select nullif(checkpoint.data->>'lastRunStatus', '')
+           from usage_sync_checkpoints checkpoint
+           where checkpoint.scope = 'newapi_usage_logs'
+           limit 1
+         ) as last_run_status`,
+      [period, getConfig().admin.systemAdminOpenIds],
+    );
+    const row = result.rows[0];
+    return {
+      candidates: row?.candidates ?? [],
+      departmentQuotaPeriods: row?.department_quota_periods ?? [],
+      quotaOperations: row?.quota_operations ?? [],
+      settings: {
+        usageSyncPolicy:
+          row?.usage_sync_interval_minutes === null ||
+          row?.usage_sync_interval_minutes === undefined
+            ? undefined
+            : {
+                intervalMinutes: row.usage_sync_interval_minutes,
+                settlementLagMinutes:
+                  row.usage_sync_settlement_lag_minutes ?? undefined,
+              },
+      },
+      usageSyncCheckpoint:
+        row?.settled_through || row?.integrity_blocked_at || row?.last_run_status
+          ? {
+              settledThrough: row.settled_through ?? undefined,
+              integrityBlockedAt: row.integrity_blocked_at ?? undefined,
+              lastRunStatus: row.last_run_status ?? undefined,
+            }
+          : null,
+    };
+  });
+}
+
 export async function readPostgresStore(): Promise<StoreShape> {
   const client = await getPool().connect();
   try {
-    const settings = await client.query<{ data: StoreShape["settings"] }>(
-      "select data from app_settings where id = 'default'",
-    );
     return {
       version: 1,
-      settings: settings.rows[0]?.data ?? { defaultMonthlyQuota: 200 },
+      settings: await readSettingsRow(client),
       users: await readDataRows<FeishuUser>(client, "feishu_users", "created_at, id"),
       tokenRequests: await readDataRows<TokenRequest>(
         client,
@@ -1572,8 +2167,143 @@ export async function readPostgresStore(): Promise<StoreShape> {
   }
 }
 
+export async function preparePostgresPackageResetPeriod(period: string) {
+  return withControlTransaction(async (client) => {
+    const settingsResult = await client.query<{
+      data: AppSettings;
+      current_time: Date | string;
+    }>(
+      `select data, statement_timestamp() as current_time
+       from app_settings
+       where id = 'default'
+       for share`,
+    );
+    const settingsRow = settingsResult.rows[0];
+    const currentTime =
+      settingsRow?.current_time instanceof Date
+        ? settingsRow.current_time
+        : new Date(settingsRow?.current_time ?? Date.now());
+    assertPackageResetExecutionAllowed({
+      policy: settingsRow?.data.packageReset,
+      period,
+      now: currentTime,
+    });
+
+    const departments = await client.query<{
+      department_id: string;
+      department_name: string | null;
+      assigned_quota: string;
+    }>(
+      `select policy.department_id,
+              max(nullif(user_row.data->>'departmentName', '')) as department_name,
+              coalesce(sum((policy.data->>'assignedMonthlyQuota')::numeric), 0)::text
+                as assigned_quota
+       from feishu_users user_row
+       join lateral (
+         select quota_policy.department_id, quota_policy.data
+         from user_quota_policies quota_policy
+         where quota_policy.feishu_user_id = user_row.id
+           and quota_policy.effective_from_period <= $1
+           and (
+             quota_policy.effective_to_period is null
+             or quota_policy.effective_to_period >= $1
+           )
+         order by quota_policy.version desc, quota_policy.id desc
+         limit 1
+       ) policy on true
+       where coalesce(nullif(user_row.data->>'status', ''), 'active') = 'active'
+         and policy.department_id is not null
+       group by policy.department_id
+       order by policy.department_id`,
+      [period],
+    );
+
+    const created: DepartmentQuotaPeriod[] = [];
+    for (const department of departments.rows) {
+      await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+        `department-quota:${department.department_id}:${period}`,
+      ]);
+      const existing = await client.query<{ data: DepartmentQuotaPeriod }>(
+        `select data
+         from department_quota_periods
+         where department_id = $1 and period = $2
+         for update`,
+        [department.department_id, period],
+      );
+      if (existing.rows[0]) continue;
+
+      const previous = await client.query<{ data: DepartmentQuotaPeriod }>(
+        `select data
+         from department_quota_periods
+         where department_id = $1 and period < $2
+         order by period desc, id desc
+         limit 1
+         for share`,
+        [department.department_id, period],
+      );
+      const assignedUnits = Math.ceil(
+        Math.max(Number(department.assigned_quota), 0) /
+          getConfig().newapi.quotaPerUnit,
+      );
+      const previousPolicy = previous.rows[0]?.data;
+      const now = currentTime.toISOString();
+      created.push(
+        await saveDepartmentQuotaPeriodRow(client, {
+          id: randomId("dqp"),
+          departmentId: department.department_id,
+          departmentName:
+            previousPolicy?.departmentName ?? department.department_name ?? undefined,
+          period,
+          quotaLimit:
+            previousPolicy?.quotaLimit ?? initialDepartmentQuotaLimit(assignedUnits),
+          defaultGrantQuota:
+            previousPolicy?.defaultGrantQuota ??
+            settingsRow?.data.defaultMonthlyQuota ??
+            200,
+          createdAt: now,
+          updatedAt: now,
+          updatedByFeishuUserId: PACKAGE_RESET_SYSTEM_ACTOR,
+        }),
+      );
+    }
+    return created;
+  });
+}
+
 export async function getPostgresAppSettings() {
   return withControlClient((client) => readSettingsRow(client));
+}
+
+export async function getPostgresGreenfieldInstallationManifest() {
+  return withControlClient(async (client) => {
+    const result = await client.query<{ data: GreenfieldInstallationManifest }>(
+      `select data
+       from greenfield_installation_manifest
+       where id = 'default'
+       limit 1`,
+    );
+    return result.rows[0]?.data ?? null;
+  });
+}
+
+export async function getPostgresNewApiRuntimeBindingSnapshot() {
+  return withControlClient(async (client) => {
+    const result = await client.query<{
+      settings: AppSettings;
+      manifest: GreenfieldInstallationManifest | null;
+    }>(
+      `select settings.data as settings, manifest.data as manifest
+       from app_settings settings
+       left join greenfield_installation_manifest manifest
+         on manifest.id = 'default'
+       where settings.id = 'default'
+       limit 1`,
+    );
+    return {
+      settings: result.rows[0]?.settings ?? { defaultMonthlyQuota: 200 },
+      manifest: result.rows[0]?.manifest ?? null,
+    };
+  });
 }
 
 export async function getPostgresAppSettingsForQuotaOperation() {
@@ -1598,14 +2328,14 @@ export type PostgresBillingMaterializationTarget = {
 };
 
 /**
- * Enumerates the durable user-period obligations implied by matched NewAPI
+ * Enumerates the durable user-period obligations implied by authoritative NewAPI
  * source facts. The JSON record owns the billing-period snapshot; legacy rows
  * without it fall back to the NewAPI occurrence month in Hong Kong time.
  */
-export async function listPostgresMatchedUsageBillingMaterializationTargets() {
+export async function listPostgresAuthoritativeUsageBillingMaterializationTargets() {
   return withClient(async (client) => {
     const result = await client.query<PostgresBillingMaterializationTarget>(
-      `with matched_targets as (
+      `with authoritative_targets as (
          select
            coalesce(
              nullif(data->>'feishuUserId', ''),
@@ -1619,10 +2349,12 @@ export async function listPostgresMatchedUsageBillingMaterializationTargets() {
              else null
            end as "billingPeriod"
          from newapi_usage_records
-         where match_status = 'matched'
+         where match_status in ('matched', 'no_proxy_match')
+           and feishu_user_id is not null
+           and token_account_id is not null
        )
        select distinct "feishuUserId", "billingPeriod"
-       from matched_targets
+       from authoritative_targets
        where "feishuUserId" is not null
          and "billingPeriod" is not null
        order by "feishuUserId", "billingPeriod"`,
@@ -2200,15 +2932,12 @@ export async function mutatePostgresAppSettings<T>(
       `insert into app_settings (id, data)
        values ('default', $1)
        on conflict (id) do nothing`,
-      [{ defaultMonthlyQuota: 200, billingOperations: [] }],
+      [{ defaultMonthlyQuota: 200 }],
     );
     const settingsResult = await client.query<{ data: AppSettings }>(
       "select data from app_settings where id = 'default' for update",
     );
-    const settings = settingsResult.rows[0]?.data ?? {
-      defaultMonthlyQuota: 200,
-      billingOperations: [],
-    };
+    const settings = settingsResult.rows[0]?.data ?? { defaultMonthlyQuota: 200 };
     const before = JSON.stringify(settings);
     const result = await fn(settings);
     // Deduplicated enqueue, failed claims and lease CAS misses are reads, not
@@ -2219,12 +2948,742 @@ export async function mutatePostgresAppSettings<T>(
   });
 }
 
+export async function updatePostgresAppSettingsAsActor(input: {
+  actorFeishuUserId: string;
+  defaultMonthlyQuota?: number;
+  newapiControl?: AppSettings["newapiControl"];
+  packageReset?: AppSettings["packageReset"];
+}) {
+  return withControlTransaction(async (client) => {
+    await lockAdminScopeUsersInTransaction(client, [input.actorFeishuUserId]);
+    const actorScope = await resolvePostgresActorScopeInTransaction(
+      client,
+      input.actorFeishuUserId,
+    );
+    if (!actorScope || actorScope.scopeType !== "global") {
+      throw new AdminUserActionAuthorizationError(
+        "actor_scope_missing",
+        403,
+        "当前全局管理员权限已变化，请刷新后重试",
+      );
+    }
+    if (
+      input.newapiControl &&
+      !(actorScope.source === "environment" && actorScope.role === "root")
+    ) {
+      throw new AdminUserActionAuthorizationError(
+        "root_required",
+        403,
+        "NewAPI 上游连接只能由 root 管理员修改",
+      );
+    }
+    if (input.newapiControl) {
+      const manifestResult = await client.query<{
+        data: GreenfieldInstallationManifest;
+      }>(
+        `select data
+         from greenfield_installation_manifest
+         where id = 'default'
+         for share`,
+      );
+      const binding = verifyGreenfieldInstallationBinding({
+        manifest: manifestResult.rows[0]?.data,
+        upstreamBaseUrl: input.newapiControl.baseUrl ?? "",
+        configuredControlUserId: input.newapiControl.controlUserId,
+      });
+      if (!binding.ready) {
+        const error = new Error(`绿地 NewAPI 绑定禁止变更: ${binding.reason}`);
+        error.name = "GreenfieldInstallationBindingWriteError";
+        throw error;
+      }
+    }
+    await client.query(
+      `insert into app_settings (id, data)
+       values ('default', $1)
+       on conflict (id) do nothing`,
+      [{ defaultMonthlyQuota: 200 }],
+    );
+    const result = await client.query<{ data: AppSettings }>(
+      "select data from app_settings where id = 'default' for update",
+    );
+    const current = result.rows[0]?.data ?? { defaultMonthlyQuota: 200 };
+    const now = nowIso();
+    let newapiControl = current.newapiControl;
+    if (input.newapiControl) {
+      const accessTokenCiphertext =
+        input.newapiControl.accessTokenCiphertext ??
+        current.newapiControl?.accessTokenCiphertext;
+      if (!accessTokenCiphertext) {
+        const error = new Error("首次保存 NewAPI 上游连接时必须填写用户 AK");
+        error.name = "NewApiControlSecretRequiredError";
+        throw error;
+      }
+      newapiControl = {
+        ...input.newapiControl,
+        accessTokenCiphertext,
+        updatedAt: now,
+        updatedByFeishuUserId: input.actorFeishuUserId,
+      };
+    }
+    const settings: AppSettings = {
+      ...current,
+      defaultMonthlyQuota:
+        input.defaultMonthlyQuota ?? current.defaultMonthlyQuota,
+      newapiControl,
+      packageReset: input.packageReset
+        ? normalizePackageResetPolicy({
+            ...input.packageReset,
+            updatedAt: now,
+            updatedByFeishuUserId: input.actorFeishuUserId,
+          })
+        : normalizePackageResetPolicy(current.packageReset),
+      updatedAt: now,
+      updatedByFeishuUserId: input.actorFeishuUserId,
+    };
+    return saveSettingsRow(client, settings);
+  });
+}
+
+export async function getPostgresEarliestOpenBlockingUsageIssue() {
+  return withControlClient(async (client) => {
+    const result = await client.query<{ data: UsageSyncIssue }>(
+      `select data
+       from usage_sync_issues
+       where status = 'open'
+         and coalesce(nullif(data->>'blocksSettlement', '')::boolean, false)
+       order by coalesce(
+         nullif(data->>'occurredAt', '')::timestamptz,
+         first_seen_at
+       ), id
+       limit 1`,
+    );
+    return result.rows[0]?.data ?? null;
+  });
+}
+
+export async function enqueuePostgresBillingOperation(
+  operation: BillingOperationRecord,
+  options: { requireRootActor?: boolean } = {},
+) {
+  return withControlTransaction(async (client) => {
+    if (options.requireRootActor) {
+      await lockAdminScopeUsersInTransaction(client, [
+        operation.operatedByFeishuUserId,
+      ]);
+      const actorScope = await resolvePostgresActorScopeInTransaction(
+        client,
+        operation.operatedByFeishuUserId,
+      );
+      if (
+        !actorScope ||
+        actorScope.scopeType !== "global" ||
+        actorScope.source !== "environment" ||
+        actorScope.role !== "root"
+      ) {
+        throw new AdminUserActionAuthorizationError(
+          "root_required",
+          403,
+          "该维护操作仅允许 root 执行",
+        );
+      }
+    }
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `billing-operation-kind:${operation.kind}`,
+    ]);
+    const existing = await client.query<PostgresBillingOperationRow>(
+      `select ${billingOperationColumns}
+       from billing_operations
+       where kind = $1
+         and status in ('pending', 'running')
+       order by created_at desc, id desc
+       limit 1
+       for update`,
+      [operation.kind],
+    );
+    if (existing.rows[0]) {
+      return {
+        operation: billingOperationFromRow(existing.rows[0]),
+        created: false,
+      };
+    }
+    return {
+      operation: await insertPostgresBillingOperationRow(client, operation),
+      created: true,
+    };
+  });
+}
+
+async function assertPostgresDepartmentMemberSyncScope(
+  client: PoolClient,
+  input: { actorFeishuUserId: string; departmentId: string },
+) {
+  await lockAdminScopeUsersInTransaction(client, [input.actorFeishuUserId]);
+  const actorResult = await client.query<{ data: FeishuUser }>(
+    "select data from feishu_users where id = $1 for share",
+    [input.actorFeishuUserId],
+  );
+  const actor = actorResult.rows[0]?.data;
+  const actorScope = actor
+    ? await resolvePostgresActorScopeInTransaction(client, input.actorFeishuUserId)
+    : null;
+  if (!actor || actor.status !== "active" || !actorScope) {
+    throw new AdminUserActionAuthorizationError(
+      "actor_scope_missing",
+      403,
+      "当前管理员用户或管理范围已变化，同步任务已安全停止",
+    );
+  }
+  if (
+    actorScope.scopeType === "department" &&
+    actorScope.departmentId !== input.departmentId
+  ) {
+    throw new AdminUserActionAuthorizationError(
+      "target_out_of_scope",
+      403,
+      "当前管理员已无权同步该部门",
+    );
+  }
+  const departmentResult = await client.query<{ present: boolean }>(
+    `select exists (
+       select 1 from feishu_users where department_id = $1
+       union all
+       select 1 from department_quota_periods where department_id = $1
+     ) as present`,
+    [input.departmentId],
+  );
+  if (!departmentResult.rows[0]?.present) {
+    throw new AdminUserActionAuthorizationError(
+      "target_out_of_scope",
+      403,
+      "目标部门已不存在或不在 TokenInside 管理范围内",
+    );
+  }
+  return { actor, actorScope };
+}
+
+export async function enqueuePostgresDepartmentMemberSyncOperationAsActor(
+  operation: BillingOperationRecord,
+) {
+  const departmentId = String(operation.input?.departmentId ?? "");
+  if (operation.kind !== "department_member_sync" || !departmentId) {
+    throw new Error("部门成员同步任务缺少有效部门 ID");
+  }
+  return withControlTransaction(async (client) => {
+    await assertPostgresDepartmentMemberSyncScope(client, {
+      actorFeishuUserId: operation.operatedByFeishuUserId,
+      departmentId,
+    });
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `department-directory:${departmentId}`,
+    ]);
+    const existing = await client.query<PostgresBillingOperationRow>(
+      `select ${billingOperationColumns}
+       from billing_operations
+       where kind = 'department_member_sync'
+         and input->>'departmentId' = $1
+         and status in ('pending', 'running')
+       order by created_at desc, id desc
+       limit 1
+       for update`,
+      [departmentId],
+    );
+    if (existing.rows[0]) {
+      return {
+        operation: billingOperationFromRow(existing.rows[0]),
+        created: false,
+      };
+    }
+    return {
+      operation: await insertPostgresBillingOperationRow(client, operation),
+      created: true,
+    };
+  });
+}
+
+async function getAuthorizedRunningDepartmentMemberSyncOperation(
+  client: PoolClient,
+  input: { operationId: string; leaseId: string },
+) {
+  // Lock order is deliberately actor -> department -> operation everywhere.
+  // Read immutable identity without a row lock first so an enqueue transaction
+  // can never hold the actor lock while this worker holds the operation row.
+  const identityResult = await client.query<PostgresBillingOperationRow>(
+    `select ${billingOperationColumns}
+     from billing_operations
+     where id = $1
+       and kind = 'department_member_sync'
+       and status = 'running'
+       and lease_id = $2
+       and lease_expires_at > statement_timestamp()`,
+    [input.operationId, input.leaseId],
+  );
+  const identity = identityResult.rows[0]
+    ? billingOperationFromRow(identityResult.rows[0])
+    : null;
+  const departmentId = String(identity?.input?.departmentId ?? "");
+  if (!identity || !departmentId) {
+    throw new Error(`department member sync lease lost: ${input.operationId}`);
+  }
+  await assertPostgresDepartmentMemberSyncScope(client, {
+    actorFeishuUserId: identity.operatedByFeishuUserId,
+    departmentId,
+  });
+  await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+    `department-directory:${departmentId}`,
+  ]);
+  const lockedResult = await client.query<PostgresBillingOperationRow>(
+    `select ${billingOperationColumns}
+     from billing_operations
+     where id = $1
+       and kind = 'department_member_sync'
+       and status = 'running'
+       and lease_id = $2
+       and lease_expires_at > statement_timestamp()
+     for update`,
+    [input.operationId, input.leaseId],
+  );
+  const operation = lockedResult.rows[0]
+    ? billingOperationFromRow(lockedResult.rows[0])
+    : null;
+  if (
+    !operation ||
+    operation.operatedByFeishuUserId !== identity.operatedByFeishuUserId ||
+    operation.input?.departmentId !== departmentId
+  ) {
+    throw new Error(`department member sync lease lost: ${input.operationId}`);
+  }
+  return { operation, departmentId };
+}
+
+export async function assertPostgresDepartmentMemberSyncExecutionAuthorized(input: {
+  operationId: string;
+  leaseId: string;
+}) {
+  return withControlTransaction((client) =>
+    getAuthorizedRunningDepartmentMemberSyncOperation(client, input),
+  );
+}
+
+export async function batchUpsertPostgresDepartmentMembersForSync(input: {
+  operationId: string;
+  leaseId: string;
+  tenantKey: string;
+  departmentName?: string;
+  contacts: Array<{
+    id: string;
+    openId: string;
+    unionId?: string;
+    feishuUserIdFromFeishu?: string;
+    name?: string;
+    avatarUrl?: string;
+  }>;
+  now: string;
+}) {
+  if (input.contacts.length === 0) return { synced: 0, skipped: 0 };
+  if (input.contacts.length > 50) {
+    throw new Error("单批部门成员导入不得超过 50 人");
+  }
+  return withControlTransaction(async (client) => {
+    const { departmentId } = await getAuthorizedRunningDepartmentMemberSyncOperation(
+      client,
+      input,
+    );
+    const openIds = [...new Set(input.contacts.map((contact) => contact.openId))];
+    const userLockKeys = openIds
+      .map((openId) => `feishu_user:${input.tenantKey}:${openId}`)
+      .sort();
+    // Match the OAuth/upsertFeishuUser fence exactly. One ordered SQL statement
+    // acquires the whole page without 50 control round trips and prevents an
+    // absent-row snapshot from overwriting a concurrent disable/delete state.
+    await client.query(lockDepartmentMemberSyncUsersSql, [userLockKeys]);
+    const existingResult = await client.query<{ data: FeishuUser }>(
+      `select data
+       from feishu_users
+       where tenant_key = $1 and open_id = any($2::text[])
+       for update`,
+      [input.tenantKey, openIds],
+    );
+    const existingByOpenId = new Map(
+      existingResult.rows.map((row) => [row.data.openId, row.data]),
+    );
+    const rows: Array<{
+      id: string;
+      tenantKey: string;
+      openId: string;
+      departmentId: string;
+      data: FeishuUser;
+      createdAt: string;
+      updatedAt: string;
+    }> = [];
+    let skipped = 0;
+    for (const contact of input.contacts) {
+      const existing = existingByOpenId.get(contact.openId);
+      if (existing?.departmentId && existing.departmentId !== departmentId) {
+        skipped += 1;
+        continue;
+      }
+      const user: FeishuUser = existing
+        ? {
+            ...existing,
+            unionId: contact.unionId ?? existing.unionId,
+            feishuUserIdFromFeishu:
+              contact.feishuUserIdFromFeishu ?? existing.feishuUserIdFromFeishu,
+            name: contact.name ?? existing.name,
+            avatarUrl: contact.avatarUrl ?? existing.avatarUrl,
+            departmentId,
+            departmentName: input.departmentName ?? existing.departmentName,
+            updatedAt: input.now,
+          }
+        : {
+            id: contact.id,
+            tenantKey: input.tenantKey,
+            openId: contact.openId,
+            unionId: contact.unionId,
+            feishuUserIdFromFeishu: contact.feishuUserIdFromFeishu,
+            name: contact.name,
+            avatarUrl: contact.avatarUrl,
+            departmentId,
+            departmentName: input.departmentName,
+            status: "active",
+            createdAt: input.now,
+            updatedAt: input.now,
+          };
+      rows.push({
+        id: user.id,
+        tenantKey: user.tenantKey,
+        openId: user.openId,
+        departmentId,
+        data: user,
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt,
+      });
+    }
+    if (rows.length === 0) return { synced: 0, skipped };
+    const stored = await client.query<{ id: string }>(
+      upsertDepartmentMembersSql,
+      [
+        JSON.stringify(
+          rows.map((row) => ({
+            id: row.id,
+            tenant_key: row.tenantKey,
+            open_id: row.openId,
+            department_id: row.departmentId,
+            data: row.data,
+            created_at: row.createdAt,
+            updated_at: row.updatedAt,
+          })),
+        ),
+      ],
+    );
+    return {
+      synced: stored.rowCount ?? 0,
+      skipped: skipped + rows.length - (stored.rowCount ?? 0),
+    };
+  });
+}
+
+export async function listPostgresDepartmentMemberSyncOperations(input: {
+  departmentId?: string;
+  limit?: number;
+}) {
+  const limit = Math.min(Math.max(Math.trunc(input.limit ?? 100), 1), 100);
+  return withControlClient(async (client) => {
+    const result = await client.query<PostgresBillingOperationRow>(
+      `select ${billingOperationColumns}
+       from billing_operations
+       where kind = 'department_member_sync'
+         and ($1::text is null or input->>'departmentId' = $1)
+       order by updated_at desc, id desc
+       limit $2`,
+      [input.departmentId ?? null, limit],
+    );
+    return result.rows.map(billingOperationFromRow);
+  });
+}
+
+export async function findPostgresBillingOperationById(operationId: string) {
+  return withControlClient(async (client) => {
+    const result = await client.query<PostgresBillingOperationRow>(
+      `select ${billingOperationColumns}
+       from billing_operations
+       where id = $1
+       limit 1`,
+      [operationId],
+    );
+    return result.rows[0] ? billingOperationFromRow(result.rows[0]) : null;
+  });
+}
+
+export async function listPostgresRunnableBillingOperations(input: {
+  kind: BillingOperationKind;
+  limit?: number;
+  now: string;
+}) {
+  const limit = Math.min(Math.max(Math.trunc(input.limit ?? 1), 0), 1_000);
+  if (limit === 0) return [];
+  return withControlClient(async (client) => {
+    const result = await client.query<PostgresBillingOperationRow>(
+      `select ${billingOperationColumns}
+       from billing_operations
+       where kind = $1
+         and (
+           status = 'pending'
+           or (
+             status = 'running'
+             and lease_expires_at <= $2::timestamptz
+           )
+         )
+       order by
+         case when status = 'pending' then 0 else 1 end,
+         coalesce(lease_expires_at, created_at),
+         created_at,
+         id
+       limit $3`,
+      [input.kind, input.now, limit],
+    );
+    return result.rows.map(billingOperationFromRow);
+  });
+}
+
+export async function claimPostgresBillingOperationExecution(input: {
+  operationId: string;
+  kind: BillingOperationKind;
+  leaseId: string;
+  leaseExpiresAt: string;
+}) {
+  return withControlTransaction(async (client) => {
+    const result = await client.query<PostgresBillingOperationRow>(
+      `update billing_operations set
+         status = 'running',
+         attempt_count = attempt_count + 1,
+         lease_id = $3,
+         lease_expires_at = $4::timestamptz,
+         started_at = coalesce(started_at, statement_timestamp()),
+         updated_at = statement_timestamp()
+       where id = $1
+         and kind = $2
+         and $4::timestamptz > statement_timestamp()
+         and (
+           status = 'pending'
+           or (
+             status = 'running'
+             and lease_expires_at <= statement_timestamp()
+           )
+         )
+       returning ${billingOperationColumns}`,
+      [input.operationId, input.kind, input.leaseId, input.leaseExpiresAt],
+    );
+    return result.rows[0] ? billingOperationFromRow(result.rows[0]) : null;
+  });
+}
+
+export async function renewPostgresBillingOperationExecution(input: {
+  operationId: string;
+  leaseId: string;
+  leaseExpiresAt: string;
+}) {
+  return withControlTransaction(async (client) => {
+    const result = await client.query<PostgresBillingOperationRow>(
+      `update billing_operations set
+         lease_expires_at = $3::timestamptz,
+         updated_at = statement_timestamp()
+       where id = $1
+         and status = 'running'
+         and lease_id = $2
+         and lease_expires_at > statement_timestamp()
+         and $3::timestamptz > lease_expires_at
+       returning ${billingOperationColumns}`,
+      [input.operationId, input.leaseId, input.leaseExpiresAt],
+    );
+    return result.rows[0] ? billingOperationFromRow(result.rows[0]) : null;
+  });
+}
+
+export async function recordPostgresBillingOperation(input: {
+  id?: string;
+  expectedLeaseId?: string;
+  kind: BillingOperationKind;
+  status: BillingOperationStatus;
+  dryRun: boolean;
+  operatedByFeishuUserId: string;
+  period?: string;
+  input?: Record<string, unknown>;
+  summary: BillingOperationRecord["summary"];
+  errorMessage?: string;
+}) {
+  return withControlTransaction(async (client) => {
+    if (Boolean(input.id) !== Boolean(input.expectedLeaseId)) {
+      throw new Error("billing operation completion requires both id and lease");
+    }
+    if (!isTerminalBillingOperationStatus(input.status)) {
+      throw new Error("billing operation records require a terminal status");
+    }
+    const existingResult = input.id
+      ? await client.query<PostgresBillingOperationRow>(
+          `select ${billingOperationColumns}
+           from billing_operations
+           where id = $1
+             and (
+               $2::text is null
+               or (
+                 status = 'running'
+                 and lease_id = $2
+                 and lease_expires_at > statement_timestamp()
+               )
+             )
+           for update`,
+          [input.id, input.expectedLeaseId ?? null],
+        )
+      : null;
+    const existing = existingResult?.rows[0]
+      ? billingOperationFromRow(existingResult.rows[0])
+      : undefined;
+    if (input.expectedLeaseId && !existing) {
+      throw new Error(`billing operation lease lost: ${input.id ?? "unknown"}`);
+    }
+
+    const now = nowIso();
+    const operation: BillingOperationRecord = {
+      ...(existing ?? input),
+      status: input.status,
+      summary: input.summary,
+      errorMessage: input.errorMessage,
+      id: input.id ?? existing?.id ?? randomId("bo"),
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      attemptCount: existing?.attemptCount,
+      leaseId: undefined,
+      leaseExpiresAt: undefined,
+      startedAt: existing?.startedAt,
+      completedAt: now,
+    };
+    const stored = input.expectedLeaseId
+      ? await updatePostgresBillingOperationRowWithLease(
+          client,
+          operation,
+          input.expectedLeaseId,
+        )
+      : await insertPostgresBillingOperationRow(client, operation);
+    if (!stored) {
+      throw new Error(`billing operation lease lost: ${input.id ?? "unknown"}`);
+    }
+    return stored;
+  });
+}
+
+export async function listPostgresBillingOperations(limit = 20) {
+  const boundedLimit = Math.min(Math.max(Math.trunc(limit), 0), 10_000);
+  if (boundedLimit === 0) return [];
+  return withControlClient(async (client) => {
+    const result = await client.query<PostgresBillingOperationRow>(
+      `select ${billingOperationColumns}
+       from billing_operations
+       order by updated_at desc, id desc
+       limit $1`,
+      [boundedLimit],
+    );
+    return result.rows.map(billingOperationFromRow);
+  });
+}
+
 export async function upsertPostgresUserQuotaPolicy(policy: UserQuotaPolicy) {
   return withControlTransaction(async (client) => {
-    await client.query("select pg_advisory_xact_lock(hashtext($1))", [
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
       `user-quota:${policy.feishuUserId}`,
     ]);
     return saveUserQuotaPolicyRow(client, policy);
+  });
+}
+
+export async function createPostgresUserQuotaPolicyVersion(input: {
+  feishuUserId: string;
+  assignedMonthlyQuota: number;
+  departmentId?: string;
+  effectiveFromPeriod: string;
+  sourceType: UserQuotaPolicy["sourceType"];
+  sourceId: string;
+  quotaPerUnitSnapshot: number;
+  updatedByOpenId?: string;
+}) {
+  return withControlTransaction(async (client) => {
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `user-quota:${input.feishuUserId}`,
+    ]);
+
+    const idempotent = await client.query<{ data: UserQuotaPolicy }>(
+      `select data
+       from user_quota_policies
+       where source_type = $1 and source_id = $2
+       limit 1`,
+      [input.sourceType, input.sourceId],
+    );
+    if (idempotent.rows[0]) return idempotent.rows[0].data;
+
+    // The advisory lock covers the first version, while the latest row lock is
+    // a concrete database fence for every subsequent version. Version
+    // allocation therefore stays local to this user and this short control
+    // transaction instead of reading the complete application store.
+    const previous = await client.query<{ version: number }>(
+      `select version
+       from user_quota_policies
+       where feishu_user_id = $1
+       order by version desc, id desc
+       limit 1
+       for update`,
+      [input.feishuUserId],
+    );
+    const now = nowIso();
+    const policy: UserQuotaPolicy = {
+      id: randomId("uqp"),
+      feishuUserId: input.feishuUserId,
+      assignedMonthlyQuota: Math.max(Math.trunc(input.assignedMonthlyQuota), 0),
+      departmentId: input.departmentId,
+      effectiveFromPeriod: input.effectiveFromPeriod,
+      sourceType: input.sourceType,
+      sourceId: input.sourceId,
+      version: (previous.rows[0]?.version ?? 0) + 1,
+      quotaPerUnitSnapshot: input.quotaPerUnitSnapshot,
+      createdAt: now,
+      updatedAt: now,
+      updatedByOpenId: input.updatedByOpenId,
+    };
+    const inserted = await client.query<{ data: UserQuotaPolicy }>(
+      `insert into user_quota_policies
+        (id, feishu_user_id, department_id, effective_from_period, effective_to_period,
+         version, source_type, source_id, data, created_at, updated_at)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       on conflict (source_type, source_id) do nothing
+       returning data`,
+      [
+        policy.id,
+        policy.feishuUserId,
+        policy.departmentId ?? null,
+        policy.effectiveFromPeriod,
+        policy.effectiveToPeriod ?? null,
+        policy.version,
+        policy.sourceType,
+        policy.sourceId,
+        policy,
+        policy.createdAt,
+        policy.updatedAt,
+      ],
+    );
+    if (inserted.rows[0]) return inserted.rows[0].data;
+
+    // A source may race across different user advisory keys. The unique source
+    // constraint chooses the winner; the loser returns that durable result and
+    // preserves source-level idempotency without overwriting it.
+    const concurrentlyInserted = await client.query<{ data: UserQuotaPolicy }>(
+      `select data
+       from user_quota_policies
+       where source_type = $1 and source_id = $2
+       limit 1`,
+      [input.sourceType, input.sourceId],
+    );
+    if (!concurrentlyInserted.rows[0]) {
+      throw new Error("quota policy source conflict did not resolve to a durable row");
+    }
+    return concurrentlyInserted.rows[0].data;
   });
 }
 
@@ -2271,6 +3730,39 @@ export async function listPostgresQuotaOperations(input: {
   });
 }
 
+export async function listPostgresDueQuotaOperations(input: {
+  now: string;
+  limit?: number;
+}) {
+  const limit = Math.min(Math.max(Math.trunc(input.limit ?? 100), 0), 1_000);
+  if (limit === 0) return [];
+  return withControlClient(async (client) => {
+    const result = await client.query<{ data: QuotaOperation }>(
+      `select data
+       from quota_operations
+       where (
+           state not in ('completed', 'compensated', 'cancelled', 'manual_review')
+           or (
+             state = 'manual_review'
+             and operation_type = 'key_rotation'
+             and data->>'lastErrorMessage' = 'NewAPI token 余额观测不稳定'
+             and nullif(data->>'upstreamTokenIdAfter', '') is null
+             and nullif(data->>'tokenAccountIdAfter', '') is null
+           )
+         )
+         and (next_retry_at is null or next_retry_at <= $1::timestamptz)
+         and (
+           worker_lease_expires_at is null
+           or worker_lease_expires_at <= statement_timestamp()
+         )
+       order by coalesce(next_retry_at, created_at), updated_at, id
+       limit $2`,
+      [input.now, limit],
+    );
+    return result.rows.map((row) => row.data);
+  });
+}
+
 export async function createPostgresQuotaOperation(operation: QuotaOperation) {
   return withControlTransaction(async (client) => {
     // A newly-created operation is still only planned and does not reserve
@@ -2279,6 +3771,16 @@ export async function createPostgresQuotaOperation(operation: QuotaOperation) {
     await client.query("select pg_advisory_xact_lock(hashtext($1))", [
       `user-quota:${operation.feishuUserId}`,
     ]);
+    const user = await client.query<{ data: FeishuUser }>(
+      "select data from feishu_users where id = $1 for share",
+      [operation.feishuUserId],
+    );
+    if (
+      !user.rows[0]?.data ||
+      (user.rows[0].data.status && user.rows[0].data.status !== "active")
+    ) {
+      throw new Error("额度操作目标用户已禁用、删除或不存在");
+    }
     const idempotent = await client.query<{ data: QuotaOperation }>(
       "select data from quota_operations where idempotency_key = $1",
       [operation.idempotencyKey],
@@ -2287,7 +3789,7 @@ export async function createPostgresQuotaOperation(operation: QuotaOperation) {
     const open = await client.query<{ data: QuotaOperation }>(
       `select data from quota_operations
        where feishu_user_id = $1
-         and state not in ('completed', 'compensated')
+         and state not in ('completed', 'compensated', 'cancelled')
        order by created_at desc
        limit 1`,
       [operation.feishuUserId],
@@ -2299,142 +3801,511 @@ export async function createPostgresQuotaOperation(operation: QuotaOperation) {
   });
 }
 
+type PostgresMonthlyOpenResolvedRow = {
+  feishu_user_id: string;
+  billing_period: string;
+  created_by_open_id: string | null;
+  user_data: FeishuUser | null;
+  policy_data: UserQuotaPolicy | null;
+  policy_department_id: string | null;
+  active_token_count: number;
+  is_global_admin: boolean;
+  already_opened: boolean;
+  idempotent_operation: QuotaOperation | null;
+  open_operation: QuotaOperation | null;
+  active_generation: number | null;
+  max_operation_generation: number;
+};
+
+class MonthlyOpenDepartmentLockBusyError extends Error {}
+
 export async function createPostgresMonthlyOpenOperations(
   inputs: Array<{
     feishuUserId: string;
-    departmentId: string;
+    departmentId?: string;
     billingPeriod: string;
     assignedMonthlyQuota: number;
     createdByOpenId?: string;
   }>,
+  options: { executionSource?: "root" | "package_reset" } = {},
 ) {
   if (!inputs.length) return [];
-  return withTransaction(async (client) => {
-    const departments = [
-      ...new Set(inputs.map((item) => `${item.departmentId}:${item.billingPeriod}`)),
-    ].sort();
-    for (const department of departments) {
-      await client.query("select pg_advisory_xact_lock(hashtext($1))", [
-        `department-quota:${department}`,
-      ]);
-    }
-    for (const feishuUserId of [...new Set(inputs.map((item) => item.feishuUserId))].sort()) {
-      await client.query("select pg_advisory_xact_lock(hashtext($1))", [
-        `user-quota:${feishuUserId}`,
-      ]);
-    }
-
-    const operations: QuotaOperation[] = [];
-    const newInputs: typeof inputs = [];
-    for (const input of inputs) {
-      const idempotencyKey = `monthly-open:${input.billingPeriod}:${input.feishuUserId}`;
-      const idempotent = await client.query<{ data: QuotaOperation }>(
-        "select data from quota_operations where idempotency_key = $1",
-        [idempotencyKey],
-      );
-      if (idempotent.rows[0]) {
-        if (
-          idempotent.rows[0].data.requestedAssignedQuota !== input.assignedMonthlyQuota ||
-          idempotent.rows[0].data.departmentId !== input.departmentId
-        ) {
-          throw new Error(
-            `月度开账幂等记录与当前策略不一致: ${idempotent.rows[0].data.id}`,
+  const uniqueInputs = [
+    ...new Map(
+      inputs.map((input) => [
+        `${input.feishuUserId}\u0000${input.billingPeriod}`,
+        input,
+      ]),
+    ).values(),
+  ];
+  const retryDelaysMs = [10, 25, 50, 100, 200];
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await withControlTransaction(async (client) => {
+        if (options.executionSource === "package_reset") {
+          if (
+            uniqueInputs.some(
+              (item) => item.createdByOpenId !== PACKAGE_RESET_SYSTEM_ACTOR,
+            )
+          ) {
+            throw new Error("套餐重置自动任务的审计身份无效");
+          }
+          const automaticSettings = await client.query<{
+            data: AppSettings;
+            current_time: Date | string;
+          }>(
+            `select data, statement_timestamp() as current_time
+             from app_settings
+             where id = 'default'
+             for share`,
           );
+          const row = automaticSettings.rows[0];
+          const currentTime =
+            row?.current_time instanceof Date
+              ? row.current_time
+              : new Date(row?.current_time ?? Date.now());
+          for (const period of new Set(uniqueInputs.map((item) => item.billingPeriod))) {
+            assertPackageResetExecutionAllowed({
+              policy: row?.data.packageReset,
+              period,
+              now: currentTime,
+            });
+          }
+        } else {
+          const creatorOpenIds = [
+            ...new Set(uniqueInputs.map((item) => item.createdByOpenId).filter(Boolean)),
+          ] as string[];
+          if (
+            creatorOpenIds.length !== 1 ||
+            !getConfig().admin.systemAdminOpenIds.includes(creatorOpenIds[0])
+          ) {
+            throw new AdminUserActionAuthorizationError(
+              "root_required",
+              403,
+              "套餐重置仅允许 root 执行",
+            );
+          }
+          const actorCandidate = await client.query<{ id: string }>(
+            "select id from feishu_users where open_id = $1 limit 1",
+            [creatorOpenIds[0]],
+          );
+          const actorId = actorCandidate.rows[0]?.id;
+          if (!actorId) {
+            throw new AdminUserActionAuthorizationError(
+              "root_required",
+              403,
+              "套餐重置 root 用户不存在或已失效",
+            );
+          }
+          await lockAdminScopeUsersInTransaction(client, [actorId]);
+          const actor = await client.query<{ data: FeishuUser }>(
+            "select data from feishu_users where id = $1 for update",
+            [actorId],
+          );
+          if (
+            !actor.rows[0] ||
+            actor.rows[0].data.openId !== creatorOpenIds[0] ||
+            (actor.rows[0].data.status && actor.rows[0].data.status !== "active")
+          ) {
+            throw new AdminUserActionAuthorizationError(
+              "root_required",
+              403,
+              "套餐重置 root 用户不存在或已失效",
+            );
+          }
         }
-        operations.push(idempotent.rows[0].data);
-        continue;
-      }
-      const open = await client.query<{ data: QuotaOperation }>(
-        `select data from quota_operations
-         where feishu_user_id = $1 and state not in ('completed', 'compensated')
-         limit 1`,
-        [input.feishuUserId],
-      );
-      if (open.rows[0]) {
-        throw new Error(`用户已有未完成额度操作: ${open.rows[0].data.id}`);
-      }
-      newInputs.push(input);
-    }
+        // Freeze the usage checkpoint while this short transaction revalidates
+        // it. This key is also held by usage-sync.ts for the complete scan.
+        const usageSyncLock = await client.query<{ locked: boolean }>(
+          `select pg_try_advisory_xact_lock(
+             hashtext('usage_sync:newapi_logs')::bigint
+           ) as locked`,
+        );
+        if (!usageSyncLock.rows[0]?.locked) {
+          throw new Error("月度开账结算状态不安全：用量采集正在运行");
+        }
 
-    for (const departmentKey of departments) {
-      const separator = departmentKey.lastIndexOf(":");
-      const departmentId = departmentKey.slice(0, separator);
-      const period = departmentKey.slice(separator + 1);
-      const requested = newInputs
-        .filter(
-          (item) => item.departmentId === departmentId && item.billingPeriod === period,
-        )
-        .reduce((sum, item) => sum + item.assignedMonthlyQuota, 0);
-      if (requested === 0) continue;
-      const policy = await client.query<{ data: DepartmentQuotaPeriod }>(
-        `select data from department_quota_periods
-         where department_id = $1 and period = $2
-         for update`,
-        [departmentId, period],
-      );
-      if (!policy.rows[0]) throw new Error(`部门 ${departmentId} 缺少 ${period} 账期预算`);
-      const budgetQuota = Math.max(
-        Math.round(policy.rows[0].data.quotaLimit * getConfig().newapi.quotaPerUnit),
-        0,
-      );
-      const committed = await client.query<{ quota: string }>(
-        `select coalesce(sum(signed_quota), 0)::text as quota
-         from quota_ledger_entries
-         where department_id = $1 and period = $2`,
-        [departmentId, period],
-      );
-      const pending = await client.query<{ quota: string }>(
-        `select coalesce(sum(greatest(coalesce((data->>'reservedDepartmentQuota')::bigint, 0), 0)), 0)::text as quota
-         from quota_operations
-         where department_id = $1 and billing_period = $2
-           and state not in ('completed', 'compensated')`,
-        [departmentId, period],
-      );
-      const available = Math.max(
-        budgetQuota -
-          Math.max(Number(committed.rows[0]?.quota ?? 0), 0) -
-          Math.max(Number(pending.rows[0]?.quota ?? 0), 0),
-        0,
-      );
-      if (requested > available) {
-        throw new Error(`部门 ${departmentId} 可用额度不足，月度开账整批未创建`);
-      }
-    }
+        // The plan supplies candidate identities only. Every business fact is
+        // read again after the same short user lock used by policy/operation
+        // creation, so a concurrent first provision or policy change wins
+        // cleanly before this batch decides whether to enqueue.
+        const userIds = [
+          ...new Set(uniqueInputs.map((item) => item.feishuUserId)),
+        ].sort();
+        for (const feishuUserId of userIds) {
+          await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+            `user-quota:${feishuUserId}`,
+          ]);
+        }
+        // Stabilize existing manual global scopes. A concurrent insertion can
+        // only turn a rejection into a later successful retry; revocation of a
+        // scope observed below must wait for this transaction.
+        await client.query(
+          `select id
+           from admin_scopes
+           where feishu_user_id = any($1::text[])
+             and status = 'active'
+           order by feishu_user_id, id
+           for share`,
+          [userIds],
+        );
 
-    for (const input of newInputs) {
-      const stateResult = await client.query<{ data: UserQuotaState }>(
-        "select data from user_quota_states where feishu_user_id = $1",
-        [input.feishuUserId],
-      );
-      const generationResult = await client.query<{ generation: number }>(
-        `select coalesce(max(operation_generation), 0)::integer as generation
-         from token_accounts where feishu_user_id = $1`,
-        [input.feishuUserId],
-      );
-      const now = nowIso();
-      const operation: QuotaOperation = {
-        id: randomId("qo"),
-        operationType: "monthly_open",
-        idempotencyKey: `monthly-open:${input.billingPeriod}:${input.feishuUserId}`,
-        feishuUserId: input.feishuUserId,
-        departmentId: input.departmentId,
-        billingPeriod: input.billingPeriod,
-        requestedAssignedQuota: input.assignedMonthlyQuota,
-        reservedDepartmentQuota: input.assignedMonthlyQuota,
-        operationGeneration:
-          (stateResult.rows[0]?.data.activeGeneration ??
-            generationResult.rows[0]?.generation ??
-            0) + 1,
-        state: "budget_reserved",
-        attemptCount: 0,
-        createdByOpenId: input.createdByOpenId,
-        createdAt: now,
-        updatedAt: now,
-      };
-      operations.push(await saveQuotaOperationRow(client, operation));
+        const requestedFacts = uniqueInputs.map((input) => ({
+          feishu_user_id: input.feishuUserId,
+          billing_period: input.billingPeriod,
+          created_by_open_id: input.createdByOpenId ?? null,
+        }));
+        const resolvedResult = await client.query<PostgresMonthlyOpenResolvedRow>(
+          `with requested as materialized (
+             select request.feishu_user_id,
+                    request.billing_period,
+                    request.created_by_open_id
+             from jsonb_to_recordset($1::jsonb) as request(
+               feishu_user_id text,
+               billing_period text,
+               created_by_open_id text
+             )
+           )
+           select
+             request.feishu_user_id,
+             request.billing_period,
+             request.created_by_open_id,
+             user_row.data as user_data,
+             policy.data as policy_data,
+             policy.department_id as policy_department_id,
+             (
+               select count(*)::integer
+               from token_accounts account
+               where account.feishu_user_id = request.feishu_user_id
+                 and account.status = 'active'
+             ) as active_token_count,
+             (
+               user_row.open_id = any($2::text[])
+               or exists (
+                 select 1
+                 from admin_scopes scope
+                 where scope.feishu_user_id = request.feishu_user_id
+                   and scope.scope_type = 'global'
+                   and scope.status = 'active'
+               )
+             ) as is_global_admin,
+             exists (
+               select 1
+               from quota_ledger_entries entry
+               where entry.feishu_user_id = request.feishu_user_id
+                 and entry.period = request.billing_period
+                 and entry.entry_type = 'period_open_authorization'
+             ) as already_opened,
+             (
+               select operation.data
+               from quota_operations operation
+               where operation.idempotency_key =
+                 'monthly-open:' || request.billing_period || ':' || request.feishu_user_id
+               limit 1
+             ) as idempotent_operation,
+             (
+               select operation.data
+               from quota_operations operation
+               where operation.feishu_user_id = request.feishu_user_id
+                 and operation.state not in ('completed', 'compensated', 'cancelled')
+               order by operation.created_at desc, operation.id desc
+               limit 1
+             ) as open_operation,
+             (
+               select state.active_generation
+               from user_quota_states state
+               where state.feishu_user_id = request.feishu_user_id
+             ) as active_generation,
+             (
+               select coalesce(max(account.operation_generation), 0)::integer
+               from token_accounts account
+               where account.feishu_user_id = request.feishu_user_id
+             ) as max_operation_generation
+           from requested request
+           left join feishu_users user_row
+             on user_row.id = request.feishu_user_id
+           left join lateral (
+             select quota_policy.data, quota_policy.department_id
+             from user_quota_policies quota_policy
+             where quota_policy.feishu_user_id = request.feishu_user_id
+               and quota_policy.effective_from_period <= request.billing_period
+               and (
+                 quota_policy.effective_to_period is null
+                 or quota_policy.effective_to_period >= request.billing_period
+               )
+             order by quota_policy.version desc, quota_policy.id desc
+             limit 1
+           ) policy on true
+           order by request.feishu_user_id, request.billing_period`,
+          [JSON.stringify(requestedFacts), getConfig().admin.systemAdminOpenIds],
+        );
+
+        const operations: QuotaOperation[] = [];
+        const resolvedInputs: Array<{
+          feishuUserId: string;
+          departmentId?: string;
+          billingPeriod: string;
+          assignedMonthlyQuota: number;
+          createdByOpenId?: string;
+          operationGeneration: number;
+          reopenOperation?: QuotaOperation;
+        }> = [];
+        for (const row of resolvedResult.rows) {
+          const idempotent = row.idempotent_operation;
+          if (idempotent && idempotent.state !== "cancelled") {
+            operations.push(idempotent);
+            continue;
+          }
+          // A concurrent first provision may have committed this marker after
+          // preflight. It is authoritative and makes this candidate a no-op.
+          if (row.already_opened) continue;
+          if (
+            !row.user_data ||
+            (row.user_data.status && row.user_data.status !== "active")
+          ) {
+            throw new Error(
+              `月度开账用户已禁用、删除或不存在: ${row.feishu_user_id}`,
+            );
+          }
+          if (!row.policy_data) {
+            throw new Error(`月度开账用户缺少当前有效额度策略: ${row.feishu_user_id}`);
+          }
+          if (row.active_token_count > 1) {
+            throw new Error(`月度开账用户存在多个 active Key: ${row.feishu_user_id}`);
+          }
+          if (!row.policy_department_id && !row.is_global_admin) {
+            throw new Error(`月度开账用户缺少部门归属: ${row.feishu_user_id}`);
+          }
+          if (row.open_operation) {
+            throw new Error(`用户已有未完成额度操作: ${row.open_operation.id}`);
+          }
+          if (
+            idempotent &&
+            !canReopenMonthlyOpenAfterAccessRevoke(idempotent)
+          ) {
+            throw new Error(
+              `已取消的月度开账操作存在不安全副作用，禁止自动恢复: ${idempotent.id}`,
+            );
+          }
+          const assignedMonthlyQuota = Number(row.policy_data.assignedMonthlyQuota);
+          if (!Number.isSafeInteger(assignedMonthlyQuota) || assignedMonthlyQuota < 0) {
+            throw new Error(`月度开账用户当前额度策略无效: ${row.feishu_user_id}`);
+          }
+          resolvedInputs.push({
+            feishuUserId: row.feishu_user_id,
+            departmentId: row.policy_department_id ?? undefined,
+            billingPeriod: row.billing_period,
+            assignedMonthlyQuota,
+            createdByOpenId: row.created_by_open_id ?? undefined,
+            operationGeneration:
+              (row.active_generation ?? row.max_operation_generation ?? 0) + 1,
+            reopenOperation: idempotent ?? undefined,
+          });
+        }
+        if (!resolvedInputs.length) return operations;
+
+        const checkpointResult = await client.query<{
+          data: UsageSyncCheckpoint;
+          current_time: Date | string;
+        }>(
+          `select data, statement_timestamp() as current_time
+           from usage_sync_checkpoints
+           where scope = 'newapi_usage_logs'
+           limit 1
+           for share`,
+        );
+        const settingsResult = await client.query<{ data: AppSettings }>(
+          "select data from app_settings where id = 'default' for share",
+        );
+        const blockingIssue = await client.query<{ id: string }>(
+          `select id
+           from usage_sync_issues
+           where status = 'open'
+             and coalesce(nullif(data->>'blocksSettlement', '')::boolean, false)
+           order by first_seen_at, id
+           limit 1
+           for share`,
+        );
+        const checkpoint = checkpointResult.rows[0]?.data;
+        const currentTimeValue = checkpointResult.rows[0]?.current_time;
+        const currentTime =
+          currentTimeValue instanceof Date
+            ? currentTimeValue.toISOString()
+            : currentTimeValue;
+        const syncPolicy = settingsResult.rows[0]?.data.usageSyncPolicy;
+        const settlementRunHealthy =
+          checkpoint?.lastRunStatus === "applied" ||
+          checkpoint?.lastRunStatus === "continuation_pending";
+        if (
+          !checkpoint ||
+          !settlementRunHealthy ||
+          checkpoint.integrityBlockedAt ||
+          checkpoint.integrityBlockedIssueId ||
+          blockingIssue.rows[0] ||
+          !isSettlementWatermarkFresh({
+            settledThrough: checkpoint.settledThrough,
+            now: currentTime,
+            maxLagMinutes:
+              2 * (syncPolicy?.intervalMinutes ?? 60) +
+              (syncPolicy?.settlementLagMinutes ?? 5),
+          })
+        ) {
+          throw new Error("月度开账结算状态不安全：稳定水位或完整性门禁未通过");
+        }
+
+        const departmentScopes = [
+          ...new Map(
+            resolvedInputs.flatMap((item) =>
+              item.departmentId
+                ? [
+                    [
+                      `${item.departmentId}\u0000${item.billingPeriod}`,
+                      {
+                        departmentId: item.departmentId,
+                        billingPeriod: item.billingPeriod,
+                      },
+                    ] as const,
+                  ]
+                : [],
+            ),
+          ).values(),
+        ].sort(
+          (a, b) =>
+            a.departmentId.localeCompare(b.departmentId) ||
+            a.billingPeriod.localeCompare(b.billingPeriod),
+        );
+        for (const scope of departmentScopes) {
+          const lock = await client.query<{ locked: boolean }>(
+            "select pg_try_advisory_xact_lock(hashtext($1)::bigint) as locked",
+            [`department-quota:${scope.departmentId}:${scope.billingPeriod}`],
+          );
+          if (!lock.rows[0]?.locked) {
+            throw new MonthlyOpenDepartmentLockBusyError(
+              `月度开账部门预算锁繁忙: ${scope.departmentId}:${scope.billingPeriod}`,
+            );
+          }
+        }
+
+        for (const scope of departmentScopes) {
+          const { departmentId, billingPeriod: period } = scope;
+          const requested = resolvedInputs
+            .filter(
+              (item) =>
+                item.departmentId === departmentId && item.billingPeriod === period,
+            )
+            .reduce((sum, item) => sum + item.assignedMonthlyQuota, 0);
+          if (requested === 0) continue;
+          const policy = await client.query<{ data: DepartmentQuotaPeriod }>(
+            `select data from department_quota_periods
+             where department_id = $1 and period = $2
+             for update`,
+            [departmentId, period],
+          );
+          if (!policy.rows[0]) {
+            throw new Error(`部门 ${departmentId} 缺少 ${period} 账期预算`);
+          }
+          const budgetQuota = Math.max(
+            Math.round(policy.rows[0].data.quotaLimit * getConfig().newapi.quotaPerUnit),
+            0,
+          );
+          const committed = await client.query<{ quota: string }>(
+            `select coalesce(sum(signed_quota), 0)::text as quota
+             from quota_ledger_entries
+             where department_id = $1 and period = $2`,
+            [departmentId, period],
+          );
+          const pending = await client.query<{ quota: string }>(
+            `select coalesce(sum(greatest(coalesce((data->>'reservedDepartmentQuota')::bigint, 0), 0)), 0)::text as quota
+             from quota_operations
+             where department_id = $1 and billing_period = $2
+               and state not in ('completed', 'compensated', 'cancelled')`,
+            [departmentId, period],
+          );
+          const available = Math.max(
+            budgetQuota -
+              Math.max(Number(committed.rows[0]?.quota ?? 0), 0) -
+              Math.max(Number(pending.rows[0]?.quota ?? 0), 0),
+            0,
+          );
+          if (requested > available) {
+            throw new Error(`部门 ${departmentId} 可用额度不足，月度开账整批未创建`);
+          }
+        }
+
+        for (const input of resolvedInputs) {
+          const now = nowIso();
+          if (input.reopenOperation) {
+            const reopened = reopenMonthlyOpenAfterAccessRevoke(
+              input.reopenOperation,
+              {
+                departmentId: input.departmentId,
+                assignedMonthlyQuota: input.assignedMonthlyQuota,
+                operationGeneration: input.operationGeneration,
+                createdByOpenId: input.createdByOpenId,
+                reopenedAt: now,
+              },
+            );
+            const updated = await client.query<{ data: QuotaOperation }>(
+              `update quota_operations
+               set department_id = $2,
+                   state = $3,
+                   operation_generation = $4,
+                   next_retry_at = null,
+                   worker_lease_id = null,
+                   worker_lease_expires_at = null,
+                   data = $5,
+                   updated_at = $6,
+                   completed_at = null
+               where id = $1
+                 and state = 'cancelled'
+               returning data`,
+              [
+                reopened.id,
+                reopened.departmentId ?? null,
+                reopened.state,
+                reopened.operationGeneration,
+                reopened,
+                reopened.updatedAt,
+              ],
+            );
+            if (!updated.rows[0]) {
+              throw new Error(`月度开账取消操作状态已变化，无法原子恢复: ${reopened.id}`);
+            }
+            operations.push(updated.rows[0].data);
+            continue;
+          }
+          const operation: QuotaOperation = {
+            id: randomId("qo"),
+            operationType: "monthly_open",
+            idempotencyKey: `monthly-open:${input.billingPeriod}:${input.feishuUserId}`,
+            feishuUserId: input.feishuUserId,
+            departmentId: input.departmentId,
+            billingPeriod: input.billingPeriod,
+            requestedAssignedQuota: input.assignedMonthlyQuota,
+            reservedDepartmentQuota: input.departmentId
+              ? input.assignedMonthlyQuota
+              : 0,
+            operationGeneration: input.operationGeneration,
+            state: input.departmentId ? "budget_reserved" : "planned",
+            attemptCount: 0,
+            createdByOpenId: input.createdByOpenId,
+            createdAt: now,
+            updatedAt: now,
+          };
+          operations.push(await saveQuotaOperationRow(client, operation));
+        }
+        return operations;
+      });
+    } catch (error) {
+      if (
+        !(error instanceof MonthlyOpenDepartmentLockBusyError) ||
+        attempt >= retryDelaysMs.length
+      ) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));
     }
-    return operations;
-  });
+  }
 }
 
 export async function updatePostgresQuotaOperation(
@@ -2480,7 +4351,9 @@ export async function transitionPostgresQuotaOperation(
       idempotencyKey: operation.idempotencyKey,
       state,
       completedAt:
-        state === "completed" || state === "compensated" ? nowIso() : patch.completedAt,
+        state === "completed" || state === "compensated" || state === "cancelled"
+          ? nowIso()
+          : patch.completedAt,
       updatedAt: patch.updatedAt ?? nowIso(),
     };
     return saveQuotaOperationRow(client, updated);
@@ -2490,47 +4363,59 @@ export async function transitionPostgresQuotaOperation(
 export async function claimPostgresQuotaOperationExecution(input: {
   operationId: string;
   leaseId: string;
-  leaseExpiresAt: string;
+  leaseDurationMs: number;
 }) {
   return withControlTransaction(async (client) => {
-    const current = await client.query<{ data: QuotaOperation }>(
-      "select data from quota_operations where id = $1 for update",
-      [input.operationId],
+    const result = await client.query<{ data: QuotaOperation }>(
+      `update quota_operations
+       set worker_lease_id = $2,
+           worker_lease_expires_at = statement_timestamp()
+             + ($3::bigint * interval '1 millisecond'),
+           data = data || jsonb_build_object(
+             'workerLeaseId', $2::text,
+             'workerLeaseExpiresAt', statement_timestamp()
+               + ($3::bigint * interval '1 millisecond'),
+             'updatedAt', statement_timestamp()
+           ),
+           updated_at = statement_timestamp()
+       where id = $1
+         and state not in ('completed', 'compensated', 'cancelled')
+         and (
+           worker_lease_id is null
+           or worker_lease_id = $2
+           or worker_lease_expires_at <= statement_timestamp()
+         )
+       returning data`,
+      [input.operationId, input.leaseId, Math.max(Math.trunc(input.leaseDurationMs), 1)],
     );
-    const operation = current.rows[0]?.data;
-    if (!operation) return null;
-    if (
-      operation.workerLeaseId &&
-      operation.workerLeaseId !== input.leaseId &&
-      operation.workerLeaseExpiresAt &&
-      operation.workerLeaseExpiresAt > nowIso()
-    ) {
-      return null;
-    }
-    return saveQuotaOperationRow(client, {
-      ...operation,
-      workerLeaseId: input.leaseId,
-      workerLeaseExpiresAt: input.leaseExpiresAt,
-    });
+    return result.rows[0]?.data ?? null;
   });
 }
 
 export async function renewPostgresQuotaOperationExecution(input: {
   operationId: string;
   leaseId: string;
-  leaseExpiresAt: string;
+  leaseDurationMs: number;
 }) {
   return withControlTransaction(async (client) => {
-    const current = await client.query<{ data: QuotaOperation }>(
-      "select data from quota_operations where id = $1 for update",
-      [input.operationId],
+    const result = await client.query<{ data: QuotaOperation }>(
+      `update quota_operations
+       set worker_lease_expires_at = statement_timestamp()
+             + ($3::bigint * interval '1 millisecond'),
+           data = data || jsonb_build_object(
+             'workerLeaseExpiresAt', statement_timestamp()
+               + ($3::bigint * interval '1 millisecond'),
+             'updatedAt', statement_timestamp()
+           ),
+           updated_at = statement_timestamp()
+       where id = $1
+         and worker_lease_id = $2
+         and state not in ('completed', 'compensated', 'cancelled')
+         and worker_lease_expires_at > statement_timestamp()
+       returning data`,
+      [input.operationId, input.leaseId, Math.max(Math.trunc(input.leaseDurationMs), 1)],
     );
-    const operation = current.rows[0]?.data;
-    if (!operation || operation.workerLeaseId !== input.leaseId) return null;
-    return saveQuotaOperationRow(client, {
-      ...operation,
-      workerLeaseExpiresAt: input.leaseExpiresAt,
-    });
+    return result.rows[0]?.data ?? null;
   });
 }
 
@@ -2539,17 +4424,18 @@ export async function releasePostgresQuotaOperationExecution(input: {
   leaseId: string;
 }) {
   return withControlTransaction(async (client) => {
-    const current = await client.query<{ data: QuotaOperation }>(
-      "select data from quota_operations where id = $1 for update",
-      [input.operationId],
+    const result = await client.query<{ data: QuotaOperation }>(
+      `update quota_operations
+       set worker_lease_id = null,
+           worker_lease_expires_at = null,
+           data = (data - 'workerLeaseId' - 'workerLeaseExpiresAt') ||
+             jsonb_build_object('updatedAt', statement_timestamp()),
+           updated_at = statement_timestamp()
+       where id = $1 and worker_lease_id = $2
+       returning data`,
+      [input.operationId, input.leaseId],
     );
-    const operation = current.rows[0]?.data;
-    if (!operation || operation.workerLeaseId !== input.leaseId) return operation ?? null;
-    return saveQuotaOperationRow(client, {
-      ...operation,
-      workerLeaseId: undefined,
-      workerLeaseExpiresAt: undefined,
-    });
+    return result.rows[0]?.data ?? null;
   });
 }
 
@@ -2774,6 +4660,592 @@ export async function updatePostgresDepartmentQuotaRequest(
   });
 }
 
+async function readPostgresDepartmentQuotaFacts(
+  client: PoolClient,
+  departmentId: string,
+  period: string,
+) {
+  const result = await client.query<{
+    allocated_quota: string;
+    pending_reserved_quota: string;
+    department_name: string | null;
+  }>(
+    `select
+       coalesce((
+         select sum(greatest(coalesce((billing.data->>'monthlyQuota')::numeric, 0), 0))
+         from user_billing_periods billing
+         join feishu_users member on member.id = billing.feishu_user_id
+         where billing.period = $2
+           and member.department_id = $1
+           and coalesce(member.data->>'status', 'active') <> 'deleted'
+       ), 0)::text as allocated_quota,
+       coalesce((
+         select sum(greatest(coalesce((event.data->>'delta')::numeric, 0), 0))
+         from quota_change_events event
+         where event.department_id = $1
+           and event.period = $2
+           and event.status = 'pending'
+           and (
+             nullif(event.data->>'expiresAt', '') is null
+             or (event.data->>'expiresAt')::timestamptz > statement_timestamp()
+           )
+       ), 0)::text as pending_reserved_quota,
+       (
+         select nullif(member.data->>'departmentName', '')
+         from feishu_users member
+         where member.department_id = $1
+         order by member.updated_at desc, member.id
+         limit 1
+       ) as department_name`,
+    [departmentId, period],
+  );
+  const row = result.rows[0];
+  return {
+    allocatedQuota: Number(row?.allocated_quota ?? 0),
+    pendingReservedQuota: Number(row?.pending_reserved_quota ?? 0),
+    departmentName: row?.department_name ?? undefined,
+  };
+}
+
+async function readOrCreatePostgresDepartmentQuotaPeriod(
+  client: PoolClient,
+  input: {
+    departmentId: string;
+    departmentName?: string;
+    period: string;
+  },
+) {
+  const existing = await client.query<{ data: DepartmentQuotaPeriod }>(
+    `select data from department_quota_periods
+     where department_id = $1 and period = $2
+     for update`,
+    [input.departmentId, input.period],
+  );
+  if (existing.rows[0]?.data) return existing.rows[0].data;
+  const [facts, settings] = await Promise.all([
+    readPostgresDepartmentQuotaFacts(
+      client,
+      input.departmentId,
+      input.period,
+    ),
+    readSettingsRow(client),
+  ]);
+  const now = nowIso();
+  return saveDepartmentQuotaPeriodRow(client, {
+    id: randomId("dqp"),
+    departmentId: input.departmentId,
+    departmentName: input.departmentName ?? facts.departmentName,
+    period: input.period,
+    quotaLimit: initialDepartmentQuotaLimit(facts.allocatedQuota),
+    defaultGrantQuota: settings.defaultMonthlyQuota,
+    createdAt: now,
+    updatedAt: now,
+  });
+}
+
+export async function updatePostgresDepartmentQuotaPolicyAsActor(input: {
+  actorFeishuUserId: string;
+  departmentId: string;
+  departmentName?: string;
+  period: string;
+  quotaLimit?: number;
+  defaultGrantQuota?: number;
+}) {
+  return withControlTransaction(async (client) => {
+    await lockAdminScopeUsersInTransaction(client, [input.actorFeishuUserId]);
+    const actorScope = await resolvePostgresActorScopeInTransaction(
+      client,
+      input.actorFeishuUserId,
+    );
+    if (!actorScope) {
+      throw new AdminUserActionAuthorizationError(
+        "actor_scope_missing",
+        403,
+        "当前管理员权限已变化，请刷新后重试",
+      );
+    }
+    if (
+      actorScope.scopeType === "department" &&
+      actorScope.departmentId !== input.departmentId
+    ) {
+      throw new AdminUserActionAuthorizationError(
+        "target_out_of_scope",
+        403,
+        "不能修改其他部门的额度设置",
+      );
+    }
+    if (actorScope.scopeType === "department" && input.quotaLimit !== undefined) {
+      throw new AdminUserActionAuthorizationError(
+        "target_out_of_scope",
+        403,
+        "部门总额度上限只能由系统管理员直接设置",
+      );
+    }
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `department-quota:${input.departmentId}:${input.period}`,
+    ]);
+    const policy = await readOrCreatePostgresDepartmentQuotaPeriod(client, input);
+    const facts = await readPostgresDepartmentQuotaFacts(
+      client,
+      input.departmentId,
+      input.period,
+    );
+    if (input.quotaLimit !== undefined) {
+      const error = validateDepartmentQuotaLimit(
+        input.quotaLimit,
+        facts.allocatedQuota + facts.pendingReservedQuota,
+      );
+      if (error) throw new Error(error);
+    }
+    if (
+      input.defaultGrantQuota !== undefined &&
+      (!Number.isInteger(input.defaultGrantQuota) ||
+        input.defaultGrantQuota <= 0 ||
+        input.defaultGrantQuota > 1_000_000)
+    ) {
+      throw new Error("部门默认发放额度必须是 1 到 1000000 之间的整数");
+    }
+    const now = nowIso();
+    const updated = await saveDepartmentQuotaPeriodRow(client, {
+      ...policy,
+      departmentName: input.departmentName ?? policy.departmentName ?? facts.departmentName,
+      quotaLimit: input.quotaLimit ?? policy.quotaLimit,
+      defaultGrantQuota: input.defaultGrantQuota ?? policy.defaultGrantQuota,
+      updatedAt: now,
+      updatedByFeishuUserId: input.actorFeishuUserId,
+    });
+    if (input.quotaLimit !== undefined && input.quotaLimit !== policy.quotaLimit) {
+      await saveQuotaChangeEventRow(client, {
+        id: randomId("qce"),
+        departmentId: input.departmentId,
+        departmentName: updated.departmentName,
+        period: input.period,
+        operatedByFeishuUserId: input.actorFeishuUserId,
+        kind: "department_limit_set",
+        status: "applied",
+        previousValue: policy.quotaLimit,
+        nextValue: input.quotaLimit,
+        delta: input.quotaLimit - policy.quotaLimit,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    if (
+      input.defaultGrantQuota !== undefined &&
+      input.defaultGrantQuota !== policy.defaultGrantQuota
+    ) {
+      await saveQuotaChangeEventRow(client, {
+        id: randomId("qce"),
+        departmentId: input.departmentId,
+        departmentName: updated.departmentName,
+        period: input.period,
+        operatedByFeishuUserId: input.actorFeishuUserId,
+        kind: "department_default_set",
+        status: "applied",
+        previousValue: policy.defaultGrantQuota,
+        nextValue: input.defaultGrantQuota,
+        delta: input.defaultGrantQuota - policy.defaultGrantQuota,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    return updated;
+  });
+}
+
+export async function createPostgresDepartmentQuotaRequestAsActor(input: {
+  actorFeishuUserId: string;
+  departmentId: string;
+  departmentName?: string;
+  period: string;
+  action: DepartmentQuotaRequest["action"];
+  reason: string;
+  requestedQuotaLimit?: number;
+  approvalTargetOpenId: string;
+  approvalActionNonceHash: string;
+}) {
+  return withControlTransaction(async (client) => {
+    await lockAdminScopeUsersInTransaction(client, [input.actorFeishuUserId]);
+    const actorScope = await resolvePostgresActorScopeInTransaction(
+      client,
+      input.actorFeishuUserId,
+    );
+    if (
+      !actorScope ||
+      actorScope.scopeType !== "department" ||
+      actorScope.departmentId !== input.departmentId
+    ) {
+      throw new AdminUserActionAuthorizationError(
+        "target_out_of_scope",
+        403,
+        "当前部门管理员权限已变化，请刷新后重试",
+      );
+    }
+    const actorResult = await client.query<{ data: FeishuUser }>(
+      "select data from feishu_users where id = $1 for share",
+      [input.actorFeishuUserId],
+    );
+    const actor = actorResult.rows[0]?.data;
+    if (!actor || (actor.status && actor.status !== "active")) {
+      throw new AdminUserActionAuthorizationError(
+        "actor_scope_missing",
+        403,
+        "当前部门管理员用户已禁用或不存在",
+      );
+    }
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `department-quota:${input.departmentId}:${input.period}`,
+    ]);
+    const policy = await readOrCreatePostgresDepartmentQuotaPeriod(client, input);
+    const duplicate = await client.query(
+      `select 1 from department_quota_requests
+       where department_id = $1
+         and period = $2
+         and status in ('pending_card_send', 'pending_card_approval', 'approval_card_send_failed')
+       limit 1
+       for update`,
+      [input.departmentId, input.period],
+    );
+    if ((duplicate.rowCount ?? 0) > 0) {
+      throw new Error("当前部门已有总额度申请正在处理");
+    }
+    if (input.action === "increase") {
+      if (input.requestedQuotaLimit === undefined) {
+        throw new Error("提高额度申请必须填写目标额度上限");
+      }
+      const facts = await readPostgresDepartmentQuotaFacts(
+        client,
+        input.departmentId,
+        input.period,
+      );
+      const error = validateDepartmentQuotaLimit(
+        input.requestedQuotaLimit,
+        facts.allocatedQuota,
+      );
+      if (error) throw new Error(error);
+      if (input.requestedQuotaLimit <= policy.quotaLimit) {
+        throw new Error("提高额度申请必须大于当前部门额度上限");
+      }
+    }
+    const now = nowIso();
+    return saveDepartmentQuotaRequestRow(client, {
+      id: randomId("dqr"),
+      departmentId: input.departmentId,
+      departmentName: input.departmentName ?? policy.departmentName,
+      period: input.period,
+      requesterFeishuUserId: actor.id,
+      action: input.action,
+      status: "pending_card_send",
+      reason: input.reason,
+      currentQuotaLimit: policy.quotaLimit,
+      requestedQuotaLimit: input.requestedQuotaLimit,
+      approvalTargetOpenId: input.approvalTargetOpenId,
+      approvalActionNonceHash: input.approvalActionNonceHash,
+      createdAt: now,
+      updatedAt: now,
+    });
+  });
+}
+
+export async function decidePostgresDepartmentQuotaRequestAsActor(input: {
+  actorFeishuUserId: string;
+  requestId: string;
+  action: "approve" | "reject";
+  approvedQuotaLimit?: number;
+}) {
+  return withControlTransaction(async (client) => {
+    const requestIdentity = await client.query<{
+      department_id: string;
+      period: string;
+    }>(
+      "select department_id, period from department_quota_requests where id = $1",
+      [input.requestId],
+    );
+    if (!requestIdentity.rows[0]) return null;
+    await lockAdminScopeUsersInTransaction(client, [input.actorFeishuUserId]);
+    const actorScope = await resolvePostgresActorScopeInTransaction(
+      client,
+      input.actorFeishuUserId,
+    );
+    if (!actorScope || actorScope.scopeType !== "global") {
+      throw new AdminUserActionAuthorizationError(
+        "actor_scope_missing",
+        403,
+        "只有当前有效的系统管理员可以审批部门额度申请",
+      );
+    }
+    const departmentId = requestIdentity.rows[0].department_id;
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `department-quota:${departmentId}:${requestIdentity.rows[0].period}`,
+    ]);
+    const requestResult = await client.query<{ data: DepartmentQuotaRequest }>(
+      "select data from department_quota_requests where id = $1 for update",
+      [input.requestId],
+    );
+    const request = requestResult.rows[0]?.data;
+    if (
+      !request ||
+      !["pending_card_send", "pending_card_approval", "approval_card_send_failed"].includes(
+        request.status,
+      )
+    ) {
+      return null;
+    }
+    const actorResult = await client.query<{ data: FeishuUser }>(
+      "select data from feishu_users where id = $1",
+      [input.actorFeishuUserId],
+    );
+    const actor = actorResult.rows[0]?.data;
+    if (!actor) {
+      throw new AdminUserActionAuthorizationError(
+        "actor_scope_missing",
+        403,
+        "当前系统管理员用户不存在",
+      );
+    }
+    const now = nowIso();
+    if (input.action === "reject") {
+      return saveDepartmentQuotaRequestRow(client, {
+        ...request,
+        status: "rejected",
+        approvalOperatorOpenId: actor.openId,
+        approvalOperatedAt: now,
+        errorMessage: undefined,
+        updatedAt: now,
+      });
+    }
+
+    const policy = await readOrCreatePostgresDepartmentQuotaPeriod(client, {
+      departmentId: request.departmentId,
+      departmentName: request.departmentName,
+      period: request.period,
+    });
+    const facts = await readPostgresDepartmentQuotaFacts(
+      client,
+      request.departmentId,
+      request.period,
+    );
+    const approvedQuotaLimit =
+      input.approvedQuotaLimit ?? request.requestedQuotaLimit;
+    if (approvedQuotaLimit === undefined) {
+      throw new Error("重置额度申请需要系统管理员填写审批额度");
+    }
+    const limitError = validateDepartmentQuotaLimit(
+      approvedQuotaLimit,
+      facts.allocatedQuota + facts.pendingReservedQuota,
+    );
+    if (limitError) throw new Error(limitError);
+    if (request.action === "increase" && approvedQuotaLimit <= policy.quotaLimit) {
+      throw new Error("提高额度审批值必须大于当前部门额度上限");
+    }
+    const updatedPolicy = await saveDepartmentQuotaPeriodRow(client, {
+      ...policy,
+      quotaLimit: approvedQuotaLimit,
+      updatedAt: now,
+      updatedByFeishuUserId: input.actorFeishuUserId,
+    });
+    await saveQuotaChangeEventRow(client, {
+      id: `qce_department_request_${request.id}`,
+      departmentId: request.departmentId,
+      departmentName: request.departmentName,
+      period: request.period,
+      operatedByFeishuUserId: input.actorFeishuUserId,
+      kind: "department_limit_set",
+      status: "applied",
+      previousValue: policy.quotaLimit,
+      nextValue: approvedQuotaLimit,
+      delta: approvedQuotaLimit - policy.quotaLimit,
+      relatedDepartmentQuotaRequestId: request.id,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const storedRequest = await saveDepartmentQuotaRequestRow(client, {
+      ...request,
+      status: "approved",
+      approvedQuotaLimit,
+      approvalOperatorOpenId: actor.openId,
+      approvalOperatedAt: now,
+      errorMessage: undefined,
+      updatedAt: now,
+    });
+    return { request: storedRequest, policy: updatedPolicy };
+  });
+}
+
+export async function getPostgresDepartmentQuotaOverview(
+  scope: AdminScope,
+  period: string,
+) {
+  return withControlClient(async (client) => {
+    const departments = await client.query<{
+      id: string;
+      department_id: string;
+      department_name: string | null;
+      quota_limit: number;
+      default_grant_quota: number;
+      allocated_quota: number;
+      pending_reserved_quota: number;
+      available_quota: number;
+      quota_consumed: number;
+      remaining_quota: number;
+      member_count: number;
+      keyed_users: number;
+      prewarmed_keys: number;
+      updated_at: Date | string;
+      updated_by_feishu_user_id: string | null;
+    }>(
+      `with department_ids as materialized (
+         select distinct department_id
+         from feishu_users
+         where department_id is not null
+         union
+         select distinct department_id
+         from department_quota_periods
+         where period = $3
+         union
+         select $2::text
+         where $1::text = 'department' and $2::text is not null
+       ), scoped_departments as materialized (
+         select department_id
+         from department_ids
+         where department_id is not null
+           and ($1::text = 'global' or department_id = $2)
+       ), member_stats as materialized (
+         select member.department_id,
+           max(nullif(member.data->>'departmentName', '')) as department_name,
+           count(*) filter (
+             where coalesce(member.data->>'status', 'active') <> 'deleted'
+           )::integer as member_count,
+           coalesce(sum(greatest(coalesce((billing.data->>'monthlyQuota')::numeric, 0), 0)), 0)::double precision as allocated_quota,
+           coalesce(sum(greatest(coalesce((billing.data->>'quotaConsumed')::numeric, 0), 0)), 0)::double precision as quota_consumed,
+           coalesce(sum(greatest(coalesce((billing.data->>'remainingQuota')::numeric, 0), 0)), 0)::double precision as remaining_quota
+         from feishu_users member
+         join scoped_departments scoped on scoped.department_id = member.department_id
+         left join user_billing_periods billing
+           on billing.feishu_user_id = member.id and billing.period = $3
+         where coalesce(member.data->>'status', 'active') <> 'deleted'
+         group by member.department_id
+       ), account_stats as materialized (
+         select member.department_id,
+           count(distinct account.feishu_user_id) filter (
+             where account.status = 'active'
+           )::integer as keyed_users,
+           count(*) filter (
+             where account.status = 'pending_activation'
+               and nullif(account.data->>'prewarmedAt', '') is not null
+           )::integer as prewarmed_keys
+         from token_accounts account
+         join feishu_users member on member.id = account.feishu_user_id
+         join scoped_departments scoped on scoped.department_id = member.department_id
+         group by member.department_id
+       ), reservation_stats as materialized (
+         select event.department_id,
+           coalesce(sum(greatest(coalesce((event.data->>'delta')::numeric, 0), 0)), 0)::double precision as pending_reserved_quota
+         from quota_change_events event
+         join scoped_departments scoped on scoped.department_id = event.department_id
+         where event.period = $3
+           and event.status = 'pending'
+           and (
+             nullif(event.data->>'expiresAt', '') is null
+             or (event.data->>'expiresAt')::timestamptz > statement_timestamp()
+           )
+         group by event.department_id
+       ), settings as materialized (
+         select coalesce((data->>'defaultMonthlyQuota')::double precision, 200) as default_grant_quota
+         from app_settings where id = 'default'
+       )
+       select
+         coalesce(policy.id, 'virtual:' || scoped.department_id || ':' || $3) as id,
+         scoped.department_id,
+         coalesce(nullif(policy.data->>'departmentName', ''), members.department_name) as department_name,
+         coalesce(
+           (policy.data->>'quotaLimit')::double precision,
+           greatest(1000, coalesce(members.allocated_quota, 0))
+         ) as quota_limit,
+         coalesce(
+           (policy.data->>'defaultGrantQuota')::double precision,
+           settings.default_grant_quota,
+           200
+         ) as default_grant_quota,
+         coalesce(members.allocated_quota, 0) as allocated_quota,
+         coalesce(reservations.pending_reserved_quota, 0) as pending_reserved_quota,
+         greatest(
+           coalesce((policy.data->>'quotaLimit')::double precision, greatest(1000, coalesce(members.allocated_quota, 0)))
+             - coalesce(members.allocated_quota, 0)
+             - coalesce(reservations.pending_reserved_quota, 0),
+           0
+         ) as available_quota,
+         coalesce(members.quota_consumed, 0) as quota_consumed,
+         coalesce(members.remaining_quota, 0) as remaining_quota,
+         coalesce(members.member_count, 0)::integer as member_count,
+         coalesce(accounts.keyed_users, 0)::integer as keyed_users,
+         coalesce(accounts.prewarmed_keys, 0)::integer as prewarmed_keys,
+         coalesce(policy.updated_at, statement_timestamp()) as updated_at,
+         nullif(policy.data->>'updatedByFeishuUserId', '') as updated_by_feishu_user_id
+       from scoped_departments scoped
+       left join department_quota_periods policy
+         on policy.department_id = scoped.department_id and policy.period = $3
+       left join member_stats members on members.department_id = scoped.department_id
+       left join account_stats accounts on accounts.department_id = scoped.department_id
+       left join reservation_stats reservations on reservations.department_id = scoped.department_id
+       left join settings on true
+       order by coalesce(nullif(policy.data->>'departmentName', ''), members.department_name, scoped.department_id)`,
+      [scope.scopeType, scope.departmentId ?? null, period],
+    );
+    const requests = await client.query<{
+      data: DepartmentQuotaRequest;
+      requester_name: string | null;
+      requester_open_id: string | null;
+    }>(
+      `select request.data,
+              requester.data->>'name' as requester_name,
+              requester.open_id as requester_open_id
+       from department_quota_requests request
+       left join feishu_users requester on requester.id = request.requester_feishu_user_id
+       where request.period = $3
+         and ($1::text = 'global' or request.department_id = $2)
+       order by request.updated_at desc, request.id desc
+       limit 200`,
+      [scope.scopeType, scope.departmentId ?? null, period],
+    );
+    const recentEvents = await client.query<{ data: QuotaChangeEvent }>(
+      `select data from quota_change_events
+       where period = $3
+         and ($1::text = 'global' or department_id = $2)
+       order by updated_at desc, id desc
+       limit 100`,
+      [scope.scopeType, scope.departmentId ?? null, period],
+    );
+    return {
+      period,
+      departments: departments.rows.map((row) => ({
+        id: row.id,
+        departmentId: row.department_id,
+        departmentName: row.department_name ?? undefined,
+        period,
+        quotaLimit: Number(row.quota_limit),
+        defaultGrantQuota: Number(row.default_grant_quota),
+        allocatedQuota: Number(row.allocated_quota),
+        pendingReservedQuota: Number(row.pending_reserved_quota),
+        availableQuota: Number(row.available_quota),
+        quotaConsumed: Number(row.quota_consumed),
+        remainingQuota: Number(row.remaining_quota),
+        memberCount: Number(row.member_count),
+        keyedUsers: Number(row.keyed_users),
+        prewarmedKeys: Number(row.prewarmed_keys),
+        updatedAt: postgresTimestampIso(row.updated_at),
+        updatedByFeishuUserId: row.updated_by_feishu_user_id ?? undefined,
+      })),
+      requests: requests.rows.map((row) => ({
+        ...row.data,
+        requesterName: row.requester_name ?? undefined,
+        requesterOpenId: row.requester_open_id ?? undefined,
+      })),
+      recentEvents: recentEvents.rows.map((row) => row.data),
+    };
+  });
+}
+
 export async function upsertPostgresQuotaChangeEvent(event: QuotaChangeEvent) {
   return withTransaction((client) => saveQuotaChangeEventRow(client, event));
 }
@@ -2863,10 +5335,78 @@ export async function insertPostgresTokenAccount(account: TokenAccount) {
   });
 }
 
+export async function insertPostgresPrewarmedTokenAccountIfEligible(input: {
+  departmentId: string;
+  account: TokenAccount;
+}) {
+  return withControlTransaction(async (client) => {
+    const user = await client.query<{ data: FeishuUser }>(
+      `select data
+       from feishu_users
+       where id = $1
+         and department_id = $2
+         and coalesce(data->>'status', 'active') = 'active'
+       for update`,
+      [input.account.feishuUserId, input.departmentId],
+    );
+    if (!user.rows[0]) return null;
+
+    const eligibility = await client.query<{ blocked: boolean }>(
+      `select
+         exists (
+           select 1
+           from token_accounts account
+           where account.feishu_user_id = $1
+             and account.status in ('pending_activation', 'active', 'draining', 'settling')
+         ) or exists (
+           select 1
+           from quota_operations operation
+           where operation.feishu_user_id = $1
+             and operation.state not in ('completed', 'compensated', 'cancelled')
+         ) as blocked`,
+      [input.account.feishuUserId],
+    );
+    if (eligibility.rows[0]?.blocked) return null;
+
+    return saveTokenAccountRow(client, input.account);
+  });
+}
+
+export async function claimPostgresPrewarmedTokenAccount(input: {
+  feishuUserId: string;
+  tokenRequestId: string;
+  billingPeriod: string;
+  operationGeneration?: number;
+}) {
+  return withControlTransaction(async (client) => {
+    const result = await client.query<{ data: TokenAccount }>(
+      `select data
+       from token_accounts
+       where feishu_user_id = $1
+         and status = 'pending_activation'
+         and newapi_token_id is not null
+         and nullif(data->>'prewarmedCredentialCiphertext', '') is not null
+       order by created_at, id
+       limit 1
+       for update`,
+      [input.feishuUserId],
+    );
+    const account = result.rows[0]?.data;
+    if (!account?.newapiTokenId || !account.prewarmedCredentialCiphertext) return null;
+    return saveTokenAccountRow(client, {
+      ...account,
+      tokenRequestId: input.tokenRequestId,
+      billingPeriod: input.billingPeriod,
+      operationGeneration:
+        input.operationGeneration ?? account.operationGeneration,
+    });
+  });
+}
+
 export async function insertPostgresTokenAccountForQuotaOperation(account: TokenAccount) {
-  // quota_restore/key_rotation already perform an authoritative snapshot at
-  // their accounting boundary. A pending replacement account has no usage or
-  // ledger effect, so inserting it must not trigger another full user rebuild.
+  // Key rotation performs an authoritative snapshot at its accounting
+  // boundary. A pending replacement account has no usage or ledger effect, so
+  // inserting it must not trigger another full user rebuild.
   return withControlTransaction((client) => saveTokenAccountRow(client, account));
 }
 
@@ -3055,76 +5595,6 @@ export async function finalizePostgresTokenProvision(input: {
   });
 }
 
-export async function recordPostgresMonthlyResetApplied(input: {
-  tokenAccountId: string;
-  feishuUserId: string;
-  period: string;
-  monthlyQuota: number;
-  approvalOperatorOpenId: string;
-  now: string;
-  requestId: string;
-  approvalUuid: string;
-}) {
-  return withTransaction(async (client) => {
-    await lockPostgresUserQuotaFence(client, input.feishuUserId);
-    const accountResult = await client.query<{ data: TokenAccount }>(
-      `select data from token_accounts
-       where id = $1 and feishu_user_id = $2 and status = 'active'
-       for update`,
-      [input.tokenAccountId, input.feishuUserId],
-    );
-    const account = accountResult.rows[0]?.data;
-    if (!account) {
-      return {
-        applied: false,
-        reason: "active_token_not_found",
-        account: null,
-        request: null,
-      };
-    }
-    if (account.billingPeriod === input.period) {
-      return {
-        applied: false,
-        reason: "already_current_period",
-        account,
-        request: null,
-      };
-    }
-
-    const previousPeriod = account.billingPeriod || periodFromIso(account.createdAt);
-    const updatedAccount: TokenAccount = {
-      ...account,
-      billingPeriod: input.period,
-    };
-    const storedAccount = await saveTokenAccountRow(client, updatedAccount);
-    const request: TokenRequest = {
-      id: input.requestId,
-      feishuUserId: input.feishuUserId,
-      requestType: "monthly_reset",
-      status: "provisioned",
-      reason: `monthly billing reset ${input.period}`,
-      requestedMonthlyQuota: input.monthlyQuota,
-      approvedMonthlyQuota: input.monthlyQuota,
-      approvalUuid: input.approvalUuid,
-      approvalMode: "manual",
-      approvalOperatorOpenId: input.approvalOperatorOpenId,
-      approvalOperatedAt: input.now,
-      tokenAccountId: storedAccount.id,
-      createdAt: input.now,
-      updatedAt: input.now,
-    };
-    const storedRequest = await saveTokenRequestRow(client, request);
-    await syncPostgresBillingPeriodForUser(client, input.feishuUserId, previousPeriod);
-    await syncPostgresBillingPeriodForUser(client, input.feishuUserId, input.period);
-    return {
-      applied: true,
-      reason: "applied",
-      account: storedAccount,
-      request: storedRequest,
-    };
-  });
-}
-
 export async function upsertPostgresFeishuEvent(
   event: Omit<FeishuEvent, "id" | "createdAt">,
 ) {
@@ -3157,19 +5627,36 @@ export async function upsertPostgresManualAdminScope(input: {
   departmentId?: string;
 }) {
   return withTransaction(async (client) => {
-    const userResult = await client.query<{ data: FeishuUser }>(
-      `select data from feishu_users
+    const identityResult = await client.query<{ id: string }>(
+      `select id from feishu_users
        where open_id = $1
        order by created_at, id
-       limit 1
-       for update`,
+       limit 1`,
       [input.targetOpenId],
+    );
+    const targetUserId = identityResult.rows[0]?.id;
+    if (!targetUserId) {
+      return {
+        scope: null,
+        error: "target_user_not_found" as const,
+      };
+    }
+    await lockAdminScopeUsersInTransaction(client, [targetUserId]);
+    const userResult = await client.query<{ data: FeishuUser }>(
+      "select data from feishu_users where id = $1 for update",
+      [targetUserId],
     );
     const targetUser = userResult.rows[0]?.data;
     if (!targetUser) {
       return {
         scope: null,
         error: "target_user_not_found" as const,
+      };
+    }
+    if (isInactiveUser(targetUser)) {
+      return {
+        scope: null,
+        error: "target_user_inactive" as const,
       };
     }
 
@@ -3189,17 +5676,6 @@ export async function upsertPostgresManualAdminScope(input: {
       [targetUser.id, input.scopeType, input.departmentId ?? null],
     );
     const now = nowIso();
-    if (isInactiveUser(targetUser)) {
-      await saveFeishuUserRow(client, {
-        ...targetUser,
-        status: "active",
-        disabledAt: undefined,
-        disabledReason: undefined,
-        deletedAt: undefined,
-        deletedReason: undefined,
-        updatedAt: now,
-      });
-    }
     const existing = existingResult.rows[0]?.data;
     if (existing) {
       const updated: AdminScope = {
@@ -3231,6 +5707,13 @@ export async function updatePostgresManualAdminScope(input: {
   disabledByFeishuUserId?: string;
 }) {
   return withTransaction(async (client) => {
+    const identityResult = await client.query<{ feishu_user_id: string }>(
+      "select feishu_user_id from admin_scopes where id = $1",
+      [input.scopeId],
+    );
+    const feishuUserId = identityResult.rows[0]?.feishu_user_id;
+    if (!feishuUserId) return null;
+    await lockAdminScopeUsersInTransaction(client, [feishuUserId]);
     const result = await client.query<{ data: AdminScope }>(
       "select data from admin_scopes where id = $1 for update",
       [input.scopeId],
@@ -3268,6 +5751,7 @@ export async function syncPostgresDepartmentSupervisorAdminScope(input: {
   isSupervisor: boolean;
 }) {
   return withTransaction(async (client) => {
+    await lockAdminScopeUsersInTransaction(client, [input.feishuUserId]);
     await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
       `admin_scope:department_supervisor:${input.feishuUserId}:${input.departmentId}`,
     ]);
@@ -3350,39 +5834,154 @@ export async function syncPostgresDepartmentSupervisorAdminScope(input: {
   });
 }
 
-export async function updatePostgresUserAccessStatus(input: {
+type UpdatePostgresUserAccessStatusInput = {
+  actorFeishuUserId: string;
   feishuUserId: string;
   status: "disabled" | "deleted";
   reason?: string;
   tokenStatus: Extract<TokenStatus, "disabled" | "revoked">;
   adminRevokedByFeishuUserId?: string;
-}) {
-  return withTransaction(async (client) => {
-    await lockPostgresUserQuotaFence(client, input.feishuUserId);
-    const now = nowIso();
-    const userResult = await client.query<{ data: FeishuUser }>(
-      "select data from feishu_users where id = $1 for update",
-      [input.feishuUserId],
-    );
-    const user = userResult.rows[0]?.data;
-    if (!user) return null;
+  adminScopeLocksHeld?: boolean;
+  upstreamDisabledAt?: string;
+  consumptionBarrierCutoffAt?: string;
+};
 
-    const activeResult = await client.query<{ data: TokenAccount }>(
+async function updatePostgresUserAccessStatusWithClient(
+  client: PoolClient,
+  input: UpdatePostgresUserAccessStatusInput,
+) {
+  const now = nowIso();
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `user-quota:${input.feishuUserId}`,
+    ]);
+    const authorized = await authorizePostgresAdminUserAction(client, {
+      actorFeishuUserId: input.actorFeishuUserId,
+      targetFeishuUserId: input.feishuUserId,
+      adminScopeLocksHeld: input.adminScopeLocksHeld,
+      destructiveAccessRevoke: true,
+    });
+    if (!authorized) return null;
+    const user = authorized.targetUser;
+
+    const accountResult = await client.query<{ data: TokenAccount }>(
       `select data from token_accounts
-       where feishu_user_id = $1 and status = 'active'
-       order by created_at desc, id desc
-       limit 1
+       where feishu_user_id = $1
+         and (
+           ($2::text = 'revoked' and status <> 'revoked')
+           or
+           ($2::text = 'disabled'
+             and status in ('pending_activation', 'active', 'draining', 'settling'))
+         )
+       order by created_at, id
+       for update`,
+      [input.feishuUserId, input.tokenStatus],
+    );
+    const storedAccounts: TokenAccount[] = [];
+    for (const row of accountResult.rows) {
+      const nextStatus =
+        input.tokenStatus === "disabled" && row.data.status === "pending_activation"
+          ? "orphaned"
+          : input.tokenStatus;
+      storedAccounts.push(
+        await saveTokenAccountRow(client, {
+          ...row.data,
+          status: nextStatus,
+          disabledAt: now,
+          prewarmedCredentialCiphertext:
+            nextStatus === "orphaned" || nextStatus === "revoked"
+              ? undefined
+              : row.data.prewarmedCredentialCiphertext,
+        }),
+      );
+    }
+
+    const openOperations = await client.query<{ data: QuotaOperation }>(
+      `select data from quota_operations
+       where feishu_user_id = $1
+         and state not in ('completed', 'compensated', 'cancelled')
+       order by created_at, id
        for update`,
       [input.feishuUserId],
     );
-    const activeAccount = activeResult.rows[0]?.data;
-    const storedAccount = activeAccount
-      ? await saveTokenAccountRow(client, {
-          ...activeAccount,
-          status: input.tokenStatus,
-          disabledAt: now,
-        })
-      : null;
+    const cancelledOperationIds: string[] = [];
+    const manualReviewOperationIds: string[] = [];
+    for (const row of openOperations.rows) {
+      const operation = row.data;
+      const cancellable = canCancelQuotaOperationForAccessRevoke(operation);
+      if (cancellable) cancelledOperationIds.push(operation.id);
+      else manualReviewOperationIds.push(operation.id);
+      await saveQuotaOperationRow(client, {
+        ...operation,
+        state: cancellable ? "cancelled" : "manual_review",
+        reservedDepartmentQuota: cancellable ? 0 : operation.reservedDepartmentQuota,
+        nextRetryAt: undefined,
+        workerLeaseId: undefined,
+        workerLeaseExpiresAt: undefined,
+        lastErrorCode: cancellable
+          ? "user_access_revoked"
+          : "user_access_revoked_manual_review",
+        lastErrorMessage:
+          input.reason ??
+          (input.status === "deleted" ? "用户已删除，额度操作已终止" : "用户已禁用，额度操作已终止"),
+        evidence: {
+          ...operation.evidence,
+          userAccessRevokedAt: now,
+          userAccessStatus: input.status,
+          ...(cancellable
+            ? { cancelledFromState: operation.state }
+            : { manualReviewFromState: operation.state }),
+          credentialRevokedAt:
+            operation.credentialCiphertext && !operation.credentialDeliveredAt
+              ? now
+              : operation.evidence?.credentialRevokedAt,
+        },
+        credentialCiphertext:
+          operation.credentialDeliveredAt ? operation.credentialCiphertext : undefined,
+        updatedAt: now,
+        completedAt: cancellable ? now : undefined,
+      });
+      if (operation.requestId) {
+        const requestResult = await client.query<{ data: TokenRequest }>(
+          "select data from token_requests where id = $1 for update",
+          [operation.requestId],
+        );
+        const tokenRequest = requestResult.rows[0]?.data;
+        if (tokenRequest && tokenRequest.status !== "provisioned") {
+          await saveTokenRequestRow(client, {
+            ...tokenRequest,
+            status: "approved_provision_failed",
+            errorMessage:
+              input.status === "deleted"
+                ? "用户已删除，原账务任务已终止；重新申请后将创建新任务"
+                : "用户已禁用，原账务任务已终止",
+            updatedAt: now,
+          });
+        }
+      }
+    }
+
+    const terminalCredentials = await client.query<{ data: QuotaOperation }>(
+      `select data from quota_operations
+       where feishu_user_id = $1
+         and state in ('completed', 'compensated', 'cancelled')
+         and data ? 'credentialCiphertext'
+         and not (data ? 'credentialDeliveredAt')
+       order by created_at, id
+       for update`,
+      [input.feishuUserId],
+    );
+    for (const row of terminalCredentials.rows) {
+      await saveQuotaOperationRow(client, {
+        ...row.data,
+        credentialCiphertext: undefined,
+        evidence: {
+          ...row.data.evidence,
+          credentialRevokedAt: now,
+          userAccessStatus: input.status,
+        },
+        updatedAt: now,
+      });
+    }
 
     const updatedUser: FeishuUser = {
       ...user,
@@ -3401,17 +6000,237 @@ export async function updatePostgresUserAccessStatus(input: {
         reason: "user_deleted",
         disabledByFeishuUserId: input.adminRevokedByFeishuUserId,
         now,
+        adminScopeLockHeld: input.adminScopeLocksHeld,
       });
     }
-    if (storedAccount) {
+    const quotaState = await readPostgresUserQuotaState(client, input.feishuUserId);
+    const revocationBarrier = preserveUserAccessRevocationBarrier(input, quotaState);
+    await saveUserQuotaStateRow(client, {
+      feishuUserId: input.feishuUserId,
+      admission: "closed",
+      activeGeneration: quotaState.activeGeneration,
+      operationId: undefined,
+      closedReason: "user_access_revoked",
+      ...revocationBarrier,
+      updatedAt: now,
+    });
+    const affectedPeriods = new Set(
+      storedAccounts.map(
+        (account) => account.billingPeriod || periodFromIso(account.createdAt),
+      ),
+    );
+    for (const period of affectedPeriods) {
       await syncPostgresBillingPeriodForUser(
         client,
-        storedAccount.feishuUserId,
-        storedAccount.billingPeriod || periodFromIso(storedAccount.createdAt),
+        input.feishuUserId,
+        period,
       );
     }
-    return { user: storedUser, tokenAccount: storedAccount };
+    const resumableAccount = [...storedAccounts]
+      .reverse()
+      .find((account) => account.status === input.tokenStatus) ?? null;
+    return {
+      user: storedUser,
+      tokenAccount: resumableAccount,
+      tokenAccounts: storedAccounts,
+      terminatedOperationIds: cancelledOperationIds,
+      manualReviewOperationIds,
+    };
+}
+
+export async function upsertPostgresManualAdminScopeAsActor(input: {
+  actorFeishuUserId: string;
+  targetOpenId: string;
+  scopeType: AdminScope["scopeType"];
+  departmentId?: string;
+}) {
+  return withControlTransaction(async (client) => {
+    const identity = await client.query<{ id: string }>(
+      `select id from feishu_users
+       where open_id = $1
+       order by created_at, id
+       limit 1`,
+      [input.targetOpenId],
+    );
+    const targetUserId = identity.rows[0]?.id;
+    if (!targetUserId) {
+      return { scope: null, error: "target_user_not_found" as const };
+    }
+    await lockAdminScopeUsersInTransaction(client, [
+      input.actorFeishuUserId,
+      targetUserId,
+    ]);
+    const actorScope = await resolvePostgresActorScopeInTransaction(
+      client,
+      input.actorFeishuUserId,
+    );
+    if (!actorScope || actorScope.scopeType !== "global") {
+      throw new AdminUserActionAuthorizationError(
+        "actor_scope_missing",
+        403,
+        "当前系统管理员权限已变化，请刷新后重试",
+      );
+    }
+    const actorIsRoot =
+      actorScope.source === "environment" && actorScope.role === "root";
+    if (input.scopeType === "global" && !actorIsRoot) {
+      throw new AdminUserActionAuthorizationError(
+        "root_required",
+        403,
+        "只有 root 管理员可以指派系统管理员",
+      );
+    }
+    if (
+      getConfig().admin.systemAdminOpenIds.includes(input.targetOpenId) &&
+      !actorIsRoot
+    ) {
+      throw new AdminUserActionAuthorizationError(
+        "root_required",
+        403,
+        "环境变量 root 用户仅允许 root 管理员操作",
+      );
+    }
+    const targetResult = await client.query<{ data: FeishuUser }>(
+      "select data from feishu_users where id = $1 for update",
+      [targetUserId],
+    );
+    const targetUser = targetResult.rows[0]?.data;
+    if (!targetUser) {
+      return { scope: null, error: "target_user_not_found" as const };
+    }
+    if (isInactiveUser(targetUser)) {
+      return { scope: null, error: "target_user_inactive" as const };
+    }
+    if (input.scopeType === "department" && !input.departmentId) {
+      throw new Error("指派部门管理员需要 departmentId");
+    }
+
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `admin_scope:manual:${targetUser.id}:${input.scopeType}:${input.departmentId ?? ""}`,
+    ]);
+    const existingResult = await client.query<{ data: AdminScope }>(
+      `select data from admin_scopes
+       where feishu_user_id = $1
+         and source = 'manual'
+         and scope_type = $2
+         and ($2 = 'global' or department_id is not distinct from $3)
+       order by created_at, id
+       limit 1
+       for update`,
+      [targetUser.id, input.scopeType, input.departmentId ?? null],
+    );
+    const now = nowIso();
+    const existing = existingResult.rows[0]?.data;
+    if (existing) {
+      return {
+        scope: await saveAdminScopeRow(client, {
+          ...activeAdminScope(existing, now),
+          departmentId:
+            input.scopeType === "department" ? input.departmentId : undefined,
+        }),
+        error: null,
+      };
+    }
+    const scope: AdminScope = {
+      id: randomId("as"),
+      feishuUserId: targetUser.id,
+      scopeType: input.scopeType,
+      departmentId:
+        input.scopeType === "department" ? input.departmentId : undefined,
+      source: "manual",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    };
+    return { scope: await saveAdminScopeRow(client, scope), error: null };
   });
+}
+
+export async function updatePostgresManualAdminScopeAsActor(input: {
+  actorFeishuUserId: string;
+  scopeId: string;
+  status?: AdminScope["status"];
+  departmentId?: string;
+  disabledReason?: AdminScope["disabledReason"];
+}) {
+  return withControlTransaction(async (client) => {
+    const identity = await client.query<{ feishu_user_id: string }>(
+      "select feishu_user_id from admin_scopes where id = $1",
+      [input.scopeId],
+    );
+    const targetFeishuUserId = identity.rows[0]?.feishu_user_id;
+    if (!targetFeishuUserId) return null;
+    await lockAdminScopeUsersInTransaction(client, [
+      input.actorFeishuUserId,
+      targetFeishuUserId,
+    ]);
+    const scopeResult = await client.query<{ data: AdminScope }>(
+      "select data from admin_scopes where id = $1 for update",
+      [input.scopeId],
+    );
+    const scope = scopeResult.rows[0]?.data;
+    if (!scope || scope.source === "environment") return null;
+    const actorScope = await resolvePostgresActorScopeInTransaction(
+      client,
+      input.actorFeishuUserId,
+    );
+    if (!actorScope || actorScope.scopeType !== "global") {
+      throw new AdminUserActionAuthorizationError(
+        "actor_scope_missing",
+        403,
+        "当前系统管理员权限已变化，请刷新后重试",
+      );
+    }
+    const actorIsRoot =
+      actorScope.source === "environment" && actorScope.role === "root";
+    if (scope.scopeType === "global" && !actorIsRoot) {
+      throw new AdminUserActionAuthorizationError(
+        "root_required",
+        403,
+        "只有 root 管理员可以修改或取消系统管理员",
+      );
+    }
+
+    const now = nowIso();
+    const statusUpdated =
+      input.status === "active"
+        ? activeAdminScope(scope, now)
+        : input.status === "disabled"
+          ? disabledAdminScope(scope, {
+              now,
+              reason: input.disabledReason ?? "manual_revoke",
+              disabledByFeishuUserId: input.actorFeishuUserId,
+            })
+          : scope;
+    return saveAdminScopeRow(client, {
+      ...statusUpdated,
+      departmentId:
+        scope.scopeType === "department" && input.departmentId !== undefined
+          ? input.departmentId
+          : scope.departmentId,
+      updatedAt: now,
+    });
+  });
+}
+
+export async function updatePostgresUserAccessStatus(
+  input: UpdatePostgresUserAccessStatusInput,
+) {
+  return withTransaction(async (client) => {
+    await lockPostgresUserQuotaFence(client, input.feishuUserId);
+    return updatePostgresUserAccessStatusWithClient(client, input);
+  });
+}
+
+export async function updatePostgresUserAccessStatusUnderUserFence(
+  input: UpdatePostgresUserAccessStatusInput,
+) {
+  // The caller already owns user-quota-fence on the dedicated session-lock
+  // connection. Reacquiring that key on this pooled transaction would
+  // deadlock against the caller itself.
+  return withControlTransaction((client) =>
+    updatePostgresUserAccessStatusWithClient(client, input),
+  );
 }
 
 export async function revokePostgresAdminScopesForUser(input: {
@@ -3427,18 +6246,29 @@ export async function revokePostgresAdminScopesForUser(input: {
   );
 }
 
-export async function enablePostgresUserAccess(input: {
+type EnablePostgresUserAccessInput = {
+  actorFeishuUserId: string;
   feishuUserId: string;
   reason?: string;
-}) {
-  return withTransaction(async (client) => {
-    await lockPostgresUserQuotaFence(client, input.feishuUserId);
+  expectedTokenAccountId?: string;
+  adminScopeLocksHeld?: boolean;
+};
+
+async function enablePostgresUserAccessWithClient(
+  client: PoolClient,
+  input: EnablePostgresUserAccessInput,
+) {
     const now = nowIso();
-    const userResult = await client.query<{ data: FeishuUser }>(
-      "select data from feishu_users where id = $1 for update",
-      [input.feishuUserId],
-    );
-    const user = userResult.rows[0]?.data;
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `user-quota:${input.feishuUserId}`,
+    ]);
+    const authorized = await authorizePostgresAdminUserAction(client, {
+      actorFeishuUserId: input.actorFeishuUserId,
+      targetFeishuUserId: input.feishuUserId,
+      adminScopeLocksHeld: input.adminScopeLocksHeld,
+    });
+    if (!authorized) return null;
+    const user = authorized.targetUser;
     if (!user || user.status !== "disabled") return null;
 
     const activeResult = await client.query<{ data: TokenAccount }>(
@@ -3450,13 +6280,24 @@ export async function enablePostgresUserAccess(input: {
     );
     if (activeResult.rows[0]?.data) return null;
 
-    const disabledResult = await client.query<{ data: TokenAccount }>(
-      `select data from token_accounts
-       where feishu_user_id = $1 and status = 'disabled'
-       order by coalesce(disabled_at, created_at) desc, created_at desc, id desc
+    const openOperation = await client.query<{ id: string }>(
+      `select id from quota_operations
+       where feishu_user_id = $1
+         and state not in ('completed', 'compensated', 'cancelled')
        limit 1
        for update`,
       [input.feishuUserId],
+    );
+    if (openOperation.rows[0]) return null;
+
+    const disabledResult = await client.query<{ data: TokenAccount }>(
+      `select data from token_accounts
+       where feishu_user_id = $1 and status = 'disabled'
+         and ($2::text is null or id = $2)
+       order by coalesce(disabled_at, created_at) desc, created_at desc, id desc
+       limit 1
+       for update`,
+      [input.feishuUserId, input.expectedTokenAccountId ?? null],
     );
     const disabledAccount = disabledResult.rows[0]?.data;
     if (!disabledAccount) return null;
@@ -3473,12 +6314,181 @@ export async function enablePostgresUserAccess(input: {
       disabledAt: undefined,
       disabledReason: undefined,
     });
+    const quotaState = await readPostgresUserQuotaState(client, input.feishuUserId);
+    await saveUserQuotaStateRow(client, {
+      feishuUserId: input.feishuUserId,
+      admission: "closed",
+      activeGeneration: Math.max(
+        quotaState.activeGeneration,
+        storedAccount.operationGeneration ?? 0,
+      ),
+      operationId: undefined,
+      closedReason: "user_access_resume_pending",
+      resumeTokenAccountId: storedAccount.id,
+      resumePreparedAt: now,
+      updatedAt: now,
+    });
     await syncPostgresBillingPeriodForUser(
       client,
       storedAccount.feishuUserId,
       storedAccount.billingPeriod || periodFromIso(storedAccount.createdAt),
     );
     return { user: storedUser, tokenAccount: storedAccount };
+}
+
+export async function enablePostgresUserAccess(
+  input: EnablePostgresUserAccessInput,
+) {
+  return withTransaction(async (client) => {
+    await lockPostgresUserQuotaFence(client, input.feishuUserId);
+    return enablePostgresUserAccessWithClient(client, input);
+  });
+}
+
+export async function enablePostgresUserAccessUnderUserFence(
+  input: EnablePostgresUserAccessInput,
+) {
+  return withControlTransaction((client) =>
+    enablePostgresUserAccessWithClient(client, input),
+  );
+}
+
+export async function markPostgresUserAccessResumeEnableAttemptUnderUserFence(input: {
+  feishuUserId: string;
+  expectedTokenAccountId: string;
+}) {
+  return withControlTransaction(async (client) => {
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `user-quota:${input.feishuUserId}`,
+    ]);
+    const now = nowIso();
+    const result = await client.query<{ data: UserQuotaState }>(
+      markUserAccessResumeEnableAttemptSql,
+      [input.feishuUserId, input.expectedTokenAccountId, now],
+    );
+    return result.rows[0]?.data ?? null;
+  });
+}
+
+export async function listPostgresStaleUserAccessResumeCandidates(input: {
+  staleBefore: string;
+  limit: number;
+}) {
+  return withControlClient(async (client) => {
+    const result = await client.query<{
+      user: FeishuUser;
+      account: TokenAccount;
+      quota_state: UserQuotaState;
+    }>(
+      listStaleUserAccessResumeCandidatesSql,
+      [input.staleBefore, input.limit],
+    );
+    return result.rows.map((row) => ({
+      user: row.user,
+      tokenAccount: row.account,
+      quotaState: row.quota_state,
+    }));
+  });
+}
+
+export async function finalizePostgresUserAccessResumeUnderUserFence(input: {
+  actorFeishuUserId: string;
+  feishuUserId: string;
+  expectedTokenAccountId: string;
+  adminScopeLocksHeld?: boolean;
+}) {
+  return withControlTransaction(async (client) => {
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `user-quota:${input.feishuUserId}`,
+    ]);
+    const authorized = await authorizePostgresAdminUserAction(client, {
+      actorFeishuUserId: input.actorFeishuUserId,
+      targetFeishuUserId: input.feishuUserId,
+      adminScopeLocksHeld: input.adminScopeLocksHeld,
+    });
+    if (!authorized) return null;
+    const result = await client.query<{
+      user: FeishuUser | null;
+      account: TokenAccount | null;
+      quota_state: UserQuotaState | null;
+      open_operation_id: string | null;
+    }>(
+      `select
+         (select data from feishu_users where id = $1 for update) as user,
+         (select data from token_accounts
+          where id = $2 and feishu_user_id = $1 and status = 'active'
+          for update) as account,
+         (select data from user_quota_states where feishu_user_id = $1 for update) as quota_state,
+         (select id from quota_operations
+          where feishu_user_id = $1
+            and state not in ('completed', 'compensated', 'cancelled')
+          limit 1) as open_operation_id`,
+      [input.feishuUserId, input.expectedTokenAccountId],
+    );
+    const row = result.rows[0];
+    if (
+      !row?.user ||
+      row.user.status !== "active" ||
+      !row.account ||
+      row.open_operation_id ||
+      row.quota_state?.admission !== "closed" ||
+      row.quota_state.closedReason !== "user_access_resume_pending"
+    ) {
+      return null;
+    }
+    const now = nowIso();
+    const quotaState = await saveUserQuotaStateRow(client, {
+      feishuUserId: input.feishuUserId,
+      admission: "open",
+      activeGeneration: Math.max(
+        row.quota_state.activeGeneration,
+        row.account.operationGeneration ?? 0,
+      ),
+      operationId: undefined,
+      closedReason: undefined,
+      updatedAt: now,
+    });
+    return { user: row.user, tokenAccount: row.account, quotaState };
+  });
+}
+
+export async function rollbackPostgresUserAccessResumeUnderUserFence(input: {
+  feishuUserId: string;
+  expectedTokenAccountId: string;
+  upstreamDisabledAt: string;
+  consumptionBarrierCutoffAt: string;
+  reason: string;
+}) {
+  return withControlTransaction(async (client) => {
+    // This short transaction lock serializes the three local projections. The
+    // caller also owns user-quota-fence on a dedicated connection, so quota
+    // operations and other access workflows cannot cross this compensation.
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `user-quota:${input.feishuUserId}`,
+    ]);
+    const result = await client.query<{
+      user: FeishuUser;
+      account: TokenAccount;
+      quota_state: UserQuotaState;
+    }>(rollbackPendingUserAccessResumeSql, [
+      input.feishuUserId,
+      input.expectedTokenAccountId,
+      input.upstreamDisabledAt,
+      input.consumptionBarrierCutoffAt,
+      input.reason,
+    ]);
+    const row = result.rows[0];
+    if (!row) return null;
+    await syncPostgresBillingPeriodForUser(
+      client,
+      row.account.feishuUserId,
+      row.account.billingPeriod || periodFromIso(row.account.createdAt),
+    );
+    return {
+      user: row.user,
+      tokenAccount: row.account,
+      quotaState: row.quota_state,
+    };
   });
 }
 
@@ -3924,7 +6934,7 @@ export async function reservePostgresQuotaOperationDepartmentBudget(
          where id <> $1
            and department_id = $2
            and billing_period = $3
-           and state not in ('completed', 'compensated')`,
+           and state not in ('completed', 'compensated', 'cancelled')`,
         [operationId, departmentId, billingPeriod],
       );
       const budgetQuota = Math.max(
@@ -4000,6 +7010,50 @@ function rememberBatchUsageRecord(
   );
   if (index >= 0) state.usageRecords[index] = record;
   else state.usageRecords.push(record);
+}
+
+function hasAuthoritativeUsageRecordBillingAmount(record: NewApiUsageRecord) {
+  return [record.quota, record.cost].some(
+    (value) => Number.isFinite(value) && (value as number) >= 0,
+  );
+}
+
+async function closePostgresResolvedMissingCostIssues(
+  client: PoolClient,
+  record: NewApiUsageRecord,
+) {
+  if (!hasAuthoritativeUsageRecordBillingAmount(record)) return;
+  const issues = await client.query<{ data: UsageSyncIssue }>(
+    `select data
+       from usage_sync_issues
+      where issue_type = 'missing_cost'
+        and status = 'open'
+        and newapi_token_id is not distinct from $1
+        and (
+          ($2::text is not null and newapi_request_id = $2)
+          or (
+            ($2::text is null or newapi_request_id is null)
+            and $3::text is not null
+            and newapi_log_id = $3
+          )
+        )
+      order by id
+      for update`,
+    [
+      record.newapiTokenId ?? null,
+      record.newapiRequestId ?? null,
+      record.newapiLogId ?? null,
+    ],
+  );
+  for (const row of issues.rows) {
+    if (!sameNewApiUsageSource(row.data, record)) continue;
+    await saveUsageSyncIssueRow(client, {
+      ...row.data,
+      status: "closed",
+      lastSyncedAt: record.lastSyncedAt,
+      closedAt: record.lastSyncedAt,
+    });
+  }
 }
 
 async function upsertPostgresNewApiUsageRecordWithClient(
@@ -4095,6 +7149,13 @@ async function upsertPostgresNewApiUsageRecordWithClient(
     id: existing?.id ?? record.id,
     firstSeenAt: existing?.firstSeenAt ?? record.firstSeenAt,
   });
+  if (
+    existing &&
+    !hasAuthoritativeUsageRecordBillingAmount(existing) &&
+    hasAuthoritativeUsageRecordBillingAmount(stored)
+  ) {
+    await closePostgresResolvedMissingCostIssues(client, stored);
+  }
   if (options.batchState) rememberBatchUsageRecord(options.batchState, stored);
   return stored;
 }
@@ -4570,10 +7631,10 @@ export function isPostgresAdvisoryLockBusyError(
 
 export async function withPostgresAdvisoryLock<T>(
   key: string,
-  fn: () => Promise<T>,
-  options: { wait?: boolean } = {},
+  fn: (fence?: QuotaExecutionFence) => Promise<T>,
+  options: { wait?: boolean; executionFence?: boolean } = {},
 ) {
-  return withAdvisoryLockClient(async (client) => {
+  return withAdvisoryLockClient(async (client, destroyClient) => {
     if (options.wait) {
       await client.query("select pg_advisory_lock(hashtext($1)::bigint)", [key]);
     } else {
@@ -4585,10 +7646,86 @@ export async function withPostgresAdvisoryLock<T>(
         throw new PostgresAdvisoryLockBusyError(key);
       }
     }
+    const fence = options.executionFence
+      ? createQuotaExecutionFence(key)
+      : undefined;
+    let heartbeatInFlight: Promise<void> | undefined;
+    const markFenceLost = (error: unknown) => {
+      fence?.markLost(error);
+      destroyClient();
+    };
+    const onClientError = (error: Error) => markFenceLost(error);
+    const onClientEnd = () => markFenceLost(new Error("PostgreSQL 栅栏连接已结束"));
+    client.on("error", onClientError);
+    client.on("end", onClientEnd);
+    const heartbeat = fence
+      ? setInterval(() => {
+          if (heartbeatInFlight || fence.lost || fence.closed) return;
+          let timeout: ReturnType<typeof setTimeout> | undefined;
+          const query = client.query("select 1");
+          // Keep a rejection handler on the underlying query even when the
+          // timeout wins the race and the lock client is destroyed later.
+          void query.catch(() => undefined);
+          heartbeatInFlight = Promise.race([
+            query.then(() => undefined),
+            new Promise<void>((_, reject) => {
+              timeout = setTimeout(
+                () => reject(new Error("PostgreSQL 栅栏心跳超时")),
+                10_000,
+              );
+              timeout.unref?.();
+            }),
+          ])
+            .catch(markFenceLost)
+            .finally(() => {
+              if (timeout) clearTimeout(timeout);
+              heartbeatInFlight = undefined;
+            });
+        }, 5_000)
+      : undefined;
+    heartbeat?.unref?.();
+    let callbackFailed = false;
     try {
-      return await fn();
+      const result = fence
+        ? await runWithQuotaExecutionFence(fence, () => fn(fence))
+        : await fn();
+      fence?.assertHeld();
+      return result;
+    } catch (error) {
+      callbackFailed = true;
+      throw error;
     } finally {
-      await client.query("select pg_advisory_unlock(hashtext($1)::bigint)", [key]);
+      if (heartbeat) clearInterval(heartbeat);
+      if (heartbeatInFlight) await heartbeatInFlight;
+      client.removeListener("error", onClientError);
+      client.removeListener("end", onClientEnd);
+      let fenceFailure: unknown;
+      if (fence?.lost) {
+        destroyClient();
+        if (!callbackFailed) {
+          try {
+            fence.assertHeld();
+          } catch (error) {
+            fenceFailure = error;
+          }
+        }
+      }
+      fence?.close();
+      if (fenceFailure) throw fenceFailure;
+      if (!fence?.lost) {
+        try {
+          const unlocked = await client.query<{ unlocked: boolean }>(
+            "select pg_advisory_unlock(hashtext($1)::bigint) as unlocked",
+            [key],
+          );
+          if (!unlocked.rows[0]?.unlocked) {
+            throw new Error("PostgreSQL 栅栏释放校验失败");
+          }
+        } catch (error) {
+          markFenceLost(error);
+          throw error;
+        }
+      }
     }
   });
 }
@@ -4598,6 +7735,7 @@ export async function writePostgresStore(store: StoreShape) {
   try {
     await client.query("begin");
     await client.query("delete from app_settings");
+    await client.query("delete from billing_operations");
     await client.query("delete from admin_scopes");
     await client.query("delete from usage_sync_issues");
     await client.query("delete from usage_sync_checkpoints");
@@ -4610,11 +7748,13 @@ export async function writePostgresStore(store: StoreShape) {
     await client.query("delete from user_billing_periods");
     await client.query("delete from token_accounts");
     await client.query("delete from token_requests");
+    await client.query("delete from user_quota_policies");
     await client.query("delete from feishu_users");
 
-    await client.query("insert into app_settings (id, data) values ('default', $1)", [
-      store.settings,
-    ]);
+    await saveSettingsRow(client, store.settings);
+    for (const operation of store.settings.billingOperations ?? []) {
+      await insertPostgresBillingOperationRow(client, operation);
+    }
 
     await insertJsonRows(client, "feishu_users", store.users, (user) => ({
       sql: `insert into feishu_users
@@ -4630,6 +7770,10 @@ export async function writePostgresStore(store: StoreShape) {
         user.updatedAt,
       ],
     }));
+
+    for (const policy of store.userQuotaPolicies ?? []) {
+      await saveUserQuotaPolicyRow(client, policy);
+    }
 
     await insertJsonRows(client, "token_requests", store.tokenRequests, (request) => ({
       sql: `insert into token_requests
@@ -4767,8 +7911,9 @@ export async function writePostgresStore(store: StoreShape) {
     await insertJsonRows(client, "proxy_request_logs", store.proxyRequestLogs, (log) => ({
       sql: `insert into proxy_request_logs
         (id, feishu_user_id, token_account_id, request_path, method, status_code,
+         billing_period, operation_generation, lease_expires_at, heartbeat_at,
          data, created_at)
-        values ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
       values: [
         log.id,
         log.feishuUserId ?? null,
@@ -4776,6 +7921,10 @@ export async function writePostgresStore(store: StoreShape) {
         log.requestPath,
         log.method,
         log.statusCode,
+        log.billingPeriod ?? null,
+        log.operationGeneration ?? 0,
+        log.leaseExpiresAt ?? null,
+        log.heartbeatAt ?? null,
         log,
         log.createdAt,
       ],
@@ -4784,8 +7933,9 @@ export async function writePostgresStore(store: StoreShape) {
     await insertJsonRows(client, "newapi_usage_records", store.newapiUsageRecords, (record) => ({
       sql: `insert into newapi_usage_records
         (id, newapi_log_id, newapi_request_id, newapi_token_id, token_account_id,
-         feishu_user_id, match_status, data, newapi_created_at, first_seen_at, last_synced_at)
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+         feishu_user_id, billing_period, match_status, data, newapi_created_at,
+         first_seen_at, last_synced_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
       values: [
         record.id,
         record.newapiLogId ?? null,
@@ -4793,6 +7943,7 @@ export async function writePostgresStore(store: StoreShape) {
         record.newapiTokenId ?? null,
         record.tokenAccountId ?? null,
         record.feishuUserId ?? null,
+        record.billingPeriod ?? null,
         record.matchStatus,
         record,
         record.newapiCreatedAt ?? null,

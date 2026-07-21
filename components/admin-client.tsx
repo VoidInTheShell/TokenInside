@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   ArrowLeftIcon,
   BarChart3Icon,
+  BookOpenIcon,
   Building2Icon,
   CheckCircle2Icon,
   ClipboardListIcon,
@@ -32,9 +33,22 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
 import { LoginWaitingScreen } from "@/components/login-waiting-screen";
+import {
+  BillingAuditPanel,
+  SystemHealthPanel,
+  type BillingHealthResponse,
+} from "@/components/billing-health-panels";
 import {
   UsageRecordsTable,
   type UsageOption,
@@ -81,23 +95,6 @@ type AdminScopeRecord = {
     departmentId?: string;
     departmentName?: string;
   } | null;
-  createdAt: string;
-  updatedAt: string;
-};
-
-type BillingOperationRecord = {
-  id: string;
-  kind: "usage_sync" | "monthly_reset" | "settings_update";
-  status: "pending" | "running" | "dry_run" | "applied" | "partial_failed" | "failed";
-  dryRun: boolean;
-  operatedByFeishuUserId: string;
-  period?: string;
-  input?: Record<string, unknown>;
-  summary: Record<string, string | number | boolean | undefined>;
-  errorMessage?: string;
-  attemptCount?: number;
-  startedAt?: string;
-  completedAt?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -167,6 +164,12 @@ type AdminOverviewResponse = {
   };
   settings?: {
     defaultMonthlyQuota: number;
+    packageReset?: {
+      enabled: boolean;
+      dayOfMonth: number;
+      nextResetAt?: string;
+      updatedAt?: string;
+    };
     newapiControl?: {
       baseUrl?: string;
       controlUserId?: string;
@@ -174,50 +177,6 @@ type AdminOverviewResponse = {
       source: "system_settings" | "environment";
       updatedAt?: string;
     };
-    usageSyncPolicy?: {
-      enabled: boolean;
-      intervalMinutes: number;
-      pageSize: number;
-      maxPagesPerRun: number;
-      overlapMinutes: number;
-      settlementLagMinutes?: number;
-      matchWindowMinutes: number;
-      retryBaseMinutes?: number;
-      updatedAt?: string;
-      updatedByFeishuUserId?: string;
-      lastRunAt?: string;
-      lastRunStatus?: BillingOperationRecord["status"];
-      lastRunMessage?: string;
-      lastRunBy?: "manual" | "auto";
-      nextRunAfter?: string;
-    };
-    usageSyncCheckpoint?: {
-      id: string;
-      scope: "newapi_usage_logs";
-      pageStart: number;
-      pageSize: number;
-      maxPages: number;
-      overlapMinutes: number;
-      matchWindowMinutes: number;
-      lastSeenNewapiLogId?: string;
-      lastSeenNewapiCreatedAt?: string;
-      lastRunAt?: string;
-      lastRunStatus?: BillingOperationRecord["status"];
-      lastRunBy?: "manual" | "auto";
-      nextRunAfter?: string;
-      runId?: string;
-      runStartedAt?: string;
-      scanStart?: string;
-      scanEnd?: string;
-      settledThrough?: string;
-      cursorPage?: number;
-      failureCount?: number;
-      nextRetryAt?: string;
-      updatedAt: string;
-    } | null;
-    billingOperations?: BillingOperationRecord[];
-    quotaFeatureFlags?: QuotaControlResponse["settings"]["quotaFeatureFlags"];
-    quotaMigration?: QuotaControlResponse["settings"]["quotaMigration"];
     updatedAt?: string;
   };
 };
@@ -229,7 +188,8 @@ type AdminPanel =
   | "departmentStats"
   | "userStats"
   | "usageRecords"
-  | "quotaControl"
+  | "billingAudit"
+  | "systemHealth"
   | "approvals"
   | "settings";
 
@@ -241,6 +201,8 @@ type AdminUser = {
   departmentName?: string;
   status: "active" | "disabled" | "deleted";
   role: string;
+  isGlobalAdmin?: boolean;
+  isEnvironmentRoot?: boolean;
   activeTokenStatus?: string;
   activeTokenCreatedAt?: string;
   billingPeriod?: string;
@@ -349,7 +311,7 @@ type DepartmentQuotaRequestRow = {
   status: string;
   reason: string;
   currentQuotaLimit: number;
-  requestedQuotaLimit: number;
+  requestedQuotaLimit?: number;
   approvedQuotaLimit?: number;
   requesterName?: string;
   requesterOpenId?: string;
@@ -373,6 +335,21 @@ type DepartmentQuotaResponse = {
     updatedAt: string;
   }>;
   error?: string;
+};
+
+type DepartmentMemberSyncOperation = {
+  id: string;
+  kind: "department_member_sync";
+  status: string;
+  input?: { departmentId?: string };
+  summary: {
+    synced?: number;
+    skipped?: number;
+    pages?: number;
+  };
+  errorMessage?: string;
+  createdAt: string;
+  updatedAt: string;
 };
 
 type UsageRecordsResponse = {
@@ -403,134 +380,6 @@ type AdminTokenRequestsResponse = {
   error?: string;
 };
 
-type UsageSyncDraft = {
-  page: string;
-  size: string;
-  maxPages: string;
-  overlapMinutes: string;
-  matchWindowMinutes: string;
-};
-
-type UsageSyncPolicyDraft = {
-  enabled: boolean;
-  intervalMinutes: string;
-  pageSize: string;
-  maxPagesPerRun: string;
-  overlapMinutes: string;
-  settlementLagMinutes: string;
-  matchWindowMinutes: string;
-  retryBaseMinutes: string;
-};
-
-type MonthlyResetDraft = {
-  period: string;
-  limit: string;
-};
-
-type UsageSyncAccepted = {
-  operation: BillingOperationRecord;
-  deduplicated?: boolean;
-};
-
-type MonthlyResetResult = {
-  period: string;
-  dryRun: boolean;
-  blocked: boolean;
-  blockers: Array<{ type: string; message: string }>;
-  departments: Array<{
-    departmentId: string;
-    budgetQuota: number;
-    assignedQuota: number;
-    blocked: boolean;
-    alreadyOpenedUsers?: number;
-    users: Array<{ feishuUserId: string }>;
-  }>;
-  operations?: Array<{ id: string; state: string }>;
-};
-
-type QuotaControlResponse = {
-  quotaPerUnit: number;
-  report: {
-    period: string;
-    observedUpstream: boolean;
-    settledThrough?: string;
-    totals: {
-      users: number;
-      healthy: number;
-      excessUpstream: number;
-      deficitUpstream: number;
-      provisional: number;
-    };
-    rows: Array<{
-      feishuUserId: string;
-      userName?: string;
-      departmentId?: string;
-      tokenAccountId?: string;
-      assignedMonthlyQuota: number;
-      authorizedQuota: number;
-      authoritativeConsumedQuota: number;
-      expectedAvailableQuota: number;
-      overageQuota: number;
-      observedRemainQuota?: number;
-      delta?: number;
-      observedStable: boolean;
-      status: "healthy" | "excess_upstream" | "deficit_upstream" | "provisional" | "manual_review";
-      activeGeneration: number;
-      settledThrough?: string;
-    }>;
-  };
-  operations: Array<{
-    id: string;
-    operationType: string;
-    feishuUserId: string;
-    state: string;
-    attemptCount: number;
-    operationGeneration: number;
-    targetRemainQuota?: number;
-    observedRemainBefore?: number;
-    lastErrorMessage?: string;
-    nextRetryAt?: string;
-    updatedAt: string;
-  }>;
-  ledgerEntries: Array<{
-    id: string;
-    operationId: string;
-    feishuUserId: string;
-    entryType: string;
-    signedQuota: number;
-    quotaValue: number;
-    estimated?: boolean;
-    createdAt: string;
-  }>;
-  reconciliationRecords: Array<{
-    id: string;
-    feishuUserId: string;
-    status: string;
-    delta?: number;
-    updatedAt: string;
-  }>;
-  settings: {
-    quotaFeatureFlags?: {
-      legacyAbsoluteQuotaWritesEnabled: boolean;
-      quotaLedgerShadowRead: boolean;
-      quotaSagaWritesEnabled: boolean;
-      keyRotationSagaEnabled: boolean;
-      quotaRestoreEnabled: boolean;
-      monthlyPeriodOpenEnabled: boolean;
-      reconciliationAutoDecreaseEnabled: boolean;
-      reconciliationAutoIncreaseEnabled: boolean;
-    };
-    quotaMigration?: {
-      period: string;
-      appliedAt: string;
-      planHash: string;
-      users: number;
-      estimatedUsers: number;
-    };
-  };
-  error?: string;
-};
-
 const statusLabel: Record<string, string> = {
   pending_card_send: "发送审批卡片中",
   pending_card_approval: "卡片审批中",
@@ -549,10 +398,8 @@ const statusLabel: Record<string, string> = {
 
 const requestTypeLabel: Record<string, string> = {
   first_apply: "首次申请",
-  quota_reset: "额度重置",
   key_reset: "Key 更换",
   quota_adjust: "额度调整",
-  monthly_reset: "月度重置",
 };
 
 const userStatusLabel: Record<AdminUser["status"], string> = {
@@ -624,91 +471,6 @@ function currentBillingPeriod() {
   return new Date().toISOString().slice(0, 7);
 }
 
-function parseIntegerDraft(value: string, label: string, input: { min: number; max?: number }) {
-  const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < input.min || (input.max !== undefined && parsed > input.max)) {
-    throw new Error(
-      input.max === undefined
-        ? `${label}必须是不小于 ${input.min} 的整数`
-        : `${label}必须是 ${input.min}-${input.max} 的整数`,
-    );
-  }
-  return parsed;
-}
-
-function billingKindLabel(kind: BillingOperationRecord["kind"]) {
-  if (kind === "usage_sync") return "用量同步";
-  if (kind === "monthly_reset") return "月度重置";
-  return "设置变更";
-}
-
-function billingStatusLabel(status: BillingOperationRecord["status"]) {
-  if (status === "pending") return "已排队";
-  if (status === "running") return "执行中";
-  if (status === "dry_run") return "试算";
-  if (status === "partial_failed") return "部分失败";
-  if (status === "failed") return "失败";
-  return "已执行";
-}
-
-function billingStatusVariant(status: BillingOperationRecord["status"]) {
-  if (status === "applied") return "success";
-  if (status === "failed" || status === "partial_failed") return "danger";
-  return "warning";
-}
-
-function quotaReconciliationLabel(status: string) {
-  if (status === "healthy") return "一致";
-  if (status === "excess_upstream") return "上游多余额";
-  if (status === "deficit_upstream") return "上游少余额";
-  if (status === "manual_review") return "人工处置";
-  return "暂定数据";
-}
-
-function quotaReconciliationVariant(status: string) {
-  if (status === "healthy") return "success";
-  if (status === "deficit_upstream" || status === "manual_review") return "danger";
-  return "warning";
-}
-
-function quotaOperationVariant(state: string) {
-  if (state === "completed") return "success";
-  if (state === "manual_review" || state === "compensated") return "danger";
-  return "warning";
-}
-
-function billingSummaryText(operation: BillingOperationRecord) {
-  if (operation.status === "pending") return "后台任务已持久化，等待 worker 领取";
-  if (operation.status === "running") {
-    return `后台执行中${operation.attemptCount ? `，第 ${operation.attemptCount} 次尝试` : ""}`;
-  }
-  const summary = operation.summary ?? {};
-  if (operation.kind === "usage_sync") {
-    return `取回 ${summary.fetched ?? 0}，匹配 ${summary.matched ?? 0}，更新 ${summary.updated ?? 0}，记录 ${summary.recordsUpserted ?? 0}，异常 ${summary.issuesUpserted ?? 0}`;
-  }
-  if (operation.kind === "settings_update") {
-    return `默认额度 ${summary.previousDefaultMonthlyQuota ?? "-"} -> ${summary.defaultMonthlyQuota ?? "-"}${summary.usageSyncPolicyUpdated ? "，同步策略已更新" : ""}`;
-  }
-  return `计划 ${summary.planned ?? 0}，应用 ${summary.applied ?? 0}，失败 ${summary.failed ?? 0}`;
-}
-
-function usageSyncDraftSignature(draft: UsageSyncDraft) {
-  return JSON.stringify({
-    page: draft.page.trim(),
-    size: draft.size.trim(),
-    maxPages: draft.maxPages.trim(),
-    overlapMinutes: draft.overlapMinutes.trim(),
-    matchWindowMinutes: draft.matchWindowMinutes.trim(),
-  });
-}
-
-function monthlyResetDraftSignature(draft: MonthlyResetDraft) {
-  return JSON.stringify({
-    period: draft.period.trim(),
-    limit: draft.limit.trim(),
-  });
-}
-
 async function readJsonResponse<T>(res: Response): Promise<T & { error?: string }> {
   const text = await res.text();
   if (!text.trim()) return {} as T & { error?: string };
@@ -732,8 +494,6 @@ export function AdminClient() {
   const [departmentStats, setDepartmentStats] = useState<DepartmentStatsRow[]>([]);
   const [departmentQuotaData, setDepartmentQuotaData] =
     useState<DepartmentQuotaResponse | null>(null);
-  const [quotaControlData, setQuotaControlData] =
-    useState<QuotaControlResponse | null>(null);
   const [departmentPolicyDrafts, setDepartmentPolicyDrafts] = useState<
     Record<string, { quotaLimit: string; defaultGrantQuota: string }>
   >({});
@@ -744,8 +504,9 @@ export function AdminClient() {
     useState<"increase" | "reset">("increase");
   const [departmentQuotaRequestLimit, setDepartmentQuotaRequestLimit] = useState("");
   const [departmentQuotaRequestReason, setDepartmentQuotaRequestReason] = useState("");
-  const [prewarmKeysOnMemberSync, setPrewarmKeysOnMemberSync] = useState(false);
-  const [prewarmingDepartmentId, setPrewarmingDepartmentId] = useState<string | null>(null);
+  const [departmentMemberSyncOperations, setDepartmentMemberSyncOperations] = useState<
+    Record<string, DepartmentMemberSyncOperation>
+  >({});
   const [approvalRequests, setApprovalRequests] = useState<AdminTokenRequestRow[]>([]);
   const [approvalTotalRequests, setApprovalTotalRequests] = useState(0);
   const [usageRecords, setUsageRecords] = useState<UsageRecordRow[]>([]);
@@ -789,46 +550,17 @@ export function AdminClient() {
   const [panel, setPanel] = useState<AdminPanel>("overview");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [defaultQuotaDraft, setDefaultQuotaDraft] = useState("200");
+  const [packageResetDraft, setPackageResetDraft] = useState({
+    enabled: false,
+    dayOfMonth: "1",
+  });
   const [newapiControlDraft, setNewapiControlDraft] = useState({
     baseUrl: "",
     controlUserId: "",
     accessToken: "",
   });
-  const [usageSyncDraft, setUsageSyncDraft] = useState({
-    page: "0",
-    size: "100",
-    maxPages: "1",
-    overlapMinutes: "120",
-    matchWindowMinutes: "30",
-  } satisfies UsageSyncDraft);
-  const [usageSyncPolicyDraft, setUsageSyncPolicyDraft] = useState<UsageSyncPolicyDraft>({
-    enabled: true,
-    intervalMinutes: "60",
-    pageSize: "100",
-    maxPagesPerRun: "3",
-    overlapMinutes: "120",
-    settlementLagMinutes: "5",
-    matchWindowMinutes: "30",
-    retryBaseMinutes: "5",
-  });
-  const [quotaFeatureDraft, setQuotaFeatureDraft] = useState({
-    quotaLedgerShadowRead: true,
-    quotaSagaWritesEnabled: false,
-    keyRotationSagaEnabled: false,
-    quotaRestoreEnabled: false,
-    monthlyPeriodOpenEnabled: false,
-    reconciliationAutoDecreaseEnabled: false,
-  });
-  const [monthlyResetDraft, setMonthlyResetDraft] = useState({
-    period: currentBillingPeriod(),
-    limit: "",
-  } satisfies MonthlyResetDraft);
-  const [billingResult, setBillingResult] = useState<string | null>(null);
-  const [usageSyncOperationId, setUsageSyncOperationId] = useState<string | null>(null);
-  const [lastUsageSyncDryRunSignature, setLastUsageSyncDryRunSignature] = useState<string | null>(null);
-  const [lastUsageSyncDryRunSummary, setLastUsageSyncDryRunSummary] = useState<string | null>(null);
-  const [lastMonthlyResetDryRunSignature, setLastMonthlyResetDryRunSignature] = useState<string | null>(null);
-  const [lastMonthlyResetDryRunSummary, setLastMonthlyResetDryRunSummary] = useState<string | null>(null);
+  const [billingHealthData, setBillingHealthData] =
+    useState<BillingHealthResponse | null>(null);
   const [quotaDrafts, setQuotaDrafts] = useState<Record<string, string>>({});
   const [adminUsersPage, setAdminUsersPage] = useState(1);
   const [adminUsersPageSize, setAdminUsersPageSize] = useState(10);
@@ -848,6 +580,10 @@ export function AdminClient() {
       setData(body);
       if (body.settings) {
         setDefaultQuotaDraft(String(body.settings.defaultMonthlyQuota));
+        setPackageResetDraft({
+          enabled: body.settings.packageReset?.enabled ?? false,
+          dayOfMonth: String(body.settings.packageReset?.dayOfMonth ?? 1),
+        });
         if (body.settings.newapiControl) {
           setNewapiControlDraft((current) => ({
             ...current,
@@ -855,39 +591,6 @@ export function AdminClient() {
             controlUserId: body.settings?.newapiControl?.controlUserId ?? "",
             accessToken: "",
           }));
-        }
-        const policy = body.settings.usageSyncPolicy;
-        if (policy) {
-          setUsageSyncPolicyDraft({
-            enabled: Boolean(policy.enabled),
-            intervalMinutes: String(policy.intervalMinutes ?? 60),
-            pageSize: String(policy.pageSize ?? 100),
-            maxPagesPerRun: String(policy.maxPagesPerRun ?? 3),
-            overlapMinutes: String(policy.overlapMinutes ?? 120),
-            settlementLagMinutes: String(policy.settlementLagMinutes ?? 5),
-            matchWindowMinutes: String(policy.matchWindowMinutes ?? 30),
-            retryBaseMinutes: String(policy.retryBaseMinutes ?? 5),
-          });
-          setUsageSyncDraft((current) => ({
-            ...current,
-            size: String(policy.pageSize ?? current.size),
-            maxPages: String(policy.maxPagesPerRun ?? current.maxPages),
-            overlapMinutes: String(policy.overlapMinutes ?? current.overlapMinutes),
-            matchWindowMinutes: String(policy.matchWindowMinutes ?? current.matchWindowMinutes),
-          }));
-        }
-        const quotaFlags = body.settings.quotaFeatureFlags;
-        if (quotaFlags) {
-          setQuotaFeatureDraft({
-            quotaLedgerShadowRead: Boolean(quotaFlags.quotaLedgerShadowRead),
-            quotaSagaWritesEnabled: Boolean(quotaFlags.quotaSagaWritesEnabled),
-            keyRotationSagaEnabled: Boolean(quotaFlags.keyRotationSagaEnabled),
-            quotaRestoreEnabled: Boolean(quotaFlags.quotaRestoreEnabled),
-            monthlyPeriodOpenEnabled: Boolean(quotaFlags.monthlyPeriodOpenEnabled),
-            reconciliationAutoDecreaseEnabled: Boolean(
-              quotaFlags.reconciliationAutoDecreaseEnabled,
-            ),
-          });
         }
       }
       if (body.overview?.latestRequests) {
@@ -978,6 +681,25 @@ export function AdminClient() {
     }
   }, []);
 
+  const loadDepartmentMemberSyncOperations = useCallback(async () => {
+    const res = await fetch("/api/admin/departments/sync-members", {
+      cache: "no-store",
+    });
+    const body = await readJsonResponse<{
+      operations?: DepartmentMemberSyncOperation[];
+    }>(res);
+    if (!res.ok) throw new Error(body.error ?? "读取成员同步任务失败");
+    const latestByDepartment: Record<string, DepartmentMemberSyncOperation> = {};
+    for (const operation of body.operations ?? []) {
+      const departmentId = operation.input?.departmentId;
+      if (departmentId && !latestByDepartment[departmentId]) {
+        latestByDepartment[departmentId] = operation;
+      }
+    }
+    setDepartmentMemberSyncOperations(latestByDepartment);
+    return latestByDepartment;
+  }, []);
+
   const loadDepartmentQuota = useCallback(async () => {
     setPanelLoading(true);
     setError(null);
@@ -1003,7 +725,7 @@ export function AdminClient() {
           body.requests.map((quotaRequest) => [
             quotaRequest.id,
             current[quotaRequest.id] ??
-              String(quotaRequest.approvedQuotaLimit ?? quotaRequest.requestedQuotaLimit),
+              (quotaRequest.approvedQuotaLimit ?? quotaRequest.requestedQuotaLimit)?.toString() ?? "",
           ]),
         ),
         ...current,
@@ -1013,12 +735,13 @@ export function AdminClient() {
           (current) => current || String(body.departments[0].quotaLimit),
         );
       }
+      await loadDepartmentMemberSyncOperations();
     } catch (err) {
       setError(err instanceof Error ? err.message : "读取部门额度失败");
     } finally {
       setPanelLoading(false);
     }
-  }, []);
+  }, [loadDepartmentMemberSyncOperations]);
 
   const loadUsageRecords = useCallback(async (options: { quiet?: boolean } = {}) => {
     if (!options.quiet) setPanelLoading(true);
@@ -1094,44 +817,57 @@ export function AdminClient() {
     }
   }, [approvalPage, approvalPageSize]);
 
-  const loadQuotaControl = useCallback(async (observe = false) => {
+  const loadBillingHealth = useCallback(async () => {
     setPanelLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/admin/quota-control?observe=${observe}`, {
-        cache: "no-store",
-      });
-      const body = await readJsonResponse<QuotaControlResponse>(res);
-      if (!res.ok) throw new Error(body.error ?? "读取额度一致性中心失败");
-      setQuotaControlData(body);
-      if (observe) setMessage("已完成 NewAPI 余额双读，仅生成影子对账结论。");
+      const res = await fetch("/api/admin/billing-health", { cache: "no-store" });
+      const body = await readJsonResponse<BillingHealthResponse>(res);
+      if (!res.ok) throw new Error(body.error ?? "读取账务健康快照失败");
+      setBillingHealthData(body);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "读取额度一致性中心失败");
+      setError(err instanceof Error ? err.message : "读取账务健康快照失败");
     } finally {
       setPanelLoading(false);
     }
   }, []);
 
-  const runQuotaControlAction = useCallback(async (body: Record<string, string>) => {
-    setBusy(true);
-    setError(null);
-    setMessage(null);
-    try {
-      const res = await fetch("/api/admin/quota-control", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const response = await readJsonResponse<{ operation?: { id: string } }>(res);
-      if (!res.ok) throw new Error(response.error ?? "额度操作提交失败");
-      setMessage(`额度操作已受理${response.operation?.id ? `：${response.operation.id}` : ""}`);
-      await loadQuotaControl(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "额度操作提交失败");
-    } finally {
-      setBusy(false);
+  useEffect(() => {
+    if (panel !== "departmentQuota") return;
+    if (
+      !Object.values(departmentMemberSyncOperations).some((operation) =>
+        ["pending", "running"].includes(operation.status),
+      )
+    ) {
+      return;
     }
-  }, [loadQuotaControl]);
+    const activeDepartmentIds = Object.entries(departmentMemberSyncOperations)
+      .filter(([, operation]) => ["pending", "running"].includes(operation.status))
+      .map(([departmentId]) => departmentId);
+    const timer = window.setTimeout(() => {
+      void loadDepartmentMemberSyncOperations()
+        .then((next) => {
+          if (
+            activeDepartmentIds.some(
+              (departmentId) =>
+                next[departmentId] &&
+                !["pending", "running"].includes(next[departmentId].status),
+            )
+          ) {
+            void loadDepartmentQuota();
+          }
+        })
+        .catch((error) => {
+          setError(error instanceof Error ? error.message : "读取成员同步任务失败");
+        });
+    }, 2_000);
+    return () => window.clearTimeout(timer);
+  }, [
+    departmentMemberSyncOperations,
+    loadDepartmentMemberSyncOperations,
+    loadDepartmentQuota,
+    panel,
+  ]);
 
   useEffect(() => {
     void refresh();
@@ -1152,19 +888,26 @@ export function AdminClient() {
     if (panel === "departmentQuota") void loadDepartmentQuota();
     if (panel === "departmentStats" && isSystemAdmin) void loadDepartmentStats();
     if (panel === "usageRecords") void loadUsageRecords();
-    if (panel === "quotaControl") void loadQuotaControl(false);
+    if (
+      (panel === "billingAudit" || (panel === "systemHealth" && isRootAdmin)) &&
+      !billingHealthData
+    ) {
+      void loadBillingHealth();
+    }
     if (panel === "approvals") void loadApprovalRequests();
   }, [
     data?.authorized,
+    isRootAdmin,
     isSystemAdmin,
     loadApprovalRequests,
     loadAdminScopes,
     loadAdminUsers,
+    loadBillingHealth,
     loadDepartmentStats,
     loadDepartmentQuota,
-    loadQuotaControl,
     loadUsageRecords,
     loadUserStats,
+    billingHealthData,
     panel,
   ]);
 
@@ -1283,296 +1026,6 @@ export function AdminClient() {
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存 NewAPI 上游连接失败");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function saveUsageSyncPolicy() {
-    try {
-      const intervalMinutes = parseIntegerDraft(usageSyncPolicyDraft.intervalMinutes, "自动同步周期", {
-        min: 1,
-        max: 24 * 60,
-      });
-      const pageSize = parseIntegerDraft(usageSyncPolicyDraft.pageSize, "自动同步每页数量", {
-        min: 1,
-        max: 100,
-      });
-      const maxPagesPerRun = parseIntegerDraft(usageSyncPolicyDraft.maxPagesPerRun, "自动同步最大页数", {
-        min: 1,
-        max: 20,
-      });
-      const overlapMinutes = parseIntegerDraft(usageSyncPolicyDraft.overlapMinutes, "自动同步重叠窗口", {
-        min: 0,
-        max: 7 * 24 * 60,
-      });
-      const matchWindowMinutes = parseIntegerDraft(usageSyncPolicyDraft.matchWindowMinutes, "自动同步匹配窗口", {
-        min: 1,
-        max: 24 * 60,
-      });
-      const settlementLagMinutes = parseIntegerDraft(
-        usageSyncPolicyDraft.settlementLagMinutes,
-        "自动同步结算延迟",
-        { min: 0, max: 24 * 60 },
-      );
-      const retryBaseMinutes = parseIntegerDraft(
-        usageSyncPolicyDraft.retryBaseMinutes,
-        "自动同步重试基数",
-        { min: 1, max: 24 * 60 },
-      );
-
-      setBusy(true);
-      setError(null);
-      setMessage(null);
-      const res = await fetch("/api/admin/settings", {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          usageSyncPolicy: {
-            enabled: usageSyncPolicyDraft.enabled,
-            intervalMinutes,
-            pageSize,
-            maxPagesPerRun,
-            overlapMinutes,
-            settlementLagMinutes,
-            matchWindowMinutes,
-            retryBaseMinutes,
-          },
-        }),
-      });
-      const body = await readJsonResponse<AdminOverviewResponse>(res);
-      if (!res.ok) throw new Error(body.error ?? "保存自动同步策略失败");
-      setMessage("自动同步策略已保存。");
-      await refresh();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "保存自动同步策略失败");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function saveQuotaFeatureFlags() {
-    if (
-      !data?.settings?.quotaMigration &&
-      (quotaFeatureDraft.quotaSagaWritesEnabled ||
-        quotaFeatureDraft.keyRotationSagaEnabled ||
-        quotaFeatureDraft.quotaRestoreEnabled ||
-        quotaFeatureDraft.monthlyPeriodOpenEnabled ||
-        quotaFeatureDraft.reconciliationAutoDecreaseEnabled)
-    ) {
-      setError("历史额度账本迁移未登记，不能启用 F 阶段写功能");
-      return;
-    }
-    if (
-      !quotaFeatureDraft.quotaSagaWritesEnabled &&
-      (quotaFeatureDraft.keyRotationSagaEnabled ||
-        quotaFeatureDraft.quotaRestoreEnabled ||
-        quotaFeatureDraft.monthlyPeriodOpenEnabled ||
-        quotaFeatureDraft.reconciliationAutoDecreaseEnabled)
-    ) {
-      setError("启用具体额度动作前必须先启用统一 Saga 写入");
-      return;
-    }
-    if (
-      !window.confirm(
-        "确认保存 F 阶段功能开关？自动向上补额始终保持关闭；启用写功能前应完成影子对账。",
-      )
-    ) {
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    setMessage(null);
-    try {
-      const res = await fetch("/api/admin/settings", {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          quotaFeatureFlags: {
-            legacyAbsoluteQuotaWritesEnabled: false,
-            ...quotaFeatureDraft,
-            reconciliationAutoIncreaseEnabled: false,
-          },
-        }),
-      });
-      const body = await readJsonResponse<AdminOverviewResponse>(res);
-      if (!res.ok) throw new Error(body.error ?? "保存额度功能开关失败");
-      setMessage("F 阶段功能开关已保存；自动向上补额保持关闭。");
-      await Promise.all([refresh(), loadQuotaControl(false)]);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "保存额度功能开关失败");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function runUsageSync(dryRun: boolean) {
-    let acceptedOperationId: string | null = null;
-    let requestBusyReleased = false;
-    try {
-      const signature = usageSyncDraftSignature(usageSyncDraft);
-      const page = parseIntegerDraft(usageSyncDraft.page, "起始页", { min: 0 });
-      const size = parseIntegerDraft(usageSyncDraft.size, "每页数量", { min: 1, max: 100 });
-      const maxPages = parseIntegerDraft(usageSyncDraft.maxPages, "最大页数", { min: 1, max: 20 });
-      const overlapMinutes = parseIntegerDraft(usageSyncDraft.overlapMinutes, "重叠窗口", {
-        min: 0,
-        max: 7 * 24 * 60,
-      });
-      const matchWindowMinutes = parseIntegerDraft(usageSyncDraft.matchWindowMinutes, "匹配窗口", {
-        min: 1,
-        max: 24 * 60,
-      });
-      if (!dryRun && lastUsageSyncDryRunSignature !== signature) {
-        throw new Error("执行同步前必须先用相同参数完成一次试算同步");
-      }
-      if (
-        !dryRun &&
-        !window.confirm(
-          `确认把 NewAPI 日志回填到 TokenInside 使用记录？\n${lastUsageSyncDryRunSummary ?? ""}`,
-        )
-      ) {
-        return;
-      }
-
-      setBusy(true);
-      setError(null);
-      setMessage(null);
-      setBillingResult(null);
-      const res = await fetch("/api/admin/usage-sync", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          dryRun,
-          page,
-          size,
-          maxPages,
-          overlapMinutes,
-          matchWindowMinutes,
-        }),
-      });
-      const body = await readJsonResponse<UsageSyncAccepted>(res);
-      if (!res.ok) throw new Error(body.error ?? "同步 NewAPI 用量失败");
-      acceptedOperationId = body.operation.id;
-      setUsageSyncOperationId(body.operation.id);
-      setBusy(false);
-      requestBusyReleased = true;
-      setBillingResult(
-        `NewAPI 用量${dryRun ? "试算" : "同步"}已进入后台队列（${body.operation.id}）。`,
-      );
-      setMessage(body.deduplicated ? "已有相同用量同步任务，继续跟踪原任务。" : "用量同步任务已受理。" );
-
-      let completed: BillingOperationRecord | null = null;
-      for (let attempt = 0; attempt < 150; attempt += 1) {
-        const statusResponse = await fetch(
-          `/api/admin/billing-operations/${encodeURIComponent(body.operation.id)}`,
-          { cache: "no-store" },
-        );
-        const statusBody = await readJsonResponse<{ operation: BillingOperationRecord }>(
-          statusResponse,
-        );
-        if (!statusResponse.ok) {
-          throw new Error(statusBody.error ?? "读取用量同步任务状态失败");
-        }
-        if (["dry_run", "applied", "partial_failed", "failed"].includes(statusBody.operation.status)) {
-          completed = statusBody.operation;
-          break;
-        }
-        setBillingResult(
-          `NewAPI 用量${dryRun ? "试算" : "同步"}${billingStatusLabel(statusBody.operation.status)}（${statusBody.operation.id}）。`,
-        );
-        await new Promise<void>((resolve) => window.setTimeout(resolve, 2_000));
-      }
-
-      if (!completed) {
-        setMessage("用量同步仍在后台执行，可稍后在计费操作记录中查看结果。");
-        return;
-      }
-      const summary = billingSummaryText(completed);
-      setBillingResult(
-        `NewAPI 用量${dryRun ? "试算" : "同步"}${billingStatusLabel(completed.status)}：${summary}`,
-      );
-      if (completed.status === "failed") {
-        setError(completed.errorMessage ?? "NewAPI 用量同步失败");
-      } else if (completed.status === "partial_failed") {
-        setMessage("用量同步完成当前批次，剩余窗口将由持久化 checkpoint 续跑。");
-      } else {
-        setMessage(`NewAPI 用量${dryRun ? "试算" : "同步"}完成。`);
-      }
-      if (dryRun && completed.status === "dry_run") {
-        setLastUsageSyncDryRunSignature(signature);
-        setLastUsageSyncDryRunSummary(summary);
-      } else if (!dryRun) {
-        setLastUsageSyncDryRunSignature(null);
-        setLastUsageSyncDryRunSummary(null);
-      }
-      await Promise.all([refresh(), loadUsageRecords({ quiet: true })]);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "同步 NewAPI 用量失败");
-    } finally {
-      if (acceptedOperationId) {
-        setUsageSyncOperationId((current) =>
-          current === acceptedOperationId ? null : current,
-        );
-      }
-      if (!requestBusyReleased) setBusy(false);
-    }
-  }
-
-  async function runMonthlyReset(dryRun: boolean) {
-    try {
-      const signature = monthlyResetDraftSignature(monthlyResetDraft);
-      const period = monthlyResetDraft.period.trim();
-      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(period)) {
-        throw new Error("账期必须是 YYYY-MM");
-      }
-      const limit = monthlyResetDraft.limit.trim()
-        ? parseIntegerDraft(monthlyResetDraft.limit, "处理上限", { min: 1, max: 500 })
-        : undefined;
-      if (!dryRun && lastMonthlyResetDryRunSignature !== signature) {
-        throw new Error("执行月度开账前必须先用相同参数完成一次 preflight");
-      }
-      if (
-        !dryRun &&
-        !window.confirm(
-          `确认执行 ${period} 月度开账？\n${lastMonthlyResetDryRunSummary ?? ""}`,
-        )
-      ) {
-        return;
-      }
-
-      setBusy(true);
-      setError(null);
-      setMessage(null);
-      setBillingResult(null);
-      const res = await fetch("/api/admin/billing/monthly-reset", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          dryRun,
-          period,
-          limit,
-        }),
-      });
-      const body = await readJsonResponse<MonthlyResetResult>(res);
-      if (!res.ok) throw new Error(body.error ?? "月度开账失败");
-      const plannedUsers = body.departments.reduce((sum, item) => sum + item.users.length, 0);
-      const alreadyOpenedUsers = body.departments.reduce(
-        (sum, item) => sum + (item.alreadyOpenedUsers ?? 0),
-        0,
-      );
-      const summary = `部门 ${body.departments.length}，待开账用户 ${plannedUsers}，已开账跳过 ${alreadyOpenedUsers}，阻塞 ${body.blockers.length}，已受理操作 ${body.operations?.length ?? 0}`;
-      setBillingResult(`${body.period} 月度开账${dryRun ? " preflight" : "执行"}：${summary}`);
-      setMessage(`月度开账${dryRun ? " preflight" : "操作创建"}完成。`);
-      if (dryRun) {
-        setLastMonthlyResetDryRunSignature(signature);
-        setLastMonthlyResetDryRunSummary(summary);
-      } else {
-        setLastMonthlyResetDryRunSignature(null);
-        setLastMonthlyResetDryRunSummary(null);
-      }
-      await Promise.all([refresh(), loadAdminUsers(), loadUserStats()]);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "月度开账失败");
     } finally {
       setBusy(false);
     }
@@ -1707,8 +1160,14 @@ export function AdminClient() {
   }
 
   async function submitDepartmentQuotaRequest() {
-    const requestedQuotaLimit = Number(departmentQuotaRequestLimit);
-    if (!Number.isInteger(requestedQuotaLimit) || requestedQuotaLimit < 0) {
+    const requestedQuotaLimit =
+      departmentQuotaRequestAction === "increase"
+        ? Number(departmentQuotaRequestLimit)
+        : undefined;
+    if (
+      departmentQuotaRequestAction === "increase" &&
+      (!Number.isInteger(requestedQuotaLimit) || (requestedQuotaLimit ?? -1) < 0)
+    ) {
       setError("申请的部门额度上限必须是非负整数");
       return;
     }
@@ -1725,7 +1184,7 @@ export function AdminClient() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           action: departmentQuotaRequestAction,
-          requestedQuotaLimit,
+          ...(requestedQuotaLimit === undefined ? {} : { requestedQuotaLimit }),
           reason: departmentQuotaRequestReason.trim(),
         }),
       });
@@ -1778,44 +1237,64 @@ export function AdminClient() {
 
   async function syncDepartmentMembers(departmentId: string) {
     setBusy(true);
-    if (prewarmKeysOnMemberSync) setPrewarmingDepartmentId(departmentId);
     setError(null);
     setMessage(null);
     try {
       const res = await fetch("/api/admin/departments/sync-members", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ departmentId, prewarmKeys: prewarmKeysOnMemberSync }),
+        body: JSON.stringify({ departmentId }),
       });
       const body = await readJsonResponse<{
-        synced?: number;
-        skipped?: number;
-        prewarm?: {
-          eligible?: number;
-          prewarmed?: number;
-          skippedAfterRace?: number;
-          failed?: number;
-          capped?: boolean;
-          error?: string;
-        };
+        operation?: DepartmentMemberSyncOperation;
       }>(res);
-      if (!res.ok) throw new Error(body.error ?? "同步部门成员失败");
-      const syncNotice = `已同步 ${body.synced ?? 0} 位部门成员${body.skipped ? `，跳过 ${body.skipped} 条无 open_id 记录` : ""}`;
-      if (body.prewarm?.error) {
-        setMessage(`${syncNotice}。`);
-        setError(`成员同步成功，但 Key 预热失败：${body.prewarm.error}`);
-      } else if (body.prewarm) {
-        setMessage(
-          `${syncNotice}；新增预热 Key ${body.prewarm.prewarmed ?? 0} 个${body.prewarm.skippedAfterRace ? `，竞态跳过 ${body.prewarm.skippedAfterRace} 个` : ""}${body.prewarm.failed ? `，失败回收 ${body.prewarm.failed} 个` : ""}${body.prewarm.capped ? "，本批已达 100 个上限" : ""}。`,
-        );
-      } else {
-        setMessage(`${syncNotice}。`);
+      if (res.status !== 202 || !body.operation) {
+        throw new Error(body.error ?? "提交部门成员同步任务失败");
       }
-      await Promise.all([loadAdminUsers(), loadDepartmentQuota()]);
+      setDepartmentMemberSyncOperations((current) => ({
+        ...current,
+        [departmentId]: body.operation!,
+      }));
+      setMessage("已提交成员同步任务，后台将自动执行；本页会持续刷新任务状态。");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "同步部门成员失败");
+      setError(err instanceof Error ? err.message : "提交部门成员同步任务失败");
     } finally {
-      setPrewarmingDepartmentId(null);
+      setBusy(false);
+    }
+  }
+
+  async function savePackageReset() {
+    const dayOfMonth = Number(packageResetDraft.dayOfMonth);
+    if (!Number.isInteger(dayOfMonth) || dayOfMonth < 1 || dayOfMonth > 31) {
+      setError("套餐重置日必须在 1 到 31 日之间");
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/admin/settings", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          packageReset: {
+            enabled: packageResetDraft.enabled,
+            dayOfMonth,
+          },
+        }),
+      });
+      const body = await readJsonResponse<{ error?: string }>(res);
+      if (!res.ok) throw new Error(body.error ?? "保存套餐重置设置失败");
+      setMessage(
+        packageResetDraft.enabled
+          ? `套餐重置已启用，每月 ${dayOfMonth} 日自动执行。`
+          : "套餐重置已关闭。",
+      );
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存套餐重置设置失败");
+    } finally {
       setBusy(false);
     }
   }
@@ -1962,13 +1441,6 @@ export function AdminClient() {
   );
   const approvalPageCount = Math.max(Math.ceil(approvalTotalRequests / approvalPageSize), 1);
   const currentApprovalPage = Math.min(approvalPage, approvalPageCount);
-  const usageSyncReadyToExecute =
-    lastUsageSyncDryRunSignature === usageSyncDraftSignature(usageSyncDraft);
-  const monthlyResetReadyToExecute =
-    lastMonthlyResetDryRunSignature === monthlyResetDraftSignature(monthlyResetDraft);
-  const usageSyncPolicy = data?.settings?.usageSyncPolicy;
-  const usageSyncCheckpoint = data?.settings?.usageSyncCheckpoint;
-  const quotaPerUnit = quotaControlData?.quotaPerUnit ?? 500000;
 
   const loginInProgress = loading || (!data?.authenticated && busy);
 
@@ -2111,13 +1583,23 @@ export function AdminClient() {
                 使用记录
               </button>
               <button
-                className={panel === "quotaControl" ? "nav-item active nav-button" : "nav-item nav-button"}
+                className={panel === "billingAudit" ? "nav-item active nav-button" : "nav-item nav-button"}
                 type="button"
-                onClick={() => selectPanel("quotaControl")}
+                onClick={() => selectPanel("billingAudit")}
               >
-                <GaugeIcon data-icon="inline-start" />
-                额度一致性
+                <BookOpenIcon data-icon="inline-start" />
+                账务审计
               </button>
+              {isRootAdmin && (
+                <button
+                  className={panel === "systemHealth" ? "nav-item active nav-button" : "nav-item nav-button"}
+                  type="button"
+                  onClick={() => selectPanel("systemHealth")}
+                >
+                  <ShieldCheckIcon data-icon="inline-start" />
+                  系统健康
+                </button>
+              )}
               <button
                 className={panel === "approvals" ? "nav-item active nav-button" : "nav-item nav-button"}
                 type="button"
@@ -2385,71 +1867,89 @@ export function AdminClient() {
                                 <td>{user.latestProxyLogAt ? formatDateTime(user.latestProxyLogAt) : "-"}</td>
                                 <td>
                                   <div className="user-management-actions">
-                                    <div className="user-management-action-primary">
-                                      <div className="quota-control">
-                                        <Input
-                                          min={1}
-                                          step={1}
-                                          type="number"
-                                          value={quotaDrafts[user.id] ?? ""}
-                                          placeholder="额度"
-                                          onChange={(event) =>
-                                            setQuotaDrafts((current) => ({
-                                              ...current,
-                                              [user.id]: event.target.value,
-                                            }))
-                                          }
-                                          disabled={busy || user.status !== "active"}
-                                        />
-                                        <Button
-                                          variant="outline"
-                                          size="sm"
-                                          disabled={busy || user.status !== "active"}
-                                          onClick={() => void adjustUserQuota(user.id)}
-                                        >
-                                          分配
-                                        </Button>
-                                      </div>
-                                    </div>
-                                    <div className="user-management-status-actions">
-                                      {isSystemAdmin && (
-                                        <Button
-                                          variant="outline"
-                                          size="sm"
-                                          disabled={busy}
-                                          onClick={() => {
-                                            setAdminTargetOpenId(user.openId);
-                                            setAdminDepartmentId(user.departmentId ?? "");
-                                          }}
-                                        >
-                                          <UserCogIcon data-icon="inline-start" />
-                                          指派
-                                        </Button>
-                                      )}
-                                      {user.status === "disabled" ? (
-                                        <Button
-                                          variant="outline"
-                                          size="sm"
-                                          disabled={busy || user.activeTokenStatus !== "disabled"}
-                                          onClick={() => void enableUser(user)}
-                                        >
-                                          启用
-                                        </Button>
-                                      ) : (
-                                        <Button
-                                          variant="outline"
-                                          size="sm"
-                                          disabled={busy || user.status !== "active" || user.activeTokenStatus !== "active"}
-                                          onClick={() => void disableUser(user)}
-                                        >
-                                          禁用
-                                        </Button>
-                                      )}
-                                      <Button variant="outline" size="sm" disabled={busy} onClick={() => void deleteUser(user)}>
-                                        <Trash2Icon data-icon="inline-start" />
-                                        删除
-                                      </Button>
-                                    </div>
+                                    {!user.isGlobalAdmin || isRootAdmin ? (
+                                      <>
+                                        <div className="user-management-action-primary">
+                                          <div className="quota-control">
+                                            <Input
+                                              min={1}
+                                              step={1}
+                                              type="number"
+                                              value={quotaDrafts[user.id] ?? ""}
+                                              placeholder="额度"
+                                              onChange={(event) =>
+                                                setQuotaDrafts((current) => ({
+                                                  ...current,
+                                                  [user.id]: event.target.value,
+                                                }))
+                                              }
+                                              disabled={busy || user.status !== "active"}
+                                            />
+                                            <Button
+                                              variant="outline"
+                                              size="sm"
+                                              disabled={busy || user.status !== "active"}
+                                              onClick={() => void adjustUserQuota(user.id)}
+                                            >
+                                              分配
+                                            </Button>
+                                          </div>
+                                        </div>
+                                        <div className="user-management-status-actions">
+                                          {isSystemAdmin && (
+                                            <Button
+                                              variant="outline"
+                                              size="sm"
+                                              disabled={busy}
+                                              onClick={() => {
+                                                setAdminTargetOpenId(user.openId);
+                                                setAdminDepartmentId(user.departmentId ?? "");
+                                              }}
+                                            >
+                                              <UserCogIcon data-icon="inline-start" />
+                                              指派
+                                            </Button>
+                                          )}
+                                          {data?.user?.id !== user.id &&
+                                            (user.status === "disabled" ? (
+                                              <Button
+                                                variant="outline"
+                                                size="sm"
+                                                disabled={
+                                                  busy || user.activeTokenStatus !== "disabled"
+                                                }
+                                                onClick={() => void enableUser(user)}
+                                              >
+                                                启用
+                                              </Button>
+                                            ) : (
+                                              <Button
+                                                variant="outline"
+                                                size="sm"
+                                                disabled={
+                                                  busy ||
+                                                  user.status !== "active" ||
+                                                  user.activeTokenStatus !== "active"
+                                                }
+                                                onClick={() => void disableUser(user)}
+                                              >
+                                                禁用
+                                              </Button>
+                                            ))}
+                                          {data?.user?.id !== user.id && (
+                                            <Button
+                                              variant="outline"
+                                              size="sm"
+                                              disabled={busy}
+                                              onClick={() => void deleteUser(user)}
+                                            >
+                                              <Trash2Icon data-icon="inline-start" />
+                                              删除
+                                            </Button>
+                                          )}
+                                        </div>
+                                      </>
+                                    ) : null}
                                   </div>
                                 </td>
                               </tr>
@@ -2565,15 +2065,19 @@ export function AdminClient() {
                                   </td>
                                   <td>{formatDateTime(scope.updatedAt)}</td>
                                   <td>
-                                    <Button
-                                      variant="outline"
-                                      size="sm"
-                                      disabled={busy || !canCancel}
-                                      onClick={() => void cancelAdmin(scope)}
-                                    >
-                                      <XCircleIcon data-icon="inline-start" />
-                                      取消管理员
-                                    </Button>
+                                    {scope.scopeType !== "global" || isRootAdmin ? (
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={busy || !canCancel}
+                                        onClick={() => void cancelAdmin(scope)}
+                                      >
+                                        <XCircleIcon data-icon="inline-start" />
+                                        取消管理员
+                                      </Button>
+                                    ) : (
+                                      "-"
+                                    )}
                                   </td>
                                 </tr>
                               );
@@ -2613,15 +2117,6 @@ export function AdminClient() {
                     </Button>
                     <Badge>{departmentQuotaData?.period ?? currentBillingPeriod()}</Badge>
                     <Badge>{departmentQuotaData?.departments.length ?? 0} 个部门</Badge>
-                    <label className="prewarm-option">
-                      <input
-                        type="checkbox"
-                        checked={prewarmKeysOnMemberSync}
-                        disabled={panelLoading || busy}
-                        onChange={(event) => setPrewarmKeysOnMemberSync(event.target.checked)}
-                      />
-                      <span>同步后为无 Key 成员预热</span>
-                    </label>
                   </div>
                   {!departmentQuotaData?.departments.length ? (
                     <div className="empty">{panelLoading ? "读取部门额度中" : "暂无可管理的部门额度"}</div>
@@ -2641,7 +2136,7 @@ export function AdminClient() {
                         <thead>
                           <tr>
                             <th>部门</th>
-                            <th>成员 / 已发 Key / 已预热</th>
+                            <th>成员 / 已发 Key</th>
                             <th>总额度上限</th>
                             <th>已分配</th>
                             <th>预留</th>
@@ -2656,6 +2151,12 @@ export function AdminClient() {
                               quotaLimit: String(department.quotaLimit),
                               defaultGrantQuota: String(department.defaultGrantQuota),
                             };
+                            const syncOperation =
+                              departmentMemberSyncOperations[department.departmentId];
+                            const syncActive = Boolean(
+                              syncOperation &&
+                                ["pending", "running"].includes(syncOperation.status),
+                            );
                             return (
                               <tr key={department.departmentId}>
                                 <td>
@@ -2670,7 +2171,7 @@ export function AdminClient() {
                                   </div>
                                 </td>
                                 <td>
-                                  {department.memberCount} / {department.keyedUsers} / {department.prewarmedKeys}
+                                  {department.memberCount} / {department.keyedUsers}
                                 </td>
                                 <td>
                                   {isSystemAdmin ? (
@@ -2751,23 +2252,38 @@ export function AdminClient() {
                                   </div>
                                 </td>
                                 <td>
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    disabled={busy}
-                                    onClick={() => void syncDepartmentMembers(department.departmentId)}
-                                  >
-                                    {prewarmingDepartmentId === department.departmentId ? (
-                                      <LoaderCircleIcon className="spin-icon" data-icon="inline-start" />
-                                    ) : (
-                                      <RefreshCwIcon data-icon="inline-start" />
+                                  <div className="meta-stack">
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      disabled={busy || syncActive}
+                                      onClick={() => void syncDepartmentMembers(department.departmentId)}
+                                    >
+                                      {syncActive ? (
+                                        <LoaderCircleIcon className="spin-icon" data-icon="inline-start" />
+                                      ) : (
+                                        <RefreshCwIcon data-icon="inline-start" />
+                                      )}
+                                      {syncOperation?.status === "pending"
+                                        ? "任务已提交"
+                                        : syncOperation?.status === "running"
+                                          ? "同步中…"
+                                          : "同步成员"}
+                                    </Button>
+                                    {syncOperation && (
+                                      <span title={syncOperation.errorMessage}>
+                                        {syncOperation.status === "applied"
+                                          ? `已完成：同步 ${syncOperation.summary.synced ?? 0}，跳过 ${syncOperation.summary.skipped ?? 0}`
+                                          : syncOperation.status === "partial_failed"
+                                            ? "部分完成，需查看错误"
+                                            : syncOperation.status === "failed"
+                                              ? "同步失败"
+                                              : syncOperation.status === "running"
+                                                ? `后台执行中${syncOperation.summary.pages ? `（${syncOperation.summary.pages} 页）` : ""}`
+                                                : "等待后台执行"}
+                                      </span>
                                     )}
-                                    {prewarmingDepartmentId === department.departmentId
-                                      ? "正在预热…"
-                                      : prewarmKeysOnMemberSync
-                                        ? "同步并预热"
-                                        : "同步成员"}
-                                  </Button>
+                                  </div>
                                 </td>
                               </tr>
                             );
@@ -2784,7 +2300,7 @@ export function AdminClient() {
                   <CardHeader>
                     <CardTitle>申请调整部门总额度</CardTitle>
                     <CardDescription>
-                      申请固定发送给系统管理员。重置表示设置新的绝对上限，不会批量改写成员额度。
+                      申请固定发送给系统管理员。重置申请无需填写目标额度，由系统管理员审批时确定新的绝对上限。
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
@@ -2806,21 +2322,23 @@ export function AdminClient() {
                           <option value="reset">重置部门总额度</option>
                         </select>
                       </div>
+                      {departmentQuotaRequestAction === "increase" && (
+                        <div className="field">
+                          <label htmlFor="departmentQuotaRequestLimit">申请后的总额度上限</label>
+                          <Input
+                            id="departmentQuotaRequestLimit"
+                            min={0}
+                            max={1_000_000}
+                            step={1}
+                            type="number"
+                            value={departmentQuotaRequestLimit}
+                            disabled={busy}
+                            onChange={(event) => setDepartmentQuotaRequestLimit(event.target.value)}
+                          />
+                        </div>
+                      )}
                       <div className="field">
-                        <label htmlFor="departmentQuotaRequestLimit">申请后的总额度上限</label>
-                        <Input
-                          id="departmentQuotaRequestLimit"
-                          min={0}
-                          max={1_000_000}
-                          step={1}
-                          type="number"
-                          value={departmentQuotaRequestLimit}
-                          disabled={busy}
-                          onChange={(event) => setDepartmentQuotaRequestLimit(event.target.value)}
-                        />
-                      </div>
-                      <div className="field">
-                        <label htmlFor="departmentQuotaRequestReason">申请说明</label>
+                        <label htmlFor="departmentQuotaRequestReason">申请理由</label>
                         <Textarea
                           id="departmentQuotaRequestReason"
                           value={departmentQuotaRequestReason}
@@ -2832,7 +2350,9 @@ export function AdminClient() {
                       <div className="toolbar toolbar-left">
                         <Button disabled={busy} onClick={() => void submitDepartmentQuotaRequest()}>
                           <SendIcon data-icon="inline-start" />
-                          发送给系统管理员
+                          {departmentQuotaRequestAction === "reset"
+                            ? "申请重置额度"
+                            : "申请提高额度"}
                         </Button>
                       </div>
                     </div>
@@ -2886,7 +2406,9 @@ export function AdminClient() {
                                 <td>{quotaRequest.requesterName ?? maskSecret(quotaRequest.requesterOpenId)}</td>
                                 <td>{quotaRequest.action === "increase" ? "提高" : "重置"}</td>
                                 <td>
-                                  {formatQuotaAmount(quotaRequest.currentQuotaLimit, "0")} / {formatQuotaAmount(quotaRequest.requestedQuotaLimit, "0")}
+                                  {formatQuotaAmount(quotaRequest.currentQuotaLimit, "0")} / {quotaRequest.requestedQuotaLimit === undefined
+                                    ? "待系统管理员确定"
+                                    : formatQuotaAmount(quotaRequest.requestedQuotaLimit, "0")}
                                 </td>
                                 <td>
                                   {isSystemAdmin ? (
@@ -2898,7 +2420,7 @@ export function AdminClient() {
                                       type="number"
                                       value={
                                         departmentQuotaRequestDrafts[quotaRequest.id] ??
-                                        String(quotaRequest.requestedQuotaLimit)
+                                        (quotaRequest.requestedQuotaLimit?.toString() ?? "")
                                       }
                                       disabled={!decidable || busy}
                                       onChange={(event) =>
@@ -3267,286 +2789,35 @@ export function AdminClient() {
             </Card>
           )}
 
-          {panel === "quotaControl" && (
-            <div className="stack">
-              <Card>
-                <CardHeader>
-                  <CardTitle>额度一致性中心</CardTitle>
-                  <CardDescription>
-                    分离授权账本、NewAPI 消费事实和上游观测余额。未知负向漂移只告警，不自动补额。
-                  </CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <div className="toolbar toolbar-left">
-                    <Button
-                      variant="outline"
-                      disabled={panelLoading || busy}
-                      onClick={() => void loadQuotaControl(false)}
-                    >
-                      <RefreshCwIcon data-icon="inline-start" />
-                      重建影子快照
-                    </Button>
-                    <Button
-                      variant="outline"
-                      disabled={panelLoading || busy}
-                      onClick={() => void loadQuotaControl(true)}
-                    >
-                      <GaugeIcon data-icon="inline-start" />
-                      双读上游余额
-                    </Button>
-                    <Badge>
-                      账期 {quotaControlData?.report.period ?? currentBillingPeriod()}
-                    </Badge>
-                    <Badge variant={quotaControlData?.settings.quotaMigration ? "success" : "warning"}>
-                      {quotaControlData?.settings.quotaMigration ? "历史迁移已登记" : "历史迁移未登记"}
-                    </Badge>
-                  </div>
-                  <div className="metric-grid">
-                    <div className="metric-card">
-                      <span>影子用户</span>
-                      <strong>{quotaControlData?.report.totals.users ?? 0}</strong>
-                    </div>
-                    <div className="metric-card">
-                      <span>一致</span>
-                      <strong>{quotaControlData?.report.totals.healthy ?? 0}</strong>
-                    </div>
-                    <div className="metric-card">
-                      <span>上游多余额</span>
-                      <strong>{quotaControlData?.report.totals.excessUpstream ?? 0}</strong>
-                    </div>
-                    <div className="metric-card">
-                      <span>上游少余额</span>
-                      <strong>{quotaControlData?.report.totals.deficitUpstream ?? 0}</strong>
-                    </div>
-                    <div className="metric-card">
-                      <span>暂定数据</span>
-                      <strong>{quotaControlData?.report.totals.provisional ?? 0}</strong>
-                    </div>
-                  </div>
-                  <div className="toolbar toolbar-left">
-                    {Object.entries(quotaControlData?.settings.quotaFeatureFlags ?? {}).map(
-                      ([name, enabled]) => (
-                        <Badge key={name} variant={enabled ? "success" : "warning"}>
-                          {name}: {enabled ? "on" : "off"}
-                        </Badge>
-                      ),
-                    )}
-                  </div>
-                  <p className="field-description">
-                    settledThrough：
-                    {quotaControlData?.report.settledThrough
-                      ? formatDateTime(quotaControlData.report.settledThrough)
-                      : "尚无稳定水位"}
-                    {quotaControlData?.settings.quotaMigration
-                      ? `；迁移估算用户 ${quotaControlData.settings.quotaMigration.estimatedUsers}/${quotaControlData.settings.quotaMigration.users}`
-                      : ""}
-                  </p>
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader>
-                  <CardTitle>用户额度勾稽</CardTitle>
-                  <CardDescription>A 授权策略、G 净授权、C 权威消费、E 预期可用、R 上游观测。</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  {!quotaControlData?.report.rows.length ? (
-                    <div className="empty">暂无额度影子数据</div>
-                  ) : (
-                    <div className="table-wrap">
-                      <table className="table">
-                        <thead>
-                          <tr>
-                            <th>用户</th>
-                            <th>A</th>
-                            <th>G</th>
-                            <th>C</th>
-                            <th>E</th>
-                            <th>R</th>
-                            <th>差额</th>
-                            <th>generation</th>
-                            <th>结论</th>
-                            <th>操作</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {quotaControlData.report.rows.map((row) => (
-                            <tr key={row.feishuUserId}>
-                              <td>{row.userName ?? maskSecret(row.feishuUserId)}</td>
-                              <td>{formatQuotaAmount(row.assignedMonthlyQuota / quotaPerUnit, "0")}</td>
-                              <td>{formatQuotaAmount(row.authorizedQuota / quotaPerUnit, "0")}</td>
-                              <td>{formatQuotaAmount(row.authoritativeConsumedQuota / quotaPerUnit, "0")}</td>
-                              <td>{formatQuotaAmount(row.expectedAvailableQuota / quotaPerUnit, "0")}</td>
-                              <td>
-                                {row.observedRemainQuota === undefined
-                                  ? "-"
-                                  : formatQuotaAmount(row.observedRemainQuota / quotaPerUnit, "0")}
-                              </td>
-                              <td>
-                                {row.delta === undefined
-                                  ? "-"
-                                  : formatQuotaAmount(row.delta / quotaPerUnit, "0")}
-                              </td>
-                              <td>{row.activeGeneration}</td>
-                              <td>
-                                <Badge variant={quotaReconciliationVariant(row.status)}>
-                                  {quotaReconciliationLabel(row.status)}
-                                </Badge>
-                              </td>
-                              <td>
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  disabled={
-                                    busy ||
-                                    row.status !== "excess_upstream" ||
-                                    !row.observedStable ||
-                                    !row.tokenAccountId
-                                  }
-                                  onClick={() =>
-                                    void runQuotaControlAction({
-                                      action: "reconcile_decrease",
-                                      feishuUserId: row.feishuUserId,
-                                    })
-                                  }
-                                >
-                                  安全向下校准
-                                </Button>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader>
-                  <CardTitle>Saga 操作中心</CardTitle>
-                  <CardDescription>统一查看调额、Key 更换、余额恢复、月度开账和对账状态。</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  {!quotaControlData?.operations.length ? (
-                    <div className="empty">暂无额度操作</div>
-                  ) : (
-                    <div className="table-wrap">
-                      <table className="table">
-                        <thead>
-                          <tr>
-                            <th>操作</th>
-                            <th>类型</th>
-                            <th>用户</th>
-                            <th>状态</th>
-                            <th>代际</th>
-                            <th>尝试</th>
-                            <th>错误</th>
-                            <th>更新时间</th>
-                            <th>操作</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {quotaControlData.operations.map((operation) => (
-                            <tr key={operation.id}>
-                              <td>{maskSecret(operation.id)}</td>
-                              <td>{operation.operationType}</td>
-                              <td>{maskSecret(operation.feishuUserId)}</td>
-                              <td>
-                                <Badge variant={quotaOperationVariant(operation.state)}>
-                                  {operation.state}
-                                </Badge>
-                              </td>
-                              <td>{operation.operationGeneration}</td>
-                              <td>{operation.attemptCount}</td>
-                              <td>{operation.lastErrorMessage ? maskSecret(operation.lastErrorMessage) : "-"}</td>
-                              <td>{formatDateTime(operation.updatedAt)}</td>
-                              <td>
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  disabled={
-                                    busy ||
-                                    (operation.state !== "retryable_failed" &&
-                                      operation.state !== "draining")
-                                  }
-                                  onClick={() =>
-                                    void runQuotaControlAction({
-                                      action: "retry",
-                                      operationId: operation.id,
-                                    })
-                                  }
-                                >
-                                  重试
-                                </Button>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader>
-                  <CardTitle>不可变授权账本</CardTitle>
-                  <CardDescription>纠错通过反向分录完成；普通更新或删除会被数据库拒绝。</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  {!quotaControlData?.ledgerEntries.length ? (
-                    <div className="empty">当前账期暂无账本分录</div>
-                  ) : (
-                    <div className="table-wrap">
-                      <table className="table">
-                        <thead>
-                          <tr>
-                            <th>用户</th>
-                            <th>分录类型</th>
-                            <th>额度</th>
-                            <th>估算</th>
-                            <th>operation</th>
-                            <th>时间</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {quotaControlData.ledgerEntries.map((entry) => (
-                            <tr key={entry.id}>
-                              <td>{maskSecret(entry.feishuUserId)}</td>
-                              <td>{entry.entryType}</td>
-                              <td>{formatQuotaAmount(entry.quotaValue, "0")}</td>
-                              <td>
-                                <Badge variant={entry.estimated ? "warning" : "success"}>
-                                  {entry.estimated ? "估算" : "已确认"}
-                                </Badge>
-                              </td>
-                              <td>{maskSecret(entry.operationId)}</td>
-                              <td>{formatDateTime(entry.createdAt)}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
-            </div>
+          {panel === "billingAudit" && (
+            <BillingAuditPanel
+              data={billingHealthData}
+              loading={panelLoading}
+              onRefresh={() => void loadBillingHealth()}
+            />
           )}
 
+          {panel === "systemHealth" && isRootAdmin && (
+            <SystemHealthPanel
+              data={billingHealthData}
+              loading={panelLoading}
+              onRefresh={() => void loadBillingHealth()}
+            />
+          )}
           {panel === "settings" && isSystemAdmin && (
             <Card>
               <CardHeader>
                 <CardTitle>系统设置</CardTitle>
-                <CardDescription>默认额度和全局设置只允许系统管理员修改。</CardDescription>
+                <CardDescription>
+                  只保留稳定业务配置；消费采集、重试和账期任务由后台按固定安全策略运行。
+                </CardDescription>
               </CardHeader>
               <CardContent>
-                {billingResult && <div className="alert">{billingResult}</div>}
                 {isRootAdmin && (
                   <section className="settings-section">
                     <div>
                       <h3>NewAPI 上游连接</h3>
-                      <p>仅 root 可修改。保存后代理、Key 管理和用量同步会统一切换。</p>
+                      <p>仅 root 可修改。保存后代理、Key 管理和后台消费采集会统一使用新配置。</p>
                     </div>
                     <div className="field-group">
                       <div className="field">
@@ -3611,10 +2882,11 @@ export function AdminClient() {
                     </div>
                   </section>
                 )}
+
                 <section className="settings-section">
                   <div>
-                    <h3>默认额度</h3>
-                    <p>新申请、调额基准和月度重置会使用该值。</p>
+                    <h3>默认申请额度</h3>
+                    <p>新申请、首次授权和后续额度调整会以该值作为默认建议。</p>
                   </div>
                   <div className="field">
                     <label htmlFor="defaultMonthlyQuota">默认申请额度</label>
@@ -3647,442 +2919,66 @@ export function AdminClient() {
 
                 <section className="settings-section">
                   <div>
-                    <h3>NewAPI 用量同步</h3>
-                    <p>从 NewAPI 日志回填 tokens、额度消耗和渠道字段。</p>
-                    <span className="field-description">
-                      上次同步：{usageSyncCheckpoint?.lastRunAt ? formatDateTime(usageSyncCheckpoint.lastRunAt) : "-"}
-                      {" · "}
-                      下次同步：{usageSyncCheckpoint?.nextRunAfter ? formatDateTime(usageSyncCheckpoint.nextRunAfter) : "-"}
-                      {" · "}
-                      最近日志：{usageSyncCheckpoint?.lastSeenNewapiLogId ? maskSecret(usageSyncCheckpoint.lastSeenNewapiLogId) : "-"}
-                      {" · "}
-                      稳定水位：{usageSyncCheckpoint?.settledThrough ? formatDateTime(usageSyncCheckpoint.settledThrough) : "-"}
-                      {" · "}
-                      固定窗口：{usageSyncCheckpoint?.scanStart ? formatDateTime(usageSyncCheckpoint.scanStart) : "-"}
-                      {" → "}
-                      {usageSyncCheckpoint?.scanEnd ? formatDateTime(usageSyncCheckpoint.scanEnd) : "-"}
-                    </span>
+                    <h3>套餐重置</h3>
+                    <p>按香港时区在选定日期更新所有有效用户的套餐额度。</p>
                   </div>
-                  <div className="billing-control-grid">
-                    <label className="field">
-                      <span>自动同步</span>
-                      <input
-                        type="checkbox"
-                        checked={usageSyncPolicyDraft.enabled}
+                  <div className="settings-reset-controls">
+                    <div className="settings-inline-control">
+                      <div>
+                        <label htmlFor="packageResetEnabled">自动重置</label>
+                        <span className="field-description">
+                          {packageResetDraft.enabled ? "已启用" : "已关闭"}
+                        </span>
+                      </div>
+                      <Switch
+                        id="packageResetEnabled"
+                        checked={packageResetDraft.enabled}
                         disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setUsageSyncPolicyDraft((current) => ({
+                        onCheckedChange={(enabled: boolean) =>
+                          setPackageResetDraft((current) => ({ ...current, enabled }))
+                        }
+                      />
+                    </div>
+                    <div className="field settings-reset-day-field">
+                      <label htmlFor="packageResetDay">重置日</label>
+                      <Select
+                        value={packageResetDraft.dayOfMonth}
+                        disabled={!data?.authorized || busy}
+                        onValueChange={(dayOfMonth: string) =>
+                          setPackageResetDraft((current) => ({
                             ...current,
-                            enabled: event.target.checked,
+                            dayOfMonth,
                           }))
                         }
-                      />
-                    </label>
-                    <div className="field">
-                      <label htmlFor="usageSyncPolicyInterval">同步周期(分钟)</label>
-                      <Input
-                        id="usageSyncPolicyInterval"
-                        min={1}
-                        max={1440}
-                        step={1}
-                        type="number"
-                        value={usageSyncPolicyDraft.intervalMinutes}
-                        disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setUsageSyncPolicyDraft((current) => ({
-                            ...current,
-                            intervalMinutes: event.target.value,
-                          }))
-                        }
-                      />
+                      >
+                        <SelectTrigger id="packageResetDay" aria-label="选择套餐重置日">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {Array.from({ length: 31 }, (_, index) => {
+                            const day = String(index + 1);
+                            return (
+                              <SelectItem key={day} value={day}>
+                                每月 {day} 日
+                              </SelectItem>
+                            );
+                          })}
+                        </SelectContent>
+                      </Select>
+                      <span className="field-description">
+                        {packageResetDraft.enabled && data?.settings?.packageReset?.nextResetAt
+                          ? `下次执行：${formatDateTime(data.settings.packageReset.nextResetAt)}`
+                          : "自动重置关闭时不会执行。"}
+                      </span>
                     </div>
-                    <div className="field">
-                      <label htmlFor="usageSyncPolicyPageSize">每页数量</label>
-                      <Input
-                        id="usageSyncPolicyPageSize"
-                        min={1}
-                        max={100}
-                        step={1}
-                        type="number"
-                        value={usageSyncPolicyDraft.pageSize}
-                        disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setUsageSyncPolicyDraft((current) => ({
-                            ...current,
-                            pageSize: event.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div className="field">
-                      <label htmlFor="usageSyncPolicyMaxPages">每轮页数</label>
-                      <Input
-                        id="usageSyncPolicyMaxPages"
-                        min={1}
-                        max={20}
-                        step={1}
-                        type="number"
-                        value={usageSyncPolicyDraft.maxPagesPerRun}
-                        disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setUsageSyncPolicyDraft((current) => ({
-                            ...current,
-                            maxPagesPerRun: event.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div className="field">
-                      <label htmlFor="usageSyncPolicyOverlap">重叠窗口(分钟)</label>
-                      <Input
-                        id="usageSyncPolicyOverlap"
-                        min={0}
-                        max={10080}
-                        step={1}
-                        type="number"
-                        value={usageSyncPolicyDraft.overlapMinutes}
-                        disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setUsageSyncPolicyDraft((current) => ({
-                            ...current,
-                            overlapMinutes: event.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div className="field">
-                      <label htmlFor="usageSyncPolicyMatchWindow">匹配窗口(分钟)</label>
-                      <Input
-                        id="usageSyncPolicyMatchWindow"
-                        min={1}
-                        max={1440}
-                        step={1}
-                        type="number"
-                        value={usageSyncPolicyDraft.matchWindowMinutes}
-                        disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setUsageSyncPolicyDraft((current) => ({
-                            ...current,
-                            matchWindowMinutes: event.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div className="field">
-                      <label htmlFor="usageSyncPolicySettlementLag">结算延迟(分钟)</label>
-                      <Input
-                        id="usageSyncPolicySettlementLag"
-                        min={0}
-                        max={1440}
-                        step={1}
-                        type="number"
-                        value={usageSyncPolicyDraft.settlementLagMinutes}
-                        disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setUsageSyncPolicyDraft((current) => ({
-                            ...current,
-                            settlementLagMinutes: event.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div className="field">
-                      <label htmlFor="usageSyncPolicyRetryBase">失败重试基数(分钟)</label>
-                      <Input
-                        id="usageSyncPolicyRetryBase"
-                        min={1}
-                        max={1440}
-                        step={1}
-                        type="number"
-                        value={usageSyncPolicyDraft.retryBaseMinutes}
-                        disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setUsageSyncPolicyDraft((current) => ({
-                            ...current,
-                            retryBaseMinutes: event.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                  </div>
-                  <div className="toolbar toolbar-left">
-                    <Button variant="outline" size="sm" disabled={!data?.authorized || busy} onClick={() => void saveUsageSyncPolicy()}>
-                      <SaveIcon data-icon="inline-start" />
-                      保存自动同步
-                    </Button>
-                    <Badge variant={usageSyncPolicy?.enabled ? "success" : "warning"}>
-                      {usageSyncPolicy?.enabled ? "自动同步已开启" : "自动同步未开启"}
-                    </Badge>
-                    {usageSyncCheckpoint?.lastRunStatus && (
-                      <Badge variant={billingStatusVariant(usageSyncCheckpoint.lastRunStatus)}>
-                        {billingStatusLabel(usageSyncCheckpoint.lastRunStatus)}
-                      </Badge>
-                    )}
-                  </div>
-                  <div>
-                    <h3>手动同步</h3>
-                    <p>试算确认后把 NewAPI 日志写入 source records 并回填请求额度消耗。</p>
-                  </div>
-                  <div className="billing-control-grid">
-                    <div className="field">
-                      <label htmlFor="usageSyncPage">起始页</label>
-                      <Input
-                        id="usageSyncPage"
-                        min={0}
-                        step={1}
-                        type="number"
-                        value={usageSyncDraft.page}
-                        disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setUsageSyncDraft((current) => ({ ...current, page: event.target.value }))
-                        }
-                      />
-                    </div>
-                    <div className="field">
-                      <label htmlFor="usageSyncSize">每页数量</label>
-                      <Input
-                        id="usageSyncSize"
-                        min={1}
-                        max={100}
-                        step={1}
-                        type="number"
-                        value={usageSyncDraft.size}
-                        disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setUsageSyncDraft((current) => ({ ...current, size: event.target.value }))
-                        }
-                      />
-                    </div>
-                    <div className="field">
-                      <label htmlFor="usageSyncMaxPages">最大页数</label>
-                      <Input
-                        id="usageSyncMaxPages"
-                        min={1}
-                        max={20}
-                        step={1}
-                        type="number"
-                        value={usageSyncDraft.maxPages}
-                        disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setUsageSyncDraft((current) => ({ ...current, maxPages: event.target.value }))
-                        }
-                      />
-                    </div>
-                    <div className="field">
-                      <label htmlFor="usageSyncOverlap">重叠窗口(分钟)</label>
-                      <Input
-                        id="usageSyncOverlap"
-                        min={0}
-                        max={10080}
-                        step={1}
-                        type="number"
-                        value={usageSyncDraft.overlapMinutes}
-                        disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setUsageSyncDraft((current) => ({ ...current, overlapMinutes: event.target.value }))
-                        }
-                      />
-                    </div>
-                    <div className="field">
-                      <label htmlFor="usageSyncWindow">匹配窗口(分钟)</label>
-                      <Input
-                        id="usageSyncWindow"
-                        min={1}
-                        max={1440}
-                        step={1}
-                        type="number"
-                        value={usageSyncDraft.matchWindowMinutes}
-                        disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setUsageSyncDraft((current) => ({
-                            ...current,
-                            matchWindowMinutes: event.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                  </div>
-                  <div className="toolbar toolbar-left">
                     <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={!data?.authorized || busy || Boolean(usageSyncOperationId)}
-                      onClick={() => void runUsageSync(true)}
-                    >
-                      <RefreshCwIcon data-icon="inline-start" />
-                      试算同步
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={
-                        !data?.authorized ||
-                        busy ||
-                        Boolean(usageSyncOperationId) ||
-                        !usageSyncReadyToExecute
-                      }
-                      title={usageSyncReadyToExecute ? "执行同步" : "请先用相同参数试算同步"}
-                      onClick={() => void runUsageSync(false)}
-                    >
-                      <ShieldCheckIcon data-icon="inline-start" />
-                      执行同步
-                    </Button>
-                  </div>
-                </section>
-
-                <section className="settings-section">
-                  <div>
-                    <h3>Asia/Hong_Kong 月度开账</h3>
-                    <p>先校验用户策略、部门预算、同步水位和未结操作；任何部门不足时整批阻塞。</p>
-                  </div>
-                  <div className="billing-control-grid">
-                    <div className="field">
-                      <label htmlFor="monthlyResetPeriod">目标账期</label>
-                      <Input
-                        id="monthlyResetPeriod"
-                        value={monthlyResetDraft.period}
-                        disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setMonthlyResetDraft((current) => ({ ...current, period: event.target.value }))
-                        }
-                      />
-                    </div>
-                    <div className="field">
-                      <label htmlFor="monthlyResetLimit">处理上限</label>
-                      <Input
-                        id="monthlyResetLimit"
-                        min={1}
-                        max={500}
-                        step={1}
-                        type="number"
-                        placeholder="全部"
-                        value={monthlyResetDraft.limit}
-                        disabled={!data?.authorized || busy}
-                        onChange={(event) =>
-                          setMonthlyResetDraft((current) => ({ ...current, limit: event.target.value }))
-                        }
-                      />
-                    </div>
-                  </div>
-                  <div className="toolbar toolbar-left">
-                    <Button variant="outline" size="sm" disabled={!data?.authorized || busy} onClick={() => void runMonthlyReset(true)}>
-                      <RefreshCwIcon data-icon="inline-start" />
-                      开账 preflight
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={!data?.authorized || busy || !monthlyResetReadyToExecute}
-                      title={monthlyResetReadyToExecute ? "执行开账" : "请先用相同参数完成开账 preflight"}
-                      onClick={() => void runMonthlyReset(false)}
-                    >
-                      <ShieldCheckIcon data-icon="inline-start" />
-                      执行开账
-                    </Button>
-                  </div>
-                </section>
-
-                <section className="settings-section">
-                  <div>
-                    <h3>F 阶段功能开关</h3>
-                    <p>写能力依赖历史账本迁移和统一 Saga；自动向上补额固定关闭且不可在界面开启。</p>
-                    <span className="field-description">
-                      迁移状态：
-                      {data?.settings?.quotaMigration
-                        ? `${data.settings.quotaMigration.period}，${data.settings.quotaMigration.estimatedUsers}/${data.settings.quotaMigration.users} 个用户为估算 opening`
-                        : "未登记"}
-                    </span>
-                  </div>
-                  <div className="billing-control-grid">
-                    {(
-                      [
-                        ["quotaLedgerShadowRead", "影子账本读取"],
-                        ["quotaSagaWritesEnabled", "统一 Saga 写入"],
-                        ["keyRotationSagaEnabled", "Key 更换"],
-                        ["quotaRestoreEnabled", "恢复可用额度"],
-                        ["monthlyPeriodOpenEnabled", "月度开账"],
-                        ["reconciliationAutoDecreaseEnabled", "自动向下校准"],
-                      ] as const
-                    ).map(([key, label]) => (
-                      <label className="field" key={key}>
-                        <span>{label}</span>
-                        <input
-                          type="checkbox"
-                          checked={quotaFeatureDraft[key]}
-                          disabled={!data?.authorized || busy}
-                          onChange={(event) =>
-                            setQuotaFeatureDraft((current) => ({
-                              ...current,
-                              [key]: event.target.checked,
-                            }))
-                          }
-                        />
-                      </label>
-                    ))}
-                    <div className="field" data-disabled>
-                      <span>自动向上补额</span>
-                      <input type="checkbox" checked={false} disabled />
-                      <span className="field-description">长期固定关闭；未知负向漂移进入人工处置。</span>
-                    </div>
-                  </div>
-                  <div className="toolbar toolbar-left">
-                    <Button
-                      variant="outline"
-                      size="sm"
+                      className="settings-reset-save"
                       disabled={!data?.authorized || busy}
-                      onClick={() => void saveQuotaFeatureFlags()}
+                      onClick={() => void savePackageReset()}
                     >
                       <SaveIcon data-icon="inline-start" />
-                      保存 F 开关
+                      保存套餐重置
                     </Button>
-                    <Badge variant={data?.settings?.quotaMigration ? "success" : "warning"}>
-                      {data?.settings?.quotaMigration ? "迁移门禁满足" : "迁移门禁未满足"}
-                    </Badge>
-                  </div>
-                </section>
-
-                <section className="settings-section">
-                  <div>
-                    <h3>计费操作</h3>
-                    <p>最近 50 次计费同步和重置操作会持久化到设置审计中。</p>
-                  </div>
-                  <div className="table-wrap table-scroll billing-operation-table">
-                    <table className="table">
-                      <thead>
-                        <tr>
-                          <th>时间</th>
-                          <th>类型</th>
-                          <th>状态</th>
-                          <th>账期</th>
-                          <th>摘要</th>
-                          <th>操作者</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {!(data?.settings?.billingOperations ?? []).length ? (
-                          <tr>
-                            <td colSpan={6} className="usage-empty-cell">
-                              暂无计费操作
-                            </td>
-                          </tr>
-                        ) : (
-                          (data?.settings?.billingOperations ?? []).slice(0, 50).map((operation) => (
-                            <tr key={operation.id} title={operation.errorMessage ?? undefined}>
-                              <td>{formatDateTime(operation.createdAt)}</td>
-                              <td>{billingKindLabel(operation.kind)}</td>
-                              <td>
-                                <Badge variant={billingStatusVariant(operation.status)}>
-                                  {billingStatusLabel(operation.status)}
-                                </Badge>
-                              </td>
-                              <td>{operation.period ?? "-"}</td>
-                              <td>{billingSummaryText(operation)}</td>
-                              <td>{maskSecret(operation.operatedByFeishuUserId) ?? "-"}</td>
-                            </tr>
-                          ))
-                        )}
-                      </tbody>
-                    </table>
                   </div>
                 </section>
               </CardContent>

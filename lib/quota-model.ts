@@ -9,6 +9,7 @@ export const QUOTA_TIME_ZONE = "Asia/Hong_Kong";
 const terminalOperationStates = new Set<QuotaOperationState>([
   "completed",
   "compensated",
+  "cancelled",
   "manual_review",
 ]);
 
@@ -25,41 +26,45 @@ export function normalizeQuota(value: number, field = "quota") {
 
 export function calculateQuotaAdjustment(input: {
   observedRemainBefore: number;
-  assignedQuotaBefore: number;
+  authorizedQuotaBefore: number;
+  authoritativeConsumedQuota: number;
   assignedQuotaAfter: number;
 }) {
   const observedRemainBefore = normalizeQuota(
     input.observedRemainBefore,
     "observedRemainBefore",
   );
-  const assignedQuotaBefore = normalizeQuota(input.assignedQuotaBefore, "assignedQuotaBefore");
+  const authorizedQuotaBefore = normalizeQuota(
+    input.authorizedQuotaBefore,
+    "authorizedQuotaBefore",
+  );
+  const authoritativeConsumedQuota = normalizeQuota(
+    input.authoritativeConsumedQuota,
+    "authoritativeConsumedQuota",
+  );
   const assignedQuotaAfter = normalizeQuota(input.assignedQuotaAfter, "assignedQuotaAfter");
-  const targetRemainQuota = Math.max(
-    observedRemainBefore + assignedQuotaAfter - assignedQuotaBefore,
+  // Authorization history is exclusively local. NewAPI remain_quota is only
+  // an execution projection and must never influence the immutable ledger
+  // delta. The projection may apply the explicitly approved delta, but it may
+  // neither repair a pre-existing upstream deficit nor exceed local G - C.
+  const deltaAuthorizedQuota = assignedQuotaAfter - authorizedQuotaBefore;
+  const expectedAvailableQuota = Math.max(
+    assignedQuotaAfter - authoritativeConsumedQuota,
     0,
   );
+  const overageQuota = Math.max(
+    authoritativeConsumedQuota - assignedQuotaAfter,
+    0,
+  );
+  const targetRemainQuota = Math.min(
+    expectedAvailableQuota,
+    Math.max(observedRemainBefore + deltaAuthorizedQuota, 0),
+  );
   return {
     targetRemainQuota,
-    deltaAuthorizedQuota: targetRemainQuota - observedRemainBefore,
-  };
-}
-
-export function calculateQuotaRestore(input: {
-  observedRemainBefore: number;
-  assignedMonthlyQuota: number;
-}) {
-  const observedRemainBefore = normalizeQuota(
-    input.observedRemainBefore,
-    "observedRemainBefore",
-  );
-  const assignedMonthlyQuota = normalizeQuota(
-    input.assignedMonthlyQuota,
-    "assignedMonthlyQuota",
-  );
-  const targetRemainQuota = Math.max(observedRemainBefore, assignedMonthlyQuota);
-  return {
-    targetRemainQuota,
-    grantDelta: targetRemainQuota - observedRemainBefore,
+    deltaAuthorizedQuota,
+    expectedAvailableQuota,
+    overageQuota,
   };
 }
 
@@ -80,16 +85,14 @@ export function calculateFirstProvision(input: {
     input.authoritativeConsumedQuota,
     "authoritativeConsumedQuota",
   );
-  const authorizationDelta = Math.max(
-    assignedMonthlyQuota - authorizedQuotaBefore,
-    0,
-  );
+  // First provision can also be a re-provision after access deletion. The
+  // immutable ledger survives deletion, so the opening entry must align G to
+  // the newly approved policy in both directions instead of silently keeping
+  // a larger historical authorization.
+  const authorizationDelta = assignedMonthlyQuota - authorizedQuotaBefore;
   return {
     authorizationDelta,
-    targetRemainQuota: Math.max(
-      authorizedQuotaBefore + authorizationDelta - authoritativeConsumedQuota,
-      0,
-    ),
+    targetRemainQuota: Math.max(assignedMonthlyQuota - authoritativeConsumedQuota, 0),
   };
 }
 
@@ -235,11 +238,8 @@ export function hongKongBillingPeriod(date = new Date()) {
   return `${datePart(date, "year")}-${datePart(date, "month")}`;
 }
 
-export function initialUnassignedMonthlyQuota(input: {
-  defaultMonthlyQuota: number;
-  quotaMigrationApplied: boolean;
-}) {
-  return input.quotaMigrationApplied ? 0 : Math.max(input.defaultMonthlyQuota, 0);
+export function initialUnassignedMonthlyQuota() {
+  return 0;
 }
 
 export function resolveUsageBillingPeriod(input: {

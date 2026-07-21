@@ -1,8 +1,15 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireAdminScope } from "@/lib/admin";
-import { getScopedTokenRequest, updateTokenRequest } from "@/lib/store";
-import { tokenRequestAllowsQuotaEdit } from "@/lib/token-request-policy";
+import { getConfig } from "@/lib/config";
+import {
+  QuotaSubmissionError,
+  updatePostgresTokenRequestQuotaAsActor,
+} from "@/lib/quota-operation-submit";
+import {
+  JsonQuotaSubmissionError,
+  updateJsonTokenRequestQuotaAsActor,
+} from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,25 +25,36 @@ export async function PATCH(
   const auth = await requireAdminScope();
   if (auth.error) return auth.error;
 
-  const { id } = await params;
-  const tokenRequest = await getScopedTokenRequest(auth.scope, id);
-  if (!tokenRequest) {
-    return NextResponse.json({ error: "申请单不存在或不在当前管理范围内" }, { status: 404 });
-  }
-
-  if (!tokenRequestAllowsQuotaEdit(tokenRequest)) {
-    return NextResponse.json(
-      { error: "当前记录不是可修改额度的审批申请" },
-      { status: 409 },
-    );
-  }
-
   const parsed = quotaSchema.safeParse(await request.json());
   if (!parsed.success) {
     return NextResponse.json({ error: "最终额度必须是正整数" }, { status: 400 });
   }
-  const updated = await updateTokenRequest(tokenRequest.id, {
-    approvedMonthlyQuota: parsed.data.approvedMonthlyQuota,
-  });
+  const { id } = await params;
+  let updated;
+  try {
+    updated =
+      getConfig().storeBackend === "postgres"
+        ? await updatePostgresTokenRequestQuotaAsActor({
+            actorUserId: auth.user.id,
+            requestId: id,
+            approvedMonthlyQuota: parsed.data.approvedMonthlyQuota,
+          })
+        : await updateJsonTokenRequestQuotaAsActor({
+            actorUserId: auth.user.id,
+            requestId: id,
+            approvedMonthlyQuota: parsed.data.approvedMonthlyQuota,
+          });
+  } catch (error) {
+    if (
+      error instanceof QuotaSubmissionError ||
+      error instanceof JsonQuotaSubmissionError
+    ) {
+      return NextResponse.json(
+        { error: error.message, code: error.code },
+        { status: error.status },
+      );
+    }
+    throw error;
+  }
   return NextResponse.json({ request: updated });
 }

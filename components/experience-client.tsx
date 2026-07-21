@@ -1,7 +1,7 @@
 "use client";
 
 import Image from "next/image";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BarChart3Icon,
   CheckCircle2Icon,
@@ -55,6 +55,7 @@ import {
 
 type SessionResponse = {
   authenticated: boolean;
+  workspaceAccess?: "application_only" | "provisioning" | "active";
   baseUrl: string;
   settings?: {
     defaultMonthlyQuota: number;
@@ -138,6 +139,7 @@ type UsageRecordsResponse = {
   };
   modelStats?: UsageAggregateRow[];
   apiFormatStats?: UsageAggregateRow[];
+  usageOverview?: SessionResponse["billingPeriod"];
   error?: string;
 };
 
@@ -198,11 +200,8 @@ const statusLabel: Record<string, string> = {
 
 const requestTypeLabel: Record<string, string> = {
   first_apply: "首次申请",
-  quota_reset: "恢复可用额度",
-  quota_restore: "恢复可用额度",
   key_reset: "Key 更换",
   quota_adjust: "额度调整",
-  monthly_reset: "月度开账",
 };
 
 function badgeVariant(status?: string) {
@@ -320,7 +319,6 @@ export function ExperienceClient() {
   const [key, setKey] = useState<string | null>(null);
   const [quotaOperation, setQuotaOperation] = useState<SelfQuotaOperation | null>(null);
   const [reason, setReason] = useState("");
-  const [quotaResetReason, setQuotaResetReason] = useState("");
   const [quickApprovalQuotaDrafts, setQuickApprovalQuotaDrafts] = useState<Record<string, string>>({});
   const [panel, setPanel] = useState<WorkspacePanel>("account");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -328,6 +326,8 @@ export function ExperienceClient() {
   const [error, setError] = useState<string | null>(null);
   const [feishuSdkReady, setFeishuSdkReady] = useState(false);
   const [autoLoginAttempted, setAutoLoginAttempted] = useState(false);
+  const usageFetchAbortRef = useRef<AbortController | null>(null);
+  const usageRefreshInFlightRef = useRef(false);
   const shouldAutoRefreshTokenRequests = Boolean(
     session?.authenticated &&
       !session.activeToken &&
@@ -390,6 +390,11 @@ export function ExperienceClient() {
 
   const loadUsageRecords = useCallback(async (options: { quiet?: boolean } = {}) => {
     if (!session?.activeToken) return;
+    if (options.quiet && usageRefreshInFlightRef.current) return;
+    if (!options.quiet) usageFetchAbortRef.current?.abort();
+    const controller = new AbortController();
+    usageFetchAbortRef.current = controller;
+    usageRefreshInFlightRef.current = true;
     if (!options.quiet) setUsageLoading(true);
     setError(null);
     try {
@@ -403,13 +408,26 @@ export function ExperienceClient() {
       appendUsageParam(params, "apiFormat", usageFilters.apiFormat);
       appendUsageParam(params, "status", usageFilters.status);
       appendUsageParam(params, "userAgent", usageFilters.userAgent);
-      const res = await fetch(`/api/usage-records?${params.toString()}`, { cache: "no-store" });
+      const res = await fetch(`/api/usage-records?${params.toString()}`, {
+        cache: "no-store",
+        signal: controller.signal,
+      });
       const data = (await res.json()) as UsageRecordsResponse;
       if (!res.ok) throw new Error(data.error ?? "读取使用记录失败");
       setUsageRecords(data.records);
       setUsageTotalRecords(data.total ?? data.records.length);
       setUsageModelStats(data.modelStats ?? []);
       setUsageApiFormatStats(data.apiFormatStats ?? []);
+      if ("usageOverview" in data) {
+        setSession((current) =>
+          current
+            ? {
+                ...current,
+                billingPeriod: data.usageOverview ?? null,
+              }
+            : current,
+        );
+      }
       if (data.filters) {
         setUsageFilterOptions({
           models: data.filters.models ?? [],
@@ -418,9 +436,14 @@ export function ExperienceClient() {
         });
       }
     } catch (err) {
+      if (controller.signal.aborted) return;
       setError(err instanceof Error ? err.message : "读取使用记录失败");
     } finally {
-      if (!options.quiet) setUsageLoading(false);
+      if (usageFetchAbortRef.current === controller) {
+        usageFetchAbortRef.current = null;
+        usageRefreshInFlightRef.current = false;
+        if (!options.quiet) setUsageLoading(false);
+      }
     }
   }, [
     session?.activeToken,
@@ -531,7 +554,7 @@ export function ExperienceClient() {
             (operation.operationType === "key_rotation" ||
               operation.operationType === "first_provision") &&
             (operation.credentialPendingDelivery ||
-              !["completed", "compensated", "manual_review"].includes(operation.state)),
+              !["completed", "compensated", "cancelled", "manual_review"].includes(operation.state)),
         );
         if (resumable) setQuotaOperation(resumable);
       })
@@ -543,7 +566,7 @@ export function ExperienceClient() {
 
   useEffect(() => {
     if (!quotaOperation) return;
-    if (["compensated", "manual_review"].includes(quotaOperation.state)) return;
+    if (["compensated", "cancelled", "manual_review"].includes(quotaOperation.state)) return;
     let cancelled = false;
     let timer: number | undefined;
     const poll = async () => {
@@ -554,6 +577,7 @@ export function ExperienceClient() {
         const body = (await res.json().catch(() => ({}))) as {
           operation?: SelfQuotaOperation;
           key?: string;
+          deliveryToken?: string;
           error?: string;
         };
         if (!res.ok) throw new Error(body.error ?? "读取额度操作失败");
@@ -576,6 +600,31 @@ export function ExperienceClient() {
                 ? "首次发放已完成，Key 已展示。"
                 : "Key 更换已完成，新 Key 已展示。旧 Key 已失效。",
             );
+          }
+          if (body.deliveryToken) {
+            let acknowledged = false;
+            for (const delayMs of [0, 200, 1_000]) {
+              if (delayMs > 0) {
+                await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+              }
+              const acknowledgement = await fetch(
+                `/api/quota-operations/${encodeURIComponent(quotaOperation.id)}`,
+                {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({ deliveryToken: body.deliveryToken }),
+                },
+              ).catch(() => null);
+              if (acknowledgement?.ok) {
+                acknowledged = true;
+                break;
+              }
+            }
+            if (!acknowledged) {
+              setMessage(
+                "Key 已安全展示，但交付确认暂未写入；请保留本页，系统会在下次刷新时再次交付同一 Key。",
+              );
+            }
           }
           await refresh();
           return;
@@ -623,16 +672,45 @@ export function ExperienceClient() {
 
   useEffect(() => {
     if (panel !== "usage" || !session?.activeToken || !usageAutoRefresh) return;
-    const timer = window.setInterval(() => {
-      void loadUsageRecords({ quiet: true });
-    }, 3000);
-    return () => window.clearInterval(timer);
+    let cancelled = false;
+    let polling = false;
+    let timer: number | undefined;
+    const schedule = () => {
+      if (cancelled) return;
+      timer = window.setTimeout(() => void poll(), 3000);
+    };
+    const poll = async () => {
+      if (cancelled || polling) return;
+      polling = true;
+      try {
+        if (document.visibilityState === "visible") {
+          await loadUsageRecords({ quiet: true });
+        }
+      } finally {
+        polling = false;
+        schedule();
+      }
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== "visible" || polling) return;
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = undefined;
+      void poll();
+    };
+    schedule();
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
   }, [loadUsageRecords, panel, session?.activeToken, usageAutoRefresh]);
 
   const requests = useMemo(() => session?.requests ?? [], [session]);
   const latestRequest = requests[0];
   const hasActiveToken = Boolean(session?.activeToken);
-  const title = hasActiveToken ? "用户后台" : "套餐申请";
+  const isAdminWorkspace = Boolean(session?.adminScope);
+  const title = hasActiveToken || isAdminWorkspace ? "用户后台" : "套餐申请";
   const effectiveGrantQuota = session?.settings?.defaultMonthlyQuota ?? FALLBACK_MONTHLY_QUOTA;
   const currentBillingPeriod = session?.billingPeriod ?? null;
   const currentBillingPeriodName =
@@ -753,28 +831,6 @@ export function ExperienceClient() {
       setMessage("Key 更换已受理，旧 Key 已停止接收新请求，系统正在排空在途请求并执行切换校验。");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Key 更换失败");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function requestQuotaReset() {
-    setBusy(true);
-    setError(null);
-    setMessage(null);
-    try {
-      const res = await fetch("/api/token/quota-reset", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ reason: quotaResetReason.trim() }),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.error ?? "提交额度恢复申请失败");
-      setQuotaResetReason("");
-      setMessage(body.notice ?? "恢复可用额度申请已提交。");
-      await refresh();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "提交额度恢复申请失败");
     } finally {
       setBusy(false);
     }
@@ -902,7 +958,11 @@ export function ExperienceClient() {
                 onClick={() => selectPanel("account")}
               >
                 <KeyRoundIcon data-icon="inline-start" />
-                {hasActiveToken ? "账户密钥" : title}
+                {hasActiveToken
+                  ? "账户密钥"
+                  : isAdminWorkspace
+                    ? "Key 发放状态"
+                    : title}
               </button>
               {hasActiveToken && (
                 <>
@@ -1121,7 +1181,38 @@ export function ExperienceClient() {
           )}
 
           {!hasActiveToken ? (
-            <>
+            session?.adminScope ? (
+              <Card>
+                <CardHeader>
+                  <CardTitle>管理员 Key 自动发放</CardTitle>
+                  <CardDescription>
+                    管理员用户后台已经开放；系统正在通过持久账务任务自动创建专属 Key。
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="toolbar toolbar-left">
+                    <Badge
+                      variant={
+                        latestRequest?.status === "approved_provision_failed"
+                          ? "danger"
+                          : "default"
+                      }
+                    >
+                      {latestRequest?.status === "approved_provision_failed"
+                        ? "发放失败，等待 root 检查"
+                        : session.workspaceAccess === "provisioning"
+                          ? "Key 发放中"
+                          : "等待自动发放"}
+                    </Badge>
+                    <span className="field-description">
+                      发放完成后，本页会自动切换到账户密钥与用量功能。
+                    </span>
+                  </div>
+                  <RequestHistoryList requests={requests} />
+                </CardContent>
+              </Card>
+            ) : (
+              <>
               <Card>
                 <CardHeader>
                   <CardTitle>申请套餐</CardTitle>
@@ -1167,7 +1258,8 @@ export function ExperienceClient() {
                   <RequestHistoryList requests={requests} />
                 </CardContent>
               </Card>
-            </>
+              </>
+            )
           ) : (
             <>
               {panel === "account" && (
@@ -1248,50 +1340,6 @@ export function ExperienceClient() {
 
               {panel === "usage" && (
                 <div className="stack">
-                  <section className="grid">
-                    <Card>
-                      <CardHeader>
-                        <CardTitle>恢复可用额度</CardTitle>
-                        <CardDescription>
-                          {session?.adminScope?.type === "department"
-                            ? "部门管理员的个人恢复请求会发送给系统管理员；通过后仅补足低于授权线的差额。"
-                            : "提交后按组织审批链路发送；通过后仅补足低于授权线的差额，不返还已消费额度。"}
-                        </CardDescription>
-                      </CardHeader>
-                      <CardContent>
-                        <div className="field-group">
-                          <div className="field">
-                            <label htmlFor="quotaResetAmount">授权恢复线</label>
-                            <Input
-                              id="quotaResetAmount"
-                              value={String(effectiveGrantQuota)}
-                              disabled
-                            />
-                            <span className="field-description">实际新增额度会受部门剩余预算约束。</span>
-                          </div>
-                          <div className="field">
-                            <label htmlFor="quotaResetReason">申请理由</label>
-                            <Textarea
-                              id="quotaResetReason"
-                              placeholder="请说明额度用尽原因、当前业务场景和预期恢复时间。"
-                              value={quotaResetReason}
-                              onChange={(event) => setQuotaResetReason(event.target.value)}
-                              disabled={busy}
-                            />
-                          </div>
-                          <Button
-                            variant="outline"
-                            disabled={busy || quotaResetReason.trim().length < 4}
-                            onClick={() => void requestQuotaReset()}
-                          >
-                            <RefreshCwIcon data-icon="inline-start" />
-                            申请恢复可用额度
-                          </Button>
-                        </div>
-                      </CardContent>
-                    </Card>
-                  </section>
-
                   <Card>
                     <CardHeader>
                       <div className="usage-section-header">

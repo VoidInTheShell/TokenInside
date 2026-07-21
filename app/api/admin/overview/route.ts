@@ -1,9 +1,15 @@
 import { NextResponse } from "next/server";
-import { getEffectiveAdminScopeForUser, hydrateUserDepartment } from "@/lib/admin-sync";
 import { getConfig } from "@/lib/config";
+import {
+  nextPackageResetAt,
+  normalizePackageResetPolicy,
+} from "@/lib/package-reset";
 import { getCurrentUser } from "@/lib/session";
-import { getAdminOverview, getAdminOverviewMetadata } from "@/lib/store";
-import { ensureUsageSyncScheduler } from "@/lib/usage-sync";
+import {
+  getAdminOverview,
+  getAdminOverviewMetadata,
+  getAdminScopeForKnownUser,
+} from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,35 +23,40 @@ function settingsForScope<
   T extends Awaited<ReturnType<typeof getAdminOverviewMetadata>>["settings"],
 >(
   settings: T,
-  scope: Awaited<ReturnType<typeof getEffectiveAdminScopeForUser>>,
+  scope: Awaited<ReturnType<typeof getAdminScopeForKnownUser>>,
 ) {
-  const { newapiControl, ...settingsWithoutSecret } = settings;
+  const { newapiControl } = settings;
   const fallback = getConfig().newapi;
-  const withRootNewApi = scope?.role === "root"
-    ? {
-        ...settingsWithoutSecret,
-        newapiControl: {
-          baseUrl: newapiControl?.baseUrl ?? fallback.baseUrl,
-          controlUserId: newapiControl?.controlUserId ?? fallback.controlUserId,
-          accessTokenConfigured: Boolean(
-            newapiControl?.accessTokenCiphertext ||
-              fallback.accessToken ||
-              fallback.adminAccessToken ||
-              fallback.systemAk,
-          ),
-          source: newapiControl ? "system_settings" : "environment",
-          updatedAt: newapiControl?.updatedAt,
-        },
-      }
-    : settingsWithoutSecret;
-  if (scope?.scopeType === "global") return withRootNewApi;
-  const { billingOperations: _billingOperations, ...visibleSettings } = withRootNewApi;
-  return visibleSettings;
+  const packageReset = normalizePackageResetPolicy(settings.packageReset);
+  const nextResetAt = nextPackageResetAt(packageReset);
+  return {
+    defaultMonthlyQuota: settings.defaultMonthlyQuota,
+    packageReset: {
+      ...packageReset,
+      nextResetAt: nextResetAt?.toISOString(),
+    },
+    updatedAt: settings.updatedAt,
+    ...(scope?.role === "root"
+      ? {
+          newapiControl: {
+            baseUrl: newapiControl?.baseUrl ?? fallback.baseUrl,
+            controlUserId: newapiControl?.controlUserId ?? fallback.controlUserId,
+            accessTokenConfigured: Boolean(
+              newapiControl?.accessTokenCiphertext ||
+                fallback.accessToken ||
+                fallback.adminAccessToken ||
+                fallback.systemAk,
+            ),
+            source: newapiControl ? "system_settings" : "environment",
+            updatedAt: newapiControl?.updatedAt,
+          },
+        }
+      : {}),
+  };
 }
 
 export async function GET(request: Request) {
-  void ensureUsageSyncScheduler().catch(() => undefined);
-  const user = await hydrateUserDepartment(await getCurrentUser());
+  const user = await getCurrentUser();
   if (!user) {
     return NextResponse.json(
       {
@@ -57,7 +68,7 @@ export async function GET(request: Request) {
     );
   }
 
-  const scope = await getEffectiveAdminScopeForUser(user);
+  const scope = await getAdminScopeForKnownUser(user);
   if (!scope) {
     return NextResponse.json(
       {
@@ -95,11 +106,6 @@ export async function GET(request: Request) {
       departmentName: user.departmentName,
     },
     overview,
-    settings: settingsForScope(
-      scope.scopeType === "global"
-        ? { ...metadata.settings, usageSyncCheckpoint: metadata.usageSyncCheckpoint }
-        : metadata.settings,
-      scope,
-    ),
+    settings: settingsForScope(metadata.settings, scope),
   });
 }

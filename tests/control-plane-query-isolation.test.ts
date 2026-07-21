@@ -9,6 +9,7 @@ const postgresQueriesPath = new URL(
 );
 const sessionRoutePath = new URL("../app/api/session/route.ts", import.meta.url);
 const overviewRoutePath = new URL("../app/api/admin/overview/route.ts", import.meta.url);
+const experienceClientPath = new URL("../components/experience-client.tsx", import.meta.url);
 
 function functionBody(source: string, startMarker: string, endMarker: string) {
   const start = source.indexOf(startMarker);
@@ -234,5 +235,24 @@ test("usage reports filter, aggregate and paginate inside the isolated control q
   assert.match(querySource, /aggregate_rows as materialized/);
   assert.match(querySource, /limit \$\{query\.limitParameter\} offset \$\{query\.offsetParameter\}/);
   assert.match(querySource, /count\(\*\)::integer from filtered/);
+  assert.match(querySource, /from user_billing_periods billing/);
+  assert.match(querySource, /as usage_overview/);
+  assert.match(querySource, /usageOverview: row\.usage_overview \?\? null/);
   assert.doesNotMatch(querySource, /readPostgresStore|readStore\(/);
+});
+
+test("user usage polling refreshes records and overview together without overlapping hidden-tab work", async () => {
+  const source = await readFile(experienceClientPath, "utf8");
+  const loader = functionBody(
+    source,
+    "const loadUsageRecords = useCallback(",
+    "const loadQuickApprovals = useCallback(",
+  );
+
+  assert.match(loader, /usageRefreshInFlightRef\.current/);
+  assert.match(loader, /signal: controller\.signal/);
+  assert.match(loader, /billingPeriod: data\.usageOverview \?\? null/);
+  assert.match(source, /document\.visibilityState === "visible"/);
+  assert.match(source, /window\.setTimeout\(\(\) => void poll\(\), 3000\)/);
+  assert.doesNotMatch(source, /window\.setInterval\(\(\) => \{\s*void loadUsageRecords/);
 });

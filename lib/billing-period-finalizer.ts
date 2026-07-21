@@ -1,4 +1,7 @@
-import { getConfig } from "./config.ts";
+import {
+  effectiveBillingMaterializationConcurrencyMax,
+  getConfig,
+} from "./config.ts";
 
 type ReconcileBillingPeriod = (feishuUserId: string, period: string) => Promise<void>;
 
@@ -240,7 +243,7 @@ function createPostgresBillingPeriodFinalizer() {
     {
       isEnabled: () => getConfig().storeBackend === "postgres",
       unrefTimers: true,
-      maxConcurrency: () => getConfig().billing.materializationConcurrencyMax,
+      maxConcurrency: () => effectiveBillingMaterializationConcurrencyMax(getConfig()),
     },
   );
 }

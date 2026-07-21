@@ -74,9 +74,20 @@ async function createQuotaSagaChunk(input: {
     },
     "@/lib/quota-guard": {
       assertQuotaWriteActionEnabled: async () => undefined,
-      getQuotaFeatureFlags: async () => ({ quotaSagaWritesEnabled: false }),
+      quotaWritesPaused: () => false,
     },
     "@/lib/store": {
+      findQuotaOperationById: async (operationId: string) => ({
+        id: operationId,
+        feishuUserId: `user-${operationId}`,
+        state: "planned",
+        operationType: "quota_adjust",
+        attemptCount: 0,
+      }),
+      withUserQuotaOperationLock: async (
+        _feishuUserId: string,
+        fn: () => Promise<unknown>,
+      ) => fn(),
       claimQuotaOperationExecution: async ({
         operationId,
       }: {
@@ -93,6 +104,7 @@ async function createQuotaSagaChunk(input: {
       },
       renewQuotaOperationExecution: async () => undefined,
       releaseQuotaOperationExecution: async () => undefined,
+      listDueQuotaOperations: async () => [],
     },
     "@/lib/quota-saga-state": {
       canAutoResumeKeyRotationObservationFailure: () => false,

@@ -19,6 +19,7 @@ import {
   upstreamMaxAttemptsForMethod,
 } from "@/lib/proxy-retry";
 import { syncNewApiUsageForProxyRequest } from "@/lib/usage-sync";
+import { isUsageRecordRequest } from "@/lib/usage-record-visibility";
 import {
   createSseUsageCollector,
   extractUsageFromJson,
@@ -38,6 +39,7 @@ import {
   QuotaOperationBusyError,
   StaleTokenGenerationError,
 } from "@/lib/quota-admission";
+import { resolveProxyRuntimeBinding } from "@/lib/proxy-runtime-binding-gate";
 import type { FeishuUser, ProxyRequestLog, TokenAccount } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -639,6 +641,10 @@ async function proxy(request: Request, context: RouteContext) {
   const requestUrl = new URL(request.url);
   const rawRequestPath = `/v1/${rawPath.join("/")}${requestUrl.search}`;
   const requestPath = `/v1/${path.join("/")}${requestUrl.search}`;
+  const requiresUsageSettlement = isUsageRecordRequest({
+    method: request.method,
+    requestPath,
+  });
   const unsupported = getSupportedProxyError(request.method, path);
 
   if (unsupported) {
@@ -668,6 +674,26 @@ async function proxy(request: Request, context: RouteContext) {
       requestId,
     });
   }
+
+  const binding = await resolveProxyRuntimeBinding(() =>
+    buildNewApiProxyUrl(path, requestUrl.search)
+  );
+  if (!binding.ready) {
+    console.error(JSON.stringify({
+      event: "tokeninside.proxy.greenfield_binding_unavailable",
+      requestId,
+      errorMessage: sanitizedErrorMessage(binding.error),
+    }));
+    return buildProxyErrorResponse({
+      status: 503,
+      message: "TokenInside 绿地上游绑定暂不可用，请联系系统管理员",
+      code: "greenfield_binding_unavailable",
+      requestId,
+      retryable: true,
+      retryAfterSeconds: 2,
+    });
+  }
+  const upstreamUrl = binding.value;
 
   let releaseUpstreamSlot: (() => void) | undefined;
   try {
@@ -757,7 +783,7 @@ async function proxy(request: Request, context: RouteContext) {
       userAgent: userAgent ?? undefined,
       clientIp,
       clientFamily: detectClientFamily(userAgent),
-      usageSettlementStatus: "pending",
+      usageSettlementStatus: requiresUsageSettlement ? "pending" : "not_applicable",
       usageSettlementAttempts: 0,
       usageSettlementImmediateAttempts: 0,
       usageSettlementScanAttempts: 0,
@@ -868,7 +894,6 @@ async function proxy(request: Request, context: RouteContext) {
   };
   const stopRequestHeartbeat = startProxyLeaseHeartbeat(proxyLog.id);
 
-  const upstreamUrl = await buildNewApiProxyUrl(path, requestUrl.search);
   try {
     const retryConfig = getConfig().proxy;
     const upstreamResult = await fetchUpstreamWithRetry(
@@ -947,7 +972,7 @@ async function proxy(request: Request, context: RouteContext) {
       upstreamHeadersMs,
       responseTimeUpdatedAt: upstreamResponseReceivedAt,
       ...newApiResponseRequestIdPatch(newapiResponseRequestId),
-      usageSettlementStatus: "pending",
+      usageSettlementStatus: requiresUsageSettlement ? "pending" : "not_applicable",
       usageSettlementAttempts: 0,
       usageSettlementImmediateAttempts: 0,
       usageSettlementScanAttempts: 0,
@@ -968,11 +993,13 @@ async function proxy(request: Request, context: RouteContext) {
 
     if (upstreamIsStream && upstream.body) {
       const settlement = createSettlementReadiness(proxyLog.id);
-      settleNewApiUsageAfterResponse(
-        settlementContext,
-        newapiResponseRequestId,
-        settlement.readiness,
-      );
+      if (requiresUsageSettlement) {
+        settleNewApiUsageAfterResponse(
+          settlementContext,
+          newapiResponseRequestId,
+          settlement.readiness,
+        );
+      }
       stopRequestHeartbeat();
       return new Response(
         streamWithProxyLog({
@@ -1002,11 +1029,13 @@ async function proxy(request: Request, context: RouteContext) {
       const releaseAcceptedUpstreamSlot = releaseUpstreamSlot;
       const [clientBody, recorderBody] = upstream.body.tee();
       const settlement = createSettlementReadiness(proxyLog.id);
-      settleNewApiUsageAfterResponse(
-        settlementContext,
-        newapiResponseRequestId,
-        settlement.readiness,
-      );
+      if (requiresUsageSettlement) {
+        settleNewApiUsageAfterResponse(
+          settlementContext,
+          newapiResponseRequestId,
+          settlement.readiness,
+        );
+      }
       const recordResponse = (async () => {
         let terminalPersistence: Promise<unknown>;
         try {
@@ -1073,11 +1102,13 @@ async function proxy(request: Request, context: RouteContext) {
 
     const releaseAcceptedUpstreamSlot = releaseUpstreamSlot;
     const settlement = createSettlementReadiness(proxyLog.id);
-    settleNewApiUsageAfterResponse(
-      settlementContext,
-      newapiResponseRequestId,
-      settlement.readiness,
-    );
+    if (requiresUsageSettlement) {
+      settleNewApiUsageAfterResponse(
+        settlementContext,
+        newapiResponseRequestId,
+        settlement.readiness,
+      );
+    }
     const terminalPersistence = upstreamPersistence
       .catch(() => undefined)
       .then(() => recordFinishedProxyLog({

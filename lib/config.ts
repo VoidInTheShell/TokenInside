@@ -50,11 +50,14 @@ export type RuntimeConfig = {
     globalOpenIds: string[];
   };
   billing: {
-    monthlyResetEnabled: boolean;
     operationConcurrencyMax: number;
     settlementConcurrencyMax: number;
     materializationConcurrencyMax: number;
     usageSyncContinuationDelayMs: number;
+    directConsumptionDrainGraceMs: number;
+    balanceObservationIntervalMs: number;
+    balanceObservationBatchSize: number;
+    balanceObservationReadTimeoutMs: number;
   };
 };
 
@@ -196,7 +199,6 @@ export function getConfig(): RuntimeConfig {
       ),
     },
     billing: {
-      monthlyResetEnabled: process.env.TOKENINSIDE_MONTHLY_RESET_ENABLED === "true",
       operationConcurrencyMax: positiveIntegerFromEnv(
         process.env.TOKENINSIDE_QUOTA_OPERATION_CONCURRENCY_MAX,
         1,
@@ -213,8 +215,53 @@ export function getConfig(): RuntimeConfig {
         process.env.TOKENINSIDE_USAGE_SYNC_CONTINUATION_DELAY_MS,
         250,
       ),
+      directConsumptionDrainGraceMs: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_DIRECT_CONSUMPTION_DRAIN_GRACE_MS,
+        60_000,
+      ),
+      // Balance observation is deliberately slower and smaller than the
+      // settlement loop. It uses the isolated control/lock pools and can never
+      // turn an environment value into an unbounded account scan.
+      balanceObservationIntervalMs: Math.max(
+        positiveIntegerFromEnv(
+          process.env.TOKENINSIDE_BALANCE_OBSERVATION_INTERVAL_MS,
+          300_000,
+        ),
+        60_000,
+      ),
+      balanceObservationBatchSize: Math.min(
+        positiveIntegerFromEnv(
+          process.env.TOKENINSIDE_BALANCE_OBSERVATION_BATCH_SIZE,
+          20,
+        ),
+        20,
+      ),
+      balanceObservationReadTimeoutMs: positiveIntegerFromEnv(
+        process.env.TOKENINSIDE_BALANCE_OBSERVATION_READ_TIMEOUT_MS,
+        3_000,
+      ),
     },
   };
+}
+
+export function effectiveBillingMaterializationConcurrencyMax(
+  config: Pick<RuntimeConfig, "storeBackend" | "postgres" | "billing"> = getConfig(),
+) {
+  const configuredMax = Math.max(
+    Math.trunc(config.billing.materializationConcurrencyMax),
+    1,
+  );
+  if (config.storeBackend !== "postgres") return configuredMax;
+
+  // PostgreSQL materialization shares the settlement pool with authoritative
+  // source/checkpoint writes. Leave one connection available whenever the pool
+  // has that capacity; the floor of one keeps derived work progressing for an
+  // explicitly configured single-connection pool.
+  const materializationPoolCapacity = Math.max(
+    Math.trunc(config.postgres.settlementPoolMax) - 1,
+    1,
+  );
+  return Math.min(configuredMax, materializationPoolCapacity);
 }
 
 export function requireSessionSecret() {

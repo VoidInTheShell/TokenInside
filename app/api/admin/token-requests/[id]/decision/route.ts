@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { z } from "zod";
 import { requireAdminScope } from "@/lib/admin";
 import { getConfig } from "@/lib/config";
@@ -6,16 +6,21 @@ import { nowIso } from "@/lib/crypto";
 import { provisionTokenForRequest } from "@/lib/provisioning";
 import {
   QuotaSubmissionError,
-  submitPostgresQuotaRestoreDecision,
+  rejectPostgresTokenRequestAsActor,
+  submitPostgresFirstProvisionDecision,
 } from "@/lib/quota-operation-submit";
+import { ensureQuotaOperationWorker } from "@/lib/quota-saga";
 import { getCurrentSessionIdentity } from "@/lib/session";
 import {
   getScopedTokenRequest,
+  JsonQuotaSubmissionError,
+  rejectJsonTokenRequestAsActor,
   updateTokenRequest,
-  updateTokenRequestForQuotaOperation,
 } from "@/lib/store";
-import { enqueueQuotaRestoreForRequest, ensureQuotaOperationWorker } from "@/lib/quota-saga";
-import { quotaFeatureErrorStatus } from "@/lib/quota-guard";
+import {
+  assertQuotaWriteActionEnabled,
+  quotaFeatureErrorStatus,
+} from "@/lib/quota-guard";
 import { tokenRequestRequiresAdminDecision } from "@/lib/token-request-policy";
 
 export const runtime = "nodejs";
@@ -42,22 +47,14 @@ export async function POST(
 
   if (getConfig().storeBackend === "postgres" && parsed.data.action === "approve") {
     try {
-      const submitted = await submitPostgresQuotaRestoreDecision({
+      await assertQuotaWriteActionEnabled("first_provision");
+      const submitted = await submitPostgresFirstProvisionDecision({
         actorUserId: identity.userId,
         requestId: id,
         approvedMonthlyQuota: parsed.data.approvedMonthlyQuota,
       });
-      if (submitted.handled) {
-        ensureQuotaOperationWorker();
-        return NextResponse.json(
-          {
-            request: submitted.request,
-            operation: submitted.operation,
-            deduplicated: submitted.deduplicated,
-          },
-          { status: 202 },
-        );
-      }
+      after(() => ensureQuotaOperationWorker());
+      return NextResponse.json(submitted, { status: 202 });
     } catch (err) {
       if (err instanceof QuotaSubmissionError) {
         return NextResponse.json(
@@ -71,9 +68,36 @@ export async function POST(
         );
       }
       return NextResponse.json(
-        { error: err instanceof Error ? err.message : "额度恢复操作创建失败" },
-        { status: 502 },
+        { error: err instanceof Error ? err.message : "首次发放操作受理失败" },
+        { status: quotaFeatureErrorStatus(err) ?? 502 },
       );
+    }
+  }
+
+  if (parsed.data.action === "reject") {
+    try {
+      const updated =
+        getConfig().storeBackend === "postgres"
+          ? await rejectPostgresTokenRequestAsActor({
+              actorUserId: identity.userId,
+              requestId: id,
+            })
+          : await rejectJsonTokenRequestAsActor({
+              actorUserId: identity.userId,
+              requestId: id,
+            });
+      return NextResponse.json({ request: updated });
+    } catch (error) {
+      if (
+        error instanceof QuotaSubmissionError ||
+        error instanceof JsonQuotaSubmissionError
+      ) {
+        return NextResponse.json(
+          { error: error.message, code: error.code },
+          { status: error.status },
+        );
+      }
+      throw error;
     }
   }
 
@@ -92,25 +116,33 @@ export async function POST(
     );
   }
 
-  const updateDecisionRequest =
-    tokenRequest.requestType === "quota_reset" || tokenRequest.requestType === "quota_restore"
-      ? updateTokenRequestForQuotaOperation
-      : updateTokenRequest;
   const operatedAt = nowIso();
-  if (parsed.data.action === "reject") {
-    const updated = await updateDecisionRequest(tokenRequest.id, {
-      status: "rejected",
-      approvalOperatorOpenId: auth.user.openId,
-      approvalOperatedAt: operatedAt,
-    });
-    return NextResponse.json({ request: updated });
-  }
-
   const approvedMonthlyQuota =
     parsed.data.approvedMonthlyQuota ??
     tokenRequest.approvedMonthlyQuota ??
     tokenRequest.requestedMonthlyQuota;
-  const approved = await updateDecisionRequest(tokenRequest.id, {
+
+  try {
+    await assertQuotaWriteActionEnabled("first_provision");
+  } catch (err) {
+    if (err instanceof QuotaSubmissionError) {
+      return NextResponse.json(
+        { error: err.message, code: err.code },
+        {
+          status: err.status,
+          headers: err.retryAfterSeconds
+            ? { "Retry-After": String(err.retryAfterSeconds) }
+            : undefined,
+        },
+      );
+    }
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : "首次发放操作受理失败" },
+      { status: quotaFeatureErrorStatus(err) ?? 502 },
+    );
+  }
+
+  const approved = await updateTokenRequest(tokenRequest.id, {
     status: "approved",
     approvedMonthlyQuota,
     approvalOperatorOpenId: auth.user.openId,
@@ -118,23 +150,6 @@ export async function POST(
   });
   if (!approved) {
     return NextResponse.json({ error: "申请单不存在" }, { status: 404 });
-  }
-
-  if (approved.requestType === "quota_reset" || approved.requestType === "quota_restore") {
-    try {
-      const operation = await enqueueQuotaRestoreForRequest(approved);
-      await updateTokenRequestForQuotaOperation(approved.id, {
-        status: "approved_provisioning",
-      });
-      // quota_operations is a durable queue. The process worker owns Saga
-      // execution so accepting one request cannot starve later submissions.
-      return NextResponse.json({ request: approved, operation }, { status: 202 });
-    } catch (err) {
-      return NextResponse.json(
-        { error: err instanceof Error ? err.message : "额度恢复操作创建失败" },
-        { status: quotaFeatureErrorStatus(err) ?? 502 },
-      );
-    }
   }
 
   try {

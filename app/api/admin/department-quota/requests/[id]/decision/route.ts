@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { isSystemAdminScope, requireAdminScope } from "@/lib/admin";
-import { decideDepartmentQuotaRequest } from "@/lib/store";
+import { isAdminUserActionAuthorizationError } from "@/lib/postgres-store";
+import { decideDepartmentQuotaRequestAsActor } from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -26,18 +27,23 @@ export async function POST(
   }
   const { id } = await params;
   try {
-    const result = await decideDepartmentQuotaRequest({
+    const result = await decideDepartmentQuotaRequestAsActor({
       requestId: id,
       action: parsed.data.action,
       approvedQuotaLimit: parsed.data.approvedQuotaLimit,
-      operatedByFeishuUserId: auth.user.id,
-      approvalOperatorOpenId: auth.user.openId,
+      actorFeishuUserId: auth.user.id,
     });
     if (!result) {
       return NextResponse.json({ error: "部门额度申请不存在或已处理" }, { status: 409 });
     }
     return NextResponse.json({ request: result });
   } catch (err) {
+    if (isAdminUserActionAuthorizationError(err)) {
+      return NextResponse.json(
+        { error: err.message, code: err.code },
+        { status: err.status },
+      );
+    }
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "处理部门额度审批失败" },
       { status: 409 },

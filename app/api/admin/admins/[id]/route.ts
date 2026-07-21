@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { isRootAdminScope, isSystemAdminScope, requireAdminScope } from "@/lib/admin";
-import { getAdminScopeById, revokeAdminScopesForUser, updateManualAdminScope } from "@/lib/store";
+import { isSystemAdminScope, requireAdminScope } from "@/lib/admin";
+import { ensureAdminDefaultProvisioning } from "@/lib/admin-default-provisioning";
+import { isAdminUserActionAuthorizationError } from "@/lib/postgres-store";
+import { updateManualAdminScopeAsActor } from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -22,23 +24,24 @@ export async function PATCH(
   }
 
   const { id } = await context.params;
-  const current = await getAdminScopeById(id);
-  if (!current || current.source === "environment") {
-    return NextResponse.json(
-      { error: "管理员范围不存在，或该范围来自环境变量不能在页面中修改" },
-      { status: 404 },
-    );
-  }
-  if (current.scopeType === "global" && !isRootAdminScope(auth.scope)) {
-    return NextResponse.json({ error: "只有 root 管理员可以修改系统管理员" }, { status: 403 });
-  }
-
   const input = updateAdminSchema.parse(await request.json());
-  const admin = await updateManualAdminScope({
-    scopeId: id,
-    status: input.status,
-    departmentId: input.departmentId,
-  });
+  let admin;
+  try {
+    admin = await updateManualAdminScopeAsActor({
+      actorFeishuUserId: auth.user.id,
+      scopeId: id,
+      status: input.status,
+      departmentId: input.departmentId,
+    });
+  } catch (error) {
+    if (isAdminUserActionAuthorizationError(error)) {
+      return NextResponse.json(
+        { error: error.message, code: error.code },
+        { status: error.status },
+      );
+    }
+    throw error;
+  }
   if (!admin) {
     return NextResponse.json(
       { error: "管理员范围不存在，或该范围来自环境变量不能在页面中修改" },
@@ -46,7 +49,14 @@ export async function PATCH(
     );
   }
 
-  return NextResponse.json({ admin });
+  const provisioning =
+    admin.status === "active"
+      ? await ensureAdminDefaultProvisioning({
+          feishuUserId: admin.feishuUserId,
+          trustedScope: admin,
+        })
+      : undefined;
+  return NextResponse.json({ admin, provisioning });
 }
 
 export async function DELETE(
@@ -60,23 +70,23 @@ export async function DELETE(
   }
 
   const { id } = await context.params;
-  const current = await getAdminScopeById(id);
-  if (!current || current.source === "environment") {
-    return NextResponse.json(
-      { error: "管理员范围不存在，或该范围来自环境变量不能在页面中取消" },
-      { status: 404 },
-    );
+  let admin;
+  try {
+    admin = await updateManualAdminScopeAsActor({
+      actorFeishuUserId: auth.user.id,
+      scopeId: id,
+      status: "disabled",
+      disabledReason: "manual_revoke",
+    });
+  } catch (error) {
+    if (isAdminUserActionAuthorizationError(error)) {
+      return NextResponse.json(
+        { error: error.message, code: error.code },
+        { status: error.status },
+      );
+    }
+    throw error;
   }
-  if (current.scopeType === "global" && !isRootAdminScope(auth.scope)) {
-    return NextResponse.json({ error: "只有 root 管理员可以取消系统管理员" }, { status: 403 });
-  }
-
-  const revoked = await revokeAdminScopesForUser({
-    feishuUserId: current.feishuUserId,
-    reason: "manual_revoke",
-    disabledByFeishuUserId: auth.user.id,
-  });
-  const admin = revoked.find((scope) => scope.id === id) ?? revoked[0] ?? null;
   if (!admin) {
     return NextResponse.json({ error: "取消管理员失败" }, { status: 404 });
   }

@@ -7,18 +7,25 @@ import {
   sendDepartmentQuotaApprovalCard,
 } from "@/lib/feishu";
 import {
-  createDepartmentQuotaRequest,
+  createDepartmentQuotaRequestAsActor,
   updateDepartmentQuotaRequest,
 } from "@/lib/store";
+import { isAdminUserActionAuthorizationError } from "@/lib/postgres-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const requestSchema = z.object({
-  action: z.enum(["increase", "reset"]),
-  requestedQuotaLimit: z.number().int().min(0).max(1_000_000),
-  reason: z.string().min(4).max(500),
-});
+const requestSchema = z.discriminatedUnion("action", [
+  z.object({
+    action: z.literal("increase"),
+    requestedQuotaLimit: z.number().int().min(0).max(1_000_000),
+    reason: z.string().min(4).max(500),
+  }),
+  z.object({
+    action: z.literal("reset"),
+    reason: z.string().min(4).max(500),
+  }),
+]);
 
 export async function POST(request: Request) {
   const auth = await requireAdminScope();
@@ -37,16 +44,19 @@ export async function POST(request: Request) {
   try {
     const approvalTargetOpenId = getPrimarySystemAdminOpenId();
     const nonce = randomId("department-quota-card");
-    const quotaRequest = await createDepartmentQuotaRequest({
+    const quotaRequest = await createDepartmentQuotaRequestAsActor({
+      actorFeishuUserId: auth.user.id,
       departmentId: auth.scope.departmentId,
       departmentName:
         auth.scope.departmentId === auth.user.departmentId
           ? auth.user.departmentName
           : undefined,
-      requesterFeishuUserId: auth.user.id,
       action: parsed.data.action,
       reason: parsed.data.reason,
-      requestedQuotaLimit: parsed.data.requestedQuotaLimit,
+      requestedQuotaLimit:
+        parsed.data.action === "increase"
+          ? parsed.data.requestedQuotaLimit
+          : undefined,
       approvalTargetOpenId,
       approvalActionNonceHash: sha256Hex(nonce),
     });
@@ -87,6 +97,12 @@ export async function POST(request: Request) {
       return NextResponse.json({ request: updated, error: errorMessage }, { status: 502 });
     }
   } catch (err) {
+    if (isAdminUserActionAuthorizationError(err)) {
+      return NextResponse.json(
+        { error: err.message, code: err.code },
+        { status: err.status },
+      );
+    }
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "创建部门额度申请失败" },
       { status: 409 },

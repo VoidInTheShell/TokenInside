@@ -2,37 +2,27 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { isRootAdminScope, requireAdminScope } from "@/lib/admin";
 import { getConfig } from "@/lib/config";
+import { verifyGreenfieldInstallationBinding } from "@/lib/greenfield-installation";
 import {
   invalidateEffectiveNewApiConfig,
   newApiAccessTokenSecretContext,
+  verifyNewApiControlIdentity,
 } from "@/lib/newapi-runtime";
+import { isAdminUserActionAuthorizationError } from "@/lib/postgres-store";
+import {
+  nextPackageResetAt,
+  normalizePackageResetPolicy,
+} from "@/lib/package-reset";
+import { notifyPackageResetScheduler } from "@/lib/package-reset-scheduler";
 import { sealAppSecret } from "@/lib/secret-box";
-import { getAppSettings, getStoreSnapshot, updateAppSettings } from "@/lib/store";
+import {
+  getAppSettings,
+  getGreenfieldInstallationManifest,
+  updateAppSettingsAsActor,
+} from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const usageSyncPolicySchema = z.object({
-  enabled: z.boolean().optional(),
-  intervalMinutes: z.number().int().min(1).max(24 * 60).optional(),
-  pageSize: z.number().int().min(1).max(100).optional(),
-  maxPagesPerRun: z.number().int().min(1).max(20).optional(),
-  overlapMinutes: z.number().int().min(0).max(7 * 24 * 60).optional(),
-  settlementLagMinutes: z.number().int().min(0).max(24 * 60).optional(),
-  matchWindowMinutes: z.number().int().min(1).max(24 * 60).optional(),
-  retryBaseMinutes: z.number().int().min(1).max(24 * 60).optional(),
-});
-
-const quotaFeatureFlagsSchema = z.object({
-  legacyAbsoluteQuotaWritesEnabled: z.literal(false).optional(),
-  quotaLedgerShadowRead: z.boolean().optional(),
-  quotaSagaWritesEnabled: z.boolean().optional(),
-  keyRotationSagaEnabled: z.boolean().optional(),
-  quotaRestoreEnabled: z.boolean().optional(),
-  monthlyPeriodOpenEnabled: z.boolean().optional(),
-  reconciliationAutoDecreaseEnabled: z.boolean().optional(),
-  reconciliationAutoIncreaseEnabled: z.literal(false).optional(),
-});
 
 const settingsSchema = z
   .object({
@@ -42,25 +32,35 @@ const settingsSchema = z
       controlUserId: z.string().trim().min(1).max(100),
       accessToken: z.string().trim().min(1).max(2000).optional(),
     }).optional(),
-    usageSyncPolicy: usageSyncPolicySchema.optional(),
-    quotaFeatureFlags: quotaFeatureFlagsSchema.optional(),
+    packageReset: z
+      .object({
+        enabled: z.boolean(),
+        dayOfMonth: z.number().int().min(1).max(31),
+      })
+      .optional(),
   })
   .refine(
     (value) =>
       value.defaultMonthlyQuota !== undefined ||
       value.newapiControl !== undefined ||
-      value.usageSyncPolicy !== undefined ||
-      value.quotaFeatureFlags !== undefined,
+      value.packageReset !== undefined,
   );
 
 function visibleSettings(
   settings: Awaited<ReturnType<typeof getAppSettings>>,
   root: boolean,
 ) {
-  const { newapiControl, ...safeSettings } = settings;
+  const { newapiControl } = settings;
   const fallback = getConfig().newapi;
+  const packageReset = normalizePackageResetPolicy(settings.packageReset);
+  const nextResetAt = nextPackageResetAt(packageReset);
   return {
-    ...safeSettings,
+    defaultMonthlyQuota: settings.defaultMonthlyQuota,
+    packageReset: {
+      ...packageReset,
+      nextResetAt: nextResetAt?.toISOString(),
+    },
+    updatedAt: settings.updatedAt,
     ...(root
       ? {
           newapiControl: {
@@ -105,7 +105,7 @@ export async function PATCH(request: Request) {
   const parsed = settingsSchema.safeParse(await request.json());
   if (!parsed.success) {
     return NextResponse.json(
-      { error: "默认额度必须是正整数，同步周期/页数/窗口必须在允许范围内" },
+      { error: "默认额度必须是正整数，套餐重置日必须在 1 到 31 日之间，NewAPI 上游连接必须完整有效" },
       { status: 400 },
     );
   }
@@ -115,65 +115,52 @@ export async function PATCH(request: Request) {
       { status: 403 },
     );
   }
-  if (parsed.data.quotaFeatureFlags) {
-    const current = await getAppSettings();
-    const next = {
-      ...current.quotaFeatureFlags,
-      ...parsed.data.quotaFeatureFlags,
-      legacyAbsoluteQuotaWritesEnabled: false,
-      reconciliationAutoIncreaseEnabled: false,
-    };
-    const writeFeatureEnabled = Boolean(
-      next.quotaSagaWritesEnabled ||
-        next.keyRotationSagaEnabled ||
-        next.quotaRestoreEnabled ||
-        next.monthlyPeriodOpenEnabled ||
-        next.reconciliationAutoDecreaseEnabled,
-    );
-    if (writeFeatureEnabled && !current.quotaMigration?.appliedAt) {
+  if (parsed.data.newapiControl) {
+    const manifest = await getGreenfieldInstallationManifest();
+    const binding = verifyGreenfieldInstallationBinding({
+      manifest,
+      upstreamBaseUrl: parsed.data.newapiControl.baseUrl,
+      configuredControlUserId: parsed.data.newapiControl.controlUserId,
+    });
+    if (!binding.ready) {
       return NextResponse.json(
-        { error: "历史额度账本迁移未登记，不能启用 F 阶段写功能" },
+        {
+          error: "已绑定的绿地 NewAPI 地址和控制用户不可在线变更",
+          code: binding.reason,
+        },
         { status: 409 },
       );
     }
-    if (
-      !next.quotaSagaWritesEnabled &&
-      (next.keyRotationSagaEnabled ||
-        next.quotaRestoreEnabled ||
-        next.monthlyPeriodOpenEnabled ||
-        next.reconciliationAutoDecreaseEnabled)
-    ) {
-      return NextResponse.json(
-        { error: "具体额度动作依赖统一 Saga 写入开关" },
-        { status: 400 },
-      );
-    }
-    if (
-      current.quotaFeatureFlags?.quotaSagaWritesEnabled &&
-      !next.quotaSagaWritesEnabled
-    ) {
-      const store = await getStoreSnapshot();
-      const openOperation = store.quotaOperations.find(
-        (item) => item.state !== "completed" && item.state !== "compensated",
-      );
-      if (openOperation) {
+    if (parsed.data.newapiControl.accessToken) {
+      try {
+        const identity = await verifyNewApiControlIdentity({
+          baseUrl: parsed.data.newapiControl.baseUrl,
+          controlUserId: parsed.data.newapiControl.controlUserId,
+          credential: parsed.data.newapiControl.accessToken,
+          requestTimeoutMs: getConfig().newapi.requestTimeoutMs,
+        });
+        if (identity.observedControlUserId !== manifest!.observedControlUserId) {
+          return NextResponse.json(
+            {
+              error: "新的 NewAPI 用户 AK 不属于已绑定的控制用户",
+              code: "control_credential_identity_mismatch",
+            },
+            { status: 409 },
+          );
+        }
+      } catch (error) {
         return NextResponse.json(
-          { error: `存在未结额度操作 ${openOperation.id}，不能关闭 Saga worker` },
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : "NewAPI 用户 AK 身份验证失败",
+            code: "newapi_identity_verification_failed",
+          },
           { status: 409 },
         );
       }
     }
-  }
-  const currentSettings = await getAppSettings();
-  if (
-    parsed.data.newapiControl &&
-    !parsed.data.newapiControl.accessToken &&
-    !currentSettings.newapiControl?.accessTokenCiphertext
-  ) {
-    return NextResponse.json(
-      { error: "首次保存 NewAPI 上游连接时必须填写用户 AK" },
-      { status: 400 },
-    );
   }
   const newapiControl = parsed.data.newapiControl
     ? {
@@ -184,19 +171,42 @@ export async function PATCH(request: Request) {
               parsed.data.newapiControl.accessToken,
               newApiAccessTokenSecretContext(),
             )
-          : currentSettings.newapiControl?.accessTokenCiphertext,
+          : undefined,
         updatedAt: new Date().toISOString(),
         updatedByFeishuUserId: auth.user.id,
       }
     : undefined;
-  const settings = await updateAppSettings({
-    defaultMonthlyQuota: parsed.data.defaultMonthlyQuota,
-    newapiControl,
-    usageSyncPolicy: parsed.data.usageSyncPolicy,
-    quotaFeatureFlags: parsed.data.quotaFeatureFlags,
-    updatedByFeishuUserId: auth.user.id,
-  });
+  let settings;
+  try {
+    settings = await updateAppSettingsAsActor({
+      actorFeishuUserId: auth.user.id,
+      defaultMonthlyQuota: parsed.data.defaultMonthlyQuota,
+      newapiControl,
+      packageReset: parsed.data.packageReset,
+    });
+  } catch (error) {
+    if (isAdminUserActionAuthorizationError(error)) {
+      return NextResponse.json(
+        { error: error.message, code: error.code },
+        { status: error.status },
+      );
+    }
+    if (error instanceof Error && error.name === "NewApiControlSecretRequiredError") {
+      return NextResponse.json({ error: error.message }, { status: 400 });
+    }
+    if (
+      error instanceof Error &&
+      error.name === "GreenfieldInstallationBindingWriteError"
+    ) {
+      return NextResponse.json(
+        { error: error.message, code: "greenfield_binding_drift_forbidden" },
+        { status: 409 },
+      );
+    }
+    throw error;
+  }
   if (newapiControl) invalidateEffectiveNewApiConfig();
+  if (parsed.data.packageReset) notifyPackageResetScheduler();
   return NextResponse.json({
     settings: visibleSettings(settings, isRootAdminScope(auth.scope)),
   });

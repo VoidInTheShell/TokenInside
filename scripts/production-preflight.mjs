@@ -59,6 +59,8 @@ async function canConnectPostgres() {
 const requiredPostgresTables = [
   "schema_migrations",
   "app_settings",
+  "billing_operations",
+  "greenfield_installation_manifest",
   "feishu_users",
   "token_requests",
   "token_accounts",
@@ -71,6 +73,7 @@ const requiredPostgresTables = [
   "quota_ledger_entries",
   "user_quota_states",
   "quota_reconciliation_records",
+  "quota_balance_observer_state",
   "feishu_events",
   "proxy_request_logs",
   "newapi_usage_records",
@@ -94,6 +97,29 @@ async function hasPostgresSchema() {
       [requiredPostgresTables],
     );
     return new Set(result.rows.map((row) => row.table_name)).size === requiredPostgresTables.length;
+  } catch {
+    return false;
+  } finally {
+    await pool.end();
+  }
+}
+
+async function hasGreenfieldInstallationManifest() {
+  if (!present("DATABASE_URL")) return false;
+  const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: 1,
+    connectionTimeoutMillis: 5000,
+  });
+  try {
+    const result = await pool.query(
+      `select exists(
+         select 1
+         from greenfield_installation_manifest
+         where id = 'default'
+       ) as present`,
+    );
+    return result.rows[0]?.present === true;
   } catch {
     return false;
   } finally {
@@ -178,6 +204,13 @@ if (storeBackend === "postgres") {
   checks.push(result("DATABASE_URL", safe("DATABASE_URL"), "required when store backend is postgres"));
   checks.push(result("POSTGRES_CONNECTION", await canConnectPostgres(), "PostgreSQL must accept connections"));
   checks.push(result("POSTGRES_SCHEMA", await hasPostgresSchema(), "all required tables must exist"));
+  checks.push(
+    result(
+      "GREENFIELD_INSTALLATION_MANIFEST",
+      await hasGreenfieldInstallationManifest(),
+      "run npm run greenfield:preflight before starting the application",
+    ),
+  );
   checks.push(
     result(
       "DATABASE_POOL_MAX",

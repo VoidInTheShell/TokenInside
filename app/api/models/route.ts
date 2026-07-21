@@ -1,19 +1,15 @@
 import { NextResponse } from "next/server";
 import { listModelsForNewApiToken } from "@/lib/newapi";
-import { getCurrentUser } from "@/lib/session";
-import { getActiveTokenForUser } from "@/lib/store";
+import { requireActiveWorkspaceAccess } from "@/lib/workspace-access";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
-    const user = await getCurrentUser();
-    if (!user) {
-      return NextResponse.json({ error: "Feishu OAuth session required" }, { status: 401 });
-    }
-
-    const activeToken = await getActiveTokenForUser(user.id);
+    const access = await requireActiveWorkspaceAccess();
+    if ("error" in access) return access.error;
+    const { activeToken } = access;
     if (!activeToken?.newapiTokenId) {
       return NextResponse.json({ models: [] });
     }

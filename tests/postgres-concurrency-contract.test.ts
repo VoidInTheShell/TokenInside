@@ -12,6 +12,7 @@ const quotaOperationRoutePath = new URL(
   import.meta.url,
 );
 const quotaSagaPath = new URL("../lib/quota-saga.ts", import.meta.url);
+const keyPrewarmPath = new URL("../lib/key-prewarm.ts", import.meta.url);
 const rerunSingleFlightPath = new URL("../lib/rerun-single-flight.ts", import.meta.url);
 const quotaGuardPath = new URL("../lib/quota-guard.ts", import.meta.url);
 const quotaOperationSubmitPath = new URL(
@@ -23,8 +24,8 @@ const quotaDecisionRoutePath = new URL(
   import.meta.url,
 );
 const keyResetRoutePath = new URL("../app/api/token/reset/route.ts", import.meta.url);
-const pendingUsageTailMigrationPath = new URL(
-  "../scripts/migrations/20260717_002_pending_usage_tail_index.mjs",
+const greenfieldBaselinePath = new URL(
+  "../scripts/db-migrate.mjs",
   import.meta.url,
 );
 
@@ -52,7 +53,6 @@ test("Postgres proxy admission uses a shared transaction fence without hot-row l
 
   for (const [startMarker, endMarker] of [
     ["export async function replacePostgresActiveTokenAccount", "export async function finalizePostgresTokenRotation"],
-    ["export async function recordPostgresMonthlyResetApplied", "export async function upsertPostgresFeishuEvent"],
     ["export async function updatePostgresUserAccessStatus", "export async function revokePostgresAdminScopesForUser"],
     ["export async function enablePostgresUserAccess", "export async function insertPostgresProxyLog"],
   ]) {
@@ -141,20 +141,26 @@ test("quota operation polling uses Postgres point reads and avoids advisory lock
     "export async function listQuotaOperations(",
     "export async function appendQuotaLedgerEntry(",
   );
-  const takeStart = sagaSource.indexOf("export async function takeQuotaOperationCredential(");
-  assert.notEqual(takeStart, -1);
-  const take = sagaSource.slice(takeStart);
+  const claimStart = sagaSource.indexOf("export async function claimQuotaOperationCredential(");
+  const acknowledgementStart = sagaSource.indexOf(
+    "export async function acknowledgeQuotaOperationCredential(",
+  );
+  assert.notEqual(claimStart, -1);
+  assert.notEqual(acknowledgementStart, -1);
+  const claim = sagaSource.slice(claimStart, acknowledgementStart);
 
   assert.match(byId, /findPostgresQuotaOperationById\(operationId\)/);
   assert.match(byIdempotency, /findPostgresQuotaOperationByIdempotencyKey\(idempotencyKey\)/);
   assert.match(list, /listPostgresQuotaOperations\(input\)/);
   assert.ok(
-    take.indexOf("const candidate = await findQuotaOperationById(operationId)") <
-      take.indexOf("return withUserQuotaOperationLock"),
+    claim.indexOf("const candidate = await findQuotaOperationById(operationId)") <
+      claim.indexOf("return withUserQuotaOperationLock"),
   );
-  assert.match(take, /candidate\.state !== "completed"/);
+  assert.match(claim, /candidate\.state !== "completed"/);
+  assert.doesNotMatch(claim, /credentialCiphertext: undefined/);
   assert.match(routeSource, /const credentialReady =/);
-  assert.match(routeSource, /credentialReady\s*\? await takeQuotaOperationCredential/);
+  assert.match(routeSource, /credentialReady\s*\? await claimQuotaOperationCredential/);
+  assert.match(routeSource, /acknowledgeQuotaOperationCredential/);
 });
 
 test("quota operation transitions use one locked Postgres transaction and reuse the claimed row", async () => {
@@ -178,6 +184,11 @@ test("quota operation transitions use one locked Postgres transaction and reuse 
     "async function runQuotaOperationInner(",
     "export async function runQuotaOperation(",
   );
+  const claimedRunner = functionBody(
+    sagaSource,
+    "async function runClaimedQuotaOperation(",
+    "async function runQuotaOperationInner(",
+  );
 
   assert.match(postgresTransition, /return withControlTransaction/);
   assert.equal(postgresTransition.match(/select data from quota_operations/g)?.length, 1);
@@ -186,8 +197,59 @@ test("quota operation transitions use one locked Postgres transaction and reuse 
   assert.match(postgresTransition, /saveQuotaOperationRow\(client, updated\)/);
   assert.match(storeTransition, /if \(isPostgresBackend\(\)\)/);
   assert.match(storeTransition, /return transitionPostgresQuotaOperation\(operationId, state, patch\)/);
-  assert.match(runner, /let operation = claimed/);
-  assert.doesNotMatch(runner, /operation = \(await findQuotaOperationById\(operationId\)\)/);
+  assert.match(claimedRunner, /let operation = claimed/);
+  assert.doesNotMatch(
+    claimedRunner,
+    /operation = \(await findQuotaOperationById\(operationId\)\)/,
+  );
+  assert.ok(
+    runner.indexOf("findQuotaOperationById(operationId)") <
+      runner.indexOf("withUserQuotaOperationLock"),
+  );
+  assert.ok(
+    runner.indexOf("withUserQuotaOperationLock") <
+      runner.indexOf("runClaimedQuotaOperation(operationId, executionFence)"),
+  );
+  assert.match(runner, /wait: options\.waitForFence \?\? true/);
+  assert.match(claimedRunner, /executionFence\?\.assertHeld\(\)/);
+  assert.match(claimedRunner, /executionFence\?\.markLost/);
+  assert.match(claimedRunner, /isQuotaExecutionFenceLostError/);
+});
+
+test("the due worker uses a non-blocking user fence", async () => {
+  const sagaSource = await readFile(quotaSagaPath, "utf8");
+  const dueRunner = functionBody(
+    sagaSource,
+    "export async function runDueQuotaOperations(",
+    "function scheduleQuotaWorker(",
+  );
+  assert.match(
+    dueRunner,
+    /runQuotaOperation\(operation\.id, \{ waitForFence: false \}\)/,
+  );
+});
+
+test("the complete Saga fence does not recursively acquire the prewarm user lock", async () => {
+  const [sagaSource, prewarmSource] = await Promise.all([
+    readFile(quotaSagaPath, "utf8"),
+    readFile(keyPrewarmPath, "utf8"),
+  ]);
+  const internalClaim = functionBody(
+    prewarmSource,
+    "export async function claimPrewarmedTokenForProvisionUnderUserFence(",
+    "export async function claimPrewarmedTokenForProvision(",
+  );
+  const publicClaim = functionBody(
+    prewarmSource,
+    "export async function claimPrewarmedTokenForProvision(",
+    "export async function clearClaimedPrewarmedCredential(",
+  );
+
+  assert.doesNotMatch(internalClaim, /withUserQuotaOperationLock/);
+  assert.match(publicClaim, /withUserQuotaOperationLock/);
+  assert.match(publicClaim, /claimPrewarmedTokenForProvisionUnderUserFence/);
+  assert.match(sagaSource, /claimPrewarmedTokenForProvisionUnderUserFence\(\{/);
+  assert.doesNotMatch(sagaSource, /claimPrewarmedTokenForProvision\(\{/);
 });
 
 test("quota control work uses a dedicated bounded pool while proxy admission stays on the business pool", async () => {
@@ -217,9 +279,8 @@ test("quota control work uses a dedicated bounded pool while proxy admission sta
   assert.doesNotMatch(proxyAdmission, /withControl/);
   for (const [startMarker, endMarker] of [
     ["export async function replacePostgresActiveTokenAccount", "export async function finalizePostgresTokenRotation"],
-    ["export async function recordPostgresMonthlyResetApplied", "export async function upsertPostgresFeishuEvent"],
-    ["export async function updatePostgresUserAccessStatus", "export async function revokePostgresAdminScopesForUser"],
-    ["export async function enablePostgresUserAccess", "export async function insertPostgresProxyLog"],
+    ["export async function updatePostgresUserAccessStatus", "export async function updatePostgresUserAccessStatusUnderUserFence"],
+    ["export async function enablePostgresUserAccess", "export async function enablePostgresUserAccessUnderUserFence"],
   ]) {
     const body = functionBody(source, startMarker, endMarker);
     assert.match(body, /withTransaction/);
@@ -284,6 +345,11 @@ test("authoritative settlement uses a dedicated bounded pool instead of the prox
       "export async function withPostgresAdvisoryLock<",
       /withSettlementTransaction/,
     ],
+    [
+      "export async function reconcilePostgresBillingPeriodForUser(",
+      "export async function reconcilePostgresBillingPeriodForQuotaOperation(",
+      /withSettlementTransaction/,
+    ],
   ] as const) {
     const body = functionBody(source, startMarker, endMarker);
     assert.match(body, expected);
@@ -291,7 +357,7 @@ test("authoritative settlement uses a dedicated bounded pool instead of the prox
   }
 });
 
-test("quota restore and key rotation isolate their targeted Postgres work from the business pool", async () => {
+test("key rotation isolates its targeted Postgres work from the business pool", async () => {
   const [
     postgresSource,
     storeSource,
@@ -351,10 +417,6 @@ test("quota restore and key rotation isolate their targeted Postgres work from t
 
   for (const [startMarker, endMarker] of [
     [
-      "export async function reconcilePostgresBillingPeriodForUser(",
-      "export async function reconcilePostgresBillingPeriodForQuotaOperation(",
-    ],
-    [
       "export async function rebuildPostgresDepartmentQuotaMaterializedSnapshot(",
       "export async function rebuildPostgresDepartmentQuotaMaterializedSnapshotForQuotaOperation(",
     ],
@@ -403,7 +465,7 @@ test("quota restore and key rotation isolate their targeted Postgres work from t
   );
   assert.match(
     sagaRouting,
-    /operation\.operationType === "quota_restore" \|\| operation\.operationType === "key_rotation"/,
+    /return operation\.operationType === "key_rotation"/,
   );
   const lightweightRequestUpdate = functionBody(
     postgresSource,
@@ -452,23 +514,13 @@ test("quota restore and key rotation isolate their targeted Postgres work from t
   assert.match(grantPostgresBranch, /ensureDepartmentQuotaPeriod/);
   assert.doesNotMatch(grantPostgresBranch, /readStore\(/);
 
-  assert.match(
-    guardSource,
-    /action === "quota_restore" \|\| action === "key_rotation"[\s\S]*getAppSettingsForQuotaOperation/,
-  );
-  const workerFlags = functionBody(
-    guardSource,
-    "export async function getQuotaFeatureFlags()",
-    "export async function assertQuotaWriteActionEnabled(",
-  );
-  assert.match(workerFlags, /getAppSettingsForQuotaOperation\(\)/);
-  assert.doesNotMatch(workerFlags, /\bgetAppSettings\(\)/);
-  assert.match(decisionSource, /const updateDecisionRequest =/);
-  assert.match(decisionSource, /updateTokenRequestForQuotaOperation\(approved\.id/);
+  assert.match(guardSource, /TOKENINSIDE_QUOTA_WRITES_PAUSED/);
+  assert.match(guardSource, /export function quotaWritesPaused\(\)/);
+  assert.doesNotMatch(guardSource, /getAppSettings|quotaFeatureFlags|quota_restore/);
+  assert.match(decisionSource, /await submitPostgresFirstProvisionDecision\(/);
   assert.match(resetSource, /updateTokenRequestForQuotaOperation\(tokenRequest\.id/);
   assert.match(submitSource, /max: config\.postgres\.quotaSubmitPoolMax/);
   assert.match(submitSource, /connectionTimeoutMillis: config\.postgres\.quotaSubmitConnectionTimeoutMs/);
-  assert.match(decisionSource, /await submitPostgresQuotaRestoreDecision\(/);
   assert.match(resetSource, /await submitPostgresKeyRotation\(/);
   assert.doesNotMatch(decisionSource, /after\(\(\) => runQuotaOperation/);
   assert.doesNotMatch(resetSource, /after\(\(\) => runQuotaOperation/);
@@ -611,12 +663,27 @@ test("quota saga budget reservation and materialization stay scoped to one depar
   assert.match(createOperation, /user-quota:/);
   assert.doesNotMatch(createOperation, /department-quota:/);
   assert.ok(
-    createMonthlyOpen.indexOf("department-quota:") <
-      createMonthlyOpen.indexOf("user-quota:"),
-    "monthly open must preserve department-before-user lock ordering",
+    createMonthlyOpen.indexOf("user-quota:") <
+      createMonthlyOpen.indexOf("policy_department_id") &&
+      createMonthlyOpen.indexOf("policy_department_id") <
+        createMonthlyOpen.indexOf("department-quota:"),
+    "monthly open must resolve the current policy under the user lock before choosing a department scope",
   );
-  assert.match(createMonthlyOpen, /reservedDepartmentQuota: input\.assignedMonthlyQuota/);
-  assert.match(createMonthlyOpen, /state: "budget_reserved"/);
+  assert.match(createMonthlyOpen, /pg_try_advisory_xact_lock\(hashtext\(\$1\)::bigint\)/);
+  assert.match(createMonthlyOpen, /MonthlyOpenDepartmentLockBusyError/);
+  assert.ok(
+    createMonthlyOpen.indexOf("for (let attempt") <
+      createMonthlyOpen.indexOf("withControlTransaction"),
+    "monthly-open department try-lock retries must restart the complete transaction",
+  );
+  assert.match(
+    createMonthlyOpen,
+    /reservedDepartmentQuota: input\.departmentId[\s\S]*?\? input\.assignedMonthlyQuota[\s\S]*?: 0/,
+  );
+  assert.match(
+    createMonthlyOpen,
+    /state: input\.departmentId \? "budget_reserved" : "planned"/,
+  );
   assert.match(departmentMaterializer, /pg_advisory_xact_lock/);
   assert.match(departmentMaterializer, /materializeDepartmentQuota/);
   assert.match(targetedStoreMaterializer, /reconcilePostgresBillingPeriodForUser/);
@@ -762,6 +829,33 @@ test("deferred immediate usage settlement leaves the durable pending log for the
   );
 });
 
+test("proxy only schedules authoritative usage settlement for billable generation routes", async () => {
+  const routeSource = await readFile(proxyRoutePath, "utf8");
+  const proxyLifecycle = functionBody(
+    routeSource,
+    "async function proxy(request: Request, context: RouteContext)",
+    "export function GET(request: Request, context: RouteContext)",
+  );
+
+  assert.match(
+    proxyLifecycle,
+    /const requiresUsageSettlement = isUsageRecordRequest\(\{\s*method: request\.method,\s*requestPath,\s*\}\);/,
+  );
+  assert.equal(
+    proxyLifecycle.match(
+      /usageSettlementStatus: requiresUsageSettlement \? "pending" : "not_applicable"/g,
+    )?.length,
+    2,
+    "both admission and accepted-upstream persistence must classify non-billable requests",
+  );
+  assert.equal(
+    proxyLifecycle.match(/if \(requiresUsageSettlement\) \{\s*settleNewApiUsageAfterResponse\(/g)
+      ?.length,
+    3,
+    "stream, buffered, and empty successful responses must all gate settlement scheduling",
+  );
+});
+
 test("proxy lifecycle persistence uses one atomic JSON merge statement", async () => {
   const source = await readFile(postgresStorePath, "utf8");
   const lifecycle = functionBody(
@@ -850,9 +944,9 @@ test("proxy stream read aborts are classified as client cancellation", async () 
 });
 
 test("pending usage tail backoff stays anchored to the immutable terminal time", async () => {
-  const [source, migration] = await Promise.all([
+  const [source, baseline] = await Promise.all([
     readFile(postgresStorePath, "utf8"),
-    readFile(pendingUsageTailMigrationPath, "utf8"),
+    readFile(greenfieldBaselinePath, "utf8"),
   ]);
   const horizon = functionBody(
     source,
@@ -884,13 +978,11 @@ test("pending usage tail backoff stays anchored to the immutable terminal time",
   assert.match(backoff, /when due\.scan_attempts < 3 then interval '5 minutes'/);
   assert.match(backoff, /else interval '15 minutes'/);
 
-  assert.match(migration, /proxy_request_logs_usage_pending_terminal_idx/);
-  assert.match(migration, /export const migration =/);
-  assert.match(migration, /version: "20260717_002_pending_usage_tail_index"/);
-  assert.match(migration, /statements: \[/);
-  assert.match(migration, /on proxy_request_logs \(created_at\)/);
-  assert.match(migration, /usageSettlementStatus' in \('pending', 'retrying'\)/);
-  assert.match(migration, /in \('completed', 'failed', 'cancelled'\)/);
+  assert.match(baseline, /proxy_request_logs_usage_pending_terminal_idx/);
+  assert.match(baseline, /GREENFIELD_BASELINE_VERSION = "20260717_001_greenfield_baseline"/);
+  assert.match(baseline, /on proxy_request_logs \(created_at\)/);
+  assert.match(baseline, /usageSettlementStatus' in \('pending', 'retrying'\)/);
+  assert.match(baseline, /in \('completed', 'failed', 'cancelled'\)/);
 });
 
 test("matched usage is an absorbing terminal state for late immediate retry patches", async () => {
@@ -1157,7 +1249,7 @@ test(
         `insert into quota_ledger_entries
           (id, operation_id, feishu_user_id, department_id, period, entry_type,
            signed_quota, data, created_at)
-         values ($1, $2, $3, $4, $5, 'quota_restore_grant', $6, $7, $8)`,
+         values ($1, $2, $3, $4, $5, 'quota_adjust_grant', $6, $7, $8)`,
         [
           ledgerId,
           operationId,
@@ -1172,7 +1264,7 @@ test(
             departmentId,
             period,
             signedQuota,
-            entryType: "quota_restore_grant",
+            entryType: "quota_adjust_grant",
             sourceType: "quota_operation",
             sourceId: operationId,
             quotaPerUnitSnapshot: 500_000,
@@ -1201,8 +1293,8 @@ test(
       const cleanup = await pool.connect();
       try {
         await cleanup.query("begin");
-        await cleanup.query("select set_config('tokeninside.allow_ledger_rewrite','on',true)");
-        await cleanup.query("delete from quota_ledger_entries where id = $1", [ledgerId]);
+        // quota_ledger_entries is immutable; this integration fixture remains
+        // in the disposable TEST_DATABASE_URL database as audit evidence.
         await cleanup.query(
           "delete from user_billing_periods where feishu_user_id = $1 and period = $2",
           [userId, period],

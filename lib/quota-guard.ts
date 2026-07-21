@@ -1,95 +1,40 @@
-import {
-  defaultQuotaFeatureFlags,
-  getAppSettings,
-  getAppSettingsForQuotaOperation,
-} from "./store";
-import type { QuotaFeatureFlags } from "./types";
-
 export type QuotaWriteAction =
   | "first_provision"
   | "quota_adjust"
   | "key_rotation"
-  | "quota_restore"
-  | "monthly_open"
-  | "reconcile";
+  | "monthly_open";
 
-export class QuotaFeatureDisabledError extends Error {
-  readonly code = "quota_feature_disabled";
+const pausedValues = new Set(["1", "true", "yes", "on"]);
+
+export class QuotaWritesPausedError extends Error {
+  readonly code = "quota_writes_paused";
   readonly action: QuotaWriteAction;
 
-  constructor(action: QuotaWriteAction, reason?: string) {
-    super(reason ?? `F 阶段 ${action} 写入尚未启用；旧式绝对余额写入已关闭`);
-    this.name = "QuotaFeatureDisabledError";
+  constructor(action: QuotaWriteAction) {
+    super(`额度写入已由紧急只停写开关暂停: ${action}`);
+    this.name = "QuotaWritesPausedError";
     this.action = action;
   }
 }
 
-export function quotaWriteActionEnabled(
-  flags: QuotaFeatureFlags,
-  action: QuotaWriteAction,
-) {
-  if (action === "reconcile") {
-    return flags.quotaSagaWritesEnabled && flags.reconciliationAutoDecreaseEnabled;
-  }
-  if (flags.legacyAbsoluteQuotaWritesEnabled) return true;
-  if (!flags.quotaSagaWritesEnabled) return false;
-  if (action === "first_provision" || action === "quota_adjust") return true;
-  if (action === "key_rotation") return flags.keyRotationSagaEnabled;
-  if (action === "quota_restore") return flags.quotaRestoreEnabled;
-  return flags.monthlyPeriodOpenEnabled;
-}
-
-export async function getQuotaFeatureFlags() {
-  const settings = await getAppSettingsForQuotaOperation();
-  return {
-    ...defaultQuotaFeatureFlags(),
-    ...settings.quotaFeatureFlags,
-    reconciliationAutoIncreaseEnabled: false,
-  };
+export function quotaWritesPaused() {
+  return pausedValues.has(
+    (process.env.TOKENINSIDE_QUOTA_WRITES_PAUSED ?? "").trim().toLowerCase(),
+  );
 }
 
 export async function assertQuotaWriteActionEnabled(action: QuotaWriteAction) {
-  const settings =
-    action === "quota_restore" || action === "key_rotation"
-      ? await getAppSettingsForQuotaOperation()
-      : await getAppSettings();
-  const flags = {
-    ...defaultQuotaFeatureFlags(),
-    ...settings.quotaFeatureFlags,
-    reconciliationAutoIncreaseEnabled: false,
-  };
-  if (!quotaWriteActionEnabled(flags, action)) {
+  if (quotaWritesPaused()) {
     console.warn(
       JSON.stringify({
-        event: "tokeninside.quota.legacy_write_blocked",
+        event: "tokeninside.quota.writes_paused",
         action,
       }),
     );
-    throw new QuotaFeatureDisabledError(action);
+    throw new QuotaWritesPausedError(action);
   }
-  if (!flags.legacyAbsoluteQuotaWritesEnabled && !settings.quotaMigration?.appliedAt) {
-    throw new QuotaFeatureDisabledError(
-      action,
-      `F 阶段 ${action} 写入尚未就绪：历史额度账本迁移未完成`,
-    );
-  }
-  return flags;
-}
-
-export async function assertLegacyAbsoluteQuotaWriteEnabled(action: QuotaWriteAction) {
-  const flags = await getQuotaFeatureFlags();
-  if (!flags.legacyAbsoluteQuotaWritesEnabled) {
-    console.warn(
-      JSON.stringify({
-        event: "tokeninside.quota.legacy_absolute_write_blocked",
-        action,
-      }),
-    );
-    throw new QuotaFeatureDisabledError(action);
-  }
-  return flags;
 }
 
 export function quotaFeatureErrorStatus(error: unknown) {
-  return error instanceof QuotaFeatureDisabledError ? 503 : undefined;
+  return error instanceof QuotaWritesPausedError ? 503 : undefined;
 }

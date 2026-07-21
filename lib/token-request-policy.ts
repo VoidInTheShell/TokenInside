@@ -2,8 +2,6 @@ import type { RequestStatus, TokenRequest } from "./types";
 
 const humanApprovalRequestTypes = new Set<TokenRequest["requestType"]>([
   "first_apply",
-  "quota_reset",
-  "quota_restore",
 ]);
 
 export const adminDecidableRequestStatuses = new Set<RequestStatus>([

@@ -10,6 +10,7 @@ import {
 test("billing operations distinguish queued work from terminal audit records", () => {
   assert.equal(isTerminalBillingOperationStatus("pending"), false);
   assert.equal(isTerminalBillingOperationStatus("running"), false);
+  assert.equal(isTerminalBillingOperationStatus("continuation_pending"), true);
   assert.equal(isTerminalBillingOperationStatus("dry_run"), true);
   assert.equal(isTerminalBillingOperationStatus("applied"), true);
   assert.equal(isTerminalBillingOperationStatus("partial_failed"), true);

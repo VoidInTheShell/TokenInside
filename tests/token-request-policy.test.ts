@@ -15,10 +15,10 @@ test("approval handling only includes requests that need a human decision", () =
   );
   assert.equal(
     tokenRequestRequiresAdminDecision({
-      requestType: "quota_reset",
+      requestType: "quota_adjust",
       status: "approved_provision_failed",
     }),
-    true,
+    false,
   );
   assert.equal(
     tokenRequestRequiresAdminDecision({
@@ -36,7 +36,7 @@ test("approval handling only includes requests that need a human decision", () =
   );
   assert.equal(
     tokenRequestRequiresAdminDecision({
-      requestType: "quota_reset",
+      requestType: "quota_adjust",
       status: "provisioned",
     }),
     false,

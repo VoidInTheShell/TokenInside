@@ -233,31 +233,48 @@ export async function listFeishuDepartmentUsers(
   departmentId: string,
   options: { fetchChild?: boolean } = {},
 ) {
-  const tenantAccessToken = await getTenantAccessToken();
   const users: FeishuContactUser[] = [];
+  const tenantAccessToken = await getTenantAccessToken();
   let pageToken: string | undefined;
   for (let page = 0; page < 100; page += 1) {
-    const params = new URLSearchParams({
-      department_id: departmentId,
-      department_id_type: "open_department_id",
-      fetch_child: options.fetchChild ? "true" : "false",
-      page_size: "50",
-      user_id_type: "open_id",
-    });
-    if (pageToken) params.set("page_token", pageToken);
-    const data = await feishuFetch<{
-      items?: FeishuContactUser[];
-      has_more?: boolean;
-      page_token?: string;
-    }>(`/open-apis/contact/v3/users/find_by_department?${params.toString()}`, {
-      method: "GET",
+    const result = await listFeishuDepartmentUsersPage(departmentId, {
+      fetchChild: options.fetchChild,
+      pageToken,
       tenantAccessToken,
     });
-    users.push(...(data.items ?? []));
-    if (!data.has_more || !data.page_token) break;
-    pageToken = data.page_token;
+    users.push(...result.items);
+    if (!result.hasMore || !result.pageToken) return users;
+    pageToken = result.pageToken;
   }
-  return users;
+  throw new Error("飞书部门成员超过 5000 人的单次同步上限，请拆分部门后重试");
+}
+
+export async function listFeishuDepartmentUsersPage(
+  departmentId: string,
+  options: { fetchChild?: boolean; pageToken?: string; tenantAccessToken?: string } = {},
+) {
+  const tenantAccessToken = options.tenantAccessToken ?? await getTenantAccessToken();
+  const params = new URLSearchParams({
+    department_id: departmentId,
+    department_id_type: "open_department_id",
+    fetch_child: options.fetchChild ? "true" : "false",
+    page_size: "50",
+    user_id_type: "open_id",
+  });
+  if (options.pageToken) params.set("page_token", options.pageToken);
+  const data = await feishuFetch<{
+    items?: FeishuContactUser[];
+    has_more?: boolean;
+    page_token?: string;
+  }>(`/open-apis/contact/v3/users/find_by_department?${params.toString()}`, {
+    method: "GET",
+    tenantAccessToken,
+  });
+  return {
+    items: (data.items ?? []).slice(0, 50),
+    hasMore: Boolean(data.has_more),
+    pageToken: data.page_token,
+  };
 }
 
 export function getPrimarySystemAdminOpenId() {
@@ -270,13 +287,10 @@ export function getPrimarySystemAdminOpenId() {
 
 function systemAdminFallbackNotice(
   reason: ApprovalRouteReason,
-  purpose: "token_apply" | "quota_reset",
 ) {
   if (reason === "no_department") return SYSTEM_ADMIN_FALLBACK_NOTICE;
   if (reason === "applicant_is_department_admin") {
-    return purpose === "quota_reset"
-      ? "您的个人提额请求将发送给系统管理员审批。"
-      : "您的 Token 申请将发送给系统管理员审批。";
+    return "您的 Token 申请将发送给系统管理员审批。";
   }
   if (reason === "no_leader") {
     return "未找到可用的部门审批负责人，您的请求将发送给系统管理员审批。";
@@ -290,7 +304,6 @@ function systemAdminFallbackNotice(
 function resolveSystemAdminFallback(
   error: unknown,
   knownDepartmentId: string | undefined,
-  purpose: "token_apply" | "quota_reset",
 ): ApprovalTarget {
   const systemAdminOpenId = getConfig().admin.systemAdminOpenIds[0];
   const fallbackReason =
@@ -309,7 +322,7 @@ function resolveSystemAdminFallback(
     leaderOpenId: systemAdminOpenId,
     source: "system_admin_fallback",
     reason,
-    notice: systemAdminFallbackNotice(reason, purpose),
+    notice: systemAdminFallbackNotice(reason),
     fallbackReason,
   };
 }
@@ -374,12 +387,11 @@ async function resolveDepartmentApprovalTargetForUser(
 export async function resolveApprovalTargetForUser(
   openId: string,
   knownDepartmentId?: string,
-  purpose: "token_apply" | "quota_reset" = "token_apply",
 ): Promise<ApprovalTarget> {
   try {
     return await resolveDepartmentApprovalTargetForUser(openId, knownDepartmentId);
   } catch (err) {
-    return resolveSystemAdminFallback(err, knownDepartmentId, purpose);
+    return resolveSystemAdminFallback(err, knownDepartmentId);
   }
 }
 
@@ -475,7 +487,7 @@ export async function sendDepartmentQuotaApprovalCard(input: {
   departmentId: string;
   action: "increase" | "reset";
   currentQuotaLimit: number;
-  requestedQuotaLimit: number;
+  requestedQuotaLimit?: number;
   reason: string;
 }) {
   const tenantAccessToken = await getTenantAccessToken();
@@ -498,7 +510,9 @@ export async function sendDepartmentQuotaApprovalCard(input: {
             `**部门**：${input.departmentName ?? input.departmentId}`,
             `**动作**：${input.action === "increase" ? "提高部门总额度" : "重置部门总额度"}`,
             `**当前上限**：${input.currentQuotaLimit}`,
-            `**申请上限**：${input.requestedQuotaLimit}`,
+            input.action === "increase"
+              ? `**申请上限**：${input.requestedQuotaLimit}`
+              : "**审批额度**：请系统管理员在 TokenInside 管理后台填写",
             `**申请说明**：${input.reason}`,
           ].join("\n"),
         },
@@ -506,12 +520,12 @@ export async function sendDepartmentQuotaApprovalCard(input: {
       {
         tag: "action",
         actions: [
-          {
+          ...(input.action === "increase" ? [{
             tag: "button",
             type: "primary",
             text: { tag: "plain_text", content: "通过" },
             value: { requestId: input.requestId, action: "approve", nonce: input.nonce },
-          },
+          }] : []),
           {
             tag: "button",
             type: "danger",

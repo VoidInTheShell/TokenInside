@@ -512,13 +512,13 @@ async function localCleanup(items) {
   const client = await pool.connect();
   try {
     await client.query("begin");
-    await client.query("select set_config('tokeninside.allow_ledger_rewrite', 'on', true)");
     await client.query("delete from usage_sync_issues where newapi_token_id = any($1::text[])", [tokenIds]);
     await client.query(
       "delete from newapi_usage_records where token_account_id = any($1::text[]) or feishu_user_id = any($2::text[])",
       [accountIds, userIds],
     );
-    await client.query("delete from quota_ledger_entries where feishu_user_id = any($1::text[])", [userIds]);
+    // Ledger entries are intentionally immutable. Run this destructive load
+    // harness only against a disposable database; its ledger evidence remains.
     await client.query("delete from quota_reconciliation_records where feishu_user_id = any($1::text[])", [userIds]);
     await client.query("delete from quota_operations where feishu_user_id = any($1::text[])", [userIds]);
     await client.query("delete from proxy_request_logs where feishu_user_id = any($1::text[])", [userIds]);

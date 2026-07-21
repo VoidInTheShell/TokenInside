@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { getCurrentUser } from "@/lib/session";
 import { listUserUsageReport } from "@/lib/store";
+import { requireActiveWorkspaceAccess } from "@/lib/workspace-access";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,10 +21,9 @@ function optionalParam(url: URL, key: string) {
 }
 
 export async function GET(request: Request) {
-  const user = await getCurrentUser();
-  if (!user) {
-    return NextResponse.json({ error: "需要飞书 OAuth 会话" }, { status: 401 });
-  }
+  const access = await requireActiveWorkspaceAccess();
+  if ("error" in access) return access.error;
+  const { user } = access;
 
   const url = new URL(request.url);
   const result = await listUserUsageReport({

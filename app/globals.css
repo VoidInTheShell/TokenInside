@@ -1008,6 +1008,208 @@ a {
   line-height: 1.5;
 }
 
+.switch-control {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 20px;
+  align-items: center;
+  padding: 2px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--input);
+  cursor: pointer;
+  transition: background-color 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.switch-control[data-size="sm"] {
+  width: 28px;
+  height: 16px;
+}
+
+.switch-control[data-state="checked"] {
+  background: var(--primary);
+}
+
+.switch-control:focus-visible,
+.select-trigger:focus-visible {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--ring);
+}
+
+.switch-control:disabled,
+.select-trigger:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.switch-thumb {
+  display: block;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: var(--card);
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.24);
+  transform: translateX(0);
+  transition: transform 160ms ease;
+}
+
+.switch-control[data-state="checked"] .switch-thumb {
+  transform: translateX(16px);
+}
+
+.switch-control[data-size="sm"] .switch-thumb {
+  width: 10px;
+  height: 10px;
+}
+
+.switch-control[data-size="sm"][data-state="checked"] .switch-thumb {
+  transform: translateX(12px);
+}
+
+.select-trigger {
+  display: flex;
+  width: fit-content;
+  min-width: 0;
+  height: 36px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 12px;
+  border: 1px solid var(--input);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--foreground);
+  font: inherit;
+  font-size: 13px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.select-trigger[data-size="sm"] {
+  height: 32px;
+}
+
+.select-trigger svg,
+.select-item svg,
+.select-scroll-button svg {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  color: var(--muted-foreground);
+}
+
+.select-content {
+  z-index: 60;
+  max-height: min(var(--radix-select-content-available-height), 320px);
+  min-width: var(--radix-select-trigger-width);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--foreground);
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.16);
+}
+
+.select-viewport {
+  padding: 4px;
+}
+
+.select-label {
+  display: block;
+  padding: 6px 8px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.select-item {
+  position: relative;
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  padding: 6px 32px 6px 10px;
+  border-radius: 4px;
+  font-size: 13px;
+  line-height: 1.35;
+  cursor: default;
+  user-select: none;
+  outline: none;
+}
+
+.select-item[data-highlighted] {
+  background: var(--muted);
+  color: var(--foreground);
+}
+
+.select-item[data-disabled] {
+  pointer-events: none;
+  opacity: 0.5;
+}
+
+.select-item-indicator {
+  position: absolute;
+  right: 8px;
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  align-items: center;
+  justify-content: center;
+}
+
+.select-separator {
+  height: 1px;
+  margin: 4px -4px;
+  background: var(--border);
+}
+
+.select-scroll-button {
+  display: flex;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+}
+
+.settings-reset-controls {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) auto;
+  align-items: end;
+  gap: 16px;
+}
+
+.settings-inline-control {
+  min-height: 62px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.settings-inline-control > div {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-inline-control label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.settings-reset-day-field [data-slot="select-trigger"] {
+  width: 100%;
+}
+
+.settings-reset-save {
+  min-width: 144px;
+  align-self: start;
+  margin-top: 25px;
+}
+
 .billing-control-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(120px, 1fr));
@@ -2092,6 +2294,16 @@ a {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .settings-reset-controls {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .settings-reset-save {
+    grid-column: 1 / -1;
+    justify-self: start;
+    margin-top: 0;
+  }
+
   .usage-analysis-grid,
   .usage-analysis-grid-user {
     grid-template-columns: 1fr;
@@ -2218,6 +2430,15 @@ a {
 
   .billing-control-grid {
     grid-template-columns: 1fr;
+  }
+
+  .settings-reset-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-reset-save {
+    width: 100%;
+    justify-self: stretch;
   }
 
   .metric-grid {

@@ -23,12 +23,24 @@ async function expectPgError(name, expectedCode, fn) {
   }
 }
 
+async function expectPgTransactionError(name, expectedCode, client, fn) {
+  await client.query("savepoint expected_error");
+  try {
+    await fn();
+    throw new Error(`${name} unexpectedly succeeded`);
+  } catch (error) {
+    await client.query("rollback to savepoint expected_error");
+    if (error?.code !== expectedCode) throw error;
+    pass(name, expectedCode);
+  } finally {
+    await client.query("release savepoint expected_error");
+  }
+}
+
 async function cleanupArtifacts() {
   const client = await pool.connect();
   try {
     await client.query("begin");
-    await client.query("set local tokeninside.allow_ledger_rewrite = 'on'");
-    await client.query("delete from quota_ledger_entries where id like $1", [`${runId}%`]);
     await client.query("delete from quota_operations where id like $1", [`${runId}%`]);
     await client.query("commit");
     artifactsCleaned = true;
@@ -45,11 +57,7 @@ try {
     "select version from schema_migrations order by version",
   );
   const versions = migrations.rows.map((row) => row.version);
-  for (const expected of [
-    "20260711_001_baseline",
-    "20260711_002_quota_ledger",
-    "20260711_003_quota_ledger_maintenance_guard",
-  ]) {
+  for (const expected of ["20260717_001_greenfield_baseline"]) {
     if (!versions.includes(expected)) throw new Error(`missing migration ${expected}`);
   }
   pass("migration_versions", versions);
@@ -68,7 +76,7 @@ try {
   const now = new Date().toISOString();
   const operation = {
     id: `${runId}_ledger_op`,
-    operationType: "migration",
+    operationType: "first_provision",
     idempotencyKey: `${runId}:ledger`,
     feishuUserId: `${runId}_ledger_user`,
     billingPeriod: "2026-07",
@@ -80,65 +88,46 @@ try {
     updatedAt: now,
     completedAt: now,
   };
-  await pool.query(
-    `insert into quota_operations
-      (id, operation_type, idempotency_key, feishu_user_id, billing_period,
-       state, operation_generation, data, created_at, updated_at, completed_at)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-    [
-      operation.id,
-      operation.operationType,
-      operation.idempotencyKey,
-      operation.feishuUserId,
-      operation.billingPeriod,
-      operation.state,
-      operation.operationGeneration,
-      operation,
-      now,
-      now,
-      now,
-    ],
-  );
   const ledger = {
     id: `${runId}_ledger`,
     operationId: operation.id,
     feishuUserId: operation.feishuUserId,
     period: "2026-07",
-    entryType: "migration_opening",
+    entryType: "period_open_authorization",
     signedQuota: 100,
     quotaPerUnitSnapshot: 500000,
     sourceType: "f-stage-db-check",
     sourceId: runId,
     createdAt: now,
   };
-  await pool.query(
-    `insert into quota_ledger_entries
-      (id, operation_id, feishu_user_id, period, entry_type, signed_quota, data, created_at)
-     values ($1,$2,$3,$4,$5,$6,$7,$8)`,
-    [
-      ledger.id,
-      ledger.operationId,
-      ledger.feishuUserId,
-      ledger.period,
-      ledger.entryType,
-      ledger.signedQuota,
-      ledger,
-      now,
-    ],
-  );
-  await expectPgError("ledger_update_rejected", "P0001", () =>
-    pool.query("update quota_ledger_entries set signed_quota = 101 where id = $1", [ledger.id]),
-  );
-  await expectPgError("ledger_delete_rejected", "P0001", () =>
-    pool.query("delete from quota_ledger_entries where id = $1", [ledger.id]),
-  );
-  await expectPgError("ledger_duplicate_rejected", "23505", () =>
-    pool.query(
+  const ledgerClient = await pool.connect();
+  try {
+    await ledgerClient.query("begin");
+    await ledgerClient.query(
+      `insert into quota_operations
+        (id, operation_type, idempotency_key, feishu_user_id, billing_period,
+         state, operation_generation, data, created_at, updated_at, completed_at)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [
+        operation.id,
+        operation.operationType,
+        operation.idempotencyKey,
+        operation.feishuUserId,
+        operation.billingPeriod,
+        operation.state,
+        operation.operationGeneration,
+        operation,
+        now,
+        now,
+        now,
+      ],
+    );
+    await ledgerClient.query(
       `insert into quota_ledger_entries
         (id, operation_id, feishu_user_id, period, entry_type, signed_quota, data, created_at)
        values ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [
-        `${ledger.id}_duplicate`,
+        ledger.id,
         ledger.operationId,
         ledger.feishuUserId,
         ledger.period,
@@ -147,21 +136,34 @@ try {
         ledger,
         now,
       ],
-    ),
-  );
-
-  const maintenance = await pool.connect();
-  try {
-    await maintenance.query("begin");
-    await maintenance.query("set local tokeninside.allow_ledger_rewrite = 'on'");
-    await maintenance.query(
-      "update quota_ledger_entries set signed_quota = 101 where id = $1",
-      [ledger.id],
     );
-    await maintenance.query("rollback");
-    pass("ledger_maintenance_override", "transaction-local and rolled back");
+    await expectPgTransactionError("ledger_update_rejected", "P0001", ledgerClient, () =>
+      ledgerClient.query("update quota_ledger_entries set signed_quota = 101 where id = $1", [ledger.id]),
+    );
+    await expectPgTransactionError("ledger_delete_rejected", "P0001", ledgerClient, () =>
+      ledgerClient.query("delete from quota_ledger_entries where id = $1", [ledger.id]),
+    );
+    await expectPgTransactionError("ledger_duplicate_rejected", "23505", ledgerClient, () =>
+      ledgerClient.query(
+        `insert into quota_ledger_entries
+          (id, operation_id, feishu_user_id, period, entry_type, signed_quota, data, created_at)
+         values ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [
+          `${ledger.id}_duplicate`,
+          ledger.operationId,
+          ledger.feishuUserId,
+          ledger.period,
+          ledger.entryType,
+          ledger.signedQuota,
+          ledger,
+          now,
+        ],
+      ),
+    );
+    await ledgerClient.query("rollback");
   } finally {
-    maintenance.release();
+    await ledgerClient.query("rollback").catch(() => undefined);
+    ledgerClient.release();
   }
 
   const openUser = `${runId}_open_user`;
@@ -220,7 +222,7 @@ try {
   );
 
   await cleanupArtifacts();
-  pass("test_artifact_cleanup", "ledger and operation fixtures removed");
+  pass("test_artifact_cleanup", "ledger fixture rolled back and operation fixtures removed");
   process.stdout.write(`${JSON.stringify({ ok: true, runId, checks }, null, 2)}\n`);
 } finally {
   if (!artifactsCleaned) await cleanupArtifacts();

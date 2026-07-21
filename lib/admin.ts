@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { getEffectiveAdminScopeForUser, hydrateUserDepartment } from "@/lib/admin-sync";
 import { getCurrentUser } from "@/lib/session";
+import { getAdminScopeForKnownUser } from "@/lib/store";
 import type { AdminScope } from "@/lib/types";
 
 export function isRootAdminScope(scope?: AdminScope | null) {
@@ -12,7 +12,7 @@ export function isSystemAdminScope(scope?: AdminScope | null) {
 }
 
 export async function requireAdminScope() {
-  const user = await hydrateUserDepartment(await getCurrentUser());
+  const user = await getCurrentUser();
   if (!user) {
     return {
       error: NextResponse.json({ error: "需要飞书 OAuth 会话" }, { status: 401 }),
@@ -29,7 +29,10 @@ export async function requireAdminScope() {
     };
   }
 
-  const scope = await getEffectiveAdminScopeForUser(user);
+  // Admin GET handlers must remain read-only. Department hydration and
+  // supervisor-scope synchronization belong to OAuth, explicit sync actions,
+  // or background directory jobs; authorization reads only persisted state.
+  const scope = await getAdminScopeForKnownUser(user);
   if (!scope) {
     return {
       error: NextResponse.json(

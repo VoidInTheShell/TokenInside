@@ -168,12 +168,18 @@ async function createUsageSyncSchedulerHarness(input: {
       nowIso: () => input.nowIso ?? "2026-07-17T00:00:00.000Z",
       randomId: () => "usage-run-1",
     },
+    "@/lib/quota-execution-fence": {
+      assertQuotaExecutionFenceHeld: () => undefined,
+    },
     "@/lib/quota-model": {
       fixedUsageSyncWindow: () => ({
         scanStart: input.scanStart ?? "2026-07-16T23:59:31.000Z",
         scanEnd: fixedScanEnd,
       }),
       hongKongBillingPeriod: () => "2026-07",
+    },
+    "@/lib/package-reset": {
+      packageBillingPeriod: () => "2026-07",
     },
     "@/lib/billing-period-finalizer": {
       drainBillingPeriodFinalizations: async () => undefined,
@@ -206,7 +212,7 @@ async function createUsageSyncSchedulerHarness(input: {
           requiredThrough: "2026-07-17T00:00:00.000Z",
         };
       },
-      listPostgresMatchedUsageBillingMaterializationTargets: async () => {
+      listPostgresAuthoritativeUsageBillingMaterializationTargets: async () => {
         recoveryListCalls += 1;
         await input.onListRecoveryTargets?.(recoveryListCalls);
         return input.recoveryTargets ?? [];
@@ -236,6 +242,7 @@ async function createUsageSyncSchedulerHarness(input: {
       enqueueBillingOperation: async () => undefined,
       findBillingOperationById: async () => null,
       getAppSettings: async () => ({ usageSyncPolicy: policy }),
+      getEarliestOpenBlockingUsageIssue: async () => null,
       getUsageSyncCheckpoint: async () => checkpoint,
       listRunnableBillingOperations: async () => [],
       recordBillingOperation: async () => undefined,
@@ -354,41 +361,40 @@ test("authoritative immediate settlement does not await derived period materiali
   assert.match(observer, /tokeninside\.billing_period\.materialization_failed/);
 });
 
-test("authoritative batch checkpoint does not await Postgres read-model materialization", async () => {
+test("authoritative batch awaits Postgres materialization inside the execution fence", async () => {
   const source = await readFile(usageSyncPath, "utf8");
   const batch = functionBody(
     source,
     "async function syncNewApiUsageLogsUnlocked",
     "const manualUsageSyncLeaseDurationMs",
   );
-  const observer = functionBody(
-    source,
-    "function observeUsageSyncBillingPeriodFinalization",
-    "export type NewApiProxyUsageSettlementResult",
-  );
 
-  assert.doesNotMatch(batch, /await finalizeBackfillBillingPeriods/);
-  assert.match(observer, /void finalizeBackfillBillingPeriods\(backfills\)\.catch/);
-  assert.match(observer, /tokeninside\.usage_sync\.materialization_failed/);
+  assert.match(
+    batch,
+    /await finalizeBackfillBillingPeriods\(\s*pages\.map\(\(page\) => page\.backfill\),\s*0,?\s*\)/,
+  );
+  assert.match(batch, /assertQuotaExecutionFenceHeld\(\)/);
   assert.ok(
     batch.indexOf("saveUsageSyncCheckpoint({") <
-      batch.indexOf("observeUsageSyncBillingPeriodFinalization("),
-    "the durable source checkpoint must commit before derived finalization is queued",
+      batch.indexOf("await finalizeBackfillBillingPeriods("),
+    "the durable source checkpoint must commit before in-fence derived finalization",
   );
   assert.match(batch, /getConfig\(\)\.storeBackend === "postgres"/);
   assert.match(batch, /else if \(!dryRun\)[\s\S]*await rebuildQuotaMaterializedSnapshots/);
   assert.match(batch, /Department availability is derived only from quota ledger grants/);
 });
 
-test("matched Postgres source facts enumerate distinct durable user-period materialization targets", async () => {
+test("authoritative Postgres source facts enumerate distinct durable user-period materialization targets", async () => {
   const source = await readFile(postgresStorePath, "utf8");
   const query = functionBody(
     source,
-    "export async function listPostgresMatchedUsageBillingMaterializationTargets()",
+    "export async function listPostgresAuthoritativeUsageBillingMaterializationTargets()",
     "export async function readPostgresUsageMatchingSnapshot(",
   );
 
-  assert.match(query, /where match_status = 'matched'/);
+  assert.match(query, /where match_status in \('matched', 'no_proxy_match'\)/);
+  assert.match(query, /feishu_user_id is not null/);
+  assert.match(query, /token_account_id is not null/);
   assert.match(query, /select distinct "feishuUserId", "billingPeriod"/);
   assert.match(query, /data->>'billingPeriod'/);
   assert.match(query, /newapi_created_at at time zone 'Asia\/Hong_Kong'/);
@@ -481,7 +487,7 @@ test("deferred settlement wake-ups are coalesced and never postpone an earlier s
   assert.match(scheduler, /usageSyncRuntime\.schedulerForceScanRequested\s*\? Math\.max\(/);
   assert.match(scheduler, /usageSyncContinuationDelayMs\(\)/);
   assert.match(scheduler, /usageSyncScanRetryDelayMs\(\)/);
-  assert.match(due, /if \(!policy\.enabled\) return \{ ran: false, reason: "disabled" as const \}/);
+  assert.doesNotMatch(due, /policy\.enabled|reason: "disabled"/);
   assert.match(due, /if \(!input\.force && nextRunAfter/);
   assert.match(due, /syncNewApiUsageLogs\(\{/);
   assert.match(wake, /usageSyncRuntime\.schedulerTailRefreshRequested = true/);
@@ -680,7 +686,7 @@ test("forward slices publish bounded progress before the whole catch-up target c
   assert.equal(harness.checkpoint?.settledThrough, "2026-07-16T23:58:30.000Z");
   assert.equal(harness.checkpoint?.scanStart, "2026-07-16T23:58:30.000Z");
   assert.equal(harness.checkpoint?.scanEnd, "2026-07-16T23:58:59.000Z");
-  assert.equal(harness.checkpoint?.lastRunStatus, "partial_failed");
+  assert.equal(harness.checkpoint?.lastRunStatus, "continuation_pending");
   assert.deepEqual(harness.pendingDelays(), [250]);
 
   await harness.runNextTimer();
@@ -698,7 +704,7 @@ test("a completed forward target yields one bounded durable repair slice", async
   assert.equal(harness.checkpoint?.scanMode, "repair");
   assert.equal(harness.checkpoint?.scanStart, "2026-07-16T22:00:00.000Z");
   assert.equal(harness.checkpoint?.scanEnd, "2026-07-16T22:00:29.000Z");
-  assert.equal(harness.checkpoint?.lastRunStatus, "partial_failed");
+  assert.equal(harness.checkpoint?.lastRunStatus, "continuation_pending");
 
   await harness.runNextTimer();
   assert.equal(harness.checkpoint?.repairCursorThrough, "2026-07-16T22:00:29.000Z");
@@ -734,10 +740,16 @@ test("a repair burst covers faster than wall time while yielding between slices"
     repairThrough - repairStart >= 12 * 29_000,
     "one five-minute cycle must repair more than five minutes of history",
   );
-  // The originating capacity wake retains one coalesced fresh-tail scan after
-  // the bounded repair budget; it is still one yielded slice, not a new burst.
-  if (harness.pendingDelays()[0] === 250) await harness.runNextTimer();
-  assert.ok((harness.pendingDelays()[0] ?? 0) >= 295_000);
+  // The originating capacity wake retains one coalesced fresh-tail attempt
+  // after the bounded repair budget. With no forward clock progress, a mature
+  // durable tail receives a short retry instead of the five-minute refill.
+  let tailTransitionTicks = 0;
+  while ((harness.pendingDelays()[0] ?? 0) < 10_000 && tailTransitionTicks < 4) {
+    tailTransitionTicks += 1;
+    await harness.runNextTimer();
+  }
+  assert.ok((harness.pendingDelays()[0] ?? 0) >= 10_000);
+  assert.ok((harness.pendingDelays()[0] ?? Infinity) <= 20_000);
 
   const cursorBeforeFreshWake = new Date(
     String(harness.checkpoint?.repairCursorThrough),
@@ -745,9 +757,10 @@ test("a repair burst covers faster than wall time while yielding between slices"
   const listCallsBeforeFreshWake = harness.listCalls;
   harness.setScanEnd("2026-07-17T00:00:05.000Z");
   await harness.api.syncNewApiUsageForProxyRequest({ proxyLogId: "no-refill" });
-  let shortTicks = 0;
-  while (harness.pendingDelays()[0] < 10_000 && shortTicks < 8) {
-    shortTicks += 1;
+  await harness.runNextTimer();
+  tailTransitionTicks = 0;
+  while ((harness.pendingDelays()[0] ?? 0) < 10_000 && tailTransitionTicks < 4) {
+    tailTransitionTicks += 1;
     await harness.runNextTimer();
   }
   const cursorAfterFreshWake = new Date(
@@ -763,8 +776,9 @@ test("a repair burst covers faster than wall time while yielding between slices"
     "only one bounded fresh-forward page plus verification may run",
   );
   assert.ok(
-    (harness.pendingDelays()[0] ?? 0) >= 60_000,
-    "the exhausted bucket must leave the continuation cadence",
+    (harness.pendingDelays()[0] ?? 0) >= 10_000 &&
+      (harness.pendingDelays()[0] ?? Infinity) <= 20_000,
+    "the exhausted bucket must leave continuation cadence without delaying the tail to refill",
   );
 });
 
@@ -1013,7 +1027,7 @@ test("a changing OFFSET slice resets to page zero without advancing its watermar
   assert.deepEqual(harness.pendingDelays(), [250]);
 });
 
-test("an incomplete cursor continues while affected-user materialization is still pending", async () => {
+test("an incomplete cursor schedules continuation only after in-fence materialization", async () => {
   let releaseMaterialization!: () => void;
   const materialization = new Promise<void>((resolve) => {
     releaseMaterialization = resolve;
@@ -1031,26 +1045,93 @@ test("an incomplete cursor continues while affected-user materialization is stil
   });
 
   await harness.api.syncNewApiUsageForProxyRequest({ proxyLogId: "deferred-1" });
-  await harness.runNextTimer();
-  assert.deepEqual(harness.pendingDelays(), [250]);
+  const firstRun = harness.runNextTimer();
+  for (let attempt = 0; attempt < 20 && harness.events.length < 2; attempt += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
   assert.deepEqual(harness.listedPages, [0]);
   assert.deepEqual(harness.events.slice(0, 2), [
     "checkpoint:1",
     "finalize:user-1:2026-07",
   ]);
+  assert.deepEqual(
+    harness.pendingDelays(),
+    [],
+    "the continuation must not escape the advisory execution fence while materialization is pending",
+  );
 
+  releaseMaterialization();
+  await materialization;
+  await firstRun;
+  assert.deepEqual(harness.pendingDelays(), [250]);
   await harness.runNextTimer();
   assert.deepEqual(
     harness.listedPages,
     [0, 1, 0],
-    "the forced cursor and slice verification must advance without waiting for the read model",
+    "the forced cursor and slice verification advance after the read model completes",
   );
   assert.deepEqual(harness.pendingDelays(), [250]);
-  releaseMaterialization();
-  await materialization;
 });
 
-test("a materializer rejection is observed without rolling back source progress", async () => {
+test("a due durable settlement gets a bounded forward-clock retry despite an exhausted repair bucket", async () => {
+  const sharedGlobal: Record<string, unknown> = {};
+  const harness = await createUsageSyncSchedulerHarness({
+    sharedGlobal,
+    pageTotals: [0],
+    scanStart: "2026-07-17T00:00:00.000Z",
+    scanEnd: "2026-07-17T00:00:00.000Z",
+    pendingHorizon: {
+      count: 1,
+      nextDueAt: "2000-01-01T00:00:00.000Z",
+      requiredThrough: "2026-07-17T00:00:00.000Z",
+    },
+    initialCheckpoint: {
+      id: "usage-checkpoint",
+      scope: "newapi_usage_logs",
+      settledThrough: "2026-07-17T00:00:00.000Z",
+      ingestedThrough: "2026-07-17T00:00:00.000Z",
+      scanStart: "2026-07-16T22:00:00.000Z",
+      scanEnd: "2026-07-16T22:00:29.000Z",
+      scanTargetEnd: "2026-07-16T22:00:29.000Z",
+      scanMode: "repair",
+      repairWindowStart: "2026-07-16T22:00:00.000Z",
+      repairWindowEnd: "2026-07-17T00:00:00.000Z",
+      repairCursorThrough: "2026-07-16T21:59:59.000Z",
+      cursorPage: 0,
+      lastRunStatus: "continuation_pending",
+      nextRunAfter: "2099-01-01T00:00:00.000Z",
+      updatedAt: "2026-07-17T00:00:00.000Z",
+    },
+  });
+  const runtime = sharedGlobal.__tokenInsideUsageSyncRuntime as {
+    schedulerRepairSlicesRemaining: number;
+    schedulerRepairBudgetRefillNotBeforeEpochMs: number;
+  };
+  runtime.schedulerRepairSlicesRemaining = 0;
+  runtime.schedulerRepairBudgetRefillNotBeforeEpochMs = Date.now() + 300_000;
+
+  await harness.api.ensureUsageSyncScheduler();
+  await harness.runNextTimer();
+
+  assert.equal(harness.listCalls, 0, "zero forward lag must not spend historical repair work");
+  assert.ok((harness.pendingDelays()[0] ?? 0) >= 10_000);
+  assert.ok((harness.pendingDelays()[0] ?? Infinity) <= 20_000);
+  harness.setScanEnd("2026-07-17T00:00:15.000Z");
+  await harness.runNextTimer();
+
+  assert.ok(harness.listCalls > 0, "the bounded retry must resume fresh forward ingestion");
+  assert.equal(
+    (harness.checkpoint?.lastRunSummary as Record<string, unknown>)?.scanMode,
+    "forward",
+  );
+  assert.equal(
+    harness.api.usageSettlementTailSnapshot().repairSlicesRemaining,
+    0,
+    "the settlement reread cannot mint or spend historical repair tokens",
+  );
+});
+
+test("an in-fence materializer rejection becomes a bounded scheduler failure", async () => {
   const expected = new Error("materializer failed");
   const harness = await createUsageSyncSchedulerHarness({
     pageTotals: [1],
@@ -1077,7 +1158,10 @@ test("a materializer rejection is observed without rolling back source progress"
     "finalize:user-1:2026-07",
   ]);
   assert.equal(harness.schedulerErrors.length, 1);
-  assert.match(JSON.stringify(harness.schedulerErrors[0]), /materialization_failed/);
+  assert.match(JSON.stringify(harness.schedulerErrors[0]), /usage_sync\.scheduler_failed/);
+  assert.equal(harness.checkpoint?.lastRunStatus, "partial_failed");
+  assert.equal(harness.checkpoint?.failureCount, 1);
+  assert.deepEqual(harness.pendingDelays(), [1000]);
 });
 
 test("deferrals arriving during a scan collapse into exactly one forced follow-up", async () => {
@@ -1119,20 +1203,19 @@ test("deferrals arriving during a scan collapse into exactly one forced follow-u
   assert.deepEqual(harness.schedulerErrors, []);
 });
 
-test("force never overrides a disabled usage-sync policy", async () => {
+test("stale disabled policy data cannot turn off authoritative usage ingestion", async () => {
   const harness = await createUsageSyncSchedulerHarness({
     enabled: false,
     pageTotals: [1],
   });
 
   const result = await harness.api.runDueNewApiUsageSync({ force: true });
-  assert.equal(result.ran, false);
-  assert.equal(result.reason, "disabled");
-  assert.equal(harness.listCalls, 0);
-  assert.equal(harness.lockRuns, 0);
+  assert.equal(result.ran, true);
+  assert.ok(harness.listCalls > 0);
+  assert.equal(harness.lockRuns, 1);
 });
 
-test("a deferred wake cannot keep a disabled scheduler on the continuation cadence", async () => {
+test("a deferred wake still advances ingestion when stale settings contain enabled false", async () => {
   const harness = await createUsageSyncSchedulerHarness({
     enabled: false,
     pageTotals: [1],
@@ -1142,17 +1225,9 @@ test("a deferred wake cannot keep a disabled scheduler on the continuation caden
   assert.deepEqual(harness.pendingDelays(), [250]);
   await harness.runNextTimer();
 
-  assert.equal(harness.horizonCalls, 0);
-  assert.equal(harness.listCalls, 0);
-  assert.ok(
-    (harness.pendingDelays()[0] ?? 0) >= 60_000,
-    "disabled synchronization must return to its maintenance interval",
-  );
-  const secondDelay = await harness.runNextTimer();
-  assert.ok(secondDelay >= 60_000);
-  assert.equal(harness.horizonCalls, 0);
-  assert.equal(harness.listCalls, 0);
-  assert.ok((harness.pendingDelays()[0] ?? 0) >= 60_000);
+  assert.ok(harness.horizonCalls > 0);
+  assert.ok(harness.listCalls > 0);
+  assert.deepEqual(harness.schedulerErrors, []);
 });
 
 test("a peer-owned advisory fence retries with jitter without recording scheduler failure", async () => {
@@ -1201,7 +1276,6 @@ test("a forced source failure obeys durable retry instead of looping at continua
 
 test("startup recovery re-registers a matched source target even when the original observer never ran", async () => {
   const harness = await createUsageSyncSchedulerHarness({
-    enabled: false,
     pageTotals: [0],
     recoveryTargets: [
       { feishuUserId: "recovered-user", billingPeriod: "2026-07" },
@@ -1213,8 +1287,11 @@ test("startup recovery re-registers a matched source target even when the origin
   await harness.runNextTimer();
 
   assert.equal(harness.recoveryListCalls, 1);
-  assert.equal(harness.listCalls, 0, "disabled source sync must remain disabled");
-  assert.deepEqual(harness.events, ["finalize:recovered-user:2026-07"]);
+  assert.ok(harness.listCalls > 0, "startup recovery and source ingestion both remain active");
+  assert.deepEqual(harness.events, [
+    "finalize:recovered-user:2026-07",
+    "checkpoint:0",
+  ]);
   const snapshot = harness.api.billingMaterializationRecoverySnapshot();
   assert.equal(snapshot.requested, false);
   assert.equal(snapshot.running, false);
@@ -1266,7 +1343,6 @@ test("materialization rejection requests one recovery with a real not-before bac
 
 test("drain force-enumerates durable targets before draining finalizers", async () => {
   const harness = await createUsageSyncSchedulerHarness({
-    enabled: false,
     pageTotals: [0],
     recoveryTargets: [
       { feishuUserId: "drain-user", billingPeriod: "2026-06" },
@@ -1284,7 +1360,6 @@ test("concurrent drains share one recovery enumeration instead of allocating wai
     releaseList = resolve;
   });
   const harness = await createUsageSyncSchedulerHarness({
-    enabled: false,
     pageTotals: [0],
     recoveryTargets: [
       { feishuUserId: "single-flight-user", billingPeriod: "2026-07" },
@@ -1307,7 +1382,6 @@ test("concurrent drains share one recovery enumeration instead of allocating wai
 test("JSON storage keeps durable materialization recovery as a no-op", async () => {
   const harness = await createUsageSyncSchedulerHarness({
     storeBackend: "json",
-    enabled: false,
     pageTotals: [0],
     recoveryTargets: [
       { feishuUserId: "must-not-run", billingPeriod: "2026-07" },
