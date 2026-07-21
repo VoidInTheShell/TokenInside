@@ -5,6 +5,8 @@ import test from "node:test";
 const preflightPath = new URL("../scripts/production-preflight.mjs", import.meta.url);
 const performanceProfilePath = new URL("../performance-300.env.example", import.meta.url);
 const environmentExamplePaths = [
+  new URL("../.env.example", import.meta.url),
+  new URL("../.env.production.example", import.meta.url),
   new URL("../postgres-pools.env.example", import.meta.url),
 ];
 
