@@ -194,6 +194,9 @@ compose pull tokeninside
 echo "Running versioned database migrations"
 compose run --rm --no-deps --entrypoint node tokeninside scripts/db-migrate.mjs
 
+echo "Verifying greenfield database and dedicated NewAPI binding"
+compose run --rm --no-deps --entrypoint node tokeninside scripts/greenfield-preflight.mjs
+
 echo "Checking migrated database and runtime configuration"
 compose run --rm --no-deps --entrypoint node tokeninside scripts/production-preflight.mjs
 

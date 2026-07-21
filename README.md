@@ -69,8 +69,11 @@ For a standalone Docker Compose deployment:
 
 ```bash
 cp .env.example .env
-docker compose -f docker-compose.example.yml up -d
+docker compose -f docker-compose.example.yml up -d --wait postgres
 docker compose -f docker-compose.example.yml run --rm --no-deps --entrypoint node tokeninside scripts/db-migrate.mjs
+docker compose -f docker-compose.example.yml run --rm --no-deps --entrypoint node tokeninside scripts/greenfield-preflight.mjs
+docker compose -f docker-compose.example.yml run --rm --no-deps --entrypoint node tokeninside scripts/production-preflight.mjs
+docker compose -f docker-compose.example.yml up -d --wait tokeninside
 ```
 
 Production-style deployments should set `TOKENINSIDE_IMAGE` to a fixed tag, for example:
@@ -80,6 +83,20 @@ TOKENINSIDE_IMAGE=ghcr.io/voidintheshell/tokeninside:sha-abcdef1
 ```
 
 Runtime secrets must be provided through the server-side environment file. Do not bake Feishu, NewAPI, database, or session secrets into the image.
+
+The first PostgreSQL deployment also requires
+`TOKENINSIDE_GREENFIELD_CUTOVER_AT`, set to an already-reached whole-second
+timestamp. `greenfield:preflight` refuses any existing local business facts,
+NewAPI Tokens, or NewAPI usage before that cutover. It then stores a
+non-secret upstream binding manifest. Later deployments verify only that
+manifest and the lightweight NewAPI control identity; they do not repeat the
+full empty-account scan. The application health endpoint remains `503` until
+the manifest exists and matches the configured upstream identity.
+The checked-in environment files intentionally use the non-runnable
+`replace-with-actual-greenfield-cutover-at` placeholder: replace it during the
+actual initialization with an already-reached, whole-second ISO timestamp.
+Never use a future timestamp or copy an example date, because that would leave
+the interval before the real installation outside the pollution check.
 
 ## CI/CD
 

@@ -26,9 +26,7 @@ RUN addgroup -S nodejs && adduser -S nextjs -G nodejs
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 COPY --from=builder --chown=nextjs:nodejs /app/scripts ./scripts
-COPY --from=builder --chown=nextjs:nodejs /app/lib/quota-migration.ts ./lib/quota-migration.ts
 COPY --from=builder --chown=nextjs:nodejs /app/lib/quota-model.ts ./lib/quota-model.ts
-COPY --from=builder --chown=nextjs:nodejs /app/lib/quota-risk.ts ./lib/quota-risk.ts
 
 RUN mkdir -p /app/.local-data && chown -R nextjs:nodejs /app/.local-data
 
