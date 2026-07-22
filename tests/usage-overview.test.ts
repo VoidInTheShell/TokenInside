@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildUsageOverview,
-  formatBillingPeriod,
+  formatPackagePeriod,
   formatOneDecimal,
   formatResetCountdown,
   formatTokensOneDecimal,
@@ -36,7 +36,7 @@ test("falls back to monthly quota minus consumed quota and clamps percentage", (
 test("computes the next Hong Kong month boundary", () => {
   assert.equal(nextHongKongBillingResetAt("2026-07")?.toISOString(), "2026-07-31T16:00:00.000Z");
   assert.equal(nextHongKongBillingResetAt("invalid"), null);
-  assert.equal(formatBillingPeriod("2026-07"), "2026年7月账期");
+  assert.equal(formatPackagePeriod("2026-07"), "2026年7月套餐周期");
 });
 
 test("formats countdown and required one-decimal metrics", () => {

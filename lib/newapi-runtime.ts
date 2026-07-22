@@ -1,5 +1,4 @@
 import { getConfig, type RuntimeConfig } from "@/lib/config";
-import { verifyGreenfieldInstallationBinding } from "@/lib/greenfield-installation";
 import { openAppSecret } from "@/lib/secret-box";
 import { getNewApiRuntimeBindingSnapshot } from "@/lib/store";
 
@@ -7,7 +6,6 @@ const secretContext = "app-settings:newapi-access-token";
 
 type LoadedRuntimeBinding = {
   value: RuntimeConfig["newapi"];
-  manifest: Awaited<ReturnType<typeof getNewApiRuntimeBindingSnapshot>>["manifest"];
 };
 
 type NewApiRuntimeCache = {
@@ -37,12 +35,12 @@ export function invalidateEffectiveNewApiConfig() {
   runtime.cached = undefined;
 }
 
-export class GreenfieldInstallationBindingError extends Error {
-  readonly code = "greenfield_installation_binding_invalid";
+export class NewApiControlIdentityError extends Error {
+  readonly code = "newapi_control_identity_invalid";
 
   constructor(readonly reason: string) {
-    super(`绿地 NewAPI 绑定未就绪: ${reason}`);
-    this.name = "GreenfieldInstallationBindingError";
+    super(`NewAPI 控制用户验证失败: ${reason}`);
+    this.name = "NewApiControlIdentityError";
   }
 }
 
@@ -50,15 +48,20 @@ async function loadRuntimeBinding(): Promise<LoadedRuntimeBinding> {
   const fallback = getConfig().newapi;
   const snapshot = await getNewApiRuntimeBindingSnapshot();
   const override = snapshot.settings.newapiControl;
+  const baseUrl = override?.baseUrl?.replace(/\/+$/, "") || fallback.baseUrl;
   const value = {
     ...fallback,
-    baseUrl: override?.baseUrl?.replace(/\/+$/, "") || fallback.baseUrl,
+    baseUrl,
+    publicBaseUrl:
+      fallback.publicBaseUrl && fallback.publicBaseUrl !== fallback.baseUrl
+        ? fallback.publicBaseUrl
+        : baseUrl,
     controlUserId: override?.controlUserId || fallback.controlUserId,
     accessToken: override?.accessTokenCiphertext
       ? openAppSecret(override.accessTokenCiphertext, secretContext)
       : fallback.accessToken,
   };
-  return { value, manifest: snapshot.manifest };
+  return { value };
 }
 
 export async function getEffectiveNewApiConfigForBindingCheck() {
@@ -81,17 +84,7 @@ export async function getEffectiveNewApiConfig() {
     try {
       const refreshed = await refresh;
       if (refreshed.generation !== runtime.generation) continue;
-      const { value, manifest } = refreshed.loaded;
-      if (getConfig().storeBackend === "postgres") {
-        const binding = verifyGreenfieldInstallationBinding({
-          manifest,
-          upstreamBaseUrl: value.baseUrl,
-          configuredControlUserId: value.controlUserId,
-        });
-        if (!binding.ready) {
-          throw new GreenfieldInstallationBindingError(binding.reason);
-        }
-      }
+      const { value } = refreshed.loaded;
       runtime.cached = value;
       return value;
     } catch (error) {
@@ -141,7 +134,7 @@ export async function verifyNewApiControlIdentity(input: {
   }
   const observedControlUserId = String(body.data?.id ?? "");
   if (!observedControlUserId || observedControlUserId !== input.controlUserId) {
-    throw new GreenfieldInstallationBindingError("control_credential_identity_mismatch");
+    throw new NewApiControlIdentityError("control_credential_identity_mismatch");
   }
   return { observedControlUserId };
 }

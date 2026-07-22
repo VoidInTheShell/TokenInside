@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const schedulerPath = new URL("../lib/package-reset-scheduler.ts", import.meta.url);
+const planPath = new URL("../lib/package-reset-plan.ts", import.meta.url);
 const postgresStorePath = new URL("../lib/postgres-store.ts", import.meta.url);
 const storePath = new URL("../lib/store.ts", import.meta.url);
 const settingsRoutePath = new URL(
@@ -13,9 +14,10 @@ const adminClientPath = new URL("../components/admin-client.tsx", import.meta.ur
 const instrumentationPath = new URL("../instrumentation.ts", import.meta.url);
 
 test("package reset remains a system setting backed by an automatic fenced scheduler", async () => {
-  const [scheduler, postgresStore, store, settingsRoute, adminClient, instrumentation] =
+  const [scheduler, plan, postgresStore, store, settingsRoute, adminClient, instrumentation] =
     await Promise.all([
       readFile(schedulerPath, "utf8"),
+      readFile(planPath, "utf8"),
       readFile(postgresStorePath, "utf8"),
       readFile(storePath, "utf8"),
       readFile(settingsRoutePath, "utf8"),
@@ -35,7 +37,7 @@ test("package reset remains a system setting backed by an automatic fenced sched
   assert.match(scheduler, /withPackageResetSchedulerFence/);
   assert.match(
     scheduler,
-    /await preparePackageResetPeriod\([\s\S]*?await buildMonthlyPeriodOpenPlan\([\s\S]*?await enqueuePackageResetPlan\(/,
+    /await preparePackageResetPeriod\([\s\S]*?await buildPackageResetPlan\([\s\S]*?await enqueuePackageResetPlan\(/,
   );
   assert.match(scheduler, /schedulerBlockedPollMs = 5 \* 60_000/);
   assert.match(scheduler, /schedulerCompletionRecheckMs = 60 \* 60_000/);
@@ -46,7 +48,8 @@ test("package reset remains a system setting backed by an automatic fenced sched
   assert.match(store, /assertPackageResetExecutionAllowed\([\s\S]*?store\.settings\.packageReset/);
   assert.match(store, /item\.createdByOpenId !== PACKAGE_RESET_SYSTEM_ACTOR/);
   assert.match(store, /previous\?\.quotaLimit \?\? initialDepartmentQuotaLimit/);
-  assert.match(store, /input\.account\?\.billingPeriod/);
+  assert.match(plan, /packagePeriod/);
+  assert.doesNotMatch(plan, /usage.?sync|proxy_request_logs|user_billing_periods/i);
 
   assert.match(postgresStore, /options\.executionSource === "package_reset"/);
   assert.match(postgresStore, /from app_settings[\s\S]*?for share/);

@@ -77,6 +77,7 @@ export type TokenRequest = {
   approvalDepartmentId?: string;
   approvalMode?: "feishu_card" | "feishu_approval_legacy" | "manual";
   approvalTargetOpenId?: string;
+  approvalTargetOpenIds?: string[];
   approvalTargetSource?:
     | "department_leader"
     | "parent_department_leader"
@@ -85,6 +86,7 @@ export type TokenRequest = {
   approvalRouteReason?: ApprovalRouteReason;
   approvalRouteNotice?: string;
   approvalCardMessageId?: string;
+  approvalCardMessageIds?: string[];
   approvalActionNonceHash?: string;
   approvalOperatorOpenId?: string;
   approvalOperatedAt?: string;
@@ -414,7 +416,9 @@ export type DepartmentQuotaRequest = {
   requestedQuotaLimit?: number;
   approvedQuotaLimit?: number;
   approvalTargetOpenId: string;
+  approvalTargetOpenIds?: string[];
   approvalCardMessageId?: string;
+  approvalCardMessageIds?: string[];
   approvalActionNonceHash: string;
   approvalOperatorOpenId?: string;
   approvalOperatedAt?: string;
@@ -437,6 +441,9 @@ export type QuotaChangeEvent = {
   delta: number;
   relatedTokenRequestId?: string;
   relatedDepartmentQuotaRequestId?: string;
+  packageBatchId?: string;
+  affectedUserCount?: number;
+  reservedQuota?: number;
   expiresAt?: string;
   errorMessage?: string;
   createdAt: string;

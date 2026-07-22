@@ -6,7 +6,7 @@ import { runInNewContext } from "node:vm";
 import { Pool, type PoolClient } from "pg";
 import ts from "typescript";
 import { resolveSessionAdminScopeProjection } from "../lib/admin-scope.ts";
-import { packageBillingPeriod } from "../lib/package-reset.ts";
+import { packagePeriod } from "../lib/package-reset.ts";
 import {
   canReopenFirstProvisionAfterAccessRevoke,
   reopenFirstProvisionAfterAccessRevoke,
@@ -172,6 +172,10 @@ async function loadQuotaAdjustmentHarness(input: {
       tokenRequestInAdminScope: () => false,
     },
     "@/lib/config": { getConfig: () => config },
+    "@/lib/department-quota": {
+      initialDepartmentQuotaLimit: (allocatedQuota: number) =>
+        Math.max(1000, Math.max(Math.round(allocatedQuota), 0)),
+    },
     "@/lib/crypto": {
       nowIso: () => "2099-01-15T00:00:00.000Z",
       randomId: (prefix: string) =>
@@ -182,7 +186,7 @@ async function loadQuotaAdjustmentHarness(input: {
         createHash("sha256").update(value).digest("hex"),
     },
     "@/lib/newapi": { toNewApiQuota: (quota: number) => Math.round(quota * 10) },
-    "@/lib/package-reset": { packageBillingPeriod },
+    "@/lib/package-reset": { packagePeriod },
     "@/lib/quota-model": { hongKongBillingPeriod: () => "2099-01" },
     "@/lib/quota-saga-state": {
       canReopenFirstProvisionAfterAccessRevoke,

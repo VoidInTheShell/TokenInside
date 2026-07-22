@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { isRootAdminScope, requireAdminScope } from "@/lib/admin";
 import { getConfig } from "@/lib/config";
-import { verifyGreenfieldInstallationBinding } from "@/lib/greenfield-installation";
 import {
   invalidateEffectiveNewApiConfig,
   newApiAccessTokenSecretContext,
@@ -17,7 +16,6 @@ import { notifyPackageResetScheduler } from "@/lib/package-reset-scheduler";
 import { sealAppSecret } from "@/lib/secret-box";
 import {
   getAppSettings,
-  getGreenfieldInstallationManifest,
   updateAppSettingsAsActor,
 } from "@/lib/store";
 
@@ -116,38 +114,29 @@ export async function PATCH(request: Request) {
     );
   }
   if (parsed.data.newapiControl) {
-    const manifest = await getGreenfieldInstallationManifest();
-    const binding = verifyGreenfieldInstallationBinding({
-      manifest,
-      upstreamBaseUrl: parsed.data.newapiControl.baseUrl,
-      configuredControlUserId: parsed.data.newapiControl.controlUserId,
-    });
-    if (!binding.ready) {
+    const current = await getAppSettings();
+    const fallback = getConfig().newapi;
+    const currentBaseUrl = current.newapiControl?.baseUrl ?? fallback.baseUrl;
+    const currentControlUserId =
+      current.newapiControl?.controlUserId ?? fallback.controlUserId;
+    const identityChanged =
+      currentBaseUrl.replace(/\/+$/, "") !==
+        parsed.data.newapiControl.baseUrl.replace(/\/+$/, "") ||
+      currentControlUserId !== parsed.data.newapiControl.controlUserId;
+    if (identityChanged && !parsed.data.newapiControl.accessToken) {
       return NextResponse.json(
-        {
-          error: "已绑定的绿地 NewAPI 地址和控制用户不可在线变更",
-          code: binding.reason,
-        },
-        { status: 409 },
+        { error: "修改 NewAPI 地址或控制用户时必须填写对应的用户 AK" },
+        { status: 400 },
       );
     }
     if (parsed.data.newapiControl.accessToken) {
       try {
-        const identity = await verifyNewApiControlIdentity({
+        await verifyNewApiControlIdentity({
           baseUrl: parsed.data.newapiControl.baseUrl,
           controlUserId: parsed.data.newapiControl.controlUserId,
           credential: parsed.data.newapiControl.accessToken,
           requestTimeoutMs: getConfig().newapi.requestTimeoutMs,
         });
-        if (identity.observedControlUserId !== manifest!.observedControlUserId) {
-          return NextResponse.json(
-            {
-              error: "新的 NewAPI 用户 AK 不属于已绑定的控制用户",
-              code: "control_credential_identity_mismatch",
-            },
-            { status: 409 },
-          );
-        }
       } catch (error) {
         return NextResponse.json(
           {
@@ -193,15 +182,6 @@ export async function PATCH(request: Request) {
     }
     if (error instanceof Error && error.name === "NewApiControlSecretRequiredError") {
       return NextResponse.json({ error: error.message }, { status: 400 });
-    }
-    if (
-      error instanceof Error &&
-      error.name === "GreenfieldInstallationBindingWriteError"
-    ) {
-      return NextResponse.json(
-        { error: error.message, code: "greenfield_binding_drift_forbidden" },
-        { status: 409 },
-      );
     }
     throw error;
   }

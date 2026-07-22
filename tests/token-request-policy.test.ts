@@ -18,7 +18,7 @@ test("approval handling only includes requests that need a human decision", () =
       requestType: "quota_adjust",
       status: "approved_provision_failed",
     }),
-    false,
+    true,
   );
   assert.equal(
     tokenRequestRequiresAdminDecision({
@@ -53,6 +53,13 @@ test("key changes cannot be approved or edited from complete admin history", () 
   assert.equal(
     tokenRequestAllowsQuotaEdit({
       requestType: "first_apply",
+      status: "pending_card_approval",
+    }),
+    true,
+  );
+  assert.equal(
+    tokenRequestAllowsQuotaEdit({
+      requestType: "quota_adjust",
       status: "pending_card_approval",
     }),
     true,

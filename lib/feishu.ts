@@ -477,7 +477,7 @@ export async function sendTokenApprovalCard(input: {
   );
 }
 
-export async function sendDepartmentQuotaApprovalCard(input: {
+export async function sendPackageQuotaLimitApprovalCard(input: {
   receiveOpenId: string;
   requestId: string;
   nonce: string;
@@ -485,9 +485,8 @@ export async function sendDepartmentQuotaApprovalCard(input: {
   applicantOpenId: string;
   departmentName?: string;
   departmentId: string;
-  action: "increase" | "reset";
   currentQuotaLimit: number;
-  requestedQuotaLimit?: number;
+  requestedQuotaLimit: number;
   reason: string;
 }) {
   const tenantAccessToken = await getTenantAccessToken();
@@ -497,7 +496,7 @@ export async function sendDepartmentQuotaApprovalCard(input: {
       template: "blue",
       title: {
         tag: "plain_text",
-        content: "TokenInside 部门总额度申请",
+        content: "TokenInside 总额度上限提升申请",
       },
     },
     elements: [
@@ -508,11 +507,8 @@ export async function sendDepartmentQuotaApprovalCard(input: {
           content: [
             `**申请人**：${input.applicantName ?? input.applicantOpenId}`,
             `**部门**：${input.departmentName ?? input.departmentId}`,
-            `**动作**：${input.action === "increase" ? "提高部门总额度" : "重置部门总额度"}`,
             `**当前上限**：${input.currentQuotaLimit}`,
-            input.action === "increase"
-              ? `**申请上限**：${input.requestedQuotaLimit}`
-              : "**审批额度**：请系统管理员在 TokenInside 管理后台填写",
+            `**申请上限**：${input.requestedQuotaLimit}`,
             `**申请说明**：${input.reason}`,
           ].join("\n"),
         },
@@ -520,12 +516,12 @@ export async function sendDepartmentQuotaApprovalCard(input: {
       {
         tag: "action",
         actions: [
-          ...(input.action === "increase" ? [{
+          {
             tag: "button",
             type: "primary",
             text: { tag: "plain_text", content: "通过" },
             value: { requestId: input.requestId, action: "approve", nonce: input.nonce },
-          }] : []),
+          },
           {
             tag: "button",
             type: "danger",

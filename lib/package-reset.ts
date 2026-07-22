@@ -128,7 +128,7 @@ export function nextPackageResetAt(
   return occurrence;
 }
 
-export function packageBillingPeriod(
+export function packagePeriod(
   policy: Partial<PackageResetPolicy> | undefined,
   now = new Date(),
 ) {
@@ -140,6 +140,51 @@ export function packageBillingPeriod(
   return due?.period ?? periodId(current.year, current.month);
 }
 
+export function nextPackagePeriod(
+  policy: Partial<PackageResetPolicy> | undefined,
+  now = new Date(),
+) {
+  const normalized = normalizePackageResetPolicy(policy);
+  const nextReset = nextPackageResetAt(normalized, now);
+  if (nextReset) {
+    return packagePeriod(normalized, new Date(nextReset.getTime() + 1));
+  }
+
+  const current = hongKongParts(now);
+  const next = shiftMonth(current.year, current.month, 1);
+  return periodId(next.year, next.month);
+}
+
+export function packageWindow(
+  policy: Partial<PackageResetPolicy> | undefined,
+  now = new Date(),
+) {
+  const normalized = normalizePackageResetPolicy(policy);
+  if (normalized.enabled) {
+    const due = latestDuePackageReset(normalized, now);
+    const next = nextPackageResetAt(normalized, now);
+    if (due && next) {
+      return {
+        period: due.period,
+        startAt: due.scheduledAt,
+        endAt: new Date(next.getTime() - 1).toISOString(),
+        nextResetAt: next.toISOString(),
+      };
+    }
+  }
+
+  const current = hongKongParts(now);
+  const start = resetOccurrence(current.year, current.month, 1);
+  const nextMonth = shiftMonth(current.year, current.month, 1);
+  const next = resetOccurrence(nextMonth.year, nextMonth.month, 1);
+  return {
+    period: periodId(current.year, current.month),
+    startAt: start.toISOString(),
+    endAt: new Date(next.getTime() - 1).toISOString(),
+    nextResetAt: next.toISOString(),
+  };
+}
+
 export function assertPackageResetExecutionAllowed(input: {
   policy: Partial<PackageResetPolicy> | undefined;
   period: string;
@@ -148,7 +193,7 @@ export function assertPackageResetExecutionAllowed(input: {
   const due = latestDuePackageReset(input.policy, input.now);
   if (!due) throw new Error("套餐重置自动任务已关闭");
   if (due.period !== input.period) {
-    throw new Error(`套餐重置配置已变化，当前应执行账期为 ${due.period}`);
+    throw new Error(`套餐重置配置已变化，当前应执行套餐周期为 ${due.period}`);
   }
   return due;
 }

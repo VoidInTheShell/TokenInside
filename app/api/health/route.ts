@@ -2,21 +2,14 @@ import { constants } from "node:fs";
 import { access, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
-import { billingPeriodFinalizationSnapshot } from "@/lib/billing-period-finalizer";
 import { getConfig } from "@/lib/config";
-import { verifyGreenfieldInstallationBinding } from "@/lib/greenfield-installation";
 import { getNewApiRuntimeBindingForHealth } from "@/lib/newapi-runtime";
-import { proxyConcurrencySnapshot } from "@/lib/proxy-concurrency";
 import {
   checkPostgresSchema,
   postgresPoolRuntimeSnapshot,
 } from "@/lib/postgres-store";
 import { quotaOperationExecutionSnapshot } from "@/lib/quota-saga";
 import { quotaSubmitPoolRuntimeSnapshot } from "@/lib/quota-operation-submit";
-import {
-  billingMaterializationRecoverySnapshot,
-  usageSettlementTailSnapshot,
-} from "@/lib/usage-sync";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -48,7 +41,6 @@ export async function GET() {
   const config = getConfig();
   const runtimeBinding = await getNewApiRuntimeBindingForHealth().catch(() => ({
     value: config.newapi,
-    manifest: null,
   }));
   const effectiveNewApi = runtimeBinding.value;
   const postgresSchema =
@@ -64,18 +56,9 @@ export async function GET() {
     config.storeBackend === "postgres"
       ? postgresSchema?.error !== "connection_failed"
       : await canWriteStoreDirectory(config.storePath);
-  const greenfieldManifest = runtimeBinding.manifest;
-  const greenfieldBinding =
-    config.storeBackend === "postgres"
-      ? verifyGreenfieldInstallationBinding({
-          manifest: greenfieldManifest,
-          upstreamBaseUrl: effectiveNewApi.baseUrl,
-          configuredControlUserId: effectiveNewApi.controlUserId,
-        })
-      : { ready: true as const, reason: undefined };
   const storeReady =
     config.storeBackend === "postgres"
-      ? storeWritable && postgresSchema?.ready && greenfieldBinding.ready
+      ? storeWritable && postgresSchema?.ready
       : storeWritable;
   const status = storeReady ? "ok" : "degraded";
 
@@ -99,20 +82,10 @@ export async function GET() {
                 error: postgresSchema?.error,
               }
             : undefined,
-        greenfieldInstallation:
-          config.storeBackend === "postgres"
-            ? {
-                ready: greenfieldBinding.ready,
-                reason: greenfieldBinding.reason,
-                checkedAt: greenfieldManifest?.checkedAt,
-                cutoverAt: greenfieldManifest?.cutoverAt,
-              }
-            : undefined,
         postgresPool:
           config.storeBackend === "postgres"
               ? {
                 max: config.postgres.poolMax,
-                settlementMax: config.postgres.settlementPoolMax,
                 controlMax: config.postgres.controlPoolMax,
                 quotaSubmitMax: config.postgres.quotaSubmitPoolMax,
                 lockMax: config.postgres.lockPoolMax,
@@ -124,11 +97,7 @@ export async function GET() {
                 },
               }
             : undefined,
-        proxyConcurrency: proxyConcurrencySnapshot(),
         quotaOperations: quotaOperationExecutionSnapshot(),
-        billingMaterialization: billingPeriodFinalizationSnapshot(),
-        billingMaterializationRecovery: billingMaterializationRecoverySnapshot(),
-        usageSettlementTail: usageSettlementTailSnapshot(),
       },
       configuration: {
         sessionSecret: configured(config.sessionSecret),
@@ -144,18 +113,12 @@ export async function GET() {
         newapiMock: config.newapi.mock,
         newapiQuotaPerUnit: config.newapi.quotaPerUnit,
         newapiRequestTimeoutMs: config.newapi.requestTimeoutMs,
-        proxyQueueTimeoutMs: config.proxy.queueTimeoutMs,
         systemAdmins: config.admin.systemAdminOpenIds.length,
         environmentAdmins: config.admin.systemAdminOpenIds.length > 0,
-        quotaOperationConcurrencyMax: config.billing.operationConcurrencyMax,
+        quotaOperationConcurrencyMax: config.quotaControl.operationConcurrencyMax,
         quotaSubmitConnectionTimeoutMs: config.postgres.quotaSubmitConnectionTimeoutMs,
         quotaSubmitStatementTimeoutMs: config.postgres.quotaSubmitStatementTimeoutMs,
         quotaSubmitLockTimeoutMs: config.postgres.quotaSubmitLockTimeoutMs,
-        usageSettlementConcurrencyMax: config.billing.settlementConcurrencyMax,
-        billingMaterializationConcurrencyMax:
-          config.billing.materializationConcurrencyMax,
-        usageSyncContinuationDelayMs:
-          config.billing.usageSyncContinuationDelayMs,
       },
     },
     {

@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "TokenInside",
-  description: "Feishu-bound NewAPI token control plane and proxy gateway",
+  description: "飞书用户的 NewAPI Key 与套餐管理控制台",
   icons: {
     icon: "/icon.svg",
   },

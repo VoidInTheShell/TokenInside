@@ -191,6 +191,20 @@ function requestIsStream(record: UsageRecordRow) {
   );
 }
 
+function displayFirstByteMs(record: UsageRecordRow) {
+  if (!requestIsStream(record)) return undefined;
+  const firstByteMs = record.firstByteMs;
+  if (
+    firstByteMs === undefined ||
+    !Number.isFinite(firstByteMs) ||
+    firstByteMs < 0 ||
+    (record.durationMs > 0 && firstByteMs >= record.durationMs)
+  ) {
+    return undefined;
+  }
+  return firstByteMs;
+}
+
 function statusLabel(record: UsageRecordRow) {
   const status = displayStatus(record);
   if (status === "failed") return "失败";
@@ -223,8 +237,8 @@ function formatApiFormat(value?: string) {
 
 function usageSourceLabel(value?: UsageRecordRow["usageSource"]) {
   if (value === "newapi_log") return "NewAPI";
-  if (value === "proxy_json") return "代理JSON";
-  if (value === "proxy_stream") return "代理流式";
+  if (value === "proxy_json") return "JSON";
+  if (value === "proxy_stream") return "流式";
   if (value === "missing") return "缺用量";
   return "未记录";
 }
@@ -238,7 +252,7 @@ function formatOutputRate(record: UsageRecordRow) {
   const rate = calculateOutputTokensPerSecond({
     completionTokens: record.completionTokens,
     durationMs: record.durationMs,
-    firstByteMs: record.firstByteMs,
+    firstByteMs: displayFirstByteMs(record),
     newapiUseTimeSeconds: record.newapiUseTimeSeconds,
     isStream: requestIsStream(record),
   });
@@ -333,7 +347,7 @@ function PerformanceCell({ record }: { record: UsageRecordRow }) {
   return (
     <div className="usage-performance">
       <span>
-        {formatMs(record.firstByteMs)}
+        {formatMs(displayFirstByteMs(record))}
         <span className="usage-muted"> / </span>
         {formatMs(total)}
       </span>

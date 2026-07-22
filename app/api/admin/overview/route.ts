@@ -5,9 +5,10 @@ import {
   normalizePackageResetPolicy,
 } from "@/lib/package-reset";
 import { getCurrentUser } from "@/lib/session";
+import { getNewApiAdminOverviewMetrics } from "@/lib/newapi-reporting";
 import {
-  getAdminOverview,
-  getAdminOverviewMetadata,
+  getAdminControlOverview,
+  getAppSettings,
   getAdminScopeForKnownUser,
 } from "@/lib/store";
 
@@ -20,7 +21,7 @@ function responseStatus(request: Request, status: 401 | 403) {
 }
 
 function settingsForScope<
-  T extends Awaited<ReturnType<typeof getAdminOverviewMetadata>>["settings"],
+  T extends Awaited<ReturnType<typeof getAppSettings>>,
 >(
   settings: T,
   scope: Awaited<ReturnType<typeof getAdminScopeForKnownUser>>,
@@ -89,10 +90,28 @@ export async function GET(request: Request) {
     );
   }
 
-  const [overview, metadata] = await Promise.all([
-    getAdminOverview(scope),
-    getAdminOverviewMetadata(),
+  const [controlOverview, usageMetrics, settings] = await Promise.all([
+    getAdminControlOverview(scope),
+    getNewApiAdminOverviewMetrics(scope),
+    getAppSettings(),
   ]);
+  const overview = {
+    ...controlOverview,
+    reportingSource: usageMetrics.source,
+    reportingTruncated: usageMetrics.truncated,
+    totals: {
+      ...controlOverview.totals,
+      requestCount: usageMetrics.requestCount,
+      promptTokens: usageMetrics.promptTokens,
+      completionTokens: usageMetrics.completionTokens,
+      totalTokens: usageMetrics.totalTokens,
+      packagePeriod: usageMetrics.period,
+      packageQuota: usageMetrics.packageQuota,
+      quotaConsumed: usageMetrics.consumedQuota,
+      remainingQuota: usageMetrics.remainingQuota,
+      usageRecordCount: usageMetrics.usageRecordCount,
+    },
+  };
   return NextResponse.json({
     authenticated: true,
     authorized: true,
@@ -106,6 +125,6 @@ export async function GET(request: Request) {
       departmentName: user.departmentName,
     },
     overview,
-    settings: settingsForScope(metadata.settings, scope),
+    settings: settingsForScope(settings, scope),
   });
 }

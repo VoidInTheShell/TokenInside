@@ -8,10 +8,6 @@ import {
   validateDepartmentQuotaLimit,
 } from "@/lib/department-quota";
 import {
-  verifyGreenfieldInstallationBinding,
-  type GreenfieldInstallationManifest,
-} from "@/lib/greenfield-installation";
-import {
   assertQuotaExecutionFenceHeld,
   createQuotaExecutionFence,
   runWithQuotaExecutionFence,
@@ -54,6 +50,10 @@ import {
 } from "@/lib/usage-matching";
 import { preserveUserAccessRevocationBarrier } from "@/lib/user-access-state";
 import {
+  openQuotaAdjustmentRequestStatuses,
+  PendingQuotaAdjustmentRequestError,
+} from "@/lib/token-request-policy";
+import {
   lockDepartmentMemberSyncUsersSql,
   upsertDepartmentMembersSql,
 } from "@/lib/department-member-sync-sql";
@@ -92,13 +92,12 @@ import type {
   UserBillingPeriod,
 } from "@/lib/types";
 
-const POSTGRES_POOL_REGISTRY_VERSION = 1;
+const POSTGRES_POOL_REGISTRY_VERSION = 2;
 
 type PostgresPoolRegistry = {
   version: typeof POSTGRES_POOL_REGISTRY_VERSION;
   configFingerprint?: string;
   business?: Pool;
-  settlement?: Pool;
   control?: Pool;
   advisoryLock?: Pool;
 };
@@ -107,8 +106,8 @@ type PostgresPoolGlobal = typeof globalThis & {
   __tokenInsidePostgresPoolRegistry?: PostgresPoolRegistry;
 };
 
-// Next.js emits independent server chunks for instrumentation, /v1, health,
-// and control routes. Module-local Pool variables are duplicated in those
+// Next.js emits independent server chunks for instrumentation, health, and
+// control routes. Module-local Pool variables are duplicated in those
 // chunks, so both the connection budget and health snapshot would otherwise
 // be false. All chunks in this Node process share this one versioned registry.
 const postgresPoolGlobal = globalThis as PostgresPoolGlobal;
@@ -133,7 +132,6 @@ function getValidatedPostgresPoolRegistry() {
   const fingerprint = JSON.stringify({
     databaseUrl: config.databaseUrl,
     poolMax: config.postgres.poolMax,
-    settlementPoolMax: config.postgres.settlementPoolMax,
     controlPoolMax: config.postgres.controlPoolMax,
     lockPoolMax: config.postgres.lockPoolMax,
     idleTimeoutMs: config.postgres.poolIdleTimeoutMs,
@@ -159,7 +157,6 @@ export function postgresPoolRuntimeSnapshot() {
   const registry = getPostgresPoolRegistry();
   return {
     business: poolRuntimeSnapshot(registry.business),
-    settlement: poolRuntimeSnapshot(registry.settlement),
     control: poolRuntimeSnapshot(registry.control),
     lock: poolRuntimeSnapshot(registry.advisoryLock),
   };
@@ -168,26 +165,18 @@ export function postgresPoolRuntimeSnapshot() {
 export const REQUIRED_POSTGRES_TABLES = [
   "schema_migrations",
   "app_settings",
-  "greenfield_installation_manifest",
   "billing_operations",
   "feishu_users",
   "token_requests",
   "token_accounts",
-  "user_billing_periods",
   "department_quota_periods",
-  "department_quota_requests",
   "quota_change_events",
   "user_quota_policies",
   "quota_operations",
   "quota_ledger_entries",
   "user_quota_states",
   "quota_reconciliation_records",
-  "quota_balance_observer_state",
   "feishu_events",
-  "proxy_request_logs",
-  "newapi_usage_records",
-  "usage_sync_checkpoints",
-  "usage_sync_issues",
   "admin_scopes",
 ] as const;
 
@@ -221,22 +210,6 @@ function getControlPool() {
     connectionTimeoutMillis: config.postgres.poolConnectionTimeoutMs,
   });
   return registry.control;
-}
-
-function getSettlementPool() {
-  const { config, registry } = getValidatedPostgresPoolRegistry();
-  if (registry.settlement) return registry.settlement;
-  const databaseUrl = config.databaseUrl;
-  if (!databaseUrl) {
-    throw new Error("DATABASE_URL is required when TOKENINSIDE_STORE_BACKEND=postgres");
-  }
-  registry.settlement = new Pool({
-    connectionString: databaseUrl,
-    max: config.postgres.settlementPoolMax,
-    idleTimeoutMillis: config.postgres.poolIdleTimeoutMs,
-    connectionTimeoutMillis: config.postgres.poolConnectionTimeoutMs,
-  });
-  return registry.settlement;
 }
 
 function getAdvisoryLockPool() {
@@ -298,7 +271,7 @@ async function withControlClient<T>(fn: (client: PoolClient) => Promise<T>) {
 
 async function withSettlementClient<T>(fn: (client: PoolClient) => Promise<T>) {
   assertQuotaExecutionFenceHeld();
-  const client = await getSettlementPool().connect();
+  const client = await getPool().connect();
   try {
     const result = await fn(client);
     assertQuotaExecutionFenceHeld();
@@ -1910,17 +1883,11 @@ type PostgresMonthlyPeriodOpenSnapshotRow = {
     feishuUserId: string;
     departmentId?: string;
   }>;
-  usage_sync_interval_minutes: number | null;
-  usage_sync_settlement_lag_minutes: number | null;
-  settled_through: string | null;
-  integrity_blocked_at: string | null;
-  last_run_status: UsageSyncCheckpoint["lastRunStatus"] | null;
 };
 
 /**
- * Loads only the control facts needed to plan one monthly opening. In
- * particular, the plan never needs request or authoritative-usage detail;
- * settlement freshness is represented by the durable checkpoint.
+ * Loads only the control facts needed to plan one package reset. NewAPI usage
+ * is read authoritatively by each quota operation after the Key is frozen.
  */
 export async function getPostgresMonthlyPeriodOpenSnapshot(period: string) {
   return withControlClient(async (client) => {
@@ -2018,35 +1985,7 @@ export async function getPostgresMonthlyPeriodOpenSnapshot(period: string) {
              where operation.state not in ('completed', 'compensated', 'cancelled')
            ),
            '[]'::jsonb
-         ) as quota_operations,
-         (
-           select nullif(settings.data #>> '{usageSyncPolicy,intervalMinutes}', '')::integer
-           from app_settings settings
-           where settings.id = 'default'
-         ) as usage_sync_interval_minutes,
-         (
-           select nullif(settings.data #>> '{usageSyncPolicy,settlementLagMinutes}', '')::integer
-           from app_settings settings
-           where settings.id = 'default'
-         ) as usage_sync_settlement_lag_minutes,
-         (
-           select nullif(checkpoint.data->>'settledThrough', '')
-           from usage_sync_checkpoints checkpoint
-           where checkpoint.scope = 'newapi_usage_logs'
-           limit 1
-         ) as settled_through,
-         (
-           select nullif(checkpoint.data->>'integrityBlockedAt', '')
-           from usage_sync_checkpoints checkpoint
-           where checkpoint.scope = 'newapi_usage_logs'
-           limit 1
-         ) as integrity_blocked_at,
-         (
-           select nullif(checkpoint.data->>'lastRunStatus', '')
-           from usage_sync_checkpoints checkpoint
-           where checkpoint.scope = 'newapi_usage_logs'
-           limit 1
-         ) as last_run_status`,
+         ) as quota_operations`,
       [period, getConfig().admin.systemAdminOpenIds],
     );
     const row = result.rows[0];
@@ -2054,25 +1993,6 @@ export async function getPostgresMonthlyPeriodOpenSnapshot(period: string) {
       candidates: row?.candidates ?? [],
       departmentQuotaPeriods: row?.department_quota_periods ?? [],
       quotaOperations: row?.quota_operations ?? [],
-      settings: {
-        usageSyncPolicy:
-          row?.usage_sync_interval_minutes === null ||
-          row?.usage_sync_interval_minutes === undefined
-            ? undefined
-            : {
-                intervalMinutes: row.usage_sync_interval_minutes,
-                settlementLagMinutes:
-                  row.usage_sync_settlement_lag_minutes ?? undefined,
-              },
-      },
-      usageSyncCheckpoint:
-        row?.settled_through || row?.integrity_blocked_at || row?.last_run_status
-          ? {
-              settledThrough: row.settled_through ?? undefined,
-              integrityBlockedAt: row.integrity_blocked_at ?? undefined,
-              lastRunStatus: row.last_run_status ?? undefined,
-            }
-          : null,
     };
   });
 }
@@ -2094,21 +2014,13 @@ export async function readPostgresStore(): Promise<StoreShape> {
         "token_accounts",
         "created_at, id",
       ),
-      userBillingPeriods: await readDataRows<UserBillingPeriod>(
-        client,
-        "user_billing_periods",
-        "period, id",
-      ),
+      userBillingPeriods: [],
       departmentQuotaPeriods: await readDataRows<DepartmentQuotaPeriod>(
         client,
         "department_quota_periods",
         "period, department_id, id",
       ),
-      departmentQuotaRequests: await readDataRows<DepartmentQuotaRequest>(
-        client,
-        "department_quota_requests",
-        "created_at, id",
-      ),
+      departmentQuotaRequests: [],
       quotaChangeEvents: await readDataRows<QuotaChangeEvent>(
         client,
         "quota_change_events",
@@ -2140,26 +2052,10 @@ export async function readPostgresStore(): Promise<StoreShape> {
         "created_at, id",
       ),
       feishuEvents: await readDataRows<FeishuEvent>(client, "feishu_events", "created_at, id"),
-      proxyRequestLogs: await readDataRows<ProxyRequestLog>(
-        client,
-        "proxy_request_logs",
-        "created_at, id",
-      ),
-      newapiUsageRecords: await readDataRows<NewApiUsageRecord>(
-        client,
-        "newapi_usage_records",
-        "coalesce(newapi_created_at, last_synced_at), id",
-      ),
-      usageSyncCheckpoints: await readDataRows<UsageSyncCheckpoint>(
-        client,
-        "usage_sync_checkpoints",
-        "updated_at, id",
-      ),
-      usageSyncIssues: await readDataRows<UsageSyncIssue>(
-        client,
-        "usage_sync_issues",
-        "last_seen_at, id",
-      ),
+      proxyRequestLogs: [],
+      newapiUsageRecords: [],
+      usageSyncCheckpoints: [],
+      usageSyncIssues: [],
       adminScopes: await readDataRows<AdminScope>(client, "admin_scopes", "created_at, id"),
     };
   } finally {
@@ -2194,27 +2090,41 @@ export async function preparePostgresPackageResetPeriod(period: string) {
       department_name: string | null;
       assigned_quota: string;
     }>(
-      `select policy.department_id,
-              max(nullif(user_row.data->>'departmentName', '')) as department_name,
-              coalesce(sum((policy.data->>'assignedMonthlyQuota')::numeric), 0)::text
-                as assigned_quota
-       from feishu_users user_row
-       join lateral (
-         select quota_policy.department_id, quota_policy.data
-         from user_quota_policies quota_policy
-         where quota_policy.feishu_user_id = user_row.id
-           and quota_policy.effective_from_period <= $1
-           and (
-             quota_policy.effective_to_period is null
-             or quota_policy.effective_to_period >= $1
-           )
-         order by quota_policy.version desc, quota_policy.id desc
-         limit 1
-       ) policy on true
-       where coalesce(nullif(user_row.data->>'status', ''), 'active') = 'active'
-         and policy.department_id is not null
-       group by policy.department_id
-       order by policy.department_id`,
+      `with assigned as materialized (
+         select policy.department_id,
+                max(nullif(user_row.data->>'departmentName', '')) as department_name,
+                coalesce(sum((policy.data->>'assignedMonthlyQuota')::numeric), 0)::text
+                  as assigned_quota
+         from feishu_users user_row
+         join lateral (
+           select quota_policy.department_id, quota_policy.data
+           from user_quota_policies quota_policy
+           where quota_policy.feishu_user_id = user_row.id
+             and quota_policy.effective_from_period <= $1
+             and (
+               quota_policy.effective_to_period is null
+               or quota_policy.effective_to_period >= $1
+             )
+           order by quota_policy.version desc, quota_policy.id desc
+           limit 1
+         ) policy on true
+         where coalesce(nullif(user_row.data->>'status', ''), 'active') = 'active'
+           and policy.department_id is not null
+         group by policy.department_id
+       ), known as materialized (
+         select distinct on (quota_period.department_id)
+                quota_period.department_id,
+                nullif(quota_period.data->>'departmentName', '') as department_name
+         from department_quota_periods quota_period
+         where quota_period.period < $1
+         order by quota_period.department_id, quota_period.period desc, quota_period.id desc
+       )
+       select coalesce(assigned.department_id, known.department_id) as department_id,
+              coalesce(assigned.department_name, known.department_name) as department_name,
+              coalesce(assigned.assigned_quota, '0')::text as assigned_quota
+       from assigned
+       full join known on known.department_id = assigned.department_id
+       order by coalesce(assigned.department_id, known.department_id)`,
       [period],
     );
 
@@ -2274,34 +2184,16 @@ export async function getPostgresAppSettings() {
   return withControlClient((client) => readSettingsRow(client));
 }
 
-export async function getPostgresGreenfieldInstallationManifest() {
-  return withControlClient(async (client) => {
-    const result = await client.query<{ data: GreenfieldInstallationManifest }>(
-      `select data
-       from greenfield_installation_manifest
-       where id = 'default'
-       limit 1`,
-    );
-    return result.rows[0]?.data ?? null;
-  });
-}
-
 export async function getPostgresNewApiRuntimeBindingSnapshot() {
   return withControlClient(async (client) => {
-    const result = await client.query<{
-      settings: AppSettings;
-      manifest: GreenfieldInstallationManifest | null;
-    }>(
-      `select settings.data as settings, manifest.data as manifest
-       from app_settings settings
-       left join greenfield_installation_manifest manifest
-         on manifest.id = 'default'
-       where settings.id = 'default'
+    const result = await client.query<{ settings: AppSettings }>(
+      `select data as settings
+       from app_settings
+       where id = 'default'
        limit 1`,
     );
     return {
       settings: result.rows[0]?.settings ?? { defaultMonthlyQuota: 200 },
-      manifest: result.rows[0]?.manifest ?? null,
     };
   });
 }
@@ -2976,26 +2868,6 @@ export async function updatePostgresAppSettingsAsActor(input: {
         403,
         "NewAPI 上游连接只能由 root 管理员修改",
       );
-    }
-    if (input.newapiControl) {
-      const manifestResult = await client.query<{
-        data: GreenfieldInstallationManifest;
-      }>(
-        `select data
-         from greenfield_installation_manifest
-         where id = 'default'
-         for share`,
-      );
-      const binding = verifyGreenfieldInstallationBinding({
-        manifest: manifestResult.rows[0]?.data,
-        upstreamBaseUrl: input.newapiControl.baseUrl ?? "",
-        configuredControlUserId: input.newapiControl.controlUserId,
-      });
-      if (!binding.ready) {
-        const error = new Error(`绿地 NewAPI 绑定禁止变更: ${binding.reason}`);
-        error.name = "GreenfieldInstallationBindingWriteError";
-        throw error;
-      }
     }
     await client.query(
       `insert into app_settings (id, data)
@@ -3914,17 +3786,6 @@ export async function createPostgresMonthlyOpenOperations(
             );
           }
         }
-        // Freeze the usage checkpoint while this short transaction revalidates
-        // it. This key is also held by usage-sync.ts for the complete scan.
-        const usageSyncLock = await client.query<{ locked: boolean }>(
-          `select pg_try_advisory_xact_lock(
-             hashtext('usage_sync:newapi_logs')::bigint
-           ) as locked`,
-        );
-        if (!usageSyncLock.rows[0]?.locked) {
-          throw new Error("月度开账结算状态不安全：用量采集正在运行");
-        }
-
         // The plan supplies candidate identities only. Every business fact is
         // read again after the same short user lock used by policy/operation
         // creation, so a concurrent first provision or policy change wins
@@ -4103,55 +3964,6 @@ export async function createPostgresMonthlyOpenOperations(
           });
         }
         if (!resolvedInputs.length) return operations;
-
-        const checkpointResult = await client.query<{
-          data: UsageSyncCheckpoint;
-          current_time: Date | string;
-        }>(
-          `select data, statement_timestamp() as current_time
-           from usage_sync_checkpoints
-           where scope = 'newapi_usage_logs'
-           limit 1
-           for share`,
-        );
-        const settingsResult = await client.query<{ data: AppSettings }>(
-          "select data from app_settings where id = 'default' for share",
-        );
-        const blockingIssue = await client.query<{ id: string }>(
-          `select id
-           from usage_sync_issues
-           where status = 'open'
-             and coalesce(nullif(data->>'blocksSettlement', '')::boolean, false)
-           order by first_seen_at, id
-           limit 1
-           for share`,
-        );
-        const checkpoint = checkpointResult.rows[0]?.data;
-        const currentTimeValue = checkpointResult.rows[0]?.current_time;
-        const currentTime =
-          currentTimeValue instanceof Date
-            ? currentTimeValue.toISOString()
-            : currentTimeValue;
-        const syncPolicy = settingsResult.rows[0]?.data.usageSyncPolicy;
-        const settlementRunHealthy =
-          checkpoint?.lastRunStatus === "applied" ||
-          checkpoint?.lastRunStatus === "continuation_pending";
-        if (
-          !checkpoint ||
-          !settlementRunHealthy ||
-          checkpoint.integrityBlockedAt ||
-          checkpoint.integrityBlockedIssueId ||
-          blockingIssue.rows[0] ||
-          !isSettlementWatermarkFresh({
-            settledThrough: checkpoint.settledThrough,
-            now: currentTime,
-            maxLagMinutes:
-              2 * (syncPolicy?.intervalMinutes ?? 60) +
-              (syncPolicy?.settlementLagMinutes ?? 5),
-          })
-        ) {
-          throw new Error("月度开账结算状态不安全：稳定水位或完整性门禁未通过");
-        }
 
         const departmentScopes = [
           ...new Map(
@@ -4515,6 +4327,28 @@ export async function upsertPostgresFeishuUser(input: {
 
 export async function insertPostgresTokenRequest(request: TokenRequest) {
   return withControlTransaction(async (client) => {
+    if (request.requestType === "quota_adjust") {
+      await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+        `quota-adjust-request:${request.feishuUserId}`,
+      ]);
+      const existing = await client.query(
+        `select 1
+         from token_requests
+         where feishu_user_id = $1
+           and request_type = 'quota_adjust'
+           and status = any($2::text[])
+           and id <> $3
+         limit 1`,
+        [
+          request.feishuUserId,
+          [...openQuotaAdjustmentRequestStatuses],
+          request.id,
+        ],
+      );
+      if ((existing.rowCount ?? 0) > 0) {
+        throw new PendingQuotaAdjustmentRequestError();
+      }
+    }
     const stored = await saveTokenRequestRow(client, request);
     if (stored.requestType === "first_apply") {
       const userResult = await client.query<{ data: FeishuUser }>(
@@ -4526,8 +4360,6 @@ export async function insertPostgresTokenRequest(request: TokenRequest) {
         const updatedUser: FeishuUser = {
           ...user,
           status: "active",
-          deletedAt: undefined,
-          deletedReason: undefined,
           updatedAt: stored.updatedAt,
         };
         await saveFeishuUserRow(client, updatedUser);
@@ -4556,7 +4388,6 @@ async function transitionPostgresTokenRequestWithClient(
   id: string,
   patch: Partial<Omit<TokenRequest, "id" | "createdAt">>,
   allowedStatuses?: RequestStatus[],
-  options: { syncBillingPeriod?: boolean } = {},
 ) {
   const result = await client.query<{ data: TokenRequest }>(
     "select data from token_requests where id = $1 for update",
@@ -4571,22 +4402,7 @@ async function transitionPostgresTokenRequestWithClient(
     ...patch,
     updatedAt: nowIso(),
   };
-  const stored = await saveTokenRequestRow(client, updated);
-  if (options.syncBillingPeriod !== false && stored.tokenAccountId) {
-    const accountResult = await client.query<{ data: TokenAccount }>(
-      "select data from token_accounts where id = $1",
-      [stored.tokenAccountId],
-    );
-    const account = accountResult.rows[0]?.data;
-    if (account) {
-      await syncPostgresBillingPeriodForUser(
-        client,
-        account.feishuUserId,
-        account.billingPeriod || periodFromIso(account.createdAt),
-      );
-    }
-  }
-  return stored;
+  return saveTokenRequestRow(client, updated);
 }
 
 export async function transitionPostgresTokenRequest(
@@ -4615,13 +4431,7 @@ export async function transitionPostgresTokenRequestAfterQuotaMaterialization(
   allowedStatuses?: RequestStatus[],
 ) {
   return withControlTransaction((client) =>
-    transitionPostgresTokenRequestWithClient(
-      client,
-      id,
-      patch,
-      allowedStatuses,
-      { syncBillingPeriod: false },
-    ),
+    transitionPostgresTokenRequestWithClient(client, id, patch, allowedStatuses),
   );
 }
 
@@ -4672,23 +4482,33 @@ async function readPostgresDepartmentQuotaFacts(
   }>(
     `select
        coalesce((
-         select sum(greatest(coalesce((billing.data->>'monthlyQuota')::numeric, 0), 0))
-         from user_billing_periods billing
-         join feishu_users member on member.id = billing.feishu_user_id
-         where billing.period = $2
-           and member.department_id = $1
+         select sum(
+           greatest(coalesce((policy.data->>'assignedMonthlyQuota')::numeric, 0), 0)
+         ) / $3::numeric
+         from feishu_users member
+         join lateral (
+           select quota_policy.data
+           from user_quota_policies quota_policy
+           where quota_policy.feishu_user_id = member.id
+             and quota_policy.effective_from_period <= $2
+             and (
+               quota_policy.effective_to_period is null
+               or quota_policy.effective_to_period >= $2
+             )
+           order by quota_policy.version desc, quota_policy.id desc
+           limit 1
+         ) policy on true
+         where member.department_id = $1
            and coalesce(member.data->>'status', 'active') <> 'deleted'
        ), 0)::text as allocated_quota,
        coalesce((
-         select sum(greatest(coalesce((event.data->>'delta')::numeric, 0), 0))
-         from quota_change_events event
-         where event.department_id = $1
-           and event.period = $2
-           and event.status = 'pending'
-           and (
-             nullif(event.data->>'expiresAt', '') is null
-             or (event.data->>'expiresAt')::timestamptz > statement_timestamp()
-           )
+         select sum(
+           greatest(coalesce((operation.data->>'reservedDepartmentQuota')::numeric, 0), 0)
+         ) / $3::numeric
+         from quota_operations operation
+         where operation.department_id = $1
+           and operation.billing_period = $2
+           and operation.state not in ('completed', 'compensated', 'cancelled')
        ), 0)::text as pending_reserved_quota,
        (
          select nullif(member.data->>'departmentName', '')
@@ -4697,7 +4517,7 @@ async function readPostgresDepartmentQuotaFacts(
          order by member.updated_at desc, member.id
          limit 1
        ) as department_name`,
-    [departmentId, period],
+    [departmentId, period, getConfig().newapi.quotaPerUnit],
   );
   const row = result.rows[0];
   return {
@@ -5116,13 +4936,25 @@ export async function getPostgresDepartmentQuotaOverview(
            count(*) filter (
              where coalesce(member.data->>'status', 'active') <> 'deleted'
            )::integer as member_count,
-           coalesce(sum(greatest(coalesce((billing.data->>'monthlyQuota')::numeric, 0), 0)), 0)::double precision as allocated_quota,
-           coalesce(sum(greatest(coalesce((billing.data->>'quotaConsumed')::numeric, 0), 0)), 0)::double precision as quota_consumed,
-           coalesce(sum(greatest(coalesce((billing.data->>'remainingQuota')::numeric, 0), 0)), 0)::double precision as remaining_quota
+           coalesce(
+             sum(greatest(coalesce((policy.data->>'assignedMonthlyQuota')::numeric, 0), 0))
+               / $4::numeric,
+             0
+           )::double precision as allocated_quota
          from feishu_users member
          join scoped_departments scoped on scoped.department_id = member.department_id
-         left join user_billing_periods billing
-           on billing.feishu_user_id = member.id and billing.period = $3
+         left join lateral (
+           select quota_policy.data
+           from user_quota_policies quota_policy
+           where quota_policy.feishu_user_id = member.id
+             and quota_policy.effective_from_period <= $3
+             and (
+               quota_policy.effective_to_period is null
+               or quota_policy.effective_to_period >= $3
+             )
+           order by quota_policy.version desc, quota_policy.id desc
+           limit 1
+         ) policy on true
          where coalesce(member.data->>'status', 'active') <> 'deleted'
          group by member.department_id
        ), account_stats as materialized (
@@ -5139,17 +4971,17 @@ export async function getPostgresDepartmentQuotaOverview(
          join scoped_departments scoped on scoped.department_id = member.department_id
          group by member.department_id
        ), reservation_stats as materialized (
-         select event.department_id,
-           coalesce(sum(greatest(coalesce((event.data->>'delta')::numeric, 0), 0)), 0)::double precision as pending_reserved_quota
-         from quota_change_events event
-         join scoped_departments scoped on scoped.department_id = event.department_id
-         where event.period = $3
-           and event.status = 'pending'
-           and (
-             nullif(event.data->>'expiresAt', '') is null
-             or (event.data->>'expiresAt')::timestamptz > statement_timestamp()
-           )
-         group by event.department_id
+         select operation.department_id,
+           coalesce(
+             sum(greatest(coalesce((operation.data->>'reservedDepartmentQuota')::numeric, 0), 0))
+               / $4::numeric,
+             0
+           )::double precision as pending_reserved_quota
+         from quota_operations operation
+         join scoped_departments scoped on scoped.department_id = operation.department_id
+         where operation.billing_period = $3
+           and operation.state not in ('completed', 'compensated', 'cancelled')
+         group by operation.department_id
        ), settings as materialized (
          select coalesce((data->>'defaultMonthlyQuota')::double precision, 200) as default_grant_quota
          from app_settings where id = 'default'
@@ -5175,8 +5007,8 @@ export async function getPostgresDepartmentQuotaOverview(
              - coalesce(reservations.pending_reserved_quota, 0),
            0
          ) as available_quota,
-         coalesce(members.quota_consumed, 0) as quota_consumed,
-         coalesce(members.remaining_quota, 0) as remaining_quota,
+         0::double precision as quota_consumed,
+         0::double precision as remaining_quota,
          coalesce(members.member_count, 0)::integer as member_count,
          coalesce(accounts.keyed_users, 0)::integer as keyed_users,
          coalesce(accounts.prewarmed_keys, 0)::integer as prewarmed_keys,
@@ -5190,32 +5022,43 @@ export async function getPostgresDepartmentQuotaOverview(
        left join reservation_stats reservations on reservations.department_id = scoped.department_id
        left join settings on true
        order by coalesce(nullif(policy.data->>'departmentName', ''), members.department_name, scoped.department_id)`,
-      [scope.scopeType, scope.departmentId ?? null, period],
+      [
+        scope.scopeType,
+        scope.departmentId ?? null,
+        period,
+        getConfig().newapi.quotaPerUnit,
+      ],
     );
-    const requests = await client.query<{
-      data: DepartmentQuotaRequest;
-      requester_name: string | null;
-      requester_open_id: string | null;
-    }>(
-      `select request.data,
-              requester.data->>'name' as requester_name,
-              requester.open_id as requester_open_id
-       from department_quota_requests request
-       left join feishu_users requester on requester.id = request.requester_feishu_user_id
-       where request.period = $3
-         and ($1::text = 'global' or request.department_id = $2)
-       order by request.updated_at desc, request.id desc
-       limit 200`,
-      [scope.scopeType, scope.departmentId ?? null, period],
-    );
-    const recentEvents = await client.query<{ data: QuotaChangeEvent }>(
-      `select data from quota_change_events
-       where period = $3
-         and ($1::text = 'global' or department_id = $2)
-       order by updated_at desc, id desc
-       limit 100`,
-      [scope.scopeType, scope.departmentId ?? null, period],
-    );
+    const [requests, recentEvents] = await Promise.all([
+      client.query<{
+        data: DepartmentQuotaRequest;
+        requester_name: string | null;
+        requester_open_id: string | null;
+        operator_name: string | null;
+      }>(
+        `select request.data,
+                nullif(requester.data->>'name', '') as requester_name,
+                requester.open_id as requester_open_id,
+                nullif(operator_user.data->>'name', '') as operator_name
+         from department_quota_requests request
+         left join feishu_users requester on requester.id = request.requester_feishu_user_id
+         left join feishu_users operator_user
+           on operator_user.open_id = nullif(request.data->>'approvalOperatorOpenId', '')
+         where request.period = $1
+           and ($2::text = 'global' or request.department_id = $3)
+         order by request.updated_at desc, request.id desc`,
+        [period, scope.scopeType, scope.departmentId ?? null],
+      ),
+      client.query<{ data: QuotaChangeEvent }>(
+        `select data
+         from quota_change_events
+         where period = $1
+           and ($2::text = 'global' or department_id = $3)
+         order by updated_at desc, id desc
+         limit 100`,
+        [period, scope.scopeType, scope.departmentId ?? null],
+      ),
+    ]);
     return {
       period,
       departments: departments.rows.map((row) => ({
@@ -5240,6 +5083,7 @@ export async function getPostgresDepartmentQuotaOverview(
         ...row.data,
         requesterName: row.requester_name ?? undefined,
         requesterOpenId: row.requester_open_id ?? undefined,
+        approvalOperatorName: row.operator_name ?? undefined,
       })),
       recentEvents: recentEvents.rows.map((row) => row.data),
     };
@@ -5324,15 +5168,7 @@ export async function findPostgresActiveTokenByHash(keyHash: string) {
 }
 
 export async function insertPostgresTokenAccount(account: TokenAccount) {
-  return withControlTransaction(async (client) => {
-    const stored = await saveTokenAccountRow(client, account);
-    await syncPostgresBillingPeriodForUser(
-      client,
-      stored.feishuUserId,
-      stored.billingPeriod || periodFromIso(stored.createdAt),
-    );
-    return stored;
-  });
+  return withControlTransaction((client) => saveTokenAccountRow(client, account));
 }
 
 export async function insertPostgresPrewarmedTokenAccountIfEligible(input: {
@@ -5474,18 +5310,7 @@ export async function replacePostgresActiveTokenAccount(input: {
       replacedByTokenAccountId: input.account.id,
     };
     await saveTokenAccountRow(client, replaced);
-    const stored = await saveTokenAccountRow(client, input.account);
-    await syncPostgresBillingPeriodForUser(
-      client,
-      oldAccount.feishuUserId,
-      oldAccount.billingPeriod || periodFromIso(oldAccount.createdAt),
-    );
-    await syncPostgresBillingPeriodForUser(
-      client,
-      stored.feishuUserId,
-      stored.billingPeriod || periodFromIso(stored.createdAt),
-    );
-    return stored;
+    return saveTokenAccountRow(client, input.account);
   });
 }
 
@@ -5952,8 +5777,8 @@ async function updatePostgresUserAccessStatusWithClient(
             status: "approved_provision_failed",
             errorMessage:
               input.status === "deleted"
-                ? "用户已删除，原账务任务已终止；重新申请后将创建新任务"
-                : "用户已禁用，原账务任务已终止",
+                ? "用户已删除，Key 与套餐操作已终止；重新申请后将创建新操作"
+                : "用户已禁用，Key 与套餐操作已终止",
             updatedAt: now,
           });
         }
@@ -6014,18 +5839,6 @@ async function updatePostgresUserAccessStatusWithClient(
       ...revocationBarrier,
       updatedAt: now,
     });
-    const affectedPeriods = new Set(
-      storedAccounts.map(
-        (account) => account.billingPeriod || periodFromIso(account.createdAt),
-      ),
-    );
-    for (const period of affectedPeriods) {
-      await syncPostgresBillingPeriodForUser(
-        client,
-        input.feishuUserId,
-        period,
-      );
-    }
     const resumableAccount = [...storedAccounts]
       .reverse()
       .find((account) => account.status === input.tokenStatus) ?? null;
@@ -6328,11 +6141,6 @@ async function enablePostgresUserAccessWithClient(
       resumePreparedAt: now,
       updatedAt: now,
     });
-    await syncPostgresBillingPeriodForUser(
-      client,
-      storedAccount.feishuUserId,
-      storedAccount.billingPeriod || periodFromIso(storedAccount.createdAt),
-    );
     return { user: storedUser, tokenAccount: storedAccount };
 }
 
@@ -6479,11 +6287,6 @@ export async function rollbackPostgresUserAccessResumeUnderUserFence(input: {
     ]);
     const row = result.rows[0];
     if (!row) return null;
-    await syncPostgresBillingPeriodForUser(
-      client,
-      row.account.feishuUserId,
-      row.account.billingPeriod || periodFromIso(row.account.createdAt),
-    );
     return {
       user: row.user,
       tokenAccount: row.account,
@@ -6908,7 +6711,7 @@ export async function reservePostgresQuotaOperationDepartmentBudget(
         [departmentId, billingPeriod],
       );
       const policy = policyResult.rows[0]?.data;
-      if (!policy) throw new Error("部门账期预算不存在");
+      if (!policy) throw new Error("部门套餐周期设置不存在");
 
       const committedResult = await client.query<{ quota: string }>(
         `select coalesce(sum(entry.signed_quota), 0)::text as quota

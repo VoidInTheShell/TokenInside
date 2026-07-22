@@ -1,138 +1,86 @@
 # TokenInside
 
-TokenInside is a Feishu-based token request, management, and LLM API gateway for teams that want to bind generated API keys to Feishu users while forwarding compatible `/v1` requests to a NewAPI backend.
+TokenInside 是飞书与 NewAPI 之间的业务控制面。飞书用户在 TokenInside 完成登录、套餐申请和审批后，获得归属于 NewAPI 同一承载用户的独立 Key；模型请求、余额扣减和用量日志均由 NewAPI 直接承载。
 
-## What It Provides
+## 系统边界
 
-- Feishu OAuth login and session binding.
-- Token request and approval workflow.
-- User-facing token status, quota, and usage views.
-- Admin-facing user, quota, department, and usage management.
-- OpenAI-compatible `/v1` proxying through per-user keys.
-- Docker Compose deployment with PostgreSQL and health checks.
+- TokenInside：飞书 OAuth、组织与管理员范围、审批、Key 生命周期、套餐策略、套餐重置、用户与部门管理、NewAPI 数据可视化。
+- NewAPI：Key 实际余额、模型请求、用量计费、请求日志与消费记录的权威数据源。
+- 客户端：使用 TokenInside 展示的 NewAPI 地址与个人 Key 直接调用 NewAPI。
+- 套餐重置：更新用户在 NewAPI 中的套餐额度上限，不删除 NewAPI 请求和消费日志。
 
-## Repository Layout
+TokenInside 不提供 `/v1/*` 模型请求入口，也不维护独立的消费账本或二次计费链路。
+
+## 主要能力
+
+- 飞书 OAuth 登录、会话绑定和组织信息同步。
+- 飞书审批与管理后台审批处理。
+- NewAPI Key 创建、查看、启用、禁用、轮换和删除。
+- 用户套餐额度调整与按配置日自动重置。
+- 用户管理、套餐管理、用户统计、部门统计和使用记录。
+- 使用记录的搜索、筛选、排序、分页和首字/总耗时展示。
+- PostgreSQL 状态存储、运行健康检查与 Docker Compose 部署。
+
+## 目录
 
 ```text
-app/          Next.js app routes and API handlers
-components/   React UI components
-lib/          Feishu, NewAPI, storage, billing, and admin logic
-scripts/      Database, production preflight, and deployment helper scripts
+app/          Next.js 页面与 API 路由
+components/   React 与 shadcn 风格组件
+lib/          飞书、NewAPI、权限、套餐和存储逻辑
+scripts/      数据库初始化、部署检查与发布脚本
+tests/        单元、契约和 PostgreSQL 功能测试
 ```
 
-## Local Development
-
-Install dependencies:
+## 本地开发
 
 ```bash
 npm ci
-```
-
-Run type checks:
-
-```bash
 npm run typecheck
-```
-
-Run a production build:
-
-```bash
+npm test
 npm run build
-```
-
-Run the local development server:
-
-```bash
 npm run dev
 ```
 
-The default development port is `16878`.
+开发服务默认监听 `127.0.0.1:16878`。
 
-## Docker Deployment
+## Docker 部署
 
-TokenInside publishes container images to GitHub Container Registry:
+镜像发布到：
 
 ```text
 ghcr.io/voidintheshell/tokeninside
 ```
 
-Common tags:
+常用标签包括 `staging`、`production`、`sha-<commit>` 和 `v<release>`。
 
-```text
-staging
-production
-sha-<commit>
-v<release>
-```
-
-For a standalone Docker Compose deployment:
+独立 Compose 部署：
 
 ```bash
-cp .env.example .env
+cp tokeninside.env.example .env
 docker compose -f docker-compose.example.yml up -d --wait postgres
 docker compose -f docker-compose.example.yml run --rm --no-deps --entrypoint node tokeninside scripts/db-migrate.mjs
-docker compose -f docker-compose.example.yml run --rm --no-deps --entrypoint node tokeninside scripts/greenfield-preflight.mjs
 docker compose -f docker-compose.example.yml run --rm --no-deps --entrypoint node tokeninside scripts/production-preflight.mjs
 docker compose -f docker-compose.example.yml up -d --wait tokeninside
 ```
 
-Production-style deployments should set `TOKENINSIDE_IMAGE` to a fixed tag, for example:
-
-```text
-TOKENINSIDE_IMAGE=ghcr.io/voidintheshell/tokeninside:sha-abcdef1
-```
-
-Runtime secrets must be provided through the server-side environment file. Do not bake Feishu, NewAPI, database, or session secrets into the image.
-
-The first PostgreSQL deployment also requires
-`TOKENINSIDE_GREENFIELD_CUTOVER_AT`, set to an already-reached whole-second
-timestamp. `greenfield:preflight` refuses any existing local business facts,
-NewAPI Tokens, or NewAPI usage before that cutover. It then stores a
-non-secret upstream binding manifest. Later deployments verify only that
-manifest and the lightweight NewAPI control identity; they do not repeat the
-full empty-account scan. The application health endpoint remains `503` until
-the manifest exists and matches the configured upstream identity.
-The checked-in environment files intentionally use the non-runnable
-`replace-with-actual-greenfield-cutover-at` placeholder: replace it during the
-actual initialization with an already-reached, whole-second ISO timestamp.
-Never use a future timestamp or copy an example date, because that would leave
-the interval before the real installation outside the pollution check.
+运行密钥只写入服务端环境文件，不写入镜像、前端资源或仓库。`NEWAPI_BASE_URL` 是 TokenInside 后端访问地址；当浏览器和客户端应使用不同地址时，通过 `NEWAPI_PUBLIC_BASE_URL` 单独配置。
 
 ## CI/CD
 
-GitHub Actions is the canonical deployment path:
+`.github/workflows/tokeninside-ci-cd.yml` 负责校验、构建和发布 Linux/AMD64 镜像。推送到 `main` 后，LA 专用 self-hosted runner 拉取不可变的 `sha-<commit>` 镜像，执行数据库初始化检查并更新应用容器。运行环境 `.env` 保留在服务端，GitHub 不托管服务端 SSH 私钥。
 
-```text
-.github/workflows/tokeninside-ci-cd.yml
-```
+生产发布使用版本标签和受保护的 GitHub `production` Environment。
 
-Every push to `main` validates the application, publishes a Linux/AMD64 image to GHCR, and automatically dispatches the immutable `sha-<commit>` image to the dedicated LA self-hosted runner. The deployer creates a PostgreSQL recovery point, runs versioned migrations under a PostgreSQL advisory lock, checks the migrated schema, replaces only the application service, and verifies local plus public health endpoints.
+## 配置
 
-The LA runner is installed as the systemd service `actions.runner.VoidInTheShell-TokenInside.tokeninside-la-staging.service` under the `tokeninside-ci` account. It connects outward to GitHub, so staging deployment does not require GitHub to hold an SSH private key or connect inbound to the server. The staging job is restricted to its labels (`self-hosted`, `linux`, `x64`, `tokeninside-la`, `staging`).
+以 `tokeninside.env.example` 为配置入口，重点包括：
 
-The `staging` GitHub Environment has only these deployment values:
-
-| Type | Name | Value for LA |
-| --- | --- | --- |
-| Variable | `DEPLOY_DIR` | `/opt/tokeninside` |
-| Variable | `APP_URL` | `https://ti.kumiko-love.com` |
-
-The server retains runtime `.env` locally; CI never uploads it. Every release stores its Compose source under `.release-source/<commit>`, records the image, OCI revision, backup path, prior image, and final status in `.deploy/releases.log`. If an application update fails after a successful migration, the deployer restores the preceding application image. It never restores PostgreSQL automatically: migrations must follow the backward-compatible expand/contract pattern described in [`scripts/migrations/README.md`](scripts/migrations/README.md).
-
-Production is deliberately outside this automatic staging path. Version tags and the protected `production` GitHub Environment remain the route for a later production rollout.
-
-## Configuration
-
-Use `.env.example` as a starting point and replace every placeholder before running a real deployment.
-
-Important configuration groups:
-
-- Feishu application credentials and callback verification keys.
-- NewAPI backend URL and control credential.
-- Session secret.
-- PostgreSQL connection string and pool settings.
-- TokenInside image tag and resource tuning values.
+- 飞书应用凭据、审批定义和事件校验配置。
+- NewAPI 后端/公开地址、控制用户 ID 与服务端凭据。
+- TokenInside 会话密钥和系统管理员 open_id。
+- PostgreSQL 连接串、连接池与资源限制。
+- 套餐操作并发和请求完成等待时间。
 
 ## License
 
-No license has been declared yet.
+当前未声明开源许可证。

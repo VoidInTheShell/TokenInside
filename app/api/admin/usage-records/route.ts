@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { requireAdminScope } from "@/lib/admin";
-import { listAdminUsageRecords } from "@/lib/store";
+import { listNewApiAdminUsageRecords } from "@/lib/newapi-reporting";
+import { newApiReportingFailure } from "@/lib/newapi-reporting-response";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,23 +26,27 @@ export async function GET(request: Request) {
   if (auth.error) return auth.error;
 
   const url = new URL(request.url);
-  const result = await listAdminUsageRecords({
-    scope: auth.scope,
-    userId: optionalParam(url, "userId"),
-    departmentId: optionalParam(url, "departmentId"),
-    model: optionalParam(url, "model"),
-    provider: optionalParam(url, "provider"),
-    apiFormat: optionalParam(url, "apiFormat"),
-    status: optionalParam(url, "status"),
-    userAgent: optionalParam(url, "userAgent"),
-    clientFamily: optionalParam(url, "clientFamily"),
-    search: optionalParam(url, "search"),
-    preset: optionalParam(url, "preset"),
-    startDate: optionalParam(url, "startDate"),
-    endDate: optionalParam(url, "endDate"),
-    hideUnknownRecords: url.searchParams.get("hideUnknownRecords") === "true",
-    limit: positiveInt(url.searchParams.get("limit"), 100),
-    offset: nonNegativeInt(url.searchParams.get("offset"), 0),
-  });
-  return NextResponse.json(result);
+  try {
+    const result = await listNewApiAdminUsageRecords({
+      scope: auth.scope,
+      userId: optionalParam(url, "userId"),
+      departmentId: optionalParam(url, "departmentId"),
+      model: optionalParam(url, "model"),
+      provider: optionalParam(url, "provider"),
+      apiFormat: optionalParam(url, "apiFormat"),
+      status: optionalParam(url, "status"),
+      userAgent: optionalParam(url, "userAgent"),
+      clientFamily: optionalParam(url, "clientFamily"),
+      search: optionalParam(url, "search"),
+      preset: optionalParam(url, "preset"),
+      startDate: optionalParam(url, "startDate"),
+      endDate: optionalParam(url, "endDate"),
+      hideUnknownRecords: url.searchParams.get("hideUnknownRecords") === "true",
+      limit: positiveInt(url.searchParams.get("limit"), 100),
+      offset: nonNegativeInt(url.searchParams.get("offset"), 0),
+    });
+    return NextResponse.json(result);
+  } catch (error) {
+    return newApiReportingFailure(error, "NewAPI 使用记录读取失败");
+  }
 }

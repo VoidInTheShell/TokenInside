@@ -8,11 +8,13 @@ import {
   QuotaSubmissionError,
   rejectPostgresTokenRequestAsActor,
   submitPostgresFirstProvisionDecision,
+  submitPostgresQuotaAdjustmentDecision,
 } from "@/lib/quota-operation-submit";
 import { ensureQuotaOperationWorker } from "@/lib/quota-saga";
 import { getCurrentSessionIdentity } from "@/lib/session";
 import {
   getScopedTokenRequest,
+  findTokenRequestById,
   JsonQuotaSubmissionError,
   rejectJsonTokenRequestAsActor,
   updateTokenRequest,
@@ -47,12 +49,22 @@ export async function POST(
 
   if (getConfig().storeBackend === "postgres" && parsed.data.action === "approve") {
     try {
-      await assertQuotaWriteActionEnabled("first_provision");
-      const submitted = await submitPostgresFirstProvisionDecision({
-        actorUserId: identity.userId,
-        requestId: id,
-        approvedMonthlyQuota: parsed.data.approvedMonthlyQuota,
-      });
+      const pendingRequest = await findTokenRequestById(id);
+      const isQuotaAdjustment = pendingRequest?.requestType === "quota_adjust";
+      await assertQuotaWriteActionEnabled(
+        isQuotaAdjustment ? "quota_adjust" : "first_provision",
+      );
+      const submitted = isQuotaAdjustment
+        ? await submitPostgresQuotaAdjustmentDecision({
+            actorUserId: identity.userId,
+            requestId: id,
+            approvedMonthlyQuota: parsed.data.approvedMonthlyQuota,
+          })
+        : await submitPostgresFirstProvisionDecision({
+            actorUserId: identity.userId,
+            requestId: id,
+            approvedMonthlyQuota: parsed.data.approvedMonthlyQuota,
+          });
       after(() => ensureQuotaOperationWorker());
       return NextResponse.json(submitted, { status: 202 });
     } catch (err) {
@@ -68,7 +80,7 @@ export async function POST(
         );
       }
       return NextResponse.json(
-        { error: err instanceof Error ? err.message : "首次发放操作受理失败" },
+        { error: err instanceof Error ? err.message : "额度操作受理失败" },
         { status: quotaFeatureErrorStatus(err) ?? 502 },
       );
     }
@@ -123,7 +135,9 @@ export async function POST(
     tokenRequest.requestedMonthlyQuota;
 
   try {
-    await assertQuotaWriteActionEnabled("first_provision");
+    await assertQuotaWriteActionEnabled(
+      tokenRequest.requestType === "quota_adjust" ? "quota_adjust" : "first_provision",
+    );
   } catch (err) {
     if (err instanceof QuotaSubmissionError) {
       return NextResponse.json(
@@ -137,7 +151,7 @@ export async function POST(
       );
     }
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "首次发放操作受理失败" },
+      { error: err instanceof Error ? err.message : "额度操作受理失败" },
       { status: quotaFeatureErrorStatus(err) ?? 502 },
     );
   }

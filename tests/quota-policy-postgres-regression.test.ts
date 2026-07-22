@@ -16,7 +16,7 @@ function section(source: string, startMarker: string, endMarker: string) {
   return normalized.slice(start, end);
 }
 
-test("greenfield quota policies keep source idempotency in scalar PostgreSQL columns", async () => {
+test("quota policies keep source idempotency in scalar PostgreSQL columns", async () => {
   const [baseline, postgresStore] = await Promise.all([
     readFile(baselinePath, "utf8"),
     readFile(postgresStorePath, "utf8"),

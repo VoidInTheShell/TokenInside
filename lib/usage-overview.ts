@@ -33,13 +33,13 @@ export function nextHongKongBillingResetAt(period?: string | null) {
   return new Date(Date.UTC(year, month, 1) - hongKongOffsetMs);
 }
 
-export function formatBillingPeriod(period?: string | null) {
+export function formatPackagePeriod(period?: string | null) {
   const match = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(period ?? "");
-  return match ? `${match[1]}年${Number(match[2])}月账期` : "当前月度账期";
+  return match ? `${match[1]}年${Number(match[2])}月套餐周期` : "当前套餐周期";
 }
 
 export function formatResetCountdown(resetAt: Date | null, nowMs: number) {
-  if (!resetAt || !Number.isFinite(resetAt.getTime())) return "等待账期信息";
+  if (!resetAt || !Number.isFinite(resetAt.getTime())) return "等待套餐周期信息";
   const diffMinutes = Math.max(Math.ceil((resetAt.getTime() - nowMs) / 60_000), 0);
   if (diffMinutes <= 0) return "即将刷新";
   const days = Math.floor(diffMinutes / (24 * 60));

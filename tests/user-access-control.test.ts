@@ -65,7 +65,7 @@ async function loadUserAccessHarness(input: {
     },
     "@/lib/config": {
       getConfig: () => ({
-        billing: { directConsumptionDrainGraceMs: 60_000 },
+        quotaControl: { directConsumptionDrainGraceMs: 60_000 },
       }),
     },
     "@/lib/crypto": {
@@ -700,19 +700,18 @@ test("activated quota recovery accepts real consumption but never excess balance
   assert.match(saga, /controlState\.remainQuota > targetRemainQuota/);
   assert.match(saga, /observedRemainOnActivatedResume/);
   assert.match(saga, /assertFrozenOperationAccountBinding/);
-  assert.match(saga, /disableNewApiTokenAndVerify\(drainingAccount\.newapiTokenId\)/);
+  assert.match(saga, /disableNewApiTokenAndVerify\(account\.newapiTokenId\)/);
 });
 
-test("existing-key quota changes wait for direct consumption settlement and deleted users can reapply", async () => {
-  const saga = await readFile(sagaPath, "utf8");
+test("existing-key quota changes use a direct NewAPI drain grace and authoritative refresh", async () => {
+  const [saga, reporting] = await Promise.all([
+    readFile(sagaPath, "utf8"),
+    readFile(new URL("../lib/newapi-reporting.ts", import.meta.url), "utf8"),
+  ]);
+  assert.match(saga, /prepareDirectNewApiControl/);
   assert.match(saga, /directConsumptionDrainGraceMs/);
-  assert.match(saga, /consumptionBarrierCutoffAt/);
-  assert.match(saga, /consumptionBarrierStatus: "drain_grace_pending"/);
-  assert.match(saga, /consumptionBarrierStatus: "settlement_pending"/);
-  assert.match(saga, /ingestQuotaBarrierUsage/);
-  assert.match(saga, /await rebuildOperationQuotaSnapshot\(current\)/);
-  assert.match(saga, /consumptionBarrierStatus: "satisfied"/);
-  assert.match(saga, /current\.operationType === "first_provision"/);
-  assert.match(saga, /state\.closedReason === "user_access_revoked"/);
-  assert.match(saga, /canTakeOverRevokedAdmission/);
+  assert.match(saga, /directDrainReadyAt/);
+  assert.match(saga, /getNewApiUserAuthoritativeQuotaSnapshot/);
+  assert.doesNotMatch(saga, /ingestQuotaBarrierUsage|rebuildOperationQuotaSnapshot/);
+  assert.match(reporting, /currentPackageContext\(bindings, \{ forceRefresh: true \}\)/);
 });

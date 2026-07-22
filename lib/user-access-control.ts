@@ -263,7 +263,7 @@ async function compensateFailedResume(
         const upstreamDisabledAt = nowIso();
         const consumptionBarrierCutoffAt = new Date(
           Date.parse(upstreamDisabledAt) +
-            getConfig().billing.directConsumptionDrainGraceMs,
+            getConfig().quotaControl.directConsumptionDrainGraceMs,
         ).toISOString();
         const rolledBack = await rollbackUserAccessResumeUnderUserFence({
           feishuUserId,
@@ -378,7 +378,7 @@ export async function suspendUserAccess(input: {
           const consumptionBarrierCutoffAt = upstreamDisabledAt
             ? new Date(
                 Date.parse(upstreamDisabledAt) +
-                  getConfig().billing.directConsumptionDrainGraceMs,
+                  getConfig().quotaControl.directConsumptionDrainGraceMs,
               ).toISOString()
             : undefined;
           fence?.assertHeld();

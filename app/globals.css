@@ -490,6 +490,77 @@ a {
   overflow-wrap: anywhere;
 }
 
+.account-dashboard {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-areas:
+    "key endpoints"
+    "request overview";
+  align-items: stretch;
+  gap: 16px;
+}
+
+.account-current-key {
+  grid-area: key;
+}
+
+.account-endpoints {
+  grid-area: endpoints;
+}
+
+.account-quota-request {
+  grid-area: request;
+  display: flex;
+  flex-direction: column;
+}
+
+.account-usage-overview {
+  grid-area: overview;
+  min-width: 0;
+}
+
+.account-usage-overview > .card {
+  height: 100%;
+}
+
+.quota-request-heading,
+.quota-request-footer {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.quota-request-form {
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.quota-request-form > .card-content {
+  flex: 1;
+}
+
+.quota-request-form .textarea {
+  min-height: 74px;
+}
+
+.quota-request-footer {
+  border-top: 1px solid var(--border);
+}
+
+.quota-request-footer .field-description {
+  min-width: 0;
+  flex: 1;
+}
+
+.quota-request-footer .button {
+  flex: 0 0 auto;
+}
+
 .user-card {
   display: grid;
   grid-template-columns: auto minmax(180px, 1fr) minmax(130px, auto) auto;
@@ -876,7 +947,7 @@ a {
 }
 
 .department-quota-table {
-  min-width: 1090px;
+  min-width: 1360px;
   table-layout: fixed;
 }
 
@@ -898,6 +969,56 @@ a {
 
 .department-quota-col-action {
   width: 134px;
+}
+
+.package-limit-request-panel,
+.package-limit-requests {
+  margin-top: 20px;
+  border-top: 1px solid var(--border);
+  padding-top: 18px;
+}
+
+.package-limit-request-panel {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.7fr) minmax(0, 2fr);
+  align-items: end;
+  gap: 18px;
+}
+
+.package-limit-request-panel h3,
+.package-limit-requests h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.package-limit-request-panel p,
+.package-limit-requests p {
+  margin: 4px 0 0;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+
+.package-limit-request-controls {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.7fr) minmax(240px, 1.5fr) auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.package-limit-request-controls .field {
+  gap: 6px;
+}
+
+.section-heading-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.package-limit-request-table {
+  min-width: 1180px;
 }
 
 .user-management-actions {
@@ -1676,6 +1797,30 @@ a {
   gap: 10px;
 }
 
+.directory-filters {
+  margin: 14px 0;
+}
+
+.directory-filter-leading {
+  min-width: 0;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+
+.directory-filter-actions {
+  min-width: 0;
+  display: flex;
+  align-items: flex-end;
+}
+
+.directory-filter-actions .button {
+  width: 100%;
+  min-height: 34px;
+}
+
 .usage-records-controls-user .usage-records-actions {
   flex-wrap: nowrap;
 }
@@ -1683,6 +1828,35 @@ a {
 @media (min-width: 721px) {
   .usage-records-control-row {
     grid-template-columns: repeat(10, minmax(0, 1fr));
+  }
+
+  .directory-filters {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    flex-wrap: nowrap;
+    width: 100%;
+  }
+
+  .directory-filters > * {
+    flex: 0 0 auto;
+    min-width: 0;
+  }
+
+  .directory-filters > .usage-filter:not(.usage-search-filter) {
+    width: clamp(96px, 6vw, 116px);
+  }
+
+  .directory-filters > .directory-filter-actions {
+    width: auto;
+    margin-left: auto;
+  }
+
+  .directory-filters > .usage-search-filter {
+    flex: 1 1 240px;
+    width: auto;
+    min-width: 240px;
+    max-width: 480px;
   }
 
   .usage-records-controls-admin .usage-records-primary-row > :nth-child(1) {
@@ -1898,8 +2072,7 @@ a {
   width: 20%;
 }
 
-.usage-table-with-client.usage-table-user .usage-col-api-format,
-.usage-table-with-client.usage-table-user .usage-col-performance {
+.usage-table-with-client.usage-table-user .usage-col-api-format {
   width: 12%;
 }
 
@@ -1907,12 +2080,10 @@ a {
   width: 6%;
 }
 
-.usage-table-with-client.usage-table-user .usage-col-tokens {
-  width: 9%;
-}
-
-.usage-table-with-client.usage-table-user .usage-col-cost {
-  width: 9%;
+.usage-table-with-client.usage-table-user .usage-col-tokens,
+.usage-table-with-client.usage-table-user .usage-col-cost,
+.usage-table-with-client.usage-table-user .usage-col-performance {
+  width: 10%;
 }
 
 .usage-table-with-client.usage-table-user .usage-col-client {
@@ -1941,16 +2112,10 @@ a {
   width: 10%;
 }
 
-.usage-table-with-client.usage-table-admin .usage-col-tokens {
-  width: 12%;
-}
-
-.usage-table-with-client.usage-table-admin .usage-col-cost {
-  width: 11%;
-}
-
+.usage-table-with-client.usage-table-admin .usage-col-tokens,
+.usage-table-with-client.usage-table-admin .usage-col-cost,
 .usage-table-with-client.usage-table-admin .usage-col-performance {
-  width: 13%;
+  width: 12%;
 }
 
 .usage-client-cell {
@@ -1991,14 +2156,14 @@ a {
   width: 23%;
 }
 
-.usage-table-user .usage-col-api-format,
-.usage-table-user .usage-col-tokens {
+.usage-table-user .usage-col-api-format {
   width: 15%;
 }
 
+.usage-table-user .usage-col-tokens,
 .usage-table-user .usage-col-cost,
 .usage-table-user .usage-col-performance {
-  width: 14%;
+  width: 14.333%;
 }
 
 .usage-table-user .usage-col-status {
@@ -2023,15 +2188,15 @@ a {
 }
 
 .usage-table-admin .usage-col-tokens {
-  width: 14%;
+  width: 15%;
 }
 
 .usage-table-admin .usage-col-cost {
-  width: 13%;
+  width: 15%;
 }
 
 .usage-table-admin .usage-col-performance {
-  width: 18%;
+  width: 15%;
 }
 
 .usage-table th.usage-number-heading.usage-tokens-heading {
@@ -2304,6 +2469,12 @@ a {
     margin-top: 0;
   }
 
+  .package-limit-request-panel,
+  .package-limit-request-controls {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
   .usage-analysis-grid,
   .usage-analysis-grid-user {
     grid-template-columns: 1fr;
@@ -2400,6 +2571,24 @@ a {
     grid-template-columns: 1fr;
   }
 
+  .account-dashboard {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "key"
+      "request"
+      "endpoints"
+      "overview";
+  }
+
+  .quota-request-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .quota-request-footer .button {
+    width: 100%;
+  }
+
   .usage-overview-header {
     align-items: flex-start;
     flex-direction: column;
@@ -2456,6 +2645,19 @@ a {
     align-items: stretch;
     display: grid;
     grid-template-columns: 1fr;
+  }
+
+  .directory-filters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .directory-filters > .directory-filter-leading {
+    grid-column: 1 / -1;
+  }
+
+  .directory-filters > .usage-search-filter {
+    grid-column: 1 / -1;
+    order: -1;
   }
 
   .usage-records-controls-user .usage-records-primary-row,

@@ -1,6 +1,7 @@
 import { getConfig } from "@/lib/config";
 import { randomId } from "@/lib/crypto";
 import { getEffectiveNewApiConfig } from "@/lib/newapi-runtime";
+import { newApiLogMetadata } from "@/lib/newapi-log-timing";
 import { assertQuotaExecutionFenceHeld } from "@/lib/quota-execution-fence";
 import {
   extractUsageFromNewApiOther,
@@ -56,6 +57,8 @@ export type NewApiLogRecord = {
   channel_name?: string;
   user_id?: string | number;
   username?: string;
+  content?: string;
+  ip?: string;
   other?: unknown;
 };
 
@@ -87,6 +90,11 @@ export type NormalizedNewApiUsageLog = UsageMetrics & {
   providerChannelName?: string;
   newapiUserId?: string;
   newapiUsername?: string;
+  requestPath?: string;
+  firstResponseTimeMs?: number;
+  statusCode?: number;
+  clientIp?: string;
+  errorMessage?: string;
 };
 
 export type NewApiUsageLogPage = {
@@ -315,7 +323,6 @@ export async function deleteNewApiTokens(newapiTokenIds: string[]) {
     body: JSON.stringify({ ids }),
   });
 }
-
 export async function createPrewarmedNewApiTokens(input: {
   count: number;
   batchLabel?: string;
@@ -482,6 +489,7 @@ export function normalizeNewApiUsageLog(record: NewApiLogRecord): NormalizedNewA
     promptTokens,
     completionTokens,
   });
+  const metadata = newApiLogMetadata(record.other);
   mergeUsageMetrics(usageMetrics, {
     cost: quota === undefined ? undefined : fromNewApiQuota(quota),
     usageFieldSources:
@@ -506,6 +514,14 @@ export function normalizeNewApiUsageLog(record: NewApiLogRecord): NormalizedNewA
     providerChannelName: stringFromNewApi(record.channel_name),
     newapiUserId: stringFromNewApi(record.user_id),
     newapiUsername: stringFromNewApi(record.username),
+    requestPath: metadata.requestPath,
+    firstResponseTimeMs: metadata.firstResponseTimeMs,
+    statusCode: metadata.statusCode,
+    clientIp: stringFromNewApi(record.ip),
+    errorMessage:
+      String(record.type ?? "") === "5"
+        ? stringFromNewApi(record.content) ?? "NewAPI 请求失败"
+        : undefined,
   };
 }
 
@@ -518,6 +534,7 @@ export async function listNewApiUsageLogs(input: {
   endTimestamp?: number;
   tokenName?: string;
   modelName?: string;
+  logType?: number;
 } = {}): Promise<NewApiUsageLogPage> {
   const newapi = await getEffectiveNewApiConfig();
   const page = Math.max(input.page ?? 0, 0);
@@ -534,7 +551,7 @@ export async function listNewApiUsageLogs(input: {
   const params = new URLSearchParams({
     p: String(page + 1),
     page_size: String(size),
-    type: "2",
+    type: String(input.logType ?? 2),
   });
   if (input.requestId) params.set("request_id", input.requestId);
   if (input.upstreamRequestId) params.set("upstream_request_id", input.upstreamRequestId);
@@ -657,10 +674,4 @@ export async function updateNewApiTokenQuota(input: {
       remain_quota: input.remainQuota,
     }),
   });
-}
-
-export async function buildNewApiProxyUrl(pathParts: string[], search: string) {
-  const newapi = await getEffectiveNewApiConfig();
-  const safePath = pathParts.map(encodeURIComponent).join("/");
-  return `${newapi.baseUrl}/v1/${safePath}${search}`;
 }

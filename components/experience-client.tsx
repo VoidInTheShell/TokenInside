@@ -25,6 +25,7 @@ import {
   Card,
   CardContent,
   CardDescription,
+  CardFooter,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -55,7 +56,7 @@ import {
 
 type SessionResponse = {
   authenticated: boolean;
-  workspaceAccess?: "application_only" | "provisioning" | "active";
+  workspaceAccess?: "application_only" | "disabled" | "provisioning" | "active";
   baseUrl: string;
   settings?: {
     defaultMonthlyQuota: number;
@@ -68,6 +69,7 @@ type SessionResponse = {
     openId: string;
     departmentId?: string;
     departmentName?: string;
+    status?: "active" | "disabled" | "deleted";
   };
   activeToken?: {
     id: string;
@@ -77,16 +79,17 @@ type SessionResponse = {
     billingPeriod: string;
     createdAt: string;
   };
-  billingPeriod?: {
+  usageOverview?: {
     period: string;
-    monthlyQuota: number;
+    nextResetAt?: string;
+    packageQuota: number;
     quotaConsumed: number;
     cost: number;
     remainingQuota: number;
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
-    proxyLogCount: number;
+    requestCount: number;
     usageRecordCount: number;
   } | null;
   adminScope?: {
@@ -100,6 +103,8 @@ type SessionResponse = {
     requestType: string;
     status: string;
     reason: string;
+    requestedMonthlyQuota: number;
+    approvedMonthlyQuota?: number;
     approvalTargetSource?: string;
     approvalRouteReason?:
       | "department_leader"
@@ -113,7 +118,7 @@ type SessionResponse = {
     createdAt: string;
     updatedAt: string;
   }>;
-  proxyLogCount: number;
+  requestCount: number;
 };
 
 type ModelsResponse = {
@@ -139,7 +144,7 @@ type UsageRecordsResponse = {
   };
   modelStats?: UsageAggregateRow[];
   apiFormatStats?: UsageAggregateRow[];
-  usageOverview?: SessionResponse["billingPeriod"];
+  usageOverview?: SessionResponse["usageOverview"];
   error?: string;
 };
 
@@ -181,6 +186,17 @@ const FALLBACK_MONTHLY_QUOTA = 200;
 const RECENT_APPROVAL_WINDOW_MS = 24 * 60 * 60 * 1000;
 const RECENT_APPROVAL_LIMIT = 500;
 const QUOTA_OPERATION_POLL_INTERVAL_MS = 500;
+const OPEN_QUOTA_REQUEST_STATUSES = new Set([
+  "pending_card_send",
+  "pending_card_approval",
+  "approval_card_send_failed",
+  "approval_route_failed",
+  "pending_feishu_approval",
+  "approved",
+  "approved_provisioning",
+  "approved_provision_failed",
+  "draft_pending_approval_config",
+]);
 
 const statusLabel: Record<string, string> = {
   pending_card_send: "发送审批卡片中",
@@ -206,7 +222,7 @@ const requestTypeLabel: Record<string, string> = {
 
 function badgeVariant(status?: string) {
   if (!status) return "default";
-  if (["provisioned", "approved"].includes(status)) return "success";
+  if (["provisioned", "approved", "completed"].includes(status)) return "success";
   if (["rejected", "cancelled", "invalidated", "approved_provision_failed"].includes(status)) {
     return "danger";
   }
@@ -262,7 +278,13 @@ function RequestHistoryList({
                 {statusLabel[request.status] ?? request.status}
               </Badge>
             </div>
-            <p>{request.reason || "未填写申请理由"}</p>
+            <p>
+              {request.requestType === "quota_adjust"
+                ? `目标套餐额度 ${formatQuotaAmount(request.requestedMonthlyQuota)}${
+                    request.reason ? ` · ${request.reason}` : ""
+                  }`
+                : request.reason || "未填写申请理由"}
+            </p>
           </div>
           <div className="request-history-meta">
             <span>提交时间</span>
@@ -319,6 +341,9 @@ export function ExperienceClient() {
   const [key, setKey] = useState<string | null>(null);
   const [quotaOperation, setQuotaOperation] = useState<SelfQuotaOperation | null>(null);
   const [reason, setReason] = useState("");
+  const [quotaRequestTarget, setQuotaRequestTarget] = useState("");
+  const [quotaRequestReason, setQuotaRequestReason] = useState("");
+  const [quotaRequestBusy, setQuotaRequestBusy] = useState(false);
   const [quickApprovalQuotaDrafts, setQuickApprovalQuotaDrafts] = useState<Record<string, string>>({});
   const [panel, setPanel] = useState<WorkspacePanel>("account");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -326,11 +351,11 @@ export function ExperienceClient() {
   const [error, setError] = useState<string | null>(null);
   const [feishuSdkReady, setFeishuSdkReady] = useState(false);
   const [autoLoginAttempted, setAutoLoginAttempted] = useState(false);
+  const adminProvisioningAttemptRef = useRef<string | null>(null);
   const usageFetchAbortRef = useRef<AbortController | null>(null);
   const usageRefreshInFlightRef = useRef(false);
   const shouldAutoRefreshTokenRequests = Boolean(
     session?.authenticated &&
-      !session.activeToken &&
       tokenRequestsNeedAutoRefresh(session.requests),
   );
 
@@ -423,7 +448,7 @@ export function ExperienceClient() {
           current
             ? {
                 ...current,
-                billingPeriod: data.usageOverview ?? null,
+                usageOverview: data.usageOverview ?? null,
               }
             : current,
         );
@@ -507,6 +532,53 @@ export function ExperienceClient() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    const userId = session?.user?.id;
+    if (
+      loading ||
+      !session?.authenticated ||
+      !userId ||
+      !session.adminScope ||
+      session.activeToken ||
+      session.workspaceAccess === "disabled" ||
+      adminProvisioningAttemptRef.current === userId
+    ) {
+      return;
+    }
+
+    adminProvisioningAttemptRef.current = userId;
+    let cancelled = false;
+    const submit = async () => {
+      try {
+        const res = await fetch("/api/token/admin-provision", { method: "POST" });
+        const data = (await res.json().catch(() => ({}))) as {
+          status?: string;
+          error?: string;
+        };
+        if (!res.ok || data.status === "failed") {
+          throw new Error(data.error ?? "管理员 Key 自动发放受理失败");
+        }
+        if (!cancelled) await refresh({ quiet: true });
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : "管理员 Key 自动发放受理失败");
+        }
+      }
+    };
+    void submit();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    loading,
+    refresh,
+    session?.activeToken,
+    session?.adminScope,
+    session?.authenticated,
+    session?.user?.id,
+    session?.workspaceAccess,
+  ]);
 
   useEffect(() => {
     if (!shouldAutoRefreshTokenRequests) return;
@@ -708,14 +780,26 @@ export function ExperienceClient() {
 
   const requests = useMemo(() => session?.requests ?? [], [session]);
   const latestRequest = requests[0];
+  const pendingQuotaRequest = requests.find(
+    (request) =>
+      request.requestType === "quota_adjust" &&
+      OPEN_QUOTA_REQUEST_STATUSES.has(request.status),
+  );
   const hasActiveToken = Boolean(session?.activeToken);
   const isAdminWorkspace = Boolean(session?.adminScope);
-  const title = hasActiveToken || isAdminWorkspace ? "用户后台" : "套餐申请";
+  const title =
+    session?.workspaceAccess === "disabled"
+      ? "账户已禁用"
+      : hasActiveToken || isAdminWorkspace
+        ? "用户后台"
+        : "套餐申请";
   const effectiveGrantQuota = session?.settings?.defaultMonthlyQuota ?? FALLBACK_MONTHLY_QUOTA;
-  const currentBillingPeriod = session?.billingPeriod ?? null;
+  const currentBillingPeriod = session?.usageOverview ?? null;
   const currentBillingPeriodName =
     currentBillingPeriod?.period ?? session?.activeToken?.billingPeriod ?? "-";
   const remainingQuota = currentBillingPeriod?.remainingQuota;
+  const currentPackageQuota =
+    currentBillingPeriod?.packageQuota ?? effectiveGrantQuota;
   const fallbackNotice = pendingApprovalRouteNotice(
     latestRequest,
     session?.adminScope?.type === "department",
@@ -732,11 +816,7 @@ export function ExperienceClient() {
     setBusy(true);
     try {
       const result = await loginWithFeishu();
-      setMessage(
-        result.method === "requestAuthCode"
-          ? "已通过飞书身份自动登录（兼容模式）。"
-          : "已通过飞书身份自动登录。",
-      );
+      setMessage("已通过飞书身份自动登录。");
       if (result.redirectTo !== window.location.pathname) {
         window.location.replace(result.redirectTo);
         return;
@@ -780,6 +860,53 @@ export function ExperienceClient() {
     }
   }
 
+  async function requestQuotaIncrease() {
+    const requestedMonthlyQuota = Number(quotaRequestTarget);
+    if (!Number.isInteger(requestedMonthlyQuota) || requestedMonthlyQuota <= 0) {
+      setError("目标套餐额度必须是正整数");
+      return;
+    }
+    if (requestedMonthlyQuota <= currentPackageQuota) {
+      setError(`目标套餐额度必须高于当前额度 ${formatQuotaAmount(currentPackageQuota)}`);
+      return;
+    }
+    if (pendingQuotaRequest) {
+      setError("已有套餐额度申请正在处理，请等待审批完成后再提交");
+      return;
+    }
+
+    setQuotaRequestBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/token/quota-request", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          requestedMonthlyQuota,
+          reason: quotaRequestReason.trim(),
+        }),
+      });
+      const body = (await res.json().catch(() => ({}))) as {
+        request?: RequestHistoryItem;
+        notice?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        if (body.request) await refresh({ quiet: true });
+        throw new Error(body.error ?? "提交套餐额度申请失败");
+      }
+      setQuotaRequestTarget("");
+      setQuotaRequestReason("");
+      setMessage(body.notice ?? "套餐额度申请已提交。");
+      await refresh({ quiet: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "提交套餐额度申请失败");
+    } finally {
+      setQuotaRequestBusy(false);
+    }
+  }
+
   async function revealKey() {
     setBusy(true);
     setError(null);
@@ -808,7 +935,7 @@ export function ExperienceClient() {
   }
 
   async function resetKey() {
-    if (!window.confirm("更换会立即停止旧 Key 接收新请求，排空已在途请求后停用旧 Key 并交付新 Key。是否继续？")) return;
+    if (!window.confirm("更换会先在 NewAPI 禁用当前 Key，等待在途请求与用量日志稳定后交付新 Key。是否继续？")) return;
     setBusy(true);
     setError(null);
     setMessage(null);
@@ -828,7 +955,7 @@ export function ExperienceClient() {
       if (!res.ok) throw new Error(body.error ?? "更换 Key 失败");
       if (!body.operation) throw new Error("服务端未返回 Key 更换操作");
       setQuotaOperation(body.operation);
-      setMessage("Key 更换已受理，旧 Key 已停止接收新请求，系统正在排空在途请求并执行切换校验。");
+      setMessage("Key 更换已受理，当前 Key 已在 NewAPI 禁用，正在等待用量日志稳定并执行切换校验。");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Key 更换失败");
     } finally {
@@ -869,6 +996,7 @@ export function ExperienceClient() {
   }
 
   async function decideQuickApproval(requestId: string, action: "approve" | "reject") {
+    const approvalRequest = quickApprovals.find((request) => request.id === requestId);
     const approvedMonthlyQuota = Number(quickApprovalQuotaDrafts[requestId]);
     if (action === "approve" && (!Number.isInteger(approvedMonthlyQuota) || approvedMonthlyQuota <= 0)) {
       setError("通过审批前需要填写正整数最终额度");
@@ -892,7 +1020,13 @@ export function ExperienceClient() {
       );
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.error ?? "处理审批失败");
-      setMessage(action === "approve" ? "审批已通过，已触发发放。" : "审批请求已拒绝。");
+      setMessage(
+        action === "approve"
+          ? approvalRequest?.requestType === "quota_adjust"
+            ? "审批已通过，已触发额度调整。"
+            : "审批已通过，已触发发放。"
+          : "审批请求已拒绝。",
+      );
       await Promise.all([refresh(), loadQuickApprovals()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "处理审批失败");
@@ -1043,10 +1177,11 @@ export function ExperienceClient() {
             </CardContent>
           </Card>
 
-          {hasActiveToken && (
+          {hasActiveToken && panel !== "account" && (
             <UsageOverviewCard
               period={currentBillingPeriodName}
-              monthlyQuota={currentBillingPeriod?.monthlyQuota}
+              nextResetAt={currentBillingPeriod?.nextResetAt}
+              monthlyQuota={currentBillingPeriod?.packageQuota}
               quotaConsumed={currentBillingPeriod?.quotaConsumed}
               remainingQuota={remainingQuota}
               totalTokens={currentBillingPeriod?.totalTokens}
@@ -1181,12 +1316,24 @@ export function ExperienceClient() {
           )}
 
           {!hasActiveToken ? (
-            session?.adminScope ? (
+            session?.workspaceAccess === "disabled" ? (
+              <Card>
+                <CardHeader>
+                  <CardTitle>当前用户已被禁用</CardTitle>
+                  <CardDescription>
+                    您的 Key 与消费记录已保留，请等待管理员解禁后继续使用。
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <Badge variant="danger">等待管理员解禁</Badge>
+                </CardContent>
+              </Card>
+            ) : session?.adminScope ? (
               <Card>
                 <CardHeader>
                   <CardTitle>管理员 Key 自动发放</CardTitle>
                   <CardDescription>
-                    管理员用户后台已经开放；系统正在通过持久账务任务自动创建专属 Key。
+                    管理员用户后台已经开放；系统正在创建专属 Key。
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
@@ -1263,8 +1410,8 @@ export function ExperienceClient() {
           ) : (
             <>
               {panel === "account" && (
-                <section className="grid grid-2">
-                  <Card>
+                <section className="account-dashboard">
+                  <Card className="account-current-key">
                     <CardHeader>
                       <CardTitle>当前 key</CardTitle>
                     </CardHeader>
@@ -1322,7 +1469,7 @@ export function ExperienceClient() {
                     </CardContent>
                   </Card>
 
-                  <Card>
+                  <Card className="account-endpoints">
                     <CardHeader>
                       <CardTitle>可用端点</CardTitle>
                     </CardHeader>
@@ -1335,6 +1482,90 @@ export function ExperienceClient() {
                       </div>
                     </CardContent>
                   </Card>
+
+                  <Card className="account-quota-request">
+                    <CardHeader>
+                      <div className="quota-request-heading">
+                        <CardTitle>申请套餐额度</CardTitle>
+                        {pendingQuotaRequest && (
+                          <Badge variant="warning">申请处理中</Badge>
+                        )}
+                      </div>
+                      <CardDescription>
+                        当前套餐额度 {formatQuotaAmount(currentPackageQuota)}，可申请更高的本周期额度。
+                      </CardDescription>
+                    </CardHeader>
+                    <form
+                      className="quota-request-form"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void requestQuotaIncrease();
+                      }}
+                    >
+                      <CardContent>
+                        <div className="field">
+                          <label htmlFor="quotaRequestTarget">目标套餐额度</label>
+                          <Input
+                            id="quotaRequestTarget"
+                            type="number"
+                            min={Math.floor(currentPackageQuota) + 1}
+                            max={1_000_000}
+                            step={1}
+                            inputMode="numeric"
+                            placeholder={`请输入大于 ${formatQuotaAmount(currentPackageQuota)} 的额度`}
+                            value={
+                              pendingQuotaRequest
+                                ? String(pendingQuotaRequest.requestedMonthlyQuota)
+                                : quotaRequestTarget
+                            }
+                            onChange={(event) => setQuotaRequestTarget(event.target.value)}
+                            disabled={Boolean(pendingQuotaRequest) || quotaRequestBusy}
+                          />
+                        </div>
+                        <div className="field">
+                          <label htmlFor="quotaRequestReason">申请理由（选填）</label>
+                          <Textarea
+                            id="quotaRequestReason"
+                            rows={2}
+                            maxLength={500}
+                            placeholder="例如：新增项目接入或本周期调用量增加"
+                            value={
+                              pendingQuotaRequest
+                                ? pendingQuotaRequest.reason
+                                : quotaRequestReason
+                            }
+                            onChange={(event) => setQuotaRequestReason(event.target.value)}
+                            disabled={Boolean(pendingQuotaRequest) || quotaRequestBusy}
+                          />
+                        </div>
+                      </CardContent>
+                      <CardFooter className="quota-request-footer">
+                        <span className="field-description">
+                          {pendingQuotaRequest
+                            ? `提交于 ${formatDateTime(pendingQuotaRequest.createdAt)}`
+                            : "提交后由部门管理员审批，root 与系统管理员兜底。"}
+                        </span>
+                        <Button
+                          type="submit"
+                          disabled={Boolean(pendingQuotaRequest) || quotaRequestBusy}
+                        >
+                          <SendIcon data-icon="inline-start" />
+                          {pendingQuotaRequest ? "申请处理中" : "提交申请"}
+                        </Button>
+                      </CardFooter>
+                    </form>
+                  </Card>
+
+                  <div className="account-usage-overview">
+                    <UsageOverviewCard
+                      period={currentBillingPeriodName}
+                      nextResetAt={currentBillingPeriod?.nextResetAt}
+                      monthlyQuota={currentBillingPeriod?.packageQuota}
+                      quotaConsumed={currentBillingPeriod?.quotaConsumed}
+                      remainingQuota={remainingQuota}
+                      totalTokens={currentBillingPeriod?.totalTokens}
+                    />
+                  </div>
                 </section>
               )}
 
@@ -1379,7 +1610,7 @@ export function ExperienceClient() {
                   <Card>
                     <CardHeader>
                       <CardTitle>使用记录</CardTitle>
-                      <CardDescription>按 Aether 维度展示请求、tokens、额度消耗和首字/总耗时。</CardDescription>
+                      <CardDescription>按 NewAPI 日志展示请求、tokens、额度消耗和首字/总耗时。</CardDescription>
                     </CardHeader>
                     <CardContent>
                       <UsageRecordsTable

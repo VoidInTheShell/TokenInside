@@ -60,25 +60,17 @@ const requiredPostgresTables = [
   "schema_migrations",
   "app_settings",
   "billing_operations",
-  "greenfield_installation_manifest",
   "feishu_users",
   "token_requests",
   "token_accounts",
-  "user_billing_periods",
   "department_quota_periods",
-  "department_quota_requests",
   "quota_change_events",
   "user_quota_policies",
   "quota_operations",
   "quota_ledger_entries",
   "user_quota_states",
   "quota_reconciliation_records",
-  "quota_balance_observer_state",
   "feishu_events",
-  "proxy_request_logs",
-  "newapi_usage_records",
-  "usage_sync_checkpoints",
-  "usage_sync_issues",
   "admin_scopes",
 ];
 
@@ -104,29 +96,6 @@ async function hasPostgresSchema() {
   }
 }
 
-async function hasGreenfieldInstallationManifest() {
-  if (!present("DATABASE_URL")) return false;
-  const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    max: 1,
-    connectionTimeoutMillis: 5000,
-  });
-  try {
-    const result = await pool.query(
-      `select exists(
-         select 1
-         from greenfield_installation_manifest
-         where id = 'default'
-       ) as present`,
-    );
-    return result.rows[0]?.present === true;
-  } catch {
-    return false;
-  } finally {
-    await pool.end();
-  }
-}
-
 const storeBackend = process.env.TOKENINSIDE_STORE_BACKEND ?? "json";
 const checks = [
   result("NODE_ENV", process.env.NODE_ENV === "production", "must be production"),
@@ -140,7 +109,7 @@ const checks = [
     safe("FEISHU_APPROVAL_EVENT_VERIFICATION_TOKEN"),
     "required for event verification",
   ),
-  result("NEWAPI_BASE_URL", safe("NEWAPI_BASE_URL"), "required for proxy/control-plane calls"),
+  result("NEWAPI_BASE_URL", safe("NEWAPI_BASE_URL"), "required for NewAPI control and reporting calls"),
   result("NEWAPI_CONTROL_USER_ID", safe("NEWAPI_CONTROL_USER_ID"), "required for NewAPI token APIs"),
   result(
     "NEWAPI_CONTROL_CREDENTIAL",
@@ -159,24 +128,18 @@ const checks = [
     "must be an integer of at least 1000 milliseconds",
   ),
   result(
-    "TOKENINSIDE_PROXY_CONCURRENCY_MAX",
-    Number.isInteger(Number(process.env.TOKENINSIDE_PROXY_CONCURRENCY_MAX ?? "60")) &&
-      Number(process.env.TOKENINSIDE_PROXY_CONCURRENCY_MAX ?? "60") >= 1,
+    "TOKENINSIDE_QUOTA_OPERATION_CONCURRENCY_MAX",
+    Number.isInteger(Number(process.env.TOKENINSIDE_QUOTA_OPERATION_CONCURRENCY_MAX ?? "1")) &&
+      Number(process.env.TOKENINSIDE_QUOTA_OPERATION_CONCURRENCY_MAX ?? "1") >= 1,
     "must be a positive integer",
   ),
   result(
-    "TOKENINSIDE_PROXY_QUEUE_TIMEOUT_MS",
-    Number.isInteger(Number(process.env.TOKENINSIDE_PROXY_QUEUE_TIMEOUT_MS ?? "30000")) &&
-      Number(process.env.TOKENINSIDE_PROXY_QUEUE_TIMEOUT_MS ?? "30000") >= 1000,
-    "must be an integer of at least 1000 milliseconds",
-  ),
-  result(
-    "TOKENINSIDE_BILLING_MATERIALIZATION_CONCURRENCY_MAX",
+    "TOKENINSIDE_DIRECT_CONSUMPTION_DRAIN_GRACE_MS",
     Number.isInteger(
-      Number(process.env.TOKENINSIDE_BILLING_MATERIALIZATION_CONCURRENCY_MAX ?? "4"),
+      Number(process.env.TOKENINSIDE_DIRECT_CONSUMPTION_DRAIN_GRACE_MS ?? "60000"),
     ) &&
-      Number(process.env.TOKENINSIDE_BILLING_MATERIALIZATION_CONCURRENCY_MAX ?? "4") >= 1,
-    "must be a positive integer",
+      Number(process.env.TOKENINSIDE_DIRECT_CONSUMPTION_DRAIN_GRACE_MS ?? "60000") >= 1000,
+    "must be an integer of at least 1000 milliseconds",
   ),
 ];
 
@@ -193,7 +156,6 @@ if (storeBackend === "json") {
 
 if (storeBackend === "postgres") {
   const businessPoolMax = Number(process.env.DATABASE_POOL_MAX ?? "8");
-  const settlementPoolMax = Number(process.env.DATABASE_SETTLEMENT_POOL_MAX ?? "2");
   const controlPoolMax = Number(process.env.DATABASE_CONTROL_POOL_MAX ?? "4");
   const quotaSubmitPoolMax = Number(process.env.DATABASE_QUOTA_SUBMIT_POOL_MAX ?? "2");
   const lockPoolMax = Number(process.env.DATABASE_LOCK_POOL_MAX ?? "10");
@@ -206,23 +168,9 @@ if (storeBackend === "postgres") {
   checks.push(result("POSTGRES_SCHEMA", await hasPostgresSchema(), "all required tables must exist"));
   checks.push(
     result(
-      "GREENFIELD_INSTALLATION_MANIFEST",
-      await hasGreenfieldInstallationManifest(),
-      "run npm run greenfield:preflight before starting the application",
-    ),
-  );
-  checks.push(
-    result(
       "DATABASE_POOL_MAX",
       Number.isInteger(businessPoolMax) && businessPoolMax >= 2,
       "business pool max must be an integer of at least 2",
-    ),
-  );
-  checks.push(
-    result(
-      "DATABASE_SETTLEMENT_POOL_MAX",
-      Number.isInteger(settlementPoolMax) && settlementPoolMax >= 1,
-      "authoritative settlement pool max must be a positive integer",
     ),
   );
   checks.push(
@@ -261,9 +209,9 @@ if (storeBackend === "postgres") {
       "POSTGRES_APP_CONNECTION_BUDGET",
       Number.isInteger(postgresMaxConnections) &&
         Number.isInteger(postgresReservedConnections) &&
-        businessPoolMax + settlementPoolMax + controlPoolMax + quotaSubmitPoolMax + lockPoolMax + 5 <
+        businessPoolMax + controlPoolMax + quotaSubmitPoolMax + lockPoolMax + 5 <
           postgresMaxConnections - postgresReservedConnections,
-      "business + settlement + control + quota-submit + lock pools and 5 maintenance connections must stay below PostgreSQL usable connections",
+      "business + control + quota-submit + lock pools and 5 maintenance connections must stay below PostgreSQL usable connections",
     ),
   );
 }

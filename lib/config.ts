@@ -8,7 +8,6 @@ export type RuntimeConfig = {
   databaseUrl?: string;
   postgres: {
     poolMax: number;
-    settlementPoolMax: number;
     controlPoolMax: number;
     quotaSubmitPoolMax: number;
     quotaSubmitConnectionTimeoutMs: number;
@@ -17,16 +16,6 @@ export type RuntimeConfig = {
     lockPoolMax: number;
     poolIdleTimeoutMs: number;
     poolConnectionTimeoutMs: number;
-  };
-  proxy: {
-    maxConcurrency: number;
-    queueTimeoutMs: number;
-    preparationMaxConcurrency: number;
-    preparationQueueTimeoutMs: number;
-    persistenceMaxConcurrency: number;
-    upstreamMaxAttempts: number;
-    upstreamRetryBaseMs: number;
-    upstreamRetryMaxDelayMs: number;
   };
   feishu: {
     appId?: string;
@@ -37,6 +26,7 @@ export type RuntimeConfig = {
   };
   newapi: {
     baseUrl: string;
+    publicBaseUrl: string;
     controlUserId?: string;
     accessToken?: string;
     adminAccessToken?: string;
@@ -47,17 +37,10 @@ export type RuntimeConfig = {
   };
   admin: {
     systemAdminOpenIds: string[];
-    globalOpenIds: string[];
   };
-  billing: {
+  quotaControl: {
     operationConcurrencyMax: number;
-    settlementConcurrencyMax: number;
-    materializationConcurrencyMax: number;
-    usageSyncContinuationDelayMs: number;
     directConsumptionDrainGraceMs: number;
-    balanceObservationIntervalMs: number;
-    balanceObservationBatchSize: number;
-    balanceObservationReadTimeoutMs: number;
   };
 };
 
@@ -101,15 +84,7 @@ export function getConfig(): RuntimeConfig {
     ),
     databaseUrl: process.env.DATABASE_URL,
     postgres: {
-      // The settlement pool is carved out of the historical ten-connection
-      // default rather than added on top of it. This keeps the single-process
-      // PostgreSQL budget stable while preventing proxy preparation and
-      // persistence from starving authoritative usage writes.
       poolMax: positiveIntegerFromEnv(process.env.DATABASE_POOL_MAX, 8),
-      settlementPoolMax: positiveIntegerFromEnv(
-        process.env.DATABASE_SETTLEMENT_POOL_MAX,
-        2,
-      ),
       controlPoolMax: positiveIntegerFromEnv(process.env.DATABASE_CONTROL_POOL_MAX, 4),
       quotaSubmitPoolMax: positiveIntegerFromEnv(
         process.env.DATABASE_QUOTA_SUBMIT_POOL_MAX,
@@ -137,40 +112,6 @@ export function getConfig(): RuntimeConfig {
         5000,
       ),
     },
-    proxy: {
-      maxConcurrency: positiveIntegerFromEnv(
-        process.env.TOKENINSIDE_PROXY_CONCURRENCY_MAX,
-        480,
-      ),
-      queueTimeoutMs: positiveIntegerFromEnv(
-        process.env.TOKENINSIDE_PROXY_QUEUE_TIMEOUT_MS,
-        30000,
-      ),
-      preparationMaxConcurrency: positiveIntegerFromEnv(
-        process.env.TOKENINSIDE_PROXY_PREPARATION_CONCURRENCY_MAX,
-        8,
-      ),
-      preparationQueueTimeoutMs: positiveIntegerFromEnv(
-        process.env.TOKENINSIDE_PROXY_PREPARATION_QUEUE_TIMEOUT_MS,
-        30000,
-      ),
-      persistenceMaxConcurrency: positiveIntegerFromEnv(
-        process.env.TOKENINSIDE_PROXY_PERSISTENCE_CONCURRENCY_MAX,
-        8,
-      ),
-      upstreamMaxAttempts: positiveIntegerFromEnv(
-        process.env.TOKENINSIDE_PROXY_UPSTREAM_MAX_ATTEMPTS,
-        2,
-      ),
-      upstreamRetryBaseMs: positiveIntegerFromEnv(
-        process.env.TOKENINSIDE_PROXY_UPSTREAM_RETRY_BASE_MS,
-        250,
-      ),
-      upstreamRetryMaxDelayMs: positiveIntegerFromEnv(
-        process.env.TOKENINSIDE_PROXY_UPSTREAM_RETRY_MAX_DELAY_MS,
-        2000,
-      ),
-    },
     feishu: {
       appId: process.env.FEISHU_APP_ID,
       appSecret: process.env.FEISHU_APP_SECRET,
@@ -180,6 +121,11 @@ export function getConfig(): RuntimeConfig {
     },
     newapi: {
       baseUrl: trimSlash(process.env.NEWAPI_BASE_URL ?? "https://new-api.550w.link"),
+      publicBaseUrl: trimSlash(
+        process.env.NEWAPI_PUBLIC_BASE_URL ??
+          process.env.NEWAPI_BASE_URL ??
+          "https://new-api.550w.link",
+      ),
       controlUserId: process.env.NEWAPI_CONTROL_USER_ID,
       accessToken: process.env.NEWAPI_ACCESS_TOKEN,
       adminAccessToken: process.env.NEWAPI_ADMIN_ACCESS_TOKEN,
@@ -189,79 +135,19 @@ export function getConfig(): RuntimeConfig {
       mock: process.env.TOKENINSIDE_MOCK_NEWAPI === "true",
     },
     admin: {
-      systemAdminOpenIds: csvFromEnv(
-        process.env.TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS,
-        process.env.TOKENINSIDE_ADMIN_OPEN_IDS,
-      ),
-      globalOpenIds: csvFromEnv(
-        process.env.TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS,
-        process.env.TOKENINSIDE_ADMIN_OPEN_IDS,
-      ),
+      systemAdminOpenIds: csvFromEnv(process.env.TOKENINSIDE_SYSTEM_ADMIN_OPEN_IDS),
     },
-    billing: {
+    quotaControl: {
       operationConcurrencyMax: positiveIntegerFromEnv(
         process.env.TOKENINSIDE_QUOTA_OPERATION_CONCURRENCY_MAX,
         1,
-      ),
-      settlementConcurrencyMax: positiveIntegerFromEnv(
-        process.env.TOKENINSIDE_USAGE_SETTLEMENT_CONCURRENCY_MAX,
-        16,
-      ),
-      materializationConcurrencyMax: positiveIntegerFromEnv(
-        process.env.TOKENINSIDE_BILLING_MATERIALIZATION_CONCURRENCY_MAX,
-        4,
-      ),
-      usageSyncContinuationDelayMs: positiveIntegerFromEnv(
-        process.env.TOKENINSIDE_USAGE_SYNC_CONTINUATION_DELAY_MS,
-        250,
       ),
       directConsumptionDrainGraceMs: positiveIntegerFromEnv(
         process.env.TOKENINSIDE_DIRECT_CONSUMPTION_DRAIN_GRACE_MS,
         60_000,
       ),
-      // Balance observation is deliberately slower and smaller than the
-      // settlement loop. It uses the isolated control/lock pools and can never
-      // turn an environment value into an unbounded account scan.
-      balanceObservationIntervalMs: Math.max(
-        positiveIntegerFromEnv(
-          process.env.TOKENINSIDE_BALANCE_OBSERVATION_INTERVAL_MS,
-          300_000,
-        ),
-        60_000,
-      ),
-      balanceObservationBatchSize: Math.min(
-        positiveIntegerFromEnv(
-          process.env.TOKENINSIDE_BALANCE_OBSERVATION_BATCH_SIZE,
-          20,
-        ),
-        20,
-      ),
-      balanceObservationReadTimeoutMs: positiveIntegerFromEnv(
-        process.env.TOKENINSIDE_BALANCE_OBSERVATION_READ_TIMEOUT_MS,
-        3_000,
-      ),
     },
   };
-}
-
-export function effectiveBillingMaterializationConcurrencyMax(
-  config: Pick<RuntimeConfig, "storeBackend" | "postgres" | "billing"> = getConfig(),
-) {
-  const configuredMax = Math.max(
-    Math.trunc(config.billing.materializationConcurrencyMax),
-    1,
-  );
-  if (config.storeBackend !== "postgres") return configuredMax;
-
-  // PostgreSQL materialization shares the settlement pool with authoritative
-  // source/checkpoint writes. Leave one connection available whenever the pool
-  // has that capacity; the floor of one keeps derived work progressing for an
-  // explicitly configured single-connection pool.
-  const materializationPoolCapacity = Math.max(
-    Math.trunc(config.postgres.settlementPoolMax) - 1,
-    1,
-  );
-  return Math.min(configuredMax, materializationPoolCapacity);
 }
 
 export function requireSessionSecret() {

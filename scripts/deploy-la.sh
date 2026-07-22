@@ -69,7 +69,6 @@ runtime_integer() {
 
 postgres_max_connections="$(runtime_integer POSTGRES_MAX_CONNECTIONS)"
 postgres_reserved_connections="$(runtime_integer POSTGRES_SUPERUSER_RESERVED_CONNECTIONS)"
-settlement_pool_max=2
 control_pool_max=4
 quota_submit_pool_max=2
 lock_pool_max=5
@@ -77,7 +76,6 @@ business_pool_max=$((
   postgres_max_connections -
   postgres_reserved_connections -
   6 -
-  settlement_pool_max -
   control_pool_max -
   quota_submit_pool_max -
   lock_pool_max
@@ -90,9 +88,8 @@ if [ "$business_pool_max" -lt 2 ]; then
   exit 2
 fi
 
-echo "Reconciling LA staging connection and worker budgets: business=${business_pool_max} settlement=${settlement_pool_max} control=${control_pool_max} quota_submit=${quota_submit_pool_max} lock=${lock_pool_max}"
+echo "Reconciling LA staging connection and worker budgets: business=${business_pool_max} control=${control_pool_max} quota_submit=${quota_submit_pool_max} lock=${lock_pool_max}"
 upsert_runtime_value DATABASE_POOL_MAX "$business_pool_max"
-upsert_runtime_value DATABASE_SETTLEMENT_POOL_MAX "$settlement_pool_max"
 upsert_runtime_value DATABASE_CONTROL_POOL_MAX "$control_pool_max"
 upsert_runtime_value DATABASE_QUOTA_SUBMIT_POOL_MAX "$quota_submit_pool_max"
 upsert_runtime_value DATABASE_QUOTA_SUBMIT_CONNECTION_TIMEOUT_MS 1000
@@ -100,9 +97,7 @@ upsert_runtime_value DATABASE_QUOTA_SUBMIT_STATEMENT_TIMEOUT_MS 3000
 upsert_runtime_value DATABASE_QUOTA_SUBMIT_LOCK_TIMEOUT_MS 1000
 upsert_runtime_value DATABASE_LOCK_POOL_MAX "$lock_pool_max"
 upsert_runtime_value TOKENINSIDE_QUOTA_OPERATION_CONCURRENCY_MAX 1
-upsert_runtime_value TOKENINSIDE_USAGE_SETTLEMENT_CONCURRENCY_MAX 16
-upsert_runtime_value TOKENINSIDE_BILLING_MATERIALIZATION_CONCURRENCY_MAX 4
-upsert_runtime_value TOKENINSIDE_USAGE_SYNC_CONTINUATION_DELAY_MS 250
+upsert_runtime_value TOKENINSIDE_DIRECT_CONSUMPTION_DRAIN_GRACE_MS 60000
 
 compose_file="${RELEASE_DIR}/docker-compose.yml"
 if [ ! -f "$compose_file" ]; then
@@ -193,9 +188,6 @@ compose pull tokeninside
 
 echo "Running versioned database migrations"
 compose run --rm --no-deps --entrypoint node tokeninside scripts/db-migrate.mjs
-
-echo "Verifying greenfield database and dedicated NewAPI binding"
-compose run --rm --no-deps --entrypoint node tokeninside scripts/greenfield-preflight.mjs
 
 echo "Checking migrated database and runtime configuration"
 compose run --rm --no-deps --entrypoint node tokeninside scripts/production-preflight.mjs

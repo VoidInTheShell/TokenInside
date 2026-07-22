@@ -1,7 +1,7 @@
 import {
-  buildMonthlyPeriodOpenPlan,
+  buildPackageResetPlan,
   enqueuePackageResetPlan,
-} from "@/lib/billing";
+} from "@/lib/package-reset-plan";
 import { latestDuePackageReset } from "@/lib/package-reset";
 import { isPostgresAdvisoryLockBusyError } from "@/lib/postgres-store";
 import {
@@ -57,7 +57,7 @@ export async function runPackageResetSchedulerOnce(
       if (!currentDue) return { status: "disabled" };
 
       await preparePackageResetPeriod(currentDue.period);
-      const plan = await buildMonthlyPeriodOpenPlan({ period: currentDue.period });
+      const plan = await buildPackageResetPlan({ period: currentDue.period });
       if (plan.blocked) {
         return {
           status: "blocked",

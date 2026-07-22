@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 
 test("NewAPI settings are root-only and never return the stored ciphertext", async () => {
@@ -23,25 +23,21 @@ test("NewAPI settings are root-only and never return the stored ciphertext", asy
   assert.match(postgres, /actorScope\.source === "environment" && actorScope\.role === "root"/);
 });
 
-test("all NewAPI calls and the proxy URL use the effective runtime settings", async () => {
-  const newapi = await readFile(new URL("../lib/newapi.ts", import.meta.url), "utf8");
-  const proxy = await readFile(
-    new URL("../app/v1/[...path]/route.ts", import.meta.url),
-    "utf8",
-  );
+test("所有 NewAPI 控制与报表调用使用运行时绑定，TI 不注册 LLM 数据面", async () => {
+  const [newapi, reporting] = await Promise.all([
+    readFile(new URL("../lib/newapi.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/newapi-reporting.ts", import.meta.url), "utf8"),
+  ]);
   assert.match(newapi, /getEffectiveNewApiConfig/);
-  assert.match(newapi, /export async function buildNewApiProxyUrl/);
-  assert.match(
-    proxy,
-    /await resolveProxyRuntimeBinding\(\(\) =>[\s\S]*?buildNewApiProxyUrl/,
+  assert.match(reporting, /listNewApiUsageLogs/);
+  assert.match(reporting, /getNewApiTokenControlState/);
+  await assert.rejects(
+    access(new URL("../app/v1/[...path]/route.ts", import.meta.url)),
   );
 });
 
-test("billing health is pure read-only and never exposes NewAPI settings", async () => {
-  const source = await readFile(
-    new URL("../app/api/admin/billing-health/route.ts", import.meta.url),
-    "utf8",
+test("管理端不注册账务健康入口", async () => {
+  await assert.rejects(
+    access(new URL("../app/api/admin/billing-health/route.ts", import.meta.url)),
   );
-  assert.match(source, /export async function GET/);
-  assert.doesNotMatch(source, /newapiControl|accessToken|POST|fetch\(|updateNewApiTokenQuota/);
 });

@@ -4,6 +4,8 @@ import { requireAdminScope } from "@/lib/admin";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId } from "@/lib/crypto";
 import { submitAndScheduleDurableQuotaWork } from "@/lib/durable-quota-submission";
+import { fromNewApiQuota, toNewApiQuota } from "@/lib/newapi";
+import { getNewApiUserAuthoritativeQuotaSnapshot } from "@/lib/newapi-reporting";
 import {
   QuotaSubmissionError,
   submitPostgresAdminFirstProvisionAllocation,
@@ -92,6 +94,31 @@ export async function POST(
     );
   }
 
+  try {
+    const authoritative = await getNewApiUserAuthoritativeQuotaSnapshot(targetUser.id);
+    if (authoritative.truncated) {
+      return NextResponse.json(
+        { error: "NewAPI 当前套餐周期日志达到查询上限，无法安全更改额度上限" },
+        { status: 409 },
+      );
+    }
+    if (toNewApiQuota(approvedMonthlyQuota) < authoritative.consumedQuota) {
+      return NextResponse.json(
+        {
+          error: `额度上限不能低于当前周期已消费额度 ${fromNewApiQuota(authoritative.consumedQuota)}`,
+          code: "quota_below_consumed",
+          consumedQuota: fromNewApiQuota(authoritative.consumedQuota),
+        },
+        { status: 409 },
+      );
+    }
+  } catch (error) {
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : "读取 NewAPI 当前周期消费失败" },
+      { status: 502 },
+    );
+  }
+
   const explicitClientRequestId =
     parsed.data.clientRequestId ?? request.headers.get("idempotency-key") ?? undefined;
   const activeToken = await getActiveTokenForUser(targetUser.id);
@@ -115,7 +142,7 @@ export async function POST(
               targetUserId: targetUser.id,
               approvedMonthlyQuota,
               reason:
-                parsed.data.reason ?? `管理员首次分配额度为 ${approvedMonthlyQuota}`,
+                parsed.data.reason ?? `管理员设置额度上限为 ${approvedMonthlyQuota}`,
               clientRequestId,
             }),
           scheduleAfter: after,
@@ -166,7 +193,7 @@ export async function POST(
     const firstApplyRequest = reusableRequest
       ? await updateTokenRequest(reusableRequest.id, {
           status: "approved",
-          reason: parsed.data.reason ?? `管理员首次分配额度为 ${approvedMonthlyQuota}`,
+          reason: parsed.data.reason ?? `管理员设置额度上限为 ${approvedMonthlyQuota}`,
           requestedMonthlyQuota: approvedMonthlyQuota,
           approvedMonthlyQuota,
           approvalOperatorOpenId: auth.user.openId,
@@ -177,7 +204,7 @@ export async function POST(
           feishuUserId: targetUser.id,
           requestType: "first_apply",
           status: "approved",
-          reason: parsed.data.reason ?? `管理员首次分配额度为 ${approvedMonthlyQuota}`,
+          reason: parsed.data.reason ?? `管理员设置额度上限为 ${approvedMonthlyQuota}`,
           requestedMonthlyQuota: approvedMonthlyQuota,
           approvedMonthlyQuota,
           approvalMode: "manual",
@@ -216,7 +243,7 @@ export async function POST(
 
   const clientRequestId = explicitClientRequestId ?? randomId("adjust");
   try {
-    const reason = parsed.data.reason ?? `管理员调额为 ${approvedMonthlyQuota}`;
+    const reason = parsed.data.reason ?? `管理员设置额度上限为 ${approvedMonthlyQuota}`;
     const submitted = await submitAndScheduleDurableQuotaWork({
       submit: () =>
         getConfig().storeBackend === "postgres"

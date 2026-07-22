@@ -65,7 +65,7 @@ async function createQuotaSagaChunk(input: {
   );
   const imports: Record<string, Record<string, unknown>> = {
     "@/lib/config": {
-      getConfig: () => ({ billing: { operationConcurrencyMax: 1 } }),
+      getConfig: () => ({ quotaControl: { operationConcurrencyMax: 1 } }),
     },
     "@/lib/crypto": {
       nowIso: () => "2026-07-17T00:00:00.000Z",

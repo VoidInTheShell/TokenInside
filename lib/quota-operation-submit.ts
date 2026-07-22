@@ -5,8 +5,9 @@ import {
 } from "@/lib/admin-scope";
 import { getConfig } from "@/lib/config";
 import { nowIso, randomId, sha256Hex } from "@/lib/crypto";
-import { toNewApiQuota } from "@/lib/newapi";
-import { packageBillingPeriod } from "@/lib/package-reset";
+import { initialDepartmentQuotaLimit } from "@/lib/department-quota";
+import { fromNewApiQuota, toNewApiQuota } from "@/lib/newapi";
+import { packagePeriod } from "@/lib/package-reset";
 import {
   canReopenFirstProvisionAfterAccessRevoke,
   reopenFirstProvisionAfterAccessRevoke,
@@ -20,10 +21,11 @@ import type {
   AppSettings,
   DepartmentQuotaPeriod,
   FeishuUser,
+  QuotaChangeEvent,
   QuotaOperation,
   TokenAccount,
   TokenRequest,
-  UserBillingPeriod,
+  UserQuotaPolicy,
 } from "@/lib/types";
 
 type QuotaSubmitRuntime = typeof globalThis & {
@@ -241,7 +243,7 @@ async function currentPackageBillingPeriodForSubmission(client: PoolClient) {
     row?.current_time instanceof Date
       ? row.current_time
       : new Date(row?.current_time ?? Date.now());
-  return packageBillingPeriod(row?.data.packageReset, currentTime);
+  return packagePeriod(row?.data.packageReset, currentTime);
 }
 
 const adminDefaultApprovalOpenId = "system:admin-default";
@@ -1155,6 +1157,230 @@ export async function submitPostgresFirstProvisionCardApproval(input: {
   });
 }
 
+export type QuotaAdjustmentDecisionSubmission = {
+  request: TokenRequest;
+  operation: QuotaOperation;
+  deduplicated: boolean;
+};
+
+async function persistQuotaAdjustmentDecisionSubmission(
+  client: PoolClient,
+  input: {
+    request: TokenRequest;
+    requestUser: FeishuUser | null;
+    approvedMonthlyQuota: number;
+    operatorOpenId: string;
+    actionable: boolean;
+    notActionableMessage: string;
+  },
+): Promise<QuotaAdjustmentDecisionSubmission> {
+  if (input.request.requestType !== "quota_adjust") {
+    throw submissionError(409, "token_request_not_actionable", "当前记录不是套餐额度申请");
+  }
+  if (!input.requestUser || (input.requestUser.status && input.requestUser.status !== "active")) {
+    throw submissionError(409, "target_user_inactive", "目标用户当前不是启用状态");
+  }
+  if (
+    !Number.isInteger(input.approvedMonthlyQuota) ||
+    input.approvedMonthlyQuota <= 0 ||
+    input.approvedMonthlyQuota > 1_000_000
+  ) {
+    throw submissionError(400, "quota_invalid", "最终额度必须是 1 至 1000000 的整数");
+  }
+
+  const idempotencyKey = `quota-adjust:${input.request.id}`;
+  const requestedAssignedQuota = toNewApiQuota(input.approvedMonthlyQuota);
+  const state = await readOperationSubmissionState(client, {
+    feishuUserId: input.request.feishuUserId,
+    idempotencyKey,
+  });
+  const existing = assertNoConflictingOperation(state, {
+    feishuUserId: input.request.feishuUserId,
+    operationType: "quota_adjust",
+    idempotencyKey,
+  });
+  if (existing) {
+    if (
+      existing.requestId !== input.request.id ||
+      existing.requestedAssignedQuota !== requestedAssignedQuota
+    ) {
+      throw submissionError(
+        409,
+        "idempotency_conflict",
+        "套餐额度申请已使用不同额度受理",
+      );
+    }
+    return { request: input.request, operation: existing, deduplicated: true };
+  }
+  if (!input.actionable) {
+    throw submissionError(
+      409,
+      "token_request_not_actionable",
+      input.notActionableMessage,
+    );
+  }
+
+  const activeAccountResult = await client.query<{ data: TokenAccount }>(
+    `select data
+     from token_accounts
+     where feishu_user_id = $1 and status = 'active'
+     order by created_at desc, id desc
+     limit 1
+     for share`,
+    [input.request.feishuUserId],
+  );
+  const activeAccount = activeAccountResult.rows[0]?.data;
+  if (!activeAccount?.newapiTokenId) {
+    throw submissionError(409, "active_token_required", "目标用户没有可调额的 active NewAPI Key");
+  }
+  const currentPolicyResult = await client.query<{ data: UserQuotaPolicy }>(
+    `select data
+     from user_quota_policies
+     where feishu_user_id = $1
+       and effective_from_period <= $2
+       and (effective_to_period is null or effective_to_period >= $2)
+     order by version desc, id desc
+     limit 1
+     for share`,
+    [input.request.feishuUserId, activeAccount.billingPeriod],
+  );
+  const assignedQuotaBefore = currentPolicyResult.rows[0]?.data.assignedMonthlyQuota ?? 0;
+  if (requestedAssignedQuota <= assignedQuotaBefore) {
+    throw submissionError(
+      409,
+      "quota_increase_required",
+      `最终额度必须高于当前额度 ${fromNewApiQuota(assignedQuotaBefore)}`,
+    );
+  }
+
+  const now = nowIso();
+  const updatedRequest: TokenRequest = {
+    ...input.request,
+    status: "approved_provisioning",
+    approvedMonthlyQuota: input.approvedMonthlyQuota,
+    approvalOperatorOpenId: input.operatorOpenId,
+    approvalOperatedAt: now,
+    errorMessage: undefined,
+    updatedAt: now,
+  };
+  const operation: QuotaOperation = {
+    id: randomId("qo"),
+    operationType: "quota_adjust",
+    idempotencyKey,
+    feishuUserId: input.request.feishuUserId,
+    departmentId: input.requestUser.departmentId,
+    billingPeriod: activeAccount.billingPeriod,
+    requestedAssignedQuota,
+    assignedQuotaBefore,
+    reservedDepartmentQuota: 0,
+    operationGeneration: (state?.generation ?? 0) + 1,
+    state: "planned",
+    attemptCount: 0,
+    upstreamTokenIdBefore: activeAccount.newapiTokenId,
+    tokenAccountIdBefore: activeAccount.id,
+    requestId: input.request.id,
+    createdByOpenId: input.operatorOpenId,
+    createdAt: now,
+    updatedAt: now,
+  };
+  return {
+    request: await saveTokenRequestRow(client, updatedRequest),
+    operation: await insertQuotaOperationRow(client, operation),
+    deduplicated: false,
+  };
+}
+
+export async function submitPostgresQuotaAdjustmentDecision(input: {
+  actorUserId: string;
+  requestId: string;
+  approvedMonthlyQuota?: number;
+}): Promise<QuotaAdjustmentDecisionSubmission> {
+  return withQuotaSubmitTransaction(async (client) => {
+    const initial = await readRequestAndUser(client, input.requestId, false);
+    if (!initial) {
+      throw submissionError(404, "token_request_not_found", "申请单不存在或不在当前管理范围内");
+    }
+    await lockAdminScopeUsersForSubmission(client, [
+      input.actorUserId,
+      initial.request_data.feishuUserId,
+    ]);
+    const { actor, scope } = await readAdminActorScope(client, input.actorUserId);
+    assertRequestScope(initial.request_data, initial.user_data, scope);
+    if (initial.request_data.requestType !== "quota_adjust") {
+      throw submissionError(409, "token_request_not_actionable", "当前记录不是套餐额度申请");
+    }
+
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `user-quota:${initial.request_data.feishuUserId}`,
+    ]);
+    const locked = await readRequestAndUser(client, input.requestId, true);
+    if (!locked || locked.request_data.requestType !== "quota_adjust") {
+      throw submissionError(404, "token_request_not_found", "套餐额度申请不存在");
+    }
+    assertRequestScope(locked.request_data, locked.user_data, scope);
+    const request = locked.request_data;
+    return persistQuotaAdjustmentDecisionSubmission(client, {
+      request,
+      requestUser: locked.user_data,
+      approvedMonthlyQuota:
+        input.approvedMonthlyQuota ??
+        request.approvedMonthlyQuota ??
+        request.requestedMonthlyQuota,
+      operatorOpenId: actor.openId,
+      actionable: tokenRequestRequiresAdminDecision(request),
+      notActionableMessage: "当前记录不是可人工处理的套餐额度申请",
+    });
+  });
+}
+
+export async function submitPostgresQuotaAdjustmentCardApproval(input: {
+  requestId: string;
+  operatorOpenId: string;
+  nonce: string;
+}): Promise<QuotaAdjustmentDecisionSubmission> {
+  return withQuotaSubmitTransaction(async (client) => {
+    const initial = await readRequestAndUser(client, input.requestId, false);
+    if (!initial || initial.request_data.requestType !== "quota_adjust") {
+      throw submissionError(404, "token_request_not_found", "套餐额度申请不存在");
+    }
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `user-quota:${initial.request_data.feishuUserId}`,
+    ]);
+    const locked = await readRequestAndUser(client, input.requestId, true);
+    if (!locked || locked.request_data.requestType !== "quota_adjust") {
+      throw submissionError(404, "token_request_not_found", "套餐额度申请不存在");
+    }
+    const request = locked.request_data;
+    if (
+      !request.approvalActionNonceHash ||
+      sha256Hex(input.nonce) !== request.approvalActionNonceHash
+    ) {
+      throw submissionError(403, "card_nonce_invalid", "审批卡片校验失败");
+    }
+    const approvalTargets = new Set(
+      request.approvalTargetOpenIds?.length
+        ? request.approvalTargetOpenIds
+        : [request.approvalTargetOpenId].filter(
+            (openId): openId is string => Boolean(openId),
+          ),
+    );
+    if (!approvalTargets.has(input.operatorOpenId)) {
+      throw submissionError(403, "card_operator_forbidden", "当前用户无权审批此申请");
+    }
+    return persistQuotaAdjustmentDecisionSubmission(client, {
+      request,
+      requestUser: locked.user_data,
+      approvedMonthlyQuota:
+        request.approvedMonthlyQuota ?? request.requestedMonthlyQuota,
+      operatorOpenId: input.operatorOpenId,
+      actionable:
+        request.status === "pending_card_approval" ||
+        request.status === "approved_provision_failed",
+      notActionableMessage: `当前申请状态不可批准: ${request.status}`,
+    });
+  });
+}
+
 export async function submitPostgresAdminFirstProvisionAllocation(input: {
   actorUserId: string;
   targetUserId: string;
@@ -1270,6 +1496,15 @@ export async function submitPostgresAdminFirstProvisionAllocation(input: {
 export type AdminQuotaAdjustmentSubmission = {
   request: TokenRequest;
   operation: QuotaOperation;
+  deduplicated: boolean;
+};
+
+export type CurrentPackageIncreaseSubmission = {
+  package: DepartmentQuotaPeriod;
+  requests: TokenRequest[];
+  operations: QuotaOperation[];
+  affectedUsers: number;
+  reservedQuota: number;
   deduplicated: boolean;
 };
 
@@ -1410,6 +1645,401 @@ export async function submitPostgresAdminQuotaAdjustment(input: {
   });
 }
 
+export async function submitPostgresCurrentPackageIncrease(input: {
+  actorUserId: string;
+  departmentId: string;
+  departmentName?: string;
+  period: string;
+  packageQuota: number;
+  clientRequestId: string;
+}): Promise<CurrentPackageIncreaseSubmission> {
+  if (
+    !Number.isInteger(input.packageQuota) ||
+    input.packageQuota <= 0 ||
+    input.packageQuota > 1_000_000
+  ) {
+    throw submissionError(400, "package_quota_invalid", "本周期套餐额度必须是正整数");
+  }
+
+  return withQuotaSubmitTransaction(async (client) => {
+    await lockAdminScopeUsersForSubmission(client, [input.actorUserId]);
+    let { actor, scope } = await readAdminActorScope(client, input.actorUserId);
+    if (
+      scope.scopeType === "department" &&
+      scope.departmentId !== input.departmentId
+    ) {
+      throw submissionError(403, "target_out_of_scope", "不能修改其他部门的套餐");
+    }
+
+    await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+      `department-quota:${input.departmentId}:${input.period}`,
+    ]);
+    const memberIdsResult = await client.query<{ id: string }>(
+      `select member.id
+       from feishu_users member
+       where member.department_id = $1
+         and coalesce(member.data->>'status', 'active') = 'active'
+         and exists (
+           select 1
+           from token_accounts account
+           where account.feishu_user_id = member.id
+             and account.status = 'active'
+             and account.newapi_token_id is not null
+         )
+       order by member.id`,
+      [input.departmentId],
+    );
+    const memberIds = memberIdsResult.rows.map((row) => row.id);
+    await lockAdminScopeUsersForSubmission(client, [input.actorUserId, ...memberIds]);
+    for (const feishuUserId of memberIds) {
+      await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [
+        `user-quota:${feishuUserId}`,
+      ]);
+    }
+
+    ({ actor, scope } = await readAdminActorScope(client, input.actorUserId));
+    if (
+      scope.scopeType === "department" &&
+      scope.departmentId !== input.departmentId
+    ) {
+      throw submissionError(403, "target_out_of_scope", "不能修改其他部门的套餐");
+    }
+
+    const batchId = `package-current-${sha256Hex(
+      `${input.actorUserId}:${input.departmentId}:${input.period}:${input.clientRequestId}`,
+    ).slice(0, 28)}`;
+    const idempotentEvent = await client.query<{ data: QuotaChangeEvent }>(
+      "select data from quota_change_events where id = $1 limit 1",
+      [batchId],
+    );
+    if (idempotentEvent.rows[0]?.data) {
+      const [policyResult, operationsResult] = await Promise.all([
+        client.query<{ data: DepartmentQuotaPeriod }>(
+          `select data from department_quota_periods
+           where department_id = $1 and period = $2
+           limit 1`,
+          [input.departmentId, input.period],
+        ),
+        client.query<{ data: QuotaOperation }>(
+          `select data from quota_operations
+           where data->>'packageBatchId' = $1
+           order by created_at, id`,
+          [batchId],
+        ),
+      ]);
+      const policy = policyResult.rows[0]?.data;
+      if (!policy) {
+        throw submissionError(409, "package_batch_incomplete", "套餐批次缺少部门周期策略");
+      }
+      const operations = operationsResult.rows.map((row) => row.data);
+      const requestIds = operations
+        .map((operation) => operation.requestId)
+        .filter((requestId): requestId is string => Boolean(requestId));
+      const requests = requestIds.length
+        ? (
+            await client.query<{ data: TokenRequest }>(
+              "select data from token_requests where id = any($1::text[]) order by created_at, id",
+              [requestIds],
+            )
+          ).rows.map((row) => row.data)
+        : [];
+      return {
+        package: policy,
+        requests,
+        operations,
+        affectedUsers: idempotentEvent.rows[0].data.affectedUserCount ?? operations.length,
+        reservedQuota: idempotentEvent.rows[0].data.reservedQuota ?? 0,
+        deduplicated: true,
+      };
+    }
+
+    const quotaPerUnit = getConfig().newapi.quotaPerUnit;
+    const factsResult = await client.query<{
+      allocated_quota: string;
+      pending_reserved_quota: string;
+      department_name: string | null;
+      settings: AppSettings;
+    }>(
+      `select
+         coalesce((
+           select sum(greatest(coalesce((policy.data->>'assignedMonthlyQuota')::numeric, 0), 0)) / $3::numeric
+           from feishu_users member
+           join lateral (
+             select quota_policy.data
+             from user_quota_policies quota_policy
+             where quota_policy.feishu_user_id = member.id
+               and quota_policy.effective_from_period <= $2
+               and (quota_policy.effective_to_period is null or quota_policy.effective_to_period >= $2)
+             order by quota_policy.version desc, quota_policy.id desc
+             limit 1
+           ) policy on true
+           where member.department_id = $1
+             and coalesce(member.data->>'status', 'active') <> 'deleted'
+         ), 0)::text as allocated_quota,
+         coalesce((
+           select sum(greatest(coalesce((operation.data->>'reservedDepartmentQuota')::numeric, 0), 0)) / $3::numeric
+           from quota_operations operation
+           where operation.department_id = $1
+             and operation.billing_period = $2
+             and operation.state not in ('completed', 'compensated', 'cancelled')
+         ), 0)::text as pending_reserved_quota,
+         (
+           select nullif(member.data->>'departmentName', '')
+           from feishu_users member
+           where member.department_id = $1
+           order by member.updated_at desc, member.id
+           limit 1
+         ) as department_name,
+         coalesce(
+           (select data from app_settings where id = 'default'),
+           '{"defaultMonthlyQuota":200}'::jsonb
+         ) as settings`,
+      [input.departmentId, input.period, quotaPerUnit],
+    );
+    const facts = factsResult.rows[0];
+    const allocatedQuota = Number(facts?.allocated_quota ?? 0);
+    const pendingReservedQuota = Number(facts?.pending_reserved_quota ?? 0);
+    const existingPolicy = await client.query<{ data: DepartmentQuotaPeriod }>(
+      `select data from department_quota_periods
+       where department_id = $1 and period = $2
+       for update`,
+      [input.departmentId, input.period],
+    );
+    const now = nowIso();
+    const policy: DepartmentQuotaPeriod =
+      existingPolicy.rows[0]?.data ?? {
+        id: randomId("dqp"),
+        departmentId: input.departmentId,
+        departmentName:
+          input.departmentName ?? facts?.department_name ?? undefined,
+        period: input.period,
+        quotaLimit: initialDepartmentQuotaLimit(allocatedQuota),
+        defaultGrantQuota: facts?.settings.defaultMonthlyQuota ?? 200,
+        createdAt: now,
+        updatedAt: now,
+      };
+    if (input.packageQuota <= policy.defaultGrantQuota) {
+      throw submissionError(
+        409,
+        "current_package_increase_required",
+        `本周期套餐额度只能调高，当前为 ${policy.defaultGrantQuota}`,
+      );
+    }
+
+    const candidateResult = await client.query<{
+      user_data: FeishuUser;
+      account_data: TokenAccount;
+      policy_data: UserQuotaPolicy | null;
+      open_operation: QuotaOperation | null;
+      has_global_scope: boolean;
+      generation: number;
+    }>(
+      `select
+         member.data as user_data,
+         account.data as account_data,
+         quota_policy.data as policy_data,
+         open_operation.data as open_operation,
+         (
+           member.open_id = any($3::text[])
+           or exists (
+             select 1 from admin_scopes protected_scope
+             where protected_scope.feishu_user_id = member.id
+               and protected_scope.status = 'active'
+               and protected_scope.scope_type = 'global'
+           )
+         ) as has_global_scope,
+         greatest(
+           coalesce((select active_generation from user_quota_states where feishu_user_id = member.id), 0),
+           coalesce((select max(operation_generation) from token_accounts where feishu_user_id = member.id), 0)
+         )::integer as generation
+       from feishu_users member
+       join lateral (
+         select data
+         from token_accounts
+         where feishu_user_id = member.id
+           and status = 'active'
+           and newapi_token_id is not null
+         order by created_at desc, id desc
+         limit 1
+       ) account on true
+       left join lateral (
+         select data
+         from user_quota_policies
+         where feishu_user_id = member.id
+           and effective_from_period <= $2
+           and (effective_to_period is null or effective_to_period >= $2)
+         order by version desc, id desc
+         limit 1
+       ) quota_policy on true
+       left join lateral (
+         select data
+         from quota_operations
+         where feishu_user_id = member.id
+           and state not in ('completed', 'compensated', 'cancelled')
+         order by created_at desc, id desc
+         limit 1
+       ) open_operation on true
+       where member.department_id = $1
+         and coalesce(member.data->>'status', 'active') = 'active'
+       order by member.id`,
+      [input.departmentId, input.period, getConfig().admin.systemAdminOpenIds],
+    );
+    const actorIsRoot =
+      scope.scopeType === "global" &&
+      scope.source === "environment" &&
+      scope.role === "root";
+    const requestedAssignedQuota = toNewApiQuota(input.packageQuota);
+    const candidates = candidateResult.rows
+      .filter((row) => actorIsRoot || !row.has_global_scope)
+      .map((row) => {
+        if (!row.policy_data) {
+          throw submissionError(
+            409,
+            "user_quota_policy_missing",
+            `用户 ${row.user_data.name ?? row.user_data.openId} 缺少当前套餐上限`,
+          );
+        }
+        if (row.open_operation) {
+          throw submissionError(
+            409,
+            "quota_operation_open",
+            `用户 ${row.user_data.name ?? row.user_data.openId} 已有未完成额度操作`,
+          );
+        }
+        return {
+          ...row,
+          assignedQuotaBefore: row.policy_data.assignedMonthlyQuota,
+          delta: Math.max(
+            requestedAssignedQuota - row.policy_data.assignedMonthlyQuota,
+            0,
+          ),
+        };
+      })
+      .filter((row) => row.delta > 0);
+    const reservedRawQuota = candidates.reduce((sum, row) => sum + row.delta, 0);
+    const reservedQuota = reservedRawQuota / quotaPerUnit;
+    const availableQuota = Math.max(
+      policy.quotaLimit - allocatedQuota - pendingReservedQuota,
+      0,
+    );
+    if (reservedQuota > availableQuota) {
+      throw submissionError(
+        409,
+        "department_quota_insufficient",
+        `本周期预算不足：需要 ${reservedQuota}，当前可用 ${availableQuota}`,
+      );
+    }
+
+    const requests: TokenRequest[] = [];
+    const operations: QuotaOperation[] = [];
+    for (const candidate of candidates) {
+      const digest = sha256Hex(`${batchId}:${candidate.user_data.id}`).slice(0, 28);
+      const request: TokenRequest = {
+        id: `tr_package_adjust_${digest}`,
+        feishuUserId: candidate.user_data.id,
+        requestType: "quota_adjust",
+        status: "approved_provisioning",
+        reason: `本周期部门套餐提高至 ${input.packageQuota}`,
+        requestedMonthlyQuota: input.packageQuota,
+        approvedMonthlyQuota: input.packageQuota,
+        approvalUuid: `approval_package_adjust_${digest}`,
+        approvalDepartmentId: input.departmentId,
+        approvalMode: "manual",
+        approvalOperatorOpenId: actor.openId,
+        approvalOperatedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const operation: QuotaOperation = {
+        id: randomId("qo"),
+        operationType: "quota_adjust",
+        idempotencyKey: `package-current:${batchId}:${candidate.user_data.id}`,
+        feishuUserId: candidate.user_data.id,
+        departmentId: input.departmentId,
+        billingPeriod: input.period,
+        requestedAssignedQuota,
+        assignedQuotaBefore: candidate.assignedQuotaBefore,
+        reservedDepartmentQuota: candidate.delta,
+        operationGeneration: candidate.generation + 1,
+        state: "planned",
+        attemptCount: 0,
+        upstreamTokenIdBefore: candidate.account_data.newapiTokenId,
+        tokenAccountIdBefore: candidate.account_data.id,
+        requestId: request.id,
+        evidence: {
+          packageBatchId: batchId,
+          packageAction: "increase_current_package",
+        },
+        createdByOpenId: actor.openId,
+        createdAt: now,
+        updatedAt: now,
+      };
+      requests.push(await saveTokenRequestRow(client, request));
+      operations.push(await insertQuotaOperationRow(client, operation));
+    }
+
+    const updatedPolicy: DepartmentQuotaPeriod = {
+      ...policy,
+      departmentName:
+        input.departmentName ?? policy.departmentName ?? facts?.department_name ?? undefined,
+      defaultGrantQuota: input.packageQuota,
+      updatedAt: now,
+      updatedByFeishuUserId: input.actorUserId,
+    };
+    const storedPolicy = (
+      await client.query<{ data: DepartmentQuotaPeriod }>(
+        `insert into department_quota_periods
+          (id, department_id, period, data, created_at, updated_at)
+         values ($1, $2, $3, $4, $5, $6)
+         on conflict (department_id, period) do update set
+           data = excluded.data,
+           updated_at = excluded.updated_at
+         returning data`,
+        [
+          updatedPolicy.id,
+          updatedPolicy.departmentId,
+          updatedPolicy.period,
+          updatedPolicy,
+          updatedPolicy.createdAt,
+          updatedPolicy.updatedAt,
+        ],
+      )
+    ).rows[0].data;
+    const event: QuotaChangeEvent = {
+      id: batchId,
+      departmentId: input.departmentId,
+      departmentName: storedPolicy.departmentName,
+      period: input.period,
+      operatedByFeishuUserId: input.actorUserId,
+      kind: "department_default_set",
+      status: "applied",
+      previousValue: policy.defaultGrantQuota,
+      nextValue: input.packageQuota,
+      delta: input.packageQuota - policy.defaultGrantQuota,
+      packageBatchId: batchId,
+      affectedUserCount: operations.length,
+      reservedQuota,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await client.query(
+      `insert into quota_change_events
+        (id, department_id, feishu_user_id, period, status,
+         related_token_request_id, data, created_at, updated_at)
+       values ($1, $2, null, $3, $4, null, $5, $6, $6)`,
+      [event.id, event.departmentId, event.period, event.status, event, now],
+    );
+    return {
+      package: storedPolicy,
+      requests,
+      operations,
+      affectedUsers: operations.length,
+      reservedQuota,
+      deduplicated: false,
+    };
+  });
+}
+
 export async function submitPostgresKeyRotation(input: {
   feishuUserId: string;
   reason: string;
@@ -1457,7 +2087,7 @@ export async function submitPostgresKeyRotation(input: {
       idempotent: QuotaOperation | null;
       open_operation: QuotaOperation | null;
       active_account: TokenAccount | null;
-      billing: UserBillingPeriod | null;
+      quota_policy: UserQuotaPolicy | null;
       department_period: DepartmentQuotaPeriod | null;
       generation: number;
     }>(
@@ -1478,9 +2108,12 @@ export async function submitPostgresKeyRotation(input: {
           order by created_at desc, id desc
           limit 1) as active_account,
          (select data
-          from user_billing_periods
-          where feishu_user_id = $1 and period = $2
-          limit 1) as billing,
+          from user_quota_policies
+          where feishu_user_id = $1
+            and effective_from_period <= $2
+            and (effective_to_period is null or effective_to_period >= $2)
+          order by version desc, id desc
+          limit 1) as quota_policy,
          (select data
           from department_quota_periods
           where department_id = $4 and period = $2
@@ -1516,7 +2149,9 @@ export async function submitPostgresKeyRotation(input: {
     }
 
     const monthlyQuota =
-      row.billing?.monthlyQuota ??
+      (row.quota_policy
+        ? fromNewApiQuota(row.quota_policy.assignedMonthlyQuota)
+        : undefined) ??
       row.department_period?.defaultGrantQuota ??
       row.settings.defaultMonthlyQuota;
     const now = nowIso();

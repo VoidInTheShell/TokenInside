@@ -122,9 +122,9 @@ test("execution revalidates current actor scope under one lock order before ever
   assert.match(jsonBatch, /assertJsonDepartmentMemberSyncScope/);
 });
 
-test("greenfield baseline accepts durable per-department sync jobs and indexes status reads", async () => {
+test("control-plane baseline accepts durable per-department sync jobs and indexes status reads", async () => {
   const migration = await readFile(migrationPath, "utf8");
-  assert.match(migration, /kind in \('usage_sync', 'department_member_sync'\)/);
+  assert.match(migration, /check \(kind = 'department_member_sync'\)/);
   assert.match(migration, /billing_operations_one_active_department_sync_idx/);
   assert.match(migration, /input->>'departmentId'/);
 });

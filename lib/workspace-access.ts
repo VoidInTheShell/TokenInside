@@ -3,7 +3,11 @@ import { getCurrentUser } from "@/lib/session";
 import { getActiveTokenForUser, listUserTokenRequests } from "@/lib/store";
 import type { FeishuUser, TokenAccount, TokenRequest } from "@/lib/types";
 
-export type WorkspaceAccess = "application_only" | "provisioning" | "active";
+export type WorkspaceAccess =
+  | "application_only"
+  | "disabled"
+  | "provisioning"
+  | "active";
 
 const firstApplyProvisioningStatuses = new Set([
   "pending_card_send",
@@ -23,7 +27,8 @@ export function resolveWorkspaceAccess(input: {
   activeToken?: TokenAccount | null;
   requests?: TokenRequest[];
 }): WorkspaceAccess {
-  if (input.user?.status && input.user.status !== "active") return "application_only";
+  if (input.user?.status === "disabled") return "disabled";
+  if (input.user?.status === "deleted") return "application_only";
   if (input.activeToken?.status === "active") return "active";
   if (
     input.requests?.some(
@@ -67,8 +72,14 @@ export async function requireActiveWorkspaceAccess() {
   return {
     error: NextResponse.json(
       {
-        error: "申请通过并完成 Key 发放后才能访问用户后台",
-        code: "active_workspace_access_required",
+        error:
+          workspaceAccess === "disabled"
+            ? "当前用户已被禁用，请等待管理员解禁"
+            : "申请通过并完成 Key 发放后才能访问用户后台",
+        code:
+          workspaceAccess === "disabled"
+            ? "workspace_user_disabled"
+            : "active_workspace_access_required",
         workspaceAccess,
       },
       { status: 403 },

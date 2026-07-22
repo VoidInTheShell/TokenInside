@@ -61,8 +61,9 @@ test("quota submission owns a small bounded pool independent from business and c
   assert.match(instrumentation, /await warmQuotaSubmitPool\(\)/);
   assert.ok(
     instrumentation.indexOf("await warmQuotaSubmitPool()") <
-      instrumentation.indexOf("await ensureUsageSyncScheduler()"),
+      instrumentation.indexOf("ensureQuotaOperationWorker()"),
   );
+  assert.doesNotMatch(instrumentation, /ensureUsageSyncScheduler|quota-balance-observer/);
 });
 
 test("session identity and submit authorization avoid shared store and external control-plane calls", async () => {

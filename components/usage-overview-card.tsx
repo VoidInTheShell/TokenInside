@@ -12,7 +12,7 @@ import {
 import { Progress } from "@/components/ui/progress";
 import {
   buildUsageOverview,
-  formatBillingPeriod,
+  formatPackagePeriod,
   formatOneDecimal,
   formatResetCountdown,
   formatTokensOneDecimal,
@@ -21,6 +21,7 @@ import {
 
 type UsageOverviewCardProps = {
   period?: string | null;
+  nextResetAt?: string | null;
   monthlyQuota?: number | null;
   quotaConsumed?: number | null;
   remainingQuota?: number | null;
@@ -29,6 +30,7 @@ type UsageOverviewCardProps = {
 
 export function UsageOverviewCard({
   period,
+  nextResetAt,
   monthlyQuota,
   quotaConsumed,
   remainingQuota,
@@ -36,7 +38,12 @@ export function UsageOverviewCard({
 }: UsageOverviewCardProps) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const overview = buildUsageOverview({ monthlyQuota, quotaConsumed, remainingQuota });
-  const resetAt = useMemo(() => nextHongKongBillingResetAt(period), [period]);
+  const resetAt = useMemo(() => {
+    const configured = nextResetAt ? new Date(nextResetAt) : null;
+    return configured && Number.isFinite(configured.getTime())
+      ? configured
+      : nextHongKongBillingResetAt(period);
+  }, [nextResetAt, period]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 60_000);
@@ -49,12 +56,12 @@ export function UsageOverviewCard({
         <div className="usage-overview-heading">
           <CardTitle>用量概览</CardTitle>
           <CardDescription>
-            {formatBillingPeriod(period)} · 月额度 {formatOneDecimal(overview.monthlyQuota)}
+            {formatPackagePeriod(period)} · 套餐额度 {formatOneDecimal(overview.monthlyQuota)}
           </CardDescription>
         </div>
         <div className="usage-overview-reset">
           <Clock3Icon aria-hidden="true" />
-          <span>距离额度刷新</span>
+          <span>距离套餐重置</span>
           <strong>{formatResetCountdown(resetAt, nowMs)}</strong>
         </div>
       </CardHeader>
@@ -66,7 +73,7 @@ export function UsageOverviewCard({
               <span>剩余用量</span>
             </div>
             <Progress
-              aria-label="月度剩余用量"
+              aria-label="套餐剩余用量"
               aria-valuetext={`${formatOneDecimal(overview.remainingPercent)}%`}
               value={overview.remainingPercent}
             />
@@ -74,12 +81,12 @@ export function UsageOverviewCard({
               <span>
                 剩余额度 {formatOneDecimal(overview.remainingQuota)} / {formatOneDecimal(overview.monthlyQuota)}
               </span>
-              <span>以每月额度为基准</span>
+              <span>以套餐额度为基准</span>
             </div>
           </div>
-          <div className="usage-overview-metrics" aria-label="账期已用数据">
+          <div className="usage-overview-metrics" aria-label="套餐周期已用数据">
             <div className="usage-overview-metric">
-              <span>账期已用 Tokens</span>
+              <span>套餐周期已用 Tokens</span>
               <strong>{formatTokensOneDecimal(totalTokens)}</strong>
             </div>
             <div className="usage-overview-metric">

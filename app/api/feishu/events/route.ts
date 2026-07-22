@@ -11,7 +11,10 @@ import {
 import { sha256Hex } from "@/lib/crypto";
 import { provisionTokenForRequest } from "@/lib/provisioning";
 import { assertQuotaWriteActionEnabled } from "@/lib/quota-guard";
-import { submitPostgresFirstProvisionCardApproval } from "@/lib/quota-operation-submit";
+import {
+  submitPostgresFirstProvisionCardApproval,
+  submitPostgresQuotaAdjustmentCardApproval,
+} from "@/lib/quota-operation-submit";
 import { ensureQuotaOperationWorker } from "@/lib/quota-saga";
 import {
   addFeishuEvent,
@@ -19,8 +22,8 @@ import {
   findDepartmentQuotaRequestById,
   findTokenRequestById,
   findTokenRequestByInstance,
-  getUserByOpenId,
   getFeishuEventByUuid,
+  getUserByOpenId,
   transitionTokenRequestStatus,
 } from "@/lib/store";
 
@@ -279,7 +282,7 @@ function isCardActionEventType(eventType?: string) {
   return eventType === "card.action.trigger" || eventType === "card.action.trigger_v1";
 }
 
-async function handleDepartmentQuotaCardAction(input: {
+async function handlePackageQuotaLimitCardAction(input: {
   encrypted: boolean;
   payload: FeishuEventPayload;
   eventUuid: string;
@@ -302,11 +305,16 @@ async function handleDepartmentQuotaCardAction(input: {
       messageId: input.messageId,
       processingStatus: "failed",
       payloadJson: { encrypted: input.encrypted, payload: input.payload },
-      errorMessage: "Invalid department quota card action nonce",
+      errorMessage: "Invalid package quota limit card action nonce",
     });
     return cardToast("审批卡片校验失败", "error");
   }
-  if (input.operatorOpenId !== quotaRequest.approvalTargetOpenId) {
+  const allowedOperators = new Set(
+    quotaRequest.approvalTargetOpenIds?.length
+      ? quotaRequest.approvalTargetOpenIds
+      : [quotaRequest.approvalTargetOpenId],
+  );
+  if (!allowedOperators.has(input.operatorOpenId)) {
     await addFeishuEvent({
       eventUuid: input.eventUuid,
       eventType: input.eventType,
@@ -316,7 +324,7 @@ async function handleDepartmentQuotaCardAction(input: {
       messageId: input.messageId,
       processingStatus: "ignored",
       payloadJson: { encrypted: input.encrypted, payload: input.payload },
-      errorMessage: "Department quota card operator is not the approval target",
+      errorMessage: "Package quota limit card operator is not an approval target",
     });
     return cardToast("当前用户无权审批此申请", "error");
   }
@@ -333,7 +341,7 @@ async function handleDepartmentQuotaCardAction(input: {
   if (!action) return cardToast("不支持的审批动作", "error");
   const operator = await getUserByOpenId(input.operatorOpenId);
   if (!operator) {
-    return cardToast("请先登录 TokenInside 管理后台后再处理部门额度申请", "error");
+    return cardToast("请先登录 TokenInside 管理后台后再处理申请", "error");
   }
   const decided = await decideDepartmentQuotaRequestAsActor({
     requestId: quotaRequest.id,
@@ -351,7 +359,7 @@ async function handleDepartmentQuotaCardAction(input: {
     processingStatus: "processed",
     payloadJson: { encrypted: input.encrypted, payload: input.payload },
   });
-  return cardToast(action === "approve" ? "部门额度申请已通过" : "部门额度申请已拒绝");
+  return cardToast(action === "approve" ? "总额度上限提升申请已通过" : "总额度上限提升申请已拒绝");
 }
 
 async function handleCardActionEvent(input: {
@@ -394,7 +402,7 @@ async function handleCardActionEvent(input: {
 
   const tokenRequest = await findTokenRequestById(cardRequestId);
   if (!tokenRequest) {
-    const departmentQuotaResult = await handleDepartmentQuotaCardAction({
+    const packageQuotaLimitResult = await handlePackageQuotaLimitCardAction({
       encrypted,
       payload,
       eventUuid,
@@ -405,7 +413,7 @@ async function handleCardActionEvent(input: {
       cardAction,
       nonce,
     });
-    if (departmentQuotaResult) return departmentQuotaResult;
+    if (packageQuotaLimitResult) return packageQuotaLimitResult;
     await addFeishuEvent({
       eventUuid,
       eventType,
@@ -436,7 +444,14 @@ async function handleCardActionEvent(input: {
     return cardToast("审批卡片校验失败", "error");
   }
 
-  if (operatorOpenId !== tokenRequest.approvalTargetOpenId) {
+  const approvalTargets = new Set(
+    tokenRequest.approvalTargetOpenIds?.length
+      ? tokenRequest.approvalTargetOpenIds
+      : [tokenRequest.approvalTargetOpenId].filter(
+          (openId): openId is string => Boolean(openId),
+        ),
+  );
+  if (!approvalTargets.has(operatorOpenId)) {
     await addFeishuEvent({
       eventUuid,
       eventType,
@@ -473,14 +488,23 @@ async function handleCardActionEvent(input: {
   const operatedAt = nowIso();
   if (isApproveAction) {
     if (getConfig().storeBackend === "postgres") {
-      await assertQuotaWriteActionEnabled("first_provision");
+      const isQuotaAdjustment = tokenRequest.requestType === "quota_adjust";
+      await assertQuotaWriteActionEnabled(
+        isQuotaAdjustment ? "quota_adjust" : "first_provision",
+      );
       await submitAndScheduleDurableQuotaWork({
         submit: () =>
-          submitPostgresFirstProvisionCardApproval({
-            requestId: tokenRequest.id,
-            operatorOpenId,
-            nonce,
-          }),
+          isQuotaAdjustment
+            ? submitPostgresQuotaAdjustmentCardApproval({
+                requestId: tokenRequest.id,
+                operatorOpenId,
+                nonce,
+              })
+            : submitPostgresFirstProvisionCardApproval({
+                requestId: tokenRequest.id,
+                operatorOpenId,
+                nonce,
+              }),
         scheduleAfter: after,
         wakeWorker: ensureQuotaOperationWorker,
       });

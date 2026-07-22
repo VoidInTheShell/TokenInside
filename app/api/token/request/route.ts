@@ -22,6 +22,15 @@ export async function POST(request: Request) {
     if (!user) {
       return NextResponse.json({ error: "Feishu OAuth session required" }, { status: 401 });
     }
+    if (user.status === "disabled") {
+      return NextResponse.json(
+        {
+          error: "当前用户已被禁用，请等待管理员解禁",
+          code: "workspace_user_disabled",
+        },
+        { status: 403 },
+      );
+    }
 
     const activeToken = await getActiveTokenForUser(user.id);
     if (activeToken) {

@@ -14,13 +14,15 @@ const usagePath = new URL("../app/api/usage-records/route.ts", import.meta.url);
 const tokenKeyPath = new URL("../app/api/token/key/route.ts", import.meta.url);
 const tokenResetPath = new URL("../app/api/token/reset/route.ts", import.meta.url);
 
-test("用户后台准入只有 application_only、provisioning、active 三态", async () => {
+test("用户后台准入区分申请、禁用、发放中和 active", async () => {
   const source = await readFile(policyPath, "utf8");
 
   assert.match(
     source,
-    /export type WorkspaceAccess = "application_only" \| "provisioning" \| "active"/,
+    /\| "application_only"[\s\S]*\| "disabled"[\s\S]*\| "provisioning"[\s\S]*\| "active"/,
   );
+  assert.match(source, /input\.user\?\.status === "disabled"\) return "disabled"/);
+  assert.match(source, /input\.user\?\.status === "deleted"\) return "application_only"/);
   assert.match(source, /input\.activeToken\?\.status === "active"/);
   assert.match(source, /request\.requestType === "first_apply"/);
   assert.match(source, /firstApplyProvisioningStatuses\.has\(request\.status\)/);
@@ -37,7 +39,8 @@ test("active 热路径不读取申请历史，未发 Key 的成员返回 403 及
 
   assert.ok(activeCheck >= 0);
   assert.ok(requestHistory > activeCheck);
-  assert.match(source, /code: "active_workspace_access_required"/);
+  assert.match(source, /"workspace_user_disabled"/);
+  assert.match(source, /"active_workspace_access_required"/);
   assert.match(source, /workspaceAccess,/);
   assert.match(source, /\{ status: 403 \}/);
 });

@@ -5,7 +5,7 @@ export class QuotaAdmissionClosedError extends Error {
   readonly operationId?: string;
 
   constructor(state: UserQuotaState) {
-    super("额度操作正在结算，请稍后重试");
+    super("额度操作正在更新，请稍后重试");
     this.name = "QuotaAdmissionClosedError";
     this.operationId = state.operationId;
   }

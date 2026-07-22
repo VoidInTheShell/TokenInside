@@ -10,15 +10,72 @@ import type {
   ProxyRequestLog,
   TokenAccount,
   TokenRequest,
+  UserQuotaPolicy,
   UserBillingPeriod,
   UsageSyncCheckpoint,
 } from "@/lib/types";
+
+type PostgresNewApiReportingBindingsRow = {
+  users: FeishuUser[];
+  token_accounts: TokenAccount[];
+  user_quota_policies: UserQuotaPolicy[];
+};
+
+export async function getPostgresNewApiReportingBindings(input: {
+  scope?: AdminScope;
+  feishuUserId?: string;
+}) {
+  return withPostgresControlClient(async (client) => {
+    const result = await client.query<PostgresNewApiReportingBindingsRow>(
+      `with scoped_users as materialized (
+         select user_row.id, user_row.data
+         from feishu_users user_row
+         where ($1::text is null or user_row.id = $1)
+           and (
+             $2::text is null
+             or $2 = 'global'
+             or user_row.department_id = $3
+           )
+       )
+       select
+         coalesce(
+           (select jsonb_agg(scoped_user.data order by scoped_user.id)
+              from scoped_users scoped_user),
+           '[]'::jsonb
+         ) as users,
+         coalesce(
+           (select jsonb_agg(account.data order by account.created_at, account.id)
+              from token_accounts account
+              join scoped_users scoped_user
+                on scoped_user.id = account.feishu_user_id
+             where account.newapi_token_id is not null),
+           '[]'::jsonb
+         ) as token_accounts,
+         coalesce(
+           (select jsonb_agg(policy.data order by policy.feishu_user_id, policy.version)
+              from user_quota_policies policy
+              join scoped_users scoped_user
+                on scoped_user.id = policy.feishu_user_id),
+           '[]'::jsonb
+         ) as user_quota_policies`,
+      [
+        input.feishuUserId ?? null,
+        input.scope?.scopeType ?? null,
+        input.scope?.departmentId ?? null,
+      ],
+    );
+    return {
+      users: result.rows[0]?.users ?? [],
+      tokenAccounts: result.rows[0]?.token_accounts ?? [],
+      userQuotaPolicies: result.rows[0]?.user_quota_policies ?? [],
+    };
+  });
+}
 
 export async function getPostgresSessionStoreSummary() {
   return withPostgresControlClient(async (client) => {
     const result = await client.query<{
       default_monthly_quota: number;
-      proxy_log_count: number;
     }>(
       `select
          coalesce(
@@ -26,14 +83,13 @@ export async function getPostgresSessionStoreSummary() {
             from app_settings
             where id = 'default'),
            200
-         ) as default_monthly_quota,
-         (select count(*)::integer from proxy_request_logs) as proxy_log_count`,
+         ) as default_monthly_quota`,
     );
     return {
       settings: {
         defaultMonthlyQuota: result.rows[0]?.default_monthly_quota ?? 200,
       },
-      proxyLogCount: result.rows[0]?.proxy_log_count ?? 0,
+      requestCount: 0,
     };
   });
 }
@@ -41,14 +97,11 @@ export async function getPostgresSessionStoreSummary() {
 type PostgresAuthenticatedSessionProjectionRow = {
   requests: TokenRequest[];
   active_token: TokenAccount | null;
-  current_billing: UserBillingPeriod | null;
-  active_token_billing: UserBillingPeriod | null;
   active_admin_scope: AdminScope | null;
   assigned_request: TokenRequest | null;
   admin_scopes: AdminScope[];
   department_quota_period: DepartmentQuotaPeriod | null;
   default_monthly_quota: number;
-  proxy_log_count: number;
 };
 
 export async function getPostgresAuthenticatedSessionProjection(input: {
@@ -75,16 +128,6 @@ export async function getPostgresAuthenticatedSessionProjection(input: {
            '[]'::jsonb
          ) as requests,
          (select token.data from active_token token) as active_token,
-         (select billing.data
-          from user_billing_periods billing
-          where billing.feishu_user_id = $1
-            and billing.period = $4
-          limit 1) as current_billing,
-         (select billing.data
-          from user_billing_periods billing
-          where billing.feishu_user_id = $1
-            and billing.period = (select token.billing_period from active_token token)
-          limit 1) as active_token_billing,
          (select scope.data
           from admin_scopes scope
           where scope.feishu_user_id = $1
@@ -114,8 +157,7 @@ export async function getPostgresAuthenticatedSessionProjection(input: {
             from app_settings settings
             where settings.id = 'default'),
            200
-         ) as default_monthly_quota,
-         (select count(*)::integer from proxy_request_logs) as proxy_log_count`,
+         ) as default_monthly_quota`,
       [
         input.feishuUserId,
         input.approvalTargetOpenId,
@@ -127,14 +169,11 @@ export async function getPostgresAuthenticatedSessionProjection(input: {
     return {
       requests: row?.requests ?? [],
       activeToken: row?.active_token ?? null,
-      currentBilling: row?.current_billing ?? null,
-      activeTokenBilling: row?.active_token_billing ?? null,
       activeAdminScope: row?.active_admin_scope ?? null,
       assignedRequest: row?.assigned_request ?? null,
       adminScopes: row?.admin_scopes ?? [],
       departmentQuotaPeriod: row?.department_quota_period ?? null,
       defaultMonthlyQuota: row?.default_monthly_quota ?? 200,
-      proxyLogCount: row?.proxy_log_count ?? 0,
     };
   });
 }
@@ -142,22 +181,18 @@ export async function getPostgresAuthenticatedSessionProjection(input: {
 type PostgresAdminUserRow = {
   user_data: FeishuUser;
   account_data: TokenAccount | null;
-  billing_data: UserBillingPeriod | null;
   request_data: TokenRequest | null;
-  log_data: ProxyRequestLog | null;
   role_label: string;
 };
 
-export async function listPostgresAdminUsers(scope: AdminScope, currentPeriod: string) {
+export async function listPostgresAdminUsers(scope: AdminScope) {
   const systemAdminOpenIds = getConfig().admin.systemAdminOpenIds;
   return withPostgresControlClient(async (client) => {
     const result = await client.query<PostgresAdminUserRow>(
       `select
          user_row.data as user_data,
          account_row.data as account_data,
-         billing_row.data as billing_data,
          request_row.data as request_data,
-         log_row.data as log_data,
          case
            when coalesce(user_row.data->>'status', 'active') <> 'active' then '普通用户'
            when user_row.open_id = any($3::text[])
@@ -188,47 +223,25 @@ export async function listPostgresAdminUsers(scope: AdminScope, currentPeriod: s
          limit 1
        ) account_row on true
        left join lateral (
-         select billing.data
-         from user_billing_periods billing
-         where billing.feishu_user_id = user_row.id
-           and billing.period = case
-             when account_row.status = 'active'
-               then coalesce(account_row.data->>'billingPeriod', $4)
-             else $4
-           end
-         limit 1
-       ) billing_row on true
-       left join lateral (
          select request.data
          from token_requests request
          where request.feishu_user_id = user_row.id
          order by request.updated_at desc, request.id
          limit 1
        ) request_row on true
-       left join lateral (
-         select log.data
-         from proxy_request_logs log
-         where log.feishu_user_id = user_row.id
-         order by log.created_at desc, log.id
-         limit 1
-       ) log_row on true
        where $1::text = 'global' or user_row.department_id = $2
        order by coalesce(
-         log_row.data->>'createdAt',
          request_row.data->>'updatedAt',
          user_row.data->>'updatedAt'
        ) desc,
        user_row.id`,
-      [scope.scopeType, scope.departmentId ?? null, systemAdminOpenIds, currentPeriod],
+      [scope.scopeType, scope.departmentId ?? null, systemAdminOpenIds],
     );
 
     return result.rows.map((row) => {
       const user = row.user_data;
       const account = row.account_data;
-      const billing = row.billing_data;
       const latestRequest = row.request_data;
-      const latestLog = row.log_data;
-      const billingPeriod = account?.status === "active" ? account.billingPeriod : currentPeriod;
       return {
         id: user.id,
         name: user.name,
@@ -241,24 +254,9 @@ export async function listPostgresAdminUsers(scope: AdminScope, currentPeriod: s
         isEnvironmentRoot: systemAdminOpenIds.includes(user.openId),
         activeTokenStatus: account?.status,
         activeTokenCreatedAt: account?.createdAt,
-        billingPeriod,
-        billingMonthlyQuota: billing?.monthlyQuota,
-        billingRemainingQuota:
-          billing?.monthlyQuota === undefined
-            ? undefined
-            : billing.remainingQuota ??
-              Math.max(billing.monthlyQuota - (billing.quotaConsumed ?? 0), 0),
-        billingQuotaConsumed: billing?.quotaConsumed ?? 0,
-        billingCost: billing?.cost ?? billing?.quotaConsumed ?? 0,
-        billingTotalTokens: billing?.totalTokens,
-        billingPromptTokens: billing?.promptTokens,
-        billingCompletionTokens: billing?.completionTokens,
-        billingProxyLogCount: billing?.proxyLogCount,
-        billingUsageRecordCount: billing?.usageRecordCount ?? 0,
         latestRequestStatus: latestRequest?.status,
         latestRequestType: latestRequest?.requestType,
         latestRequestUpdatedAt: latestRequest?.updatedAt,
-        latestProxyLogAt: latestLog?.createdAt,
         updatedAt: user.updatedAt,
         createdAt: user.createdAt,
       };
@@ -1156,14 +1154,21 @@ export async function listPostgresAdminTokenRequestRows(input: {
 }) {
   return withPostgresControlClient(async (client) => {
     const result = await client.query<{
-      page: Array<{ request: TokenRequest; user: FeishuUser | null }>;
+      page: Array<{
+        request: TokenRequest;
+        user: FeishuUser | null;
+        operator: FeishuUser | null;
+      }>;
       total: number;
     }>(
       `with scoped as materialized (
          select request.data as request_data, requester.data as user_data,
+                operator_user.data as operator_data,
                 request.updated_at, request.id
          from token_requests request
          left join feishu_users requester on requester.id = request.feishu_user_id
+         left join feishu_users operator_user
+           on operator_user.open_id = nullif(request.data->>'approvalOperatorOpenId', '')
          where (
            $1::text = 'global'
            or (
@@ -1186,12 +1191,12 @@ export async function listPostgresAdminTokenRequestRows(input: {
            and (
              not $5::boolean
              or (
-               request.request_type = 'first_apply'
+               request.request_type in ('first_apply', 'quota_adjust')
                and request.status = any($6::text[])
              )
            )
        ), page as materialized (
-         select request_data, user_data, updated_at, id
+         select request_data, user_data, operator_data, updated_at, id
          from scoped
          order by updated_at desc, id
          limit $7 offset $8
@@ -1199,7 +1204,11 @@ export async function listPostgresAdminTokenRequestRows(input: {
        select
          coalesce(
            (select jsonb_agg(
-             jsonb_build_object('request', page.request_data, 'user', page.user_data)
+             jsonb_build_object(
+               'request', page.request_data,
+               'user', page.user_data,
+               'operator', page.operator_data
+             )
              order by page.updated_at desc, page.id
            ) from page),
            '[]'::jsonb
