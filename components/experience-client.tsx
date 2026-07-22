@@ -34,6 +34,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { FeishuSdkScript, loginWithFeishu } from "@/components/feishu-login";
 import { LoginWaitingScreen } from "@/components/login-waiting-screen";
 import { UsageOverviewCard } from "@/components/usage-overview-card";
+import { adminFirstLoginNeedsProvisioning } from "@/lib/admin-login-state";
 import {
   UsageRecordsTable,
   type UsageRecordRow,
@@ -45,6 +46,7 @@ import {
 } from "@/components/usage-analysis-tables";
 import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
 import { pendingApprovalRouteNotice } from "@/lib/department-quota";
+import { newApiClientBaseUrls } from "@/lib/newapi-client-endpoints";
 import {
   TOKEN_REQUEST_REFRESH_INTERVAL_MS,
   tokenRequestsNeedAutoRefresh,
@@ -351,12 +353,21 @@ export function ExperienceClient() {
   const [error, setError] = useState<string | null>(null);
   const [feishuSdkReady, setFeishuSdkReady] = useState(false);
   const [autoLoginAttempted, setAutoLoginAttempted] = useState(false);
+  const [adminProvisioningError, setAdminProvisioningError] = useState<string | null>(null);
+  const [adminProvisioningRetryNonce, setAdminProvisioningRetryNonce] = useState(0);
+  const [adminProvisioningSubmitting, setAdminProvisioningSubmitting] = useState(false);
   const adminProvisioningAttemptRef = useRef<string | null>(null);
   const usageFetchAbortRef = useRef<AbortController | null>(null);
   const usageRefreshInFlightRef = useRef(false);
-  const shouldAutoRefreshTokenRequests = Boolean(
+  const adminFirstLoginPending = adminFirstLoginNeedsProvisioning({
+    authenticated: session?.authenticated,
+    hasAdminScope: Boolean(session?.adminScope),
+    hasActiveToken: Boolean(session?.activeToken),
+    workspaceAccess: session?.workspaceAccess,
+  });
+  const shouldAutoRefreshSession = Boolean(
     session?.authenticated &&
-      tokenRequestsNeedAutoRefresh(session.requests),
+      (adminFirstLoginPending || tokenRequestsNeedAutoRefresh(session.requests)),
   );
 
   const refresh = useCallback(async (options: { quiet?: boolean } = {}) => {
@@ -548,22 +559,35 @@ export function ExperienceClient() {
     }
 
     adminProvisioningAttemptRef.current = userId;
+    setAdminProvisioningError(null);
+    setAdminProvisioningSubmitting(true);
     let cancelled = false;
     const submit = async () => {
       try {
         const res = await fetch("/api/token/admin-provision", { method: "POST" });
         const data = (await res.json().catch(() => ({}))) as {
           status?: string;
+          reason?: string;
           error?: string;
         };
-        if (!res.ok || data.status === "failed") {
+        if (!res.ok || data.status === "failed" || data.status === "skipped") {
           throw new Error(data.error ?? "管理员 Key 自动发放受理失败");
+        }
+        if (
+          data.status === "deferred" &&
+          data.reason === "terminal_operation_without_active_key"
+        ) {
+          throw new Error("管理员 Key 首次发放未完成，请联系 root 管理员检查后重试");
         }
         if (!cancelled) await refresh({ quiet: true });
       } catch (err) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : "管理员 Key 自动发放受理失败");
+          setAdminProvisioningError(
+            err instanceof Error ? err.message : "管理员 Key 自动发放受理失败",
+          );
         }
+      } finally {
+        setAdminProvisioningSubmitting(false);
       }
     };
     void submit();
@@ -572,16 +596,17 @@ export function ExperienceClient() {
     };
   }, [
     loading,
+    adminProvisioningRetryNonce,
     refresh,
     session?.activeToken,
-    session?.adminScope,
+    session?.adminScope?.type,
     session?.authenticated,
     session?.user?.id,
     session?.workspaceAccess,
   ]);
 
   useEffect(() => {
-    if (!shouldAutoRefreshTokenRequests) return;
+    if (!shouldAutoRefreshSession) return;
 
     let refreshInFlight = false;
     const refreshPendingRequest = async () => {
@@ -606,7 +631,11 @@ export function ExperienceClient() {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [refresh, shouldAutoRefreshTokenRequests]);
+  }, [refresh, shouldAutoRefreshSession]);
+
+  useEffect(() => {
+    if (session?.activeToken) setAdminProvisioningError(null);
+  }, [session?.activeToken]);
 
   useEffect(() => {
     void loadQuickApprovals();
@@ -711,12 +740,28 @@ export function ExperienceClient() {
           return;
         }
         if (body.operation.state === "manual_review") {
-          setError(body.operation.lastErrorMessage ?? "Key 更换需要管理员人工处置");
+          const operationError =
+            body.operation.lastErrorMessage ??
+            (body.operation.operationType === "first_provision"
+              ? "管理员 Key 首次发放需要 root 管理员人工处置"
+              : "Key 更换需要管理员人工处置");
+          if (body.operation.operationType === "first_provision") {
+            setAdminProvisioningError(operationError);
+          } else {
+            setError(operationError);
+          }
           return;
         }
         timer = window.setTimeout(poll, QUOTA_OPERATION_POLL_INTERVAL_MS);
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : "读取额度操作失败");
+        if (!cancelled) {
+          const operationError = err instanceof Error ? err.message : "读取额度操作失败";
+          if (quotaOperation.operationType === "first_provision") {
+            setAdminProvisioningError(operationError);
+          } else {
+            setError(operationError);
+          }
+        }
       }
     };
     void poll();
@@ -804,6 +849,10 @@ export function ExperienceClient() {
     latestRequest,
     session?.adminScope?.type === "department",
   );
+  const clientBaseUrls = useMemo(
+    () => newApiClientBaseUrls(session?.baseUrl),
+    [session?.baseUrl],
+  );
 
   function selectPanel(nextPanel: WorkspacePanel) {
     setPanel(nextPanel);
@@ -828,6 +877,13 @@ export function ExperienceClient() {
       setBusy(false);
     }
   }, [refresh]);
+
+  const retryAdminProvisioning = useCallback(() => {
+    if (!session?.user?.id) return;
+    adminProvisioningAttemptRef.current = null;
+    setAdminProvisioningError(null);
+    setAdminProvisioningRetryNonce((current) => current + 1);
+  }, [session?.user?.id]);
 
   useEffect(() => {
     if (loading || busy || autoLoginAttempted || !feishuSdkReady || session?.authenticated) {
@@ -963,9 +1019,13 @@ export function ExperienceClient() {
     }
   }
 
-  async function copyBaseUrl() {
-    await navigator.clipboard.writeText(`${session?.baseUrl ?? ""}/v1`);
-    setMessage("已复制 Base URL。");
+  async function copyClientBaseUrl(value: string, clientName: string) {
+    if (!value) {
+      setError("NewAPI Base URL 尚未配置");
+      return;
+    }
+    await navigator.clipboard.writeText(value);
+    setMessage(`已复制 ${clientName} Base URL。`);
   }
 
   async function saveQuickApprovalQuota(requestId: string) {
@@ -1035,7 +1095,8 @@ export function ExperienceClient() {
     }
   }
 
-  const loginInProgress = loading || (!session?.authenticated && busy);
+  const loginInProgress =
+    loading || (!session?.authenticated && busy) || adminFirstLoginPending;
 
   if (loginInProgress) {
     return (
@@ -1044,7 +1105,12 @@ export function ExperienceClient() {
           onReady={() => setFeishuSdkReady(true)}
           onError={(sdkError) => setError(sdkError)}
         />
-        <LoginWaitingScreen />
+        <LoginWaitingScreen
+          mode={adminFirstLoginPending ? "admin-provisioning" : "authentication"}
+          error={adminFirstLoginPending ? adminProvisioningError : null}
+          onRetry={adminFirstLoginPending ? retryAdminProvisioning : undefined}
+          retrying={adminProvisioningSubmitting}
+        />
       </>
     );
   }
@@ -1333,7 +1399,7 @@ export function ExperienceClient() {
                 <CardHeader>
                   <CardTitle>管理员 Key 自动发放</CardTitle>
                   <CardDescription>
-                    管理员用户后台已经开放；系统正在创建专属 Key。
+                    管理员身份已确认；系统正在创建专属 Key。
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
@@ -1417,14 +1483,39 @@ export function ExperienceClient() {
                     </CardHeader>
                     <CardContent>
                       <div className="field">
-                        <label>Base URL</label>
+                        <label>OpenAI 兼容 Base URL</label>
                         <div className="key-box">
-                          <span>{session?.baseUrl ? `${session.baseUrl}/v1` : "-"}</span>
-                          <Button variant="ghost" size="sm" onClick={() => void copyBaseUrl()}>
+                          <span>{clientBaseUrls.openAiBaseUrl || "-"}</span>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() =>
+                              void copyClientBaseUrl(clientBaseUrls.openAiBaseUrl, "OpenAI 兼容")
+                            }
+                          >
                             <ClipboardCopyIcon data-icon="inline-start" />
                             复制
                           </Button>
                         </div>
+                      </div>
+                      <div className="field">
+                        <label>Claude Code Base URL</label>
+                        <div className="key-box">
+                          <span>{clientBaseUrls.claudeCodeBaseUrl || "-"}</span>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() =>
+                              void copyClientBaseUrl(clientBaseUrls.claudeCodeBaseUrl, "Claude Code")
+                            }
+                          >
+                            <ClipboardCopyIcon data-icon="inline-start" />
+                            复制
+                          </Button>
+                        </div>
+                        <span className="field-description">
+                          配置 ANTHROPIC_BASE_URL 时不要追加 /v1。
+                        </span>
                       </div>
                       <div className="field">
                         <label>NewAPI key</label>
