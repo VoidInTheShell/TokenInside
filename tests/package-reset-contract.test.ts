@@ -13,9 +13,25 @@ const settingsRoutePath = new URL(
 const adminClientPath = new URL("../components/admin-client.tsx", import.meta.url);
 const instrumentationPath = new URL("../instrumentation.ts", import.meta.url);
 const runtimeStartupPath = new URL("../lib/runtime-startup.ts", import.meta.url);
+const packageResetPath = new URL("../lib/package-reset.ts", import.meta.url);
+const usageOverviewCardPath = new URL(
+  "../components/usage-overview-card.tsx",
+  import.meta.url,
+);
 
 test("package reset remains a system setting backed by an automatic fenced scheduler", async () => {
-  const [scheduler, plan, postgresStore, store, settingsRoute, adminClient, instrumentation, runtimeStartup] =
+  const [
+    scheduler,
+    plan,
+    postgresStore,
+    store,
+    settingsRoute,
+    adminClient,
+    instrumentation,
+    runtimeStartup,
+    packageReset,
+    usageOverviewCard,
+  ] =
     await Promise.all([
       readFile(schedulerPath, "utf8"),
       readFile(planPath, "utf8"),
@@ -25,6 +41,8 @@ test("package reset remains a system setting backed by an automatic fenced sched
       readFile(adminClientPath, "utf8"),
       readFile(instrumentationPath, "utf8"),
       readFile(runtimeStartupPath, "utf8"),
+      readFile(packageResetPath, "utf8"),
+      readFile(usageOverviewCardPath, "utf8"),
     ]);
 
   assert.match(settingsRoute, /packageReset:[\s\S]*?enabled: z\.boolean\(\)/);
@@ -33,7 +51,14 @@ test("package reset remains a system setting backed by an automatic fenced sched
   assert.match(adminClient, /<h3>套餐重置<\/h3>/);
   assert.match(adminClient, /<Switch/);
   assert.match(adminClient, /Array\.from\(\{ length: 31 \}/);
+  assert.match(adminClient, /enabled:\s*true/);
+  assert.doesNotMatch(adminClient, /香港时区|Asia\/Hong_Kong/);
   assert.doesNotMatch(adminClient, /panel === "packageReset"/);
+  assert.match(packageReset, /PACKAGE_RESET_TIME_ZONE = APP_TIME_ZONE/);
+  assert.match(packageReset, /enabled:\s*true/);
+  assert.match(packageReset, /enabled:\s*policy\?\.enabled \?\? true/);
+  assert.match(usageOverviewCard, /parseAuthoritativeResetAt\(nextResetAt\)/);
+  assert.doesNotMatch(usageOverviewCard, /nextHongKongBillingResetAt|nextShanghaiBillingResetAt/);
 
   assert.match(instrumentation, /ensureRuntimeStartup/);
   assert.match(runtimeStartup, /ensurePackageResetScheduler/);

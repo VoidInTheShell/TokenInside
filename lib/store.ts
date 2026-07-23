@@ -40,7 +40,7 @@ import {
 } from "@/lib/postgres-control-queries";
 import { assertQuotaAdmission } from "@/lib/quota-admission";
 import {
-  hongKongBillingPeriod,
+  shanghaiBillingPeriod,
   initialUnassignedMonthlyQuota,
   isSettlementWatermarkFresh,
   materializeDepartmentQuota,
@@ -3758,7 +3758,7 @@ async function rebuildDepartmentQuotaMaterializedSnapshots(
 }
 
 async function rebuildQuotaMaterializedSnapshotsNow(
-  period = hongKongBillingPeriod(),
+  period = shanghaiBillingPeriod(),
 ) {
   const quotaPerUnit = getConfig().newapi.quotaPerUnit;
   if (isPostgresBackend()) {
@@ -3915,7 +3915,7 @@ type QuotaMaterializationRun = {
 
 const quotaMaterializationRuns = new Map<string, QuotaMaterializationRun>();
 
-export function rebuildQuotaMaterializedSnapshots(period = hongKongBillingPeriod()) {
+export function rebuildQuotaMaterializedSnapshots(period = shanghaiBillingPeriod()) {
   const existing = quotaMaterializationRuns.get(period);
   if (existing) {
     existing.rerun = true;
@@ -3944,7 +3944,7 @@ export function rebuildQuotaMaterializedSnapshots(period = hongKongBillingPeriod
 
 export async function rebuildUserQuotaMaterializedSnapshot(
   feishuUserId: string,
-  period = hongKongBillingPeriod(),
+  period = shanghaiBillingPeriod(),
   departmentId?: string,
 ) {
   if (isPostgresBackend()) {
@@ -3971,7 +3971,7 @@ const rebuildQuotaOperationDepartmentMaterializedSnapshot = createRerunSingleFli
 
 export async function rebuildUserQuotaMaterializedSnapshotForQuotaOperation(
   feishuUserId: string,
-  period = hongKongBillingPeriod(),
+  period = shanghaiBillingPeriod(),
   departmentId?: string,
 ) {
   if (isPostgresBackend()) {
@@ -3992,7 +3992,7 @@ export async function rebuildUserQuotaMaterializedSnapshotForQuotaOperation(
 
 export async function refreshUserBillingTokenMetadataForQuotaOperation(
   feishuUserId: string,
-  period = hongKongBillingPeriod(),
+  period = shanghaiBillingPeriod(),
 ) {
   if (isPostgresBackend()) {
     return refreshPostgresBillingPeriodTokenMetadataForQuotaOperation(

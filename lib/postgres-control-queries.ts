@@ -1,7 +1,7 @@
 import { createAsyncSnapshotCache } from "@/lib/async-snapshot-cache";
 import { getConfig } from "@/lib/config";
 import { withPostgresControlClient } from "@/lib/postgres-store";
-import { hongKongBillingPeriod } from "@/lib/quota-model";
+import { shanghaiBillingPeriod } from "@/lib/quota-model";
 import type {
   AdminScope,
   AppSettings,
@@ -726,7 +726,7 @@ function postgresUsageReportQueryParts(input: PostgresUsageReportInput) {
     ? parameter(input.feishuUserId)
     : undefined;
   const currentPeriodParameter = parameter(
-    input.currentPeriod ?? hongKongBillingPeriod(),
+    input.currentPeriod ?? shanghaiBillingPeriod(),
   );
   const limitParameter = parameter(input.limit);
   const offsetParameter = parameter(input.offset);

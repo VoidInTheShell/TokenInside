@@ -2222,7 +2222,7 @@ export type PostgresBillingMaterializationTarget = {
 /**
  * Enumerates the durable user-period obligations implied by authoritative NewAPI
  * source facts. The JSON record owns the billing-period snapshot; legacy rows
- * without it fall back to the NewAPI occurrence month in Hong Kong time.
+ * without it fall back to the NewAPI occurrence month in Shanghai time.
  */
 export async function listPostgresAuthoritativeUsageBillingMaterializationTargets() {
   return withClient(async (client) => {
@@ -2237,7 +2237,7 @@ export async function listPostgresAuthoritativeUsageBillingMaterializationTarget
              when coalesce(data->>'billingPeriod', '') ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'
                then data->>'billingPeriod'
              when newapi_created_at is not null
-               then to_char(newapi_created_at at time zone 'Asia/Hong_Kong', 'YYYY-MM')
+               then to_char(newapi_created_at at time zone 'Asia/Shanghai', 'YYYY-MM')
              else null
            end as "billingPeriod"
          from newapi_usage_records

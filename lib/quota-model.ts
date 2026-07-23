@@ -3,8 +3,9 @@ import type {
   QuotaOperationState,
   QuotaReconciliationStatus,
 } from "./types";
+import { APP_TIME_ZONE } from "./time-zone.ts";
 
-export const QUOTA_TIME_ZONE = "Asia/Hong_Kong";
+export const QUOTA_TIME_ZONE = APP_TIME_ZONE;
 
 const terminalOperationStates = new Set<QuotaOperationState>([
   "completed",
@@ -234,7 +235,7 @@ function datePart(date: Date, type: "year" | "month") {
   return part;
 }
 
-export function hongKongBillingPeriod(date = new Date()) {
+export function shanghaiBillingPeriod(date = new Date()) {
   return `${datePart(date, "year")}-${datePart(date, "month")}`;
 }
 
@@ -250,7 +251,7 @@ export function resolveUsageBillingPeriod(input: {
     return input.billingPeriod as string;
   }
   const occurredAt = input.occurredAt ? new Date(input.occurredAt) : new Date();
-  return hongKongBillingPeriod(
+  return shanghaiBillingPeriod(
     Number.isFinite(occurredAt.getTime()) ? occurredAt : new Date(),
   );
 }

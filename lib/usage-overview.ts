@@ -24,13 +24,10 @@ export function buildUsageOverview(input: {
   return { monthlyQuota, quotaConsumed, remainingQuota, remainingPercent };
 }
 
-export function nextHongKongBillingResetAt(period?: string | null) {
-  const match = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(period ?? "");
-  if (!match) return null;
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const hongKongOffsetMs = 8 * 60 * 60 * 1000;
-  return new Date(Date.UTC(year, month, 1) - hongKongOffsetMs);
+export function parseAuthoritativeResetAt(value?: string | null) {
+  if (!value) return null;
+  const resetAt = new Date(value);
+  return Number.isFinite(resetAt.getTime()) ? resetAt : null;
 }
 
 export function formatPackagePeriod(period?: string | null) {

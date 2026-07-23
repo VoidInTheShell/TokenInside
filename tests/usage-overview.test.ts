@@ -6,7 +6,7 @@ import {
   formatOneDecimal,
   formatResetCountdown,
   formatTokensOneDecimal,
-  nextHongKongBillingResetAt,
+  parseAuthoritativeResetAt,
 } from "../lib/usage-overview.ts";
 
 test("builds remaining percentage from the monthly quota baseline", () => {
@@ -33,9 +33,13 @@ test("falls back to monthly quota minus consumed quota and clamps percentage", (
   );
 });
 
-test("computes the next Hong Kong month boundary", () => {
-  assert.equal(nextHongKongBillingResetAt("2026-07")?.toISOString(), "2026-07-31T16:00:00.000Z");
-  assert.equal(nextHongKongBillingResetAt("invalid"), null);
+test("uses only the authoritative reset timestamp supplied by the server", () => {
+  assert.equal(
+    parseAuthoritativeResetAt("2026-08-14T16:00:00.000Z")?.toISOString(),
+    "2026-08-14T16:00:00.000Z",
+  );
+  assert.equal(parseAuthoritativeResetAt("invalid"), null);
+  assert.equal(parseAuthoritativeResetAt(), null);
   assert.equal(formatPackagePeriod("2026-07"), "2026年7月套餐周期");
 });
 

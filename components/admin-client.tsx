@@ -60,6 +60,7 @@ import {
 } from "@/components/usage-analysis-tables";
 import { PageSelector } from "@/components/page-selector";
 import { formatDateTime, formatDepartmentName, formatQuotaAmount, formatTokenAmount, maskSecret } from "@/lib/utils";
+import { APP_TIME_ZONE } from "@/lib/time-zone";
 import {
   tokenRequestAllowsQuotaEdit,
   tokenRequestRequiresAdminDecision,
@@ -499,7 +500,14 @@ function approvalOperatorLabel(input: {
 }
 
 function currentBillingPeriod() {
-  return new Date().toISOString().slice(0, 7);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: APP_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+  }).formatToParts(new Date());
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  return year && month ? `${year}-${month}` : "-";
 }
 
 async function readJsonResponse<T>(res: Response): Promise<T & { error?: string }> {
@@ -542,6 +550,7 @@ function DirectoryFilters({
   departments,
   loading,
   defaultSortBy = "latestActivity",
+  hideLabels = false,
   leading,
   onChange,
 }: {
@@ -549,14 +558,21 @@ function DirectoryFilters({
   departments: Array<{ id: string; name?: string }>;
   loading?: boolean;
   defaultSortBy?: AdminUserSortKey;
+  hideLabels?: boolean;
   leading?: ReactNode;
   onChange: (value: DirectoryFiltersState) => void;
 }) {
   return (
-    <div className="directory-filters usage-records-control-row">
+    <div
+      className={
+        hideLabels
+          ? "directory-filters directory-filters-labels-hidden usage-records-control-row"
+          : "directory-filters usage-records-control-row"
+      }
+    >
       {leading}
       <label className="usage-filter">
-        <span>状态</span>
+        {!hideLabels && <span>状态</span>}
         <Select
           value={value.status}
           disabled={loading}
@@ -576,7 +592,7 @@ function DirectoryFilters({
         </Select>
       </label>
       <label className="usage-filter">
-        <span>角色</span>
+        {!hideLabels && <span>角色</span>}
         <Select
           value={value.role}
           disabled={loading}
@@ -596,7 +612,7 @@ function DirectoryFilters({
         </Select>
       </label>
       <label className="usage-filter">
-        <span>部门</span>
+        {!hideLabels && <span>部门</span>}
         <Select
           value={value.departmentId}
           disabled={loading}
@@ -618,7 +634,7 @@ function DirectoryFilters({
         </Select>
       </label>
       <label className="usage-filter">
-        <span>排序</span>
+        {!hideLabels && <span>排序</span>}
         <Select
           value={value.sortBy}
           disabled={loading}
@@ -641,7 +657,7 @@ function DirectoryFilters({
         </Select>
       </label>
       <label className="usage-filter">
-        <span>顺序</span>
+        {!hideLabels && <span>顺序</span>}
         <Select
           value={value.sortOrder}
           disabled={loading}
@@ -680,10 +696,11 @@ function DirectoryFilters({
         </Button>
       </div>
       <label className="usage-filter usage-search-filter">
-        <span>搜索</span>
+        {!hideLabels && <span>搜索</span>}
         <div className="usage-search">
-          <SearchIcon size={14} />
+          <SearchIcon aria-hidden="true" />
           <Input
+            aria-label="搜索用户、Open ID 或部门"
             value={value.search}
             placeholder="搜索用户、Open ID 或部门"
             onChange={(event) => onChange({ ...value, search: event.target.value })}
@@ -793,7 +810,7 @@ export function AdminClient() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [defaultQuotaDraft, setDefaultQuotaDraft] = useState("200");
   const [packageResetDraft, setPackageResetDraft] = useState({
-    enabled: false,
+    enabled: true,
     dayOfMonth: "1",
   });
   const [newapiControlDraft, setNewapiControlDraft] = useState({
@@ -823,7 +840,7 @@ export function AdminClient() {
       if (body.settings) {
         setDefaultQuotaDraft(String(body.settings.defaultMonthlyQuota));
         setPackageResetDraft({
-          enabled: body.settings.packageReset?.enabled ?? false,
+          enabled: body.settings.packageReset?.enabled ?? true,
           dayOfMonth: String(body.settings.packageReset?.dayOfMonth ?? 1),
         });
         if (body.settings.newapiControl) {
@@ -971,67 +988,71 @@ export function AdminClient() {
     return latestByDepartment;
   }, [adminUserFilters, adminUsersPage, adminUsersPageSize]);
 
+  const applyDepartmentQuotaData = useCallback((body: PackageManagementResponse) => {
+    setDepartmentQuotaData(body);
+    setDepartmentPolicyDrafts((current) => ({
+      ...Object.fromEntries(
+        body.packages.map((department) => [
+          department.departmentId,
+          current[department.departmentId] ?? {
+            quotaLimit: String(department.totalQuotaLimit),
+            currentPackageQuota: String(department.currentPackageQuota),
+            nextPackageQuota: String(department.nextPackageQuota),
+          },
+        ]),
+      ),
+      ...current,
+    }));
+    setPackageLimitRequestDrafts((current) => ({
+      ...Object.fromEntries(
+        body.packages.map((department) => [
+          department.departmentId,
+          current[department.departmentId] ?? {
+            requestedQuotaLimit: String(
+              Math.max(
+                department.totalQuotaLimit + 1,
+                Math.ceil(
+                  department.allocatedQuota + department.pendingReservedQuota,
+                ),
+              ),
+            ),
+            reason: "",
+          },
+        ]),
+      ),
+      ...current,
+    }));
+    setPackageLimitDecisionDrafts((current) => ({
+      ...Object.fromEntries(
+        body.requests.map((quotaRequest) => [
+          quotaRequest.id,
+          current[quotaRequest.id] ??
+            String(
+              quotaRequest.approvedQuotaLimit ??
+                quotaRequest.requestedQuotaLimit ??
+                quotaRequest.currentQuotaLimit,
+            ),
+        ]),
+      ),
+      ...current,
+    }));
+  }, []);
+
   const loadDepartmentQuota = useCallback(async () => {
     setPanelLoading(true);
     setError(null);
     try {
       const res = await fetch("/api/admin/packages", { cache: "no-store" });
       const body = await readJsonResponse<PackageManagementResponse>(res);
-      if (!res.ok) throw new Error(body.error ?? "读取套餐管理失败");
-      setDepartmentQuotaData(body);
-      setDepartmentPolicyDrafts((current) => ({
-        ...Object.fromEntries(
-          body.packages.map((department) => [
-            department.departmentId,
-            current[department.departmentId] ?? {
-              quotaLimit: String(department.totalQuotaLimit),
-              currentPackageQuota: String(department.currentPackageQuota),
-              nextPackageQuota: String(department.nextPackageQuota),
-            },
-          ]),
-        ),
-        ...current,
-      }));
-      setPackageLimitRequestDrafts((current) => ({
-        ...Object.fromEntries(
-          body.packages.map((department) => [
-            department.departmentId,
-            current[department.departmentId] ?? {
-              requestedQuotaLimit: String(
-                Math.max(
-                  department.totalQuotaLimit + 1,
-                  Math.ceil(
-                    department.allocatedQuota + department.pendingReservedQuota,
-                  ),
-                ),
-              ),
-              reason: "",
-            },
-          ]),
-        ),
-        ...current,
-      }));
-      setPackageLimitDecisionDrafts((current) => ({
-        ...Object.fromEntries(
-          body.requests.map((quotaRequest) => [
-            quotaRequest.id,
-            current[quotaRequest.id] ??
-              String(
-                quotaRequest.approvedQuotaLimit ??
-                  quotaRequest.requestedQuotaLimit ??
-                  quotaRequest.currentQuotaLimit,
-              ),
-          ]),
-        ),
-        ...current,
-      }));
+      if (!res.ok) throw new Error(body.error ?? "读取部门额度失败");
+      applyDepartmentQuotaData(body);
       await loadDepartmentMemberSyncOperations();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "读取套餐管理失败");
+      setError(err instanceof Error ? err.message : "读取部门额度失败");
     } finally {
       setPanelLoading(false);
     }
-  }, [loadDepartmentMemberSyncOperations]);
+  }, [applyDepartmentQuotaData, loadDepartmentMemberSyncOperations]);
 
   const loadUsageRecords = useCallback(async (options: { quiet?: boolean } = {}) => {
     if (!options.quiet) setPanelLoading(true);
@@ -1086,11 +1107,21 @@ export function AdminClient() {
       const params = new URLSearchParams();
       params.set("limit", String(approvalPageSize));
       params.set("offset", String((approvalPage - 1) * approvalPageSize));
-      const res = await fetch(`/api/admin/token-requests?${params.toString()}`, { cache: "no-store" });
-      const body = await readJsonResponse<AdminTokenRequestsResponse>(res);
+      const [res, packageRes] = await Promise.all([
+        fetch(`/api/admin/token-requests?${params.toString()}`, { cache: "no-store" }),
+        fetch("/api/admin/packages", { cache: "no-store" }),
+      ]);
+      const [body, packageBody] = await Promise.all([
+        readJsonResponse<AdminTokenRequestsResponse>(res),
+        readJsonResponse<PackageManagementResponse>(packageRes),
+      ]);
       if (!res.ok) throw new Error(body.error ?? "读取审批申请失败");
+      if (!packageRes.ok) {
+        throw new Error(packageBody.error ?? "读取总额度上限提升申请失败");
+      }
       setApprovalRequests(body.requests);
       setApprovalTotalRequests(body.total ?? body.requests.length);
+      applyDepartmentQuotaData(packageBody);
       setQuotaDrafts((current) => ({
         ...Object.fromEntries(
           body.requests.map((request) => [
@@ -1105,7 +1136,7 @@ export function AdminClient() {
     } finally {
       if (!options.quiet) setPanelLoading(false);
     }
-  }, [approvalPage, approvalPageSize]);
+  }, [applyDepartmentQuotaData, approvalPage, approvalPageSize]);
 
   useEffect(() => {
     if (panel !== "packages") return;
@@ -1535,7 +1566,7 @@ export function AdminClient() {
           reason: "",
         },
       }));
-      await loadDepartmentQuota();
+      await loadApprovalRequests();
     } catch (err) {
       setError(err instanceof Error ? err.message : "提交总额度上限提升申请失败");
     } finally {
@@ -1574,7 +1605,7 @@ export function AdminClient() {
       const body = await readJsonResponse<Record<string, never>>(res);
       if (!res.ok) throw new Error(body.error ?? "处理总额度上限提升申请失败");
       setMessage(action === "approve" ? "总额度上限提升申请已通过。" : "总额度上限提升申请已拒绝。");
-      await loadDepartmentQuota();
+      await loadApprovalRequests();
     } catch (err) {
       setError(err instanceof Error ? err.message : "处理总额度上限提升申请失败");
     } finally {
@@ -1862,6 +1893,14 @@ export function AdminClient() {
                 用户管理
               </button>
               <button
+                className={panel === "approvals" ? "nav-item active nav-button" : "nav-item nav-button"}
+                type="button"
+                onClick={() => selectPanel("approvals")}
+              >
+                <CheckCircle2Icon data-icon="inline-start" />
+                审批处理
+              </button>
+              <button
                 className={
                   panel === "packages" ? "nav-item active nav-button" : "nav-item nav-button"
                 }
@@ -1869,7 +1908,7 @@ export function AdminClient() {
                 onClick={() => selectPanel("packages")}
               >
                 <Building2Icon data-icon="inline-start" />
-                套餐管理
+                部门额度管理
               </button>
               {isSystemAdmin && (
                 <button
@@ -1898,14 +1937,6 @@ export function AdminClient() {
               >
                 <ClipboardListIcon data-icon="inline-start" />
                 使用记录
-              </button>
-              <button
-                className={panel === "approvals" ? "nav-item active nav-button" : "nav-item nav-button"}
-                type="button"
-                onClick={() => selectPanel("approvals")}
-              >
-                <CheckCircle2Icon data-icon="inline-start" />
-                审批处理
               </button>
               {isSystemAdmin && (
                 <button
@@ -2372,15 +2403,10 @@ export function AdminClient() {
           )}
 
           {panel === "packages" && (
-            <section className="grid">
-              <Card>
+            <section className="stack department-quota-management">
+              <Card className="compact-admin-card">
                 <CardHeader>
-                  <CardTitle>套餐管理</CardTitle>
-                  <CardDescription>
-                    {isSystemAdmin
-                      ? "管理部门总额度上限、本周期即时套餐和下一周期套餐。"
-                      : "调高本周期套餐会立即占用本周期预算；下一周期套餐在下个周期生效。"}
-                  </CardDescription>
+                  <CardTitle>部门额度管理</CardTitle>
                 </CardHeader>
                 <CardContent>
                   <div className="toolbar toolbar-left">
@@ -2391,17 +2417,15 @@ export function AdminClient() {
                       onClick={() => void loadDepartmentQuota()}
                     >
                       <RefreshCwIcon data-icon="inline-start" />
-                      刷新套餐
+                      刷新额度
                     </Button>
-                    <Badge>本周期 {departmentQuotaData?.currentPeriod ?? currentBillingPeriod()}</Badge>
-                    <Badge>下一周期 {departmentQuotaData?.nextPeriod ?? "-"}</Badge>
                     <Badge>{departmentQuotaData?.packages.length ?? 0} 个部门</Badge>
                   </div>
                   {!departmentQuotaData?.packages.length ? (
-                    <div className="empty">{panelLoading ? "读取套餐中" : "暂无可管理的部门套餐"}</div>
+                    <div className="empty">{panelLoading ? "读取部门额度中" : "暂无可管理的部门"}</div>
                   ) : (
                     <div className="table-wrap">
-                      <table className="table department-quota-table">
+                      <table className="table department-quota-summary-table">
                         <colgroup>
                           <col className="department-quota-col-name" />
                           <col className="department-quota-col-members" />
@@ -2409,21 +2433,15 @@ export function AdminClient() {
                           <col className="department-quota-col-number" />
                           <col className="department-quota-col-number" />
                           <col className="department-quota-col-number" />
-                          <col className="department-quota-col-control" />
-                          <col className="department-quota-col-control" />
-                          <col className="department-quota-col-action" />
                         </colgroup>
                         <thead>
                           <tr>
                             <th>部门</th>
-                            <th>成员 / 已发 Key</th>
-                            <th>总额度上限</th>
-                            <th>已分配</th>
-                            <th>预留</th>
+                            <th>成员 / 已发</th>
+                            <th>当前总上限</th>
+                            <th>已发放</th>
                             <th>可用</th>
-                            <th>本周期套餐额度</th>
-                            <th>下一周期套餐额度</th>
-                            <th>操作</th>
+                            <th>预留</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -2433,6 +2451,8 @@ export function AdminClient() {
                               currentPackageQuota: String(department.currentPackageQuota),
                               nextPackageQuota: String(department.nextPackageQuota),
                             };
+                            const departmentLabel =
+                              department.departmentName?.trim() || "未命名部门";
                             const syncOperation =
                               departmentMemberSyncOperations[department.departmentId];
                             const syncActive = Boolean(
@@ -2441,25 +2461,49 @@ export function AdminClient() {
                             );
                             return (
                               <tr key={department.departmentId}>
-                                <td>
-                                  <div className="meta-stack">
-                                    <strong>
-                                      {formatDepartmentName(
-                                        department.departmentName,
-                                        department.departmentId,
+                                <td data-label="部门">
+                                  <strong>{departmentLabel}</strong>
+                                </td>
+                                <td data-label="成员 / 已发">
+                                  <div className="department-member-cell">
+                                    <strong>{department.memberCount} / {department.keyedUsers}</strong>
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      disabled={busy || syncActive}
+                                      onClick={() => void syncDepartmentMembers(department.departmentId)}
+                                    >
+                                      {syncActive ? (
+                                        <LoaderCircleIcon className="spin-icon" data-icon="inline-start" />
+                                      ) : (
+                                        <RefreshCwIcon data-icon="inline-start" />
                                       )}
-                                    </strong>
-                                    <span>{department.departmentId}</span>
+                                      {syncOperation?.status === "pending"
+                                        ? "任务已提交"
+                                        : syncOperation?.status === "running"
+                                          ? "同步中…"
+                                          : "同步成员"}
+                                    </Button>
                                   </div>
+                                  {syncOperation && (
+                                    <span className="department-member-status" title={syncOperation.errorMessage}>
+                                      {syncOperation.status === "applied"
+                                        ? `已完成：同步 ${syncOperation.summary.synced ?? 0}，跳过 ${syncOperation.summary.skipped ?? 0}`
+                                        : syncOperation.status === "partial_failed"
+                                          ? "部分完成，需查看错误"
+                                          : syncOperation.status === "failed"
+                                            ? "同步失败"
+                                            : syncOperation.status === "running"
+                                              ? `后台执行中${syncOperation.summary.pages ? `（${syncOperation.summary.pages} 页）` : ""}`
+                                              : "等待后台执行"}
+                                    </span>
+                                  )}
                                 </td>
-                                <td>
-                                  {department.memberCount} / {department.keyedUsers}
-                                </td>
-                                <td>
+                                <td data-label="当前总上限">
                                   {isSystemAdmin ? (
                                     <div className="quota-control quota-control-icon-action">
                                       <Input
-                                        aria-label={`${department.departmentName ?? department.departmentId} 总额度上限`}
+                                        aria-label={departmentLabel + " 当前总额度上限"}
                                         min={0}
                                         max={1_000_000}
                                         step={1}
@@ -2493,13 +2537,59 @@ export function AdminClient() {
                                     formatQuotaAmount(department.totalQuotaLimit, "0")
                                   )}
                                 </td>
-                                <td>{formatQuotaAmount(department.allocatedQuota, "0")}</td>
-                                <td>{formatQuotaAmount(department.pendingReservedQuota, "0")}</td>
-                                <td>{formatQuotaAmount(department.availableQuota, "0")}</td>
-                                <td>
+                                <td data-label="已发放">{formatQuotaAmount(department.allocatedQuota, "0")}</td>
+                                <td data-label="可用">{formatQuotaAmount(department.availableQuota, "0")}</td>
+                                <td data-label="预留">{formatQuotaAmount(department.pendingReservedQuota, "0")}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                </CardContent>
+              </Card>
+
+              <Card className="compact-admin-card">
+                <CardHeader>
+                  <CardTitle>部门套餐额度</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="toolbar toolbar-left department-package-periods">
+                    <Badge>本周期 {departmentQuotaData?.currentPeriod ?? currentBillingPeriod()}</Badge>
+                    <Badge>下一周期 {departmentQuotaData?.nextPeriod ?? "-"}</Badge>
+                  </div>
+                  {!departmentQuotaData?.packages.length ? (
+                    <div className="empty">{panelLoading ? "读取套餐额度中" : "暂无可管理的部门套餐"}</div>
+                  ) : (
+                    <div className="table-wrap">
+                      <table className="table department-package-table">
+                        <thead>
+                          <tr>
+                            <th>部门</th>
+                            <th>本周期套餐额度</th>
+                            <th>下一周期套餐额度</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {departmentQuotaData.packages.map((department) => {
+                            const draft = departmentPolicyDrafts[department.departmentId] ?? {
+                              quotaLimit: String(department.totalQuotaLimit),
+                              currentPackageQuota: String(department.currentPackageQuota),
+                              nextPackageQuota: String(department.nextPackageQuota),
+                            };
+                            const departmentLabel =
+                              department.departmentName?.trim() || "未命名部门";
+                            return (
+                              <tr key={department.departmentId}>
+                                <td data-label="部门">
+                                  <strong>{departmentLabel}</strong>
+                                </td>
+                                <td data-label="本周期套餐额度">
                                   <div className="quota-control quota-control-icon-action">
                                     <Input
-                                      aria-label={`${department.departmentName ?? department.departmentId} 套餐额度`}
+                                      aria-label={departmentLabel + " 本周期套餐额度"}
                                       min={department.currentPackageQuota + 1}
                                       max={1_000_000}
                                       step={1}
@@ -2510,8 +2600,8 @@ export function AdminClient() {
                                         setDepartmentPolicyDrafts((current) => ({
                                           ...current,
                                           [department.departmentId]: {
-                                              ...draft,
-                                              currentPackageQuota: event.target.value,
+                                            ...draft,
+                                            currentPackageQuota: event.target.value,
                                           },
                                         }))
                                       }
@@ -2533,10 +2623,10 @@ export function AdminClient() {
                                     </Button>
                                   </div>
                                 </td>
-                                <td>
+                                <td data-label="下一周期套餐额度">
                                   <div className="quota-control quota-control-icon-action">
                                     <Input
-                                      aria-label={`${department.departmentName ?? department.departmentId} 下一周期套餐额度`}
+                                      aria-label={departmentLabel + " 下一周期套餐额度"}
                                       min={1}
                                       max={1_000_000}
                                       step={1}
@@ -2570,40 +2660,6 @@ export function AdminClient() {
                                     </Button>
                                   </div>
                                 </td>
-                                <td>
-                                  <div className="meta-stack">
-                                    <Button
-                                      variant="outline"
-                                      size="sm"
-                                      disabled={busy || syncActive}
-                                      onClick={() => void syncDepartmentMembers(department.departmentId)}
-                                    >
-                                      {syncActive ? (
-                                        <LoaderCircleIcon className="spin-icon" data-icon="inline-start" />
-                                      ) : (
-                                        <RefreshCwIcon data-icon="inline-start" />
-                                      )}
-                                      {syncOperation?.status === "pending"
-                                        ? "任务已提交"
-                                        : syncOperation?.status === "running"
-                                          ? "同步中…"
-                                          : "同步成员"}
-                                    </Button>
-                                    {syncOperation && (
-                                      <span title={syncOperation.errorMessage}>
-                                        {syncOperation.status === "applied"
-                                          ? `已完成：同步 ${syncOperation.summary.synced ?? 0}，跳过 ${syncOperation.summary.skipped ?? 0}`
-                                          : syncOperation.status === "partial_failed"
-                                            ? "部分完成，需查看错误"
-                                            : syncOperation.status === "failed"
-                                              ? "同步失败"
-                                              : syncOperation.status === "running"
-                                                ? `后台执行中${syncOperation.summary.pages ? `（${syncOperation.summary.pages} 页）` : ""}`
-                                                : "等待后台执行"}
-                                      </span>
-                                    )}
-                                  </div>
-                                </td>
                               </tr>
                             );
                           })}
@@ -2611,176 +2667,8 @@ export function AdminClient() {
                       </table>
                     </div>
                   )}
-
-                  {!isSystemAdmin &&
-                    departmentQuotaData?.packages.map((department) => {
-                      const draft = packageLimitRequestDrafts[department.departmentId] ?? {
-                        requestedQuotaLimit: String(department.totalQuotaLimit + 1),
-                        reason: "",
-                      };
-                      return (
-                        <section className="package-limit-request-panel" key={`request-${department.departmentId}`}>
-                          <div>
-                            <h3>申请提升总额度上限</h3>
-                            <p>
-                              当前上限 {formatQuotaAmount(department.totalQuotaLimit, "0")}，申请会发送给 root 和系统管理员。
-                            </p>
-                          </div>
-                          <div className="package-limit-request-controls">
-                            <label className="field">
-                              <span>目标总额度上限</span>
-                              <Input
-                                type="number"
-                                min={department.totalQuotaLimit + 1}
-                                max={1_000_000}
-                                step={1}
-                                value={draft.requestedQuotaLimit}
-                                disabled={busy}
-                                onChange={(event) =>
-                                  setPackageLimitRequestDrafts((current) => ({
-                                    ...current,
-                                    [department.departmentId]: {
-                                      ...draft,
-                                      requestedQuotaLimit: event.target.value,
-                                    },
-                                  }))
-                                }
-                              />
-                            </label>
-                            <label className="field package-limit-reason-field">
-                              <span>申请理由</span>
-                              <Input
-                                value={draft.reason}
-                                maxLength={500}
-                                placeholder="说明预算不足的原因"
-                                disabled={busy}
-                                onChange={(event) =>
-                                  setPackageLimitRequestDrafts((current) => ({
-                                    ...current,
-                                    [department.departmentId]: {
-                                      ...draft,
-                                      reason: event.target.value,
-                                    },
-                                  }))
-                                }
-                              />
-                            </label>
-                            <Button
-                              disabled={busy}
-                              onClick={() => void requestPackageLimitIncrease(department.departmentId)}
-                            >
-                              发送申请
-                            </Button>
-                          </div>
-                        </section>
-                      );
-                    })}
-
-                  {!!departmentQuotaData?.requests.length && (
-                    <section className="package-limit-requests">
-                      <div className="section-heading-row">
-                        <div>
-                          <h3>总额度上限提升申请</h3>
-                          <p>{isSystemAdmin ? "处理各部门提交的提升申请。" : "查看本部门申请进度。"}</p>
-                        </div>
-                        <Badge>{departmentQuotaData.requests.length} 条</Badge>
-                      </div>
-                      <div className="table-wrap">
-                        <table className="table package-limit-request-table">
-                          <thead>
-                            <tr>
-                              <th>部门 / 申请人</th>
-                              <th>状态</th>
-                              <th>当前上限</th>
-                              <th>申请上限</th>
-                              <th>批准上限</th>
-                              <th>理由</th>
-                              <th>处理人</th>
-                              <th>更新时间</th>
-                              {isSystemAdmin && <th>操作</th>}
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {departmentQuotaData.requests.map((quotaRequest) => {
-                              const pending = [
-                                "pending_card_send",
-                                "pending_card_approval",
-                                "approval_card_send_failed",
-                              ].includes(quotaRequest.status);
-                              return (
-                                <tr key={quotaRequest.id}>
-                                  <td>
-                                    <div className="meta-stack">
-                                      <strong>{formatDepartmentName(quotaRequest.departmentName, quotaRequest.departmentId)}</strong>
-                                      <span>{quotaRequest.requesterName ?? maskSecret(quotaRequest.requesterOpenId)}</span>
-                                    </div>
-                                  </td>
-                                  <td>
-                                    <Badge variant={badgeVariant(quotaRequest.status)}>
-                                      {statusLabel[quotaRequest.status] ?? quotaRequest.status}
-                                    </Badge>
-                                  </td>
-                                  <td>{formatQuotaAmount(quotaRequest.currentQuotaLimit, "0")}</td>
-                                  <td>{formatQuotaAmount(quotaRequest.requestedQuotaLimit, "-")}</td>
-                                  <td>
-                                    {isSystemAdmin && pending ? (
-                                      <Input
-                                        aria-label={`批准总额度上限-${quotaRequest.id}`}
-                                        type="number"
-                                        min={quotaRequest.currentQuotaLimit + 1}
-                                        max={1_000_000}
-                                        step={1}
-                                        value={packageLimitDecisionDrafts[quotaRequest.id] ?? ""}
-                                        disabled={busy}
-                                        onChange={(event) =>
-                                          setPackageLimitDecisionDrafts((current) => ({
-                                            ...current,
-                                            [quotaRequest.id]: event.target.value,
-                                          }))
-                                        }
-                                      />
-                                    ) : (
-                                      formatQuotaAmount(quotaRequest.approvedQuotaLimit, "-")
-                                    )}
-                                  </td>
-                                  <td title={quotaRequest.reason}>{quotaRequest.reason}</td>
-                                  <td>
-                                    {approvalOperatorLabel(quotaRequest)}
-                                  </td>
-                                  <td>{formatDateTime(quotaRequest.updatedAt)}</td>
-                                  {isSystemAdmin && (
-                                    <td>
-                                      <div className="toolbar toolbar-left">
-                                        <Button
-                                          variant="outline"
-                                          size="sm"
-                                          disabled={busy || !pending}
-                                          onClick={() => void decidePackageLimitRequest(quotaRequest.id, "approve")}
-                                        >
-                                          通过
-                                        </Button>
-                                        <Button
-                                          variant="outline"
-                                          size="sm"
-                                          disabled={busy || !pending}
-                                          onClick={() => void decidePackageLimitRequest(quotaRequest.id, "reject")}
-                                        >
-                                          拒绝
-                                        </Button>
-                                      </div>
-                                    </td>
-                                  )}
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </div>
-                    </section>
-                  )}
                 </CardContent>
               </Card>
-
             </section>
           )}
 
@@ -2836,7 +2724,7 @@ export function AdminClient() {
           )}
 
           {panel === "userStats" && (
-            <Card>
+            <Card className="compact-admin-card user-stats-card">
               <CardHeader>
                 <CardTitle>用户统计</CardTitle>
               </CardHeader>
@@ -2846,6 +2734,7 @@ export function AdminClient() {
                   departments={userStatsDepartments}
                   loading={panelLoading}
                   defaultSortBy="quotaConsumed"
+                  hideLabels
                   leading={
                     <div className="directory-filter-leading">
                       <Button
@@ -3012,120 +2901,338 @@ export function AdminClient() {
           )}
 
           {panel === "approvals" && (
-            <Card>
-              <CardHeader>
-                <CardTitle>审批处理</CardTitle>
-              </CardHeader>
-              <CardContent>
-                {!approvalRequests.length ? (
-                  <div className="empty">暂无可查看申请</div>
-                ) : (
-                  <>
-                    <div className="table-wrap">
-                      <table className="table">
-                        <thead>
-                          <tr>
-                            <th>申请人</th>
-                            <th>类型</th>
-                            <th>状态</th>
-                            <th>处理人</th>
-                            <th>额度</th>
-                            <th>最终额度</th>
-                            <th>审批消息</th>
-                            <th>错误</th>
-                            <th>更新时间</th>
-                            <th>操作</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {approvalRequests.map((request) => (
-                            <tr key={request.id}>
-                              <td>{request.requesterName ?? maskSecret(request.requesterOpenId)}</td>
-                              <td>{requestTypeLabel[request.requestType] ?? request.requestType}</td>
-                              <td>
-                                <Badge variant={badgeVariant(request.status)}>
-                                  {statusLabel[request.status] ?? request.status}
-                                </Badge>
-                              </td>
-                              <td>
-                                {approvalOperatorLabel(request)}
-                              </td>
-                              <td>{formatQuotaAmount(request.requestedMonthlyQuota)}</td>
-                              <td>
-                                <div className="quota-control quota-control-icon-action">
-                                  <Input
-                                    aria-label="最终额度"
-                                    min={1}
-                                    step={1}
-                                    type="number"
-                                    value={quotaDrafts[request.id] ?? String(request.requestedMonthlyQuota)}
-                                    onChange={(event) =>
-                                      setQuotaDrafts((current) => ({
-                                        ...current,
-                                        [request.id]: event.target.value,
-                                      }))
-                                    }
-                                    disabled={!canEditQuota(request) || busy}
-                                  />
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    aria-label="保存最终额度"
-                                    title="保存最终额度"
-                                    disabled={!canEditQuota(request) || busy}
-                                    onClick={() => void saveRequestQuota(request.id)}
-                                  >
-                                    <SaveIcon data-icon="inline-start" />
-                                  </Button>
-                                </div>
-                              </td>
-                              <td>{maskSecret(request.approvalCardMessageId ?? request.approvalInstanceCode)}</td>
-                              <td>{request.errorMessage ? maskSecret(request.errorMessage) : "-"}</td>
-                              <td>{formatDateTime(request.updatedAt)}</td>
-                              <td>
-                                <div className="toolbar toolbar-left">
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    disabled={!canDecideRequest(request) || busy}
-                                    onClick={() => void decideRequest(request.id, "approve")}
-                                  >
-                                    通过
-                                  </Button>
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    disabled={!canDecideRequest(request) || busy}
-                                    onClick={() => void decideRequest(request.id, "reject")}
-                                  >
-                                    拒绝
-                                  </Button>
-                                </div>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
+            <section className="stack approval-management">
+              {!isSystemAdmin && !!departmentQuotaData?.packages.length && (
+                <Card className="compact-admin-card approval-limit-request-card">
+                  <CardHeader>
+                    <CardTitle>申请提升总额度上限</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    {departmentQuotaData.packages.map((department) => {
+                      const draft = packageLimitRequestDrafts[department.departmentId] ?? {
+                        requestedQuotaLimit: String(department.totalQuotaLimit + 1),
+                        reason: "",
+                      };
+                      const departmentLabel =
+                        department.departmentName?.trim() || "未命名部门";
+                      return (
+                        <section
+                          className="package-limit-request-panel approval-limit-request-panel"
+                          key={"request-" + department.departmentId}
+                        >
+                          <div className="meta-stack">
+                            <strong>{departmentLabel}</strong>
+                            <span>
+                              当前上限 {formatQuotaAmount(department.totalQuotaLimit, "0")}
+                            </span>
+                          </div>
+                          <div className="package-limit-request-controls">
+                            <label className="field">
+                              <span>目标总额度上限</span>
+                              <Input
+                                aria-label={departmentLabel + " 目标总额度上限"}
+                                type="number"
+                                min={department.totalQuotaLimit + 1}
+                                max={1_000_000}
+                                step={1}
+                                value={draft.requestedQuotaLimit}
+                                disabled={busy}
+                                onChange={(event) =>
+                                  setPackageLimitRequestDrafts((current) => ({
+                                    ...current,
+                                    [department.departmentId]: {
+                                      ...draft,
+                                      requestedQuotaLimit: event.target.value,
+                                    },
+                                  }))
+                                }
+                              />
+                            </label>
+                            <label className="field package-limit-reason-field">
+                              <span>申请理由</span>
+                              <Input
+                                aria-label={departmentLabel + " 总额度申请理由"}
+                                value={draft.reason}
+                                maxLength={500}
+                                placeholder="说明预算不足的原因"
+                                disabled={busy}
+                                onChange={(event) =>
+                                  setPackageLimitRequestDrafts((current) => ({
+                                    ...current,
+                                    [department.departmentId]: {
+                                      ...draft,
+                                      reason: event.target.value,
+                                    },
+                                  }))
+                                }
+                              />
+                            </label>
+                            <Button
+                              disabled={busy}
+                              onClick={() =>
+                                void requestPackageLimitIncrease(department.departmentId)
+                              }
+                            >
+                              发送申请
+                            </Button>
+                          </div>
+                        </section>
+                      );
+                    })}
+                  </CardContent>
+                </Card>
+              )}
+
+              <Card className="approval-list-card">
+                <CardHeader>
+                  <div className="section-heading-row approval-heading-row">
+                    <CardTitle>审批处理</CardTitle>
+                    <Badge>
+                      {approvalTotalRequests + (departmentQuotaData?.requests.length ?? 0)} 条
+                    </Badge>
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  {!approvalRequests.length && !departmentQuotaData?.requests.length ? (
+                    <div className="empty">
+                      {panelLoading ? "读取审批申请中" : "暂无可查看申请"}
                     </div>
-                    <PageSelector
-                      className="approval-pagination"
-                      currentPage={currentApprovalPage}
-                      pageCount={approvalPageCount}
-                      pageSize={approvalPageSize}
-                      pageSizeOptions={[10, 20, 50]}
-                      totalRecords={approvalTotalRequests}
-                      loading={busy}
-                      onPageChange={setApprovalPage}
-                      onPageSizeChange={(pageSize) => {
-                        setApprovalPageSize(pageSize);
-                        setApprovalPage(1);
-                      }}
-                    />
-                  </>
-                )}
-              </CardContent>
-            </Card>
+                  ) : (
+                    <>
+                      {!!approvalRequests.length && (
+                        <section className="approval-group">
+                          <div className="section-heading-row">
+                            <h3>用户额度申请</h3>
+                            <Badge>{approvalTotalRequests} 条</Badge>
+                          </div>
+                          <div className="table-wrap">
+                            <table className="table approval-request-table">
+                              <thead>
+                                <tr>
+                                  <th>申请人</th>
+                                  <th>类型</th>
+                                  <th>状态</th>
+                                  <th>处理人</th>
+                                  <th>额度</th>
+                                  <th>最终额度</th>
+                                  <th>审批消息</th>
+                                  <th>错误</th>
+                                  <th>更新时间</th>
+                                  <th>操作</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {approvalRequests.map((request) => (
+                                  <tr key={request.id}>
+                                    <td>{request.requesterName ?? maskSecret(request.requesterOpenId)}</td>
+                                    <td>{requestTypeLabel[request.requestType] ?? request.requestType}</td>
+                                    <td>
+                                      <Badge variant={badgeVariant(request.status)}>
+                                        {statusLabel[request.status] ?? request.status}
+                                      </Badge>
+                                    </td>
+                                    <td>{approvalOperatorLabel(request)}</td>
+                                    <td>{formatQuotaAmount(request.requestedMonthlyQuota)}</td>
+                                    <td>
+                                      <div className="quota-control quota-control-icon-action">
+                                        <Input
+                                          aria-label="最终额度"
+                                          min={1}
+                                          step={1}
+                                          type="number"
+                                          value={quotaDrafts[request.id] ?? String(request.requestedMonthlyQuota)}
+                                          onChange={(event) =>
+                                            setQuotaDrafts((current) => ({
+                                              ...current,
+                                              [request.id]: event.target.value,
+                                            }))
+                                          }
+                                          disabled={!canEditQuota(request) || busy}
+                                        />
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          aria-label="保存最终额度"
+                                          title="保存最终额度"
+                                          disabled={!canEditQuota(request) || busy}
+                                          onClick={() => void saveRequestQuota(request.id)}
+                                        >
+                                          <SaveIcon data-icon="inline-start" />
+                                        </Button>
+                                      </div>
+                                    </td>
+                                    <td>{maskSecret(request.approvalCardMessageId ?? request.approvalInstanceCode)}</td>
+                                    <td>{request.errorMessage ? maskSecret(request.errorMessage) : "-"}</td>
+                                    <td>{formatDateTime(request.updatedAt)}</td>
+                                    <td>
+                                      <div className="toolbar toolbar-left">
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          disabled={!canDecideRequest(request) || busy}
+                                          onClick={() => void decideRequest(request.id, "approve")}
+                                        >
+                                          通过
+                                        </Button>
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          disabled={!canDecideRequest(request) || busy}
+                                          onClick={() => void decideRequest(request.id, "reject")}
+                                        >
+                                          拒绝
+                                        </Button>
+                                      </div>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                          <PageSelector
+                            className="approval-pagination"
+                            currentPage={currentApprovalPage}
+                            pageCount={approvalPageCount}
+                            pageSize={approvalPageSize}
+                            pageSizeOptions={[10, 20, 50]}
+                            totalRecords={approvalTotalRequests}
+                            loading={busy}
+                            onPageChange={setApprovalPage}
+                            onPageSizeChange={(pageSize) => {
+                              setApprovalPageSize(pageSize);
+                              setApprovalPage(1);
+                            }}
+                          />
+                        </section>
+                      )}
+
+                      {!!departmentQuotaData?.requests.length && (
+                        <section className="approval-group">
+                          <div className="section-heading-row">
+                            <h3>总额度上限提升申请</h3>
+                            <Badge>{departmentQuotaData.requests.length} 条</Badge>
+                          </div>
+                          <div className="table-wrap">
+                            <table className="table package-limit-request-table">
+                              <thead>
+                                <tr>
+                                  <th>申请人 / 部门</th>
+                                  <th>类型</th>
+                                  <th>状态</th>
+                                  <th>处理人</th>
+                                  <th>当前上限</th>
+                                  <th>申请上限</th>
+                                  <th>最终上限</th>
+                                  <th>申请理由</th>
+                                  <th>错误</th>
+                                  <th>更新时间</th>
+                                  {isSystemAdmin && <th>操作</th>}
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {departmentQuotaData.requests.map((quotaRequest) => {
+                                  const pending = [
+                                    "pending_card_send",
+                                    "pending_card_approval",
+                                    "approval_card_send_failed",
+                                  ].includes(quotaRequest.status);
+                                  const departmentLabel =
+                                    quotaRequest.departmentName?.trim() || "未命名部门";
+                                  return (
+                                    <tr key={quotaRequest.id}>
+                                      <td>
+                                        <div className="meta-stack">
+                                          <strong>
+                                            {quotaRequest.requesterName ??
+                                              maskSecret(quotaRequest.requesterOpenId)}
+                                          </strong>
+                                          <span>{departmentLabel}</span>
+                                        </div>
+                                      </td>
+                                      <td>总额度上限</td>
+                                      <td>
+                                        <Badge variant={badgeVariant(quotaRequest.status)}>
+                                          {statusLabel[quotaRequest.status] ?? quotaRequest.status}
+                                        </Badge>
+                                      </td>
+                                      <td>{approvalOperatorLabel(quotaRequest)}</td>
+                                      <td>{formatQuotaAmount(quotaRequest.currentQuotaLimit, "0")}</td>
+                                      <td>{formatQuotaAmount(quotaRequest.requestedQuotaLimit, "-")}</td>
+                                      <td>
+                                        {isSystemAdmin && pending ? (
+                                          <Input
+                                            aria-label={"批准总额度上限-" + quotaRequest.id}
+                                            type="number"
+                                            min={quotaRequest.currentQuotaLimit + 1}
+                                            max={1_000_000}
+                                            step={1}
+                                            value={packageLimitDecisionDrafts[quotaRequest.id] ?? ""}
+                                            disabled={busy}
+                                            onChange={(event) =>
+                                              setPackageLimitDecisionDrafts((current) => ({
+                                                ...current,
+                                                [quotaRequest.id]: event.target.value,
+                                              }))
+                                            }
+                                          />
+                                        ) : (
+                                          formatQuotaAmount(quotaRequest.approvedQuotaLimit, "-")
+                                        )}
+                                      </td>
+                                      <td title={quotaRequest.reason}>{quotaRequest.reason}</td>
+                                      <td>
+                                        {quotaRequest.errorMessage
+                                          ? maskSecret(quotaRequest.errorMessage)
+                                          : "-"}
+                                      </td>
+                                      <td>{formatDateTime(quotaRequest.updatedAt)}</td>
+                                      {isSystemAdmin && (
+                                        <td>
+                                          <div className="toolbar toolbar-left">
+                                            <Button
+                                              variant="outline"
+                                              size="sm"
+                                              disabled={busy || !pending}
+                                              onClick={() =>
+                                                void decidePackageLimitRequest(
+                                                  quotaRequest.id,
+                                                  "approve",
+                                                )
+                                              }
+                                            >
+                                              通过
+                                            </Button>
+                                            <Button
+                                              variant="outline"
+                                              size="sm"
+                                              disabled={busy || !pending}
+                                              onClick={() =>
+                                                void decidePackageLimitRequest(
+                                                  quotaRequest.id,
+                                                  "reject",
+                                                )
+                                              }
+                                            >
+                                              拒绝
+                                            </Button>
+                                          </div>
+                                        </td>
+                                      )}
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        </section>
+                      )}
+                    </>
+                  )}
+                </CardContent>
+              </Card>
+            </section>
           )}
+
 
           {panel === "settings" && isSystemAdmin && (
             <Card>
@@ -3236,7 +3343,6 @@ export function AdminClient() {
                 <section className="settings-section">
                   <div>
                     <h3>套餐重置</h3>
-                    <p>按香港时区在选定日期更新所有有效用户的套餐额度。</p>
                   </div>
                   <div className="settings-reset-controls">
                     <div className="settings-inline-control">

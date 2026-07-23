@@ -16,7 +16,7 @@ import {
   formatOneDecimal,
   formatResetCountdown,
   formatTokensOneDecimal,
-  nextHongKongBillingResetAt,
+  parseAuthoritativeResetAt,
 } from "@/lib/usage-overview";
 
 type UsageOverviewCardProps = {
@@ -38,12 +38,10 @@ export function UsageOverviewCard({
 }: UsageOverviewCardProps) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const overview = buildUsageOverview({ monthlyQuota, quotaConsumed, remainingQuota });
-  const resetAt = useMemo(() => {
-    const configured = nextResetAt ? new Date(nextResetAt) : null;
-    return configured && Number.isFinite(configured.getTime())
-      ? configured
-      : nextHongKongBillingResetAt(period);
-  }, [nextResetAt, period]);
+  const resetAt = useMemo(
+    () => parseAuthoritativeResetAt(nextResetAt),
+    [nextResetAt],
+  );
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 60_000);

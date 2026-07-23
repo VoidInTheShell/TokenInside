@@ -946,29 +946,87 @@ a {
   padding-inline: 0;
 }
 
-.department-quota-table {
-  min-width: 1360px;
+.compact-admin-card .card-header,
+.compact-admin-card .card-content {
+  padding: 14px;
+}
+
+.compact-admin-card .card-content {
+  gap: 10px;
+}
+
+.department-quota-management {
+  gap: 12px;
+}
+
+.department-quota-summary-table,
+.department-package-table {
+  width: 100%;
+  min-width: 0;
   table-layout: fixed;
 }
 
 .department-quota-col-name {
-  width: 190px;
+  width: 18%;
 }
 
 .department-quota-col-members {
-  width: 170px;
+  width: 24%;
 }
 
 .department-quota-col-control {
-  width: 168px;
+  width: 22%;
 }
 
 .department-quota-col-number {
-  width: 90px;
+  width: 12%;
 }
 
-.department-quota-col-action {
-  width: 134px;
+.department-quota-summary-table th,
+.department-quota-summary-table td,
+.department-package-table th,
+.department-package-table td {
+  padding: 9px 10px;
+  vertical-align: middle;
+}
+
+.department-quota-summary-table .quota-control {
+  max-width: 180px;
+}
+
+.department-package-table th:first-child {
+  width: 32%;
+}
+
+.department-package-table th:not(:first-child) {
+  width: 34%;
+}
+
+.department-package-table .quota-control {
+  max-width: 220px;
+}
+
+.department-member-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.department-member-cell > strong {
+  white-space: nowrap;
+}
+
+.department-member-status {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.department-package-periods {
+  margin-bottom: 2px;
 }
 
 .package-limit-request-panel,
@@ -1019,6 +1077,34 @@ a {
 
 .package-limit-request-table {
   min-width: 1180px;
+}
+
+.approval-limit-request-card .package-limit-request-panel {
+  margin-top: 0;
+  border-top: 0;
+  padding-top: 0;
+}
+
+.approval-limit-request-card .package-limit-request-panel + .package-limit-request-panel {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.approval-heading-row,
+.approval-list-card > .card-header .section-heading-row {
+  margin-bottom: 0;
+}
+
+.approval-group + .approval-group {
+  margin-top: 18px;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+
+.approval-group h3 {
+  margin: 0;
+  font-size: 14px;
 }
 
 .user-management-actions {
@@ -1801,6 +1887,24 @@ a {
   margin: 14px 0;
 }
 
+.directory-filters-labels-hidden .usage-filter {
+  gap: 0;
+}
+
+.user-stats-card .card-header {
+  padding-block: 12px;
+}
+
+.user-stats-card .card-content {
+  gap: 8px;
+  padding-top: 10px;
+}
+
+.user-stats-card .directory-filters {
+  margin: 0 0 2px;
+  align-items: center;
+}
+
 .directory-filter-leading {
   min-width: 0;
   min-height: 34px;
@@ -1958,6 +2062,8 @@ a {
 .usage-search svg {
   position: absolute;
   left: 10px;
+  width: 14px;
+  height: 14px;
   color: var(--muted-foreground);
   z-index: 1;
 }
@@ -2503,6 +2609,68 @@ a {
     width: 44px;
     min-width: 44px;
     min-height: 44px;
+  }
+
+  .department-quota-summary-table,
+  .department-quota-summary-table tbody,
+  .department-package-table,
+  .department-package-table tbody {
+    display: block;
+    width: 100%;
+  }
+
+  .department-quota-summary-table thead,
+  .department-package-table thead {
+    display: none;
+  }
+
+  .department-quota-summary-table tr,
+  .department-package-table tr {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 4px 10px;
+    border-bottom: 1px solid var(--border);
+    padding: 10px 0;
+  }
+
+  .department-quota-summary-table tr:last-child,
+  .department-package-table tr:last-child {
+    border-bottom: 0;
+  }
+
+  .department-quota-summary-table td,
+  .department-package-table td {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+    border-bottom: 0;
+    padding: 5px 8px;
+  }
+
+  .department-quota-summary-table td::before,
+  .department-package-table td::before {
+    content: attr(data-label);
+    color: var(--muted-foreground);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+
+  .department-quota-summary-table td:first-child,
+  .department-quota-summary-table td:nth-child(2),
+  .department-package-table td:first-child {
+    grid-column: 1 / -1;
+  }
+
+  .department-quota-summary-table .quota-control,
+  .department-package-table .quota-control {
+    max-width: none;
+  }
+
+  .department-member-cell {
+    justify-content: space-between;
   }
 
   .main {

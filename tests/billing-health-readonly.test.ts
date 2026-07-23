@@ -40,16 +40,24 @@ test("管理后台移除账务审计与系统健康并保留三类 NewAPI 统计
   assert.doesNotMatch(source, /兼容|迁移|旧版|已下线|账期|代理请求/);
 });
 
-test("套餐管理替代部门额度入口并落实角色写权限", async () => {
+test("部门额度管理拆分预算与双周期套餐并落实角色写权限", async () => {
   const [client, route] = await Promise.all([
     readFile(adminClientPath, "utf8"),
     readFile(packagesRoutePath, "utf8"),
   ]);
   assert.match(client, /selectPanel\("packages"\)/);
-  assert.match(client, /套餐管理/);
+  assert.match(client, /部门额度管理/);
+  assert.match(client, /department-quota-summary-table/);
+  assert.match(client, /department-package-table/);
   assert.match(client, /本周期套餐额度/);
   assert.match(client, /下一周期套餐额度/);
   assert.match(client, /申请提升总额度上限/);
+  const packages = section(client, '{panel === "packages" && (', '{panel === "departmentStats" && isSystemAdmin && (');
+  const approvals = section(client, '{panel === "approvals" && (', '{panel === "settings" && isSystemAdmin && (');
+  assert.doesNotMatch(packages, /申请提升总额度上限|总额度上限提升申请/);
+  assert.match(approvals, /申请提升总额度上限/);
+  assert.match(approvals, /总额度上限提升申请/);
+  assert.doesNotMatch(packages, /<span>\{department\.departmentId\}<\/span>/);
   assert.match(client, /fetch\("\/api\/admin\/packages"/);
   assert.match(client, /fetch\("\/api\/admin\/packages\/requests"/);
   assert.match(route, /totalQuotaLimit/);

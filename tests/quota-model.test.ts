@@ -7,7 +7,7 @@ import {
   classifyQuotaReconciliation,
   conservativeRemainQuotaObservation,
   fixedUsageSyncWindow,
-  hongKongBillingPeriod,
+  shanghaiBillingPeriod,
   initialUnassignedMonthlyQuota,
   isSettlementWatermarkFresh,
   materializeDepartmentQuota,
@@ -234,8 +234,8 @@ test("reconciliation never treats unstable or unsettled reads as repairable", ()
   );
 });
 
-test("billing periods and sync windows use Hong Kong time and a frozen end", () => {
-  assert.equal(hongKongBillingPeriod(new Date("2026-06-30T16:00:00.000Z")), "2026-07");
+test("billing periods and sync windows use Shanghai time and a frozen end", () => {
+  assert.equal(shanghaiBillingPeriod(new Date("2026-06-30T16:00:00.000Z")), "2026-07");
   assert.deepEqual(
     fixedUsageSyncWindow({
       runStartedAt: "2026-07-11T10:00:00.000Z",
@@ -250,7 +250,7 @@ test("billing periods and sync windows use Hong Kong time and a frozen end", () 
   );
 });
 
-test("matched usage keeps the proxy period while unmatched usage uses Hong Kong time", () => {
+test("matched usage keeps the proxy period while unmatched usage uses Shanghai time", () => {
   const delayedLogTime = "2026-06-30T16:30:00.000Z";
   assert.equal(
     resolveUsageBillingPeriod({

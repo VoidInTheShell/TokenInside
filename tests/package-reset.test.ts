@@ -6,12 +6,14 @@ import {
   nextPackagePeriod,
   nextPackageResetAt,
   normalizePackageResetPolicy,
+  PACKAGE_RESET_TIME_ZONE,
   packagePeriod,
 } from "../lib/package-reset.ts";
 
-test("package reset policy defaults to disabled day one and clamps invalid stored days", () => {
+test("package reset policy defaults to enabled day one in Asia/Shanghai", () => {
+  assert.equal(PACKAGE_RESET_TIME_ZONE, "Asia/Shanghai");
   assert.deepEqual(normalizePackageResetPolicy(), {
-    enabled: false,
+    enabled: true,
     dayOfMonth: 1,
     updatedAt: undefined,
     updatedByFeishuUserId: undefined,
@@ -20,7 +22,7 @@ test("package reset policy defaults to disabled day one and clamps invalid store
   assert.equal(normalizePackageResetPolicy({ enabled: true, dayOfMonth: -5 }).dayOfMonth, 1);
 });
 
-test("disabled package reset preserves the Hong Kong calendar month", () => {
+test("disabled package reset preserves the Shanghai calendar month", () => {
   assert.equal(
     packagePeriod(
       { enabled: false, dayOfMonth: 15 },
@@ -37,7 +39,7 @@ test("disabled package reset preserves the Hong Kong calendar month", () => {
   );
 });
 
-test("a mid-month reset changes periods exactly at Hong Kong midnight", () => {
+test("a mid-month reset changes periods exactly at Shanghai midnight", () => {
   const policy = { enabled: true, dayOfMonth: 15 };
   const before = new Date("2026-07-14T15:59:59.999Z");
   const atReset = new Date("2026-07-14T16:00:00.000Z");
@@ -80,7 +82,7 @@ test("custom reset periods do not collide with calendar-month provision markers"
   assert.notEqual(reset?.period, "2026-07");
 });
 
-test("day 31 clamps to the final Hong Kong day in short months", () => {
+test("day 31 clamps to the final Shanghai day in short months", () => {
   const policy = { enabled: true, dayOfMonth: 31 };
   const beforeFebruaryReset = new Date("2027-02-27T15:59:59.999Z");
   const atFebruaryReset = new Date("2027-02-27T16:00:00.000Z");
@@ -93,6 +95,40 @@ test("day 31 clamps to the final Hong Kong day in short months", () => {
   assert.equal(
     nextPackageResetAt(policy, atFebruaryReset)?.toISOString(),
     "2027-03-30T16:00:00.000Z",
+  );
+});
+
+test("the configured administrator reset day drives the authoritative next reset", () => {
+  const now = new Date("2026-07-20T00:00:00.000Z");
+  const expected = new Map([
+    [1, "2026-07-31T16:00:00.000Z"],
+    [15, "2026-08-14T16:00:00.000Z"],
+    [29, "2026-07-28T16:00:00.000Z"],
+    [30, "2026-07-29T16:00:00.000Z"],
+    [31, "2026-07-30T16:00:00.000Z"],
+  ]);
+  for (const [dayOfMonth, nextResetAt] of expected) {
+    assert.equal(
+      nextPackageResetAt({ enabled: true, dayOfMonth }, now)?.toISOString(),
+      nextResetAt,
+    );
+  }
+});
+
+test("days 29 and 30 clamp to the final Shanghai day in February", () => {
+  assert.equal(
+    nextPackageResetAt(
+      { enabled: true, dayOfMonth: 29 },
+      new Date("2028-02-01T00:00:00.000Z"),
+    )?.toISOString(),
+    "2028-02-28T16:00:00.000Z",
+  );
+  assert.equal(
+    nextPackageResetAt(
+      { enabled: true, dayOfMonth: 30 },
+      new Date("2027-02-01T00:00:00.000Z"),
+    )?.toISOString(),
+    "2027-02-27T16:00:00.000Z",
   );
 });
 

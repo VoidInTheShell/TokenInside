@@ -187,7 +187,7 @@ async function loadQuotaAdjustmentHarness(input: {
     },
     "@/lib/newapi": { toNewApiQuota: (quota: number) => Math.round(quota * 10) },
     "@/lib/package-reset": { packagePeriod },
-    "@/lib/quota-model": { hongKongBillingPeriod: () => "2099-01" },
+    "@/lib/quota-model": { shanghaiBillingPeriod: () => "2099-01" },
     "@/lib/quota-saga-state": {
       canReopenFirstProvisionAfterAccessRevoke,
       reopenFirstProvisionAfterAccessRevoke,

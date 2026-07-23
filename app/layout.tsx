@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "TokenInside",
-  description: "飞书用户的 NewAPI Key 与套餐管理控制台",
+  description: "飞书用户的 NewAPI Key 与部门额度管理控制台",
   icons: {
     icon: "/icon.svg",
   },

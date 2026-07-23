@@ -1,13 +1,15 @@
 import type { PackageResetPolicy } from "./types";
+import { APP_TIME_ZONE } from "./time-zone.ts";
 
-const HONG_KONG_OFFSET_MS = 8 * 60 * 60 * 1000;
+const SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000;
 
 export const DEFAULT_PACKAGE_RESET_DAY = 1;
+export const PACKAGE_RESET_TIME_ZONE = APP_TIME_ZONE;
 export const PACKAGE_RESET_SYSTEM_ACTOR = "system:package-reset";
 
 export function defaultPackageResetPolicy(): PackageResetPolicy {
   return {
-    enabled: false,
+    enabled: true,
     dayOfMonth: DEFAULT_PACKAGE_RESET_DAY,
   };
 }
@@ -17,15 +19,15 @@ export function normalizePackageResetPolicy(
 ): PackageResetPolicy {
   const day = Math.trunc(Number(policy?.dayOfMonth ?? DEFAULT_PACKAGE_RESET_DAY));
   return {
-    enabled: policy?.enabled === true,
+    enabled: policy?.enabled ?? true,
     dayOfMonth: Math.min(Math.max(Number.isFinite(day) ? day : DEFAULT_PACKAGE_RESET_DAY, 1), 31),
     updatedAt: policy?.updatedAt,
     updatedByFeishuUserId: policy?.updatedByFeishuUserId,
   };
 }
 
-function hongKongParts(date: Date) {
-  const shifted = new Date(date.getTime() + HONG_KONG_OFFSET_MS);
+function shanghaiParts(date: Date) {
+  const shifted = new Date(date.getTime() + SHANGHAI_OFFSET_MS);
   return {
     year: shifted.getUTCFullYear(),
     month: shifted.getUTCMonth() + 1,
@@ -38,7 +40,7 @@ function daysInMonth(year: number, month: number) {
 
 function resetOccurrence(year: number, month: number, dayOfMonth: number) {
   const day = Math.min(dayOfMonth, daysInMonth(year, month));
-  return new Date(Date.UTC(year, month - 1, day, -8, 0, 0, 0));
+  return new Date(Date.UTC(year, month - 1, day) - SHANGHAI_OFFSET_MS);
 }
 
 function shiftMonth(year: number, month: number, delta: number) {
@@ -77,7 +79,7 @@ export function latestDuePackageReset(
   const normalized = normalizePackageResetPolicy(policy);
   if (!normalized.enabled) return null;
 
-  const current = hongKongParts(now);
+  const current = shanghaiParts(now);
   let occurrence = resetOccurrence(
     current.year,
     current.month,
@@ -110,7 +112,7 @@ export function nextPackageResetAt(
   const normalized = normalizePackageResetPolicy(policy);
   if (!normalized.enabled) return null;
 
-  const current = hongKongParts(now);
+  const current = shanghaiParts(now);
   let occurrenceMonth = current;
   let occurrence = resetOccurrence(
     current.year,
@@ -133,7 +135,7 @@ export function packagePeriod(
   now = new Date(),
 ) {
   const normalized = normalizePackageResetPolicy(policy);
-  const current = hongKongParts(now);
+  const current = shanghaiParts(now);
   if (!normalized.enabled) return periodId(current.year, current.month);
 
   const due = latestDuePackageReset(normalized, now);
@@ -150,7 +152,7 @@ export function nextPackagePeriod(
     return packagePeriod(normalized, new Date(nextReset.getTime() + 1));
   }
 
-  const current = hongKongParts(now);
+  const current = shanghaiParts(now);
   const next = shiftMonth(current.year, current.month, 1);
   return periodId(next.year, next.month);
 }
@@ -173,7 +175,7 @@ export function packageWindow(
     }
   }
 
-  const current = hongKongParts(now);
+  const current = shanghaiParts(now);
   const start = resetOccurrence(current.year, current.month, 1);
   const nextMonth = shiftMonth(current.year, current.month, 1);
   const next = resetOccurrence(nextMonth.year, nextMonth.month, 1);

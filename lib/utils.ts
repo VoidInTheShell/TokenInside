@@ -1,5 +1,6 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { APP_TIME_ZONE } from "./time-zone.ts";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -8,6 +9,7 @@ export function cn(...inputs: ClassValue[]) {
 export function formatDateTime(value?: string | null) {
   if (!value) return "-";
   return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: APP_TIME_ZONE,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
