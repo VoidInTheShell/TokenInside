@@ -15,6 +15,7 @@ const workerPath = new URL("../lib/department-member-sync.ts", import.meta.url);
 const storePath = new URL("../lib/store.ts", import.meta.url);
 const postgresPath = new URL("../lib/postgres-store.ts", import.meta.url);
 const instrumentationPath = new URL("../instrumentation.ts", import.meta.url);
+const runtimeStartupPath = new URL("../lib/runtime-startup.ts", import.meta.url);
 const adminClientPath = new URL("../components/admin-client.tsx", import.meta.url);
 const migrationPath = new URL("../scripts/db-migrate.mjs", import.meta.url);
 
@@ -27,10 +28,11 @@ function section(source: string, start: string, end: string) {
 }
 
 test("department member sync HTTP is a durable 202 submission, not a directory workload", async () => {
-  const [route, worker, instrumentation, client] = await Promise.all([
+  const [route, worker, instrumentation, runtimeStartup, client] = await Promise.all([
     readFile(routePath, "utf8"),
     readFile(workerPath, "utf8"),
     readFile(instrumentationPath, "utf8"),
+    readFile(runtimeStartupPath, "utf8"),
     readFile(adminClientPath, "utf8"),
   ]);
   const post = section(route, "export async function POST", "\n}");
@@ -46,7 +48,8 @@ test("department member sync HTTP is a durable 202 submission, not a directory w
   assert.match(worker, /claimBillingOperationExecution/);
   assert.match(worker, /renewBillingOperationExecution/);
   assert.match(worker, /withDepartmentMemberSyncWorkerFence/);
-  assert.match(instrumentation, /ensureDepartmentMemberSyncWorker/);
+  assert.match(instrumentation, /ensureRuntimeStartup/);
+  assert.match(runtimeStartup, /ensureDepartmentMemberSyncWorker/);
   assert.doesNotMatch(worker, /prewarmDepartmentMemberKeys|prewarmKeys/);
   assert.doesNotMatch(route, /prewarmKeys/);
   assert.doesNotMatch(client, /prewarmKeysOnMemberSync|同步并预热|无 Key 成员预热|已预热/);

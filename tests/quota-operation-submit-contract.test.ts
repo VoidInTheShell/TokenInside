@@ -10,6 +10,7 @@ const quotaDecisionRoutePath = new URL(
 );
 const keyResetRoutePath = new URL("../app/api/token/reset/route.ts", import.meta.url);
 const instrumentationPath = new URL("../instrumentation.ts", import.meta.url);
+const runtimeStartupPath = new URL("../lib/runtime-startup.ts", import.meta.url);
 
 function section(source: string, startMarker: string, endMarker?: string) {
   const start = source.indexOf(startMarker);
@@ -30,9 +31,10 @@ function assertOrdered(source: string, markers: string[]) {
 }
 
 test("quota submission owns a small bounded pool independent from business and control work", async () => {
-  const [source, instrumentation] = await Promise.all([
+  const [source, instrumentation, runtimeStartup] = await Promise.all([
     readFile(quotaSubmitPath, "utf8"),
     readFile(instrumentationPath, "utf8"),
+    readFile(runtimeStartupPath, "utf8"),
   ]);
   const pool = section(source, "function getQuotaSubmitPool()", "export function quotaSubmitPoolRuntimeSnapshot");
 
@@ -58,12 +60,20 @@ test("quota submission owns a small bounded pool independent from business and c
     source,
     /Promise\.all\(clients\.map\(\(client\) => client\.query\("select 1"\)\)\)/,
   );
-  assert.match(instrumentation, /await warmQuotaSubmitPool\(\)/);
+  assert.match(instrumentation, /void ensureRuntimeStartup\(\)/);
+  assert.doesNotMatch(instrumentation, /warmQuotaSubmitPool/);
+  assert.match(runtimeStartup, /await warmQuotaSubmitPool\(\)/);
   assert.ok(
-    instrumentation.indexOf("await warmQuotaSubmitPool()") <
-      instrumentation.indexOf("ensureQuotaOperationWorker()"),
+    runtimeStartup.indexOf("await warmQuotaSubmitPool()") <
+      runtimeStartup.indexOf("ensureQuotaOperationWorker()"),
   );
-  assert.doesNotMatch(instrumentation, /ensureUsageSyncScheduler|quota-balance-observer/);
+  assert.ok(
+    runtimeStartup.indexOf("await checkPostgresSchema()") <
+      runtimeStartup.indexOf("await warmQuotaSubmitPool()") &&
+      runtimeStartup.indexOf("await warmQuotaSubmitPool()") <
+        runtimeStartup.indexOf("ensureQuotaOperationWorker()"),
+  );
+  assert.doesNotMatch(runtimeStartup, /ensureUsageSyncScheduler|quota-balance-observer/);
 });
 
 test("session identity and submit authorization avoid shared store and external control-plane calls", async () => {

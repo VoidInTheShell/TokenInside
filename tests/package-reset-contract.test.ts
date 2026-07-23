@@ -12,9 +12,10 @@ const settingsRoutePath = new URL(
 );
 const adminClientPath = new URL("../components/admin-client.tsx", import.meta.url);
 const instrumentationPath = new URL("../instrumentation.ts", import.meta.url);
+const runtimeStartupPath = new URL("../lib/runtime-startup.ts", import.meta.url);
 
 test("package reset remains a system setting backed by an automatic fenced scheduler", async () => {
-  const [scheduler, plan, postgresStore, store, settingsRoute, adminClient, instrumentation] =
+  const [scheduler, plan, postgresStore, store, settingsRoute, adminClient, instrumentation, runtimeStartup] =
     await Promise.all([
       readFile(schedulerPath, "utf8"),
       readFile(planPath, "utf8"),
@@ -23,6 +24,7 @@ test("package reset remains a system setting backed by an automatic fenced sched
       readFile(settingsRoutePath, "utf8"),
       readFile(adminClientPath, "utf8"),
       readFile(instrumentationPath, "utf8"),
+      readFile(runtimeStartupPath, "utf8"),
     ]);
 
   assert.match(settingsRoute, /packageReset:[\s\S]*?enabled: z\.boolean\(\)/);
@@ -33,7 +35,8 @@ test("package reset remains a system setting backed by an automatic fenced sched
   assert.match(adminClient, /Array\.from\(\{ length: 31 \}/);
   assert.doesNotMatch(adminClient, /panel === "packageReset"/);
 
-  assert.match(instrumentation, /ensurePackageResetScheduler/);
+  assert.match(instrumentation, /ensureRuntimeStartup/);
+  assert.match(runtimeStartup, /ensurePackageResetScheduler/);
   assert.match(scheduler, /withPackageResetSchedulerFence/);
   assert.match(
     scheduler,

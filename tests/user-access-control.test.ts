@@ -28,6 +28,7 @@ const quotaAdjustRoutePath = new URL(
 const adminUsersPath = new URL("../components/admin-client.tsx", import.meta.url);
 const adminAssignmentRoutePath = new URL("../app/api/admin/admins/route.ts", import.meta.url);
 const instrumentationPath = new URL("../instrumentation.ts", import.meta.url);
+const runtimeStartupPath = new URL("../lib/runtime-startup.ts", import.meta.url);
 const baselinePath = new URL("../scripts/db-migrate.mjs", import.meta.url);
 
 type UserAccessApi = {
@@ -565,6 +566,7 @@ test("disable delete and enable are scope-locked fenced fail-closed workflows", 
     adminUsers,
     adminAssignmentRoute,
     instrumentation,
+    runtimeStartup,
     baseline,
   ] =
     await Promise.all([
@@ -579,6 +581,7 @@ test("disable delete and enable are scope-locked fenced fail-closed workflows", 
       readFile(adminUsersPath, "utf8"),
       readFile(adminAssignmentRoutePath, "utf8"),
       readFile(instrumentationPath, "utf8"),
+      readFile(runtimeStartupPath, "utf8"),
       readFile(baselinePath, "utf8"),
     ]);
 
@@ -653,7 +656,8 @@ test("disable delete and enable are scope-locked fenced fail-closed workflows", 
   assert.match(store, /rollbackUserAccessResumeUnderUserFence/);
   assert.match(store, /quotaState\.closedReason !== "user_access_resume_pending"/);
   assert.match(store, /resumeUpstreamEnableAttemptedAt/);
-  assert.match(instrumentation, /ensureUserAccessRecoveryWorker/);
+  assert.match(instrumentation, /ensureRuntimeStartup/);
+  assert.match(runtimeStartup, /ensureUserAccessRecoveryWorker/);
   assert.match(baseline, /user_quota_states_resume_recovery_idx/);
 
   for (const route of [deleteRoute, disableRoute, enableRoute]) {

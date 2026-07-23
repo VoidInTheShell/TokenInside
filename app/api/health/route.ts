@@ -10,6 +10,10 @@ import {
 } from "@/lib/postgres-store";
 import { quotaOperationExecutionSnapshot } from "@/lib/quota-saga";
 import { quotaSubmitPoolRuntimeSnapshot } from "@/lib/quota-operation-submit";
+import {
+  ensureRuntimeStartup,
+  runtimeStartupSnapshot,
+} from "@/lib/runtime-startup";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -38,6 +42,8 @@ function configured(value: unknown) {
 }
 
 export async function GET() {
+  void ensureRuntimeStartup();
+  const runtimeStartup = runtimeStartupSnapshot();
   const config = getConfig();
   const runtimeBinding = await getNewApiRuntimeBindingForHealth().catch(() => ({
     value: config.newapi,
@@ -60,7 +66,8 @@ export async function GET() {
     config.storeBackend === "postgres"
       ? storeWritable && postgresSchema?.ready
       : storeWritable;
-  const status = storeReady ? "ok" : "degraded";
+  const ready = storeReady && runtimeStartup.ready;
+  const status = ready ? "ok" : "degraded";
 
   return NextResponse.json(
     {
@@ -99,6 +106,7 @@ export async function GET() {
             : undefined,
         quotaOperations: quotaOperationExecutionSnapshot(),
       },
+      runtimeStartup,
       configuration: {
         sessionSecret: configured(config.sessionSecret),
         feishuApp: configured(config.feishu.appId) && configured(config.feishu.appSecret),
@@ -122,7 +130,7 @@ export async function GET() {
       },
     },
     {
-      status: storeReady ? 200 : 503,
+      status: ready ? 200 : 503,
       headers: {
         "Cache-Control": "no-store",
       },
